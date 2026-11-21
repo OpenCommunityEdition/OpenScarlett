@@ -22,7 +22,7 @@ const char* iid_name(REFIID r) {
     N(ID3D12GraphicsCommandList4) N(ID3D12GraphicsCommandList5) N(ID3D12GraphicsCommandList6) N(ID3D12GraphicsCommandList7)
     N(ID3D12GraphicsCommandList8) N(ID3D12Fence) N(ID3D12Fence1) N(ID3D12Resource) N(ID3D12Resource1) N(ID3D12Resource2)
     N(ID3D12Heap) N(ID3D12Heap1) N(ID3D12DescriptorHeap) N(ID3D12RootSignature) N(ID3D12PipelineState) N(IDXGIObject)
-    N(IDXGIDevice) N(IDXGIDevice1) N(IDXGIDevice2) N(IDXGIAdapter) N(IDXGIAdapter1) N(IDXGIAdapter2) N(IDXGIOutput)
+    N(IDXGIDevice) N(IDXGIDevice1) N(IDXGIDevice2) N(IDXGIAdapter) N(IDXGIAdapter1) N(IDXGIAdapter2) N(IDXGIOutput) N(IDXGIFactory) N(IDXGIFactory1) N(IDXGIFactory2)
     N(ID3D12Debug) N(ID3D12DebugDevice)
 #undef N
     static thread_local char buf[64];
@@ -151,6 +151,10 @@ HRESULT D3DAPI Pso_GetCachedBlob(ID3D12PipelineState* pso, ID3DBlob** out) {
     return S_OK;
 }
 std::once_flag g_simple_once;
+// Memory heaps keep the description the title created them with: the PC heap's may differ (upload
+// heaps are created as write-back custom heaps, console-only flags are dropped).
+struct MemHeapExtra { D3D12_HEAP_DESC desc; };
+void D3DAPI Heap_GetDesc(ID3D12Heap* h, D3D12_HEAP_DESC* d) { if (d) *d = ex<ID3D12Heap, MemHeapExtra>(h)->desc; }
 void init_simple_tables() {
     std::call_once(g_simple_once, [] {
         xsl_fill_default(&g_fence_tbl);
@@ -166,6 +170,7 @@ void init_simple_tables() {
         g_pso_tbl.GetCachedBlob = Pso_GetCachedBlob;
         xsl_fill_default(&g_heap_tbl);
         install_device_child_base(&g_heap_tbl);
+        g_heap_tbl.HeapTable.GetDesc = Heap_GetDesc;
         xsl_fill_default(&g_sig_tbl);
         install_device_child_base(&g_sig_tbl);
         xsl_fill_default(&g_qh_tbl);
@@ -173,6 +178,13 @@ void init_simple_tables() {
     });
 }
 }  // namespace
+
+HRESULT make_heap(Device* dev, PcObj pc, const D3D12_HEAP_DESC* desc, REFIID riid, void** out) {
+    init_simple_tables();
+    IGraphicsUnknown* o = make<ID3D12Heap1, MemHeapExtra>(Kind::Heap, &g_heap_tbl, pc, dev, Iids<ID3D12Heap1>::list, nullptr);
+    ex<ID3D12Heap, MemHeapExtra>((ID3D12Heap*)o)->desc = *desc;
+    return hand_out(o, riid, out);
+}
 
 HRESULT make_simple(Device* dev, Kind kind, PcObj pc, REFIID riid, void** out) {
     init_simple_tables();
@@ -785,6 +797,9 @@ void D3DAPI Q_Execute(ID3D12CommandQueue* q, UINT n, ID3D12CommandList* const* l
     pc::queue_execute(pc_of(q), n, v.data());
 }
 HRESULT D3DAPI Q_Signal(ID3D12CommandQueue* q, ID3D12Fence* f, UINT64 v) { return pc::queue_signal(pc_of(q), P(f), v); }
+// Signal with console cache-flush flags: a PC queue signal already follows completion of all prior
+// work, caches included.
+HRESULT D3DAPI Q_SignalX(ID3D12CommandQueue* q, ID3D12Fence* f, UINT64 v, D3D12XBOX_FLUSH) { return pc::queue_signal(pc_of(q), P(f), v); }
 HRESULT D3DAPI Q_Wait(ID3D12CommandQueue* q, ID3D12Fence* f, UINT64 v) { return pc::queue_wait(pc_of(q), P(f), v); }
 void D3DAPI Q_GetDesc(ID3D12CommandQueue* q, D3D12_COMMAND_QUEUE_DESC* d) { *d = ex<ID3D12CommandQueue, QueueExtra>(q)->desc; }
 HRESULT D3DAPI Q_SuspendX(ID3D12CommandQueue*, UINT) { return S_OK; }
@@ -852,6 +867,7 @@ HRESULT make_queue(Device* dev, PcObj pcq, const D3D12_COMMAND_QUEUE_DESC* d, RE
         install_device_child_base(&g_queue_tbl);
         g_queue_tbl.ExecuteCommandLists = Q_Execute;
         g_queue_tbl.Signal = Q_Signal;
+        g_queue_tbl.SignalX = Q_SignalX;
         g_queue_tbl.Wait = Q_Wait;
         g_queue_tbl.GetDesc = Q_GetDesc;
         g_queue_tbl.SuspendX = Q_SuspendX;

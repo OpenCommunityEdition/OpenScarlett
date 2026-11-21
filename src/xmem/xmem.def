@@ -27,7 +27,7 @@ EXPORTS
     XMemGetPartitionHandleAndId=xsl_xmem_unsupported
     XMemGetWin32HeapName=xsl_xmem_unsupported
     XMemGetWin32HeapStatistics=xsl_xmem_unsupported
-    XMemGetWorkingSetStatistics=xsl_xmem_unsupported
+    XMemGetWorkingSetStatistics
     XMemHistoryData=xsl_xmem_unsupported
     XMemIsToolsMemAvailable=xsl_xmem_unsupported
     XMemPreallocateFreeSpace=xsl_xmem_true

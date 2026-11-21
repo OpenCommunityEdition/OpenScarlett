@@ -50,6 +50,7 @@ HRESULT logged(HRESULT hr, const char* what) {
 D3D12_CPU_DESCRIPTOR_HANDLE cpu(uint64_t h) { return D3D12_CPU_DESCRIPTOR_HANDLE{(SIZE_T)h}; }
 D3D12_GPU_DESCRIPTOR_HANDLE gpu(uint64_t h) { return D3D12_GPU_DESCRIPTOR_HANDLE{h}; }
 std::string g_adapter = "unknown";
+LUID g_adapter_luid{};
 Caps g_caps{};
 IDXGIFactory4* g_factory = nullptr;
 
@@ -82,6 +83,7 @@ HRESULT_T create_device(PcObj* out) {
         char name[256];
         WideCharToMultiByte(CP_UTF8, 0, d.Description, -1, name, sizeof name, nullptr, nullptr);
         g_adapter = name;
+        g_adapter_luid = d.AdapterLuid;
     }
     ID3D12Device* dev = nullptr;
     const D3D_FEATURE_LEVEL levels[] = {D3D_FEATURE_LEVEL_12_2, D3D_FEATURE_LEVEL_12_1, D3D_FEATURE_LEVEL_12_0, D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0};
@@ -128,6 +130,7 @@ HRESULT_T create_device(PcObj* out) {
 }
 
 const char* adapter_name() { return g_adapter.c_str(); }
+uint64_t adapter_luid() { return ((uint64_t)(uint32_t)g_adapter_luid.HighPart << 32) | g_adapter_luid.LowPart; }
 const Caps& caps() { return g_caps; }
 int format_stand_in(int f) { return stand_in((DXGI_FORMAT)f); }
 void drop_map_shadow(PcObj o);
@@ -330,9 +333,65 @@ void list_resolve_query(PcObj l, PcObj h, uint32_t t, uint32_t s, uint32_t n, Pc
 HRESULT_T queue_timestamp_frequency(PcObj q, uint64_t* f) { return as<ID3D12CommandQueue>(q)->GetTimestampFrequency(f); }
 HRESULT_T queue_clock_calibration(PcObj q, uint64_t* g, uint64_t* c) { return as<ID3D12CommandQueue>(q)->GetClockCalibration(g, c); }
 
+// Console indirect argument types (D3D12XBOX_INDIRECT_ARGUMENT_TYPE_*, 100 and up). Those with a
+// PC equivalent are translated; the record layouts match (DISPATCHX and DISPATCH_L2/SINGLE take
+// the three thread-group counts of a dispatch, DISPATCH_MESH_X those of a mesh dispatch, and
+// only schedule the work differently on the console GPU). Scheduling markers without data
+// (DPBB_BREAK_BATCH, FLUSH_PIPELINEX) are dropped when they come last, where removing them moves
+// no other argument. The rest (padding, topology, descriptor table, pipeline state) has no PC
+// form and still fails.
+constexpr int kXboxArgDispatchX = 104, kXboxArgDispatchL2 = 105, kXboxArgBreakBatch = 106, kXboxArgDispatchMeshX = 107,
+              kXboxArgFlushPipeline = 108;
+bool translate_indirect_args(const D3D12_COMMAND_SIGNATURE_DESC* in, std::vector<D3D12_INDIRECT_ARGUMENT_DESC>* args) {
+    args->assign(in->pArgumentDescs, in->pArgumentDescs + in->NumArgumentDescs);
+    bool changed = false;
+    for (auto& a : *args) {
+        int t = (int)a.Type;
+        if (t == kXboxArgDispatchX || t == kXboxArgDispatchL2) { a.Type = D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH; changed = true; }
+        else if (t == kXboxArgDispatchMeshX) { a.Type = D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_MESH; changed = true; }
+    }
+    while (!args->empty() && ((int)args->back().Type == kXboxArgBreakBatch || (int)args->back().Type == kXboxArgFlushPipeline)) {
+        args->pop_back();
+        changed = true;
+    }
+    return changed;
+}
+
 HRESULT_T create_command_signature(PcObj dev, const void* desc, PcObj rs, PcObj* out) {
-    return logged(as<ID3D12Device>(dev)->CreateCommandSignature(static_cast<const D3D12_COMMAND_SIGNATURE_DESC*>(desc), as<ID3D12RootSignature>(rs),
-                                                         IID_PPV_ARGS(reinterpret_cast<ID3D12CommandSignature**>(out))), "CreateCommandSignature");
+    auto* d = static_cast<const D3D12_COMMAND_SIGNATURE_DESC*>(desc);
+    std::vector<D3D12_INDIRECT_ARGUMENT_DESC> args;
+    D3D12_COMMAND_SIGNATURE_DESC pcDesc;
+    if (d && d->pArgumentDescs && translate_indirect_args(d, &args)) {
+        pcDesc = *d;
+        pcDesc.pArgumentDescs = args.data();
+        pcDesc.NumArgumentDescs = (UINT)args.size();
+        static volatile long once = 0;
+        if (!InterlockedExchange(&once, 1)) XSL_INFO(CH, "command signatures with console argument types are translated to PC ones");
+        d = &pcDesc;
+    }
+    // The console accepts a root signature on any command signature; PC D3D12 requires one if and
+    // only if an argument changes root parameters (constants, root CBV/SRV/UAV).
+    bool rootArgs = false;
+    for (UINT i = 0; d && i < d->NumArgumentDescs; i++) {
+        D3D12_INDIRECT_ARGUMENT_TYPE t = d->pArgumentDescs[i].Type;
+        rootArgs |= t == D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT || t == D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT_BUFFER_VIEW ||
+                    t == D3D12_INDIRECT_ARGUMENT_TYPE_SHADER_RESOURCE_VIEW || t == D3D12_INDIRECT_ARGUMENT_TYPE_UNORDERED_ACCESS_VIEW;
+    }
+    if (!rootArgs) rs = nullptr;
+    HRESULT hr = as<ID3D12Device>(dev)->CreateCommandSignature(d, as<ID3D12RootSignature>(rs),
+                                                               IID_PPV_ARGS(reinterpret_cast<ID3D12CommandSignature**>(out)));
+    if (FAILED(hr) && d) {
+        std::string args;
+        for (UINT i = 0; i < d->NumArgumentDescs && i < 16; i++) {
+            const D3D12_INDIRECT_ARGUMENT_DESC& a = d->pArgumentDescs[i];
+            char b[64];
+            snprintf(b, sizeof b, "%s%d(%u,%u)", i ? " " : "", (int)a.Type, a.Constant.RootParameterIndex, a.Constant.Num32BitValuesToSet);
+            args += b;
+        }
+        XSL_ERR(CH, "CreateCommandSignature: stride %u, %u argument(s) [type(param,n)]: %s, root signature %p, node mask %x", d->ByteStride,
+                d->NumArgumentDescs, args.c_str(), rs, d->NodeMask);
+    }
+    return logged(hr, "CreateCommandSignature");
 }
 
 namespace {
@@ -573,7 +632,24 @@ void create_uav(PcObj dev, PcObj res, PcObj counter, const void* desc, uint64_t 
     as<ID3D12Device>(dev)->CreateUnorderedAccessView(as<ID3D12Resource>(res), as<ID3D12Resource>(counter), view_fix(res, desc, t), cpu(h));
 }
 void create_cbv(PcObj dev, const void* desc, uint64_t h) {
-    as<ID3D12Device>(dev)->CreateConstantBufferView(static_cast<const D3D12_CONSTANT_BUFFER_VIEW_DESC*>(desc), cpu(h));
+    // Console constant-buffer views come in 16-byte steps (D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_
+    // ALIGNMENT is 16 there); PC D3D12 requires sizes in multiples of 256, so the size is rounded
+    // up (a larger window onto the same constants). Addresses must also be 256-aligned on PC;
+    // unaligned ones cannot be fixed in the view and are reported.
+    D3D12_CONSTANT_BUFFER_VIEW_DESC d{};
+    const D3D12_CONSTANT_BUFFER_VIEW_DESC* p = static_cast<const D3D12_CONSTANT_BUFFER_VIEW_DESC*>(desc);
+    if (p) {
+        d = *p;
+        d.SizeInBytes = (d.SizeInBytes + 255) & ~255u;
+        if (d.BufferLocation & 255) {
+            static volatile long n = 0;
+            if (InterlockedIncrement(&n) <= 3)
+                XSL_WARN(CH, "constant buffer view at %llx is not 256-byte aligned (PC requirement); the shader may read shifted constants",
+                         (unsigned long long)d.BufferLocation);
+        }
+        p = &d;
+    }
+    as<ID3D12Device>(dev)->CreateConstantBufferView(p, cpu(h));
 }
 void create_sampler(PcObj dev, const void* desc, uint64_t h) {
     as<ID3D12Device>(dev)->CreateSampler(static_cast<const D3D12_SAMPLER_DESC*>(desc), cpu(h));
@@ -778,13 +854,7 @@ bool rebase_footprint(D3D12_PLACED_SUBRESOURCE_FOOTPRINT* p, UINT* x0, UINT* y0)
         UINT widthBlocks = (f.Width + fs.block - 1) / fs.block;
         ok = rem % fs.bytes == 0 && (UINT64)(widthBlocks + cols) * fs.bytes <= f.RowPitch && (rows == 0 || f.Depth == 1);
     }
-    if (!ok) {
-        static volatile long n = 0;
-        if (InterlockedIncrement(&n) <= 4)
-            XSL_WARN(CH, "texture copy with a buffer footprint at offset %llu (format %d, %ux%u, pitch %u) cannot be realigned: skipped",
-                     (unsigned long long)p->Offset, (int)f.Format, f.Width, f.Height, f.RowPitch);
-        return false;
-    }
+    if (!ok) return false;
     p->Offset -= delta;
     *x0 = cols * fs.block;
     *y0 = rows * fs.block;
@@ -799,6 +869,73 @@ bool rebase_footprint(D3D12_PLACED_SUBRESOURCE_FOOTPRINT* p, UINT* x0, UINT* y0)
 void list_copy_buffer_region(PcObj l, PcObj dst, uint64_t doff, PcObj src, uint64_t soff, uint64_t n) {
     L->CopyBufferRegion(as<ID3D12Resource>(dst), doff, as<ID3D12Resource>(src), soff, n);
 }
+void warn_unaligned_copy(const D3D12_PLACED_SUBRESOURCE_FOOTPRINT& p) {
+    static volatile long n = 0;
+    if (InterlockedIncrement(&n) <= 4)
+        XSL_WARN(CH, "texture copy with a buffer footprint at offset %llu (format %d, %ux%u, pitch %u) cannot be realigned: skipped",
+                 (unsigned long long)p.Offset, (int)p.Footprint.Format, p.Footprint.Width, p.Footprint.Height, p.Footprint.RowPitch);
+}
+
+// Staging for source footprints that cannot be rebased (the rows fill their pitch, so there is no
+// room to shift into): the footprint's bytes are copied on the CPU, when the copy is recorded,
+// from the (CPU-visible) source buffer to a 512-aligned spot in a layer-owned upload ring, and
+// the copy reads from there. Titles write upload data before recording the copy, as for the
+// constant-buffer re-alignment. One ring segment per presented frame.
+std::atomic<uint64_t> g_stage_frames{0};
+struct StageRing {
+    static constexpr uint64_t kSegment = 64ull << 20;
+    static constexpr uint32_t kSegments = 4;
+    std::mutex mu;
+    ID3D12Resource* res = nullptr;
+    uint8_t* cpu = nullptr;
+    uint64_t frame = UINT64_MAX, head = 0;
+} g_stage;
+bool stage_footprint(ID3D12GraphicsCommandList* l, D3D12_TEXTURE_COPY_LOCATION* src) {
+    auto* buf = src->pResource;
+    D3D12_RESOURCE_DESC bd = buf->GetDesc();
+    const D3D12_PLACED_SUBRESOURCE_FOOTPRINT& p = src->PlacedFootprint;
+    FormatSize fs = format_size(p.Footprint.Format);
+    if (!fs.bytes) return false;
+    uint64_t rows = (p.Footprint.Height + fs.block - 1) / fs.block;
+    uint64_t bytes = (uint64_t)p.Footprint.RowPitch * rows * p.Footprint.Depth;
+    if (p.Offset + bytes > bd.Width) bytes = bd.Width - p.Offset;  // the last row may end short of the pitch
+    if (bytes > StageRing::kSegment) return false;
+    void* mapped = nullptr;
+    D3D12_RANGE none{0, 0};
+    if (FAILED(buf->Map(0, &none, &mapped))) return false;  // not CPU-visible
+    std::lock_guard<std::mutex> g(g_stage.mu);
+    if (!g_stage.res) {
+        ID3D12Device* dev = nullptr;
+        l->GetDevice(IID_PPV_ARGS(&dev));
+        D3D12_HEAP_PROPERTIES hp{D3D12_HEAP_TYPE_UPLOAD};
+        D3D12_RESOURCE_DESC rd{};
+        rd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        rd.Width = StageRing::kSegment * StageRing::kSegments;
+        rd.Height = rd.DepthOrArraySize = rd.MipLevels = 1;
+        rd.SampleDesc.Count = 1;
+        rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        HRESULT hr = dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
+                                                  IID_PPV_ARGS(&g_stage.res));
+        dev->Release();
+        if (FAILED(hr) || FAILED(g_stage.res->Map(0, &none, (void**)&g_stage.cpu))) {
+            buf->Unmap(0, &none);
+            return false;
+        }
+        XSL_INFO(CH, "texture copies from unaligned buffer footprints are staged through a %llu MB upload ring",
+                 (unsigned long long)(rd.Width >> 20));
+    }
+    uint64_t frame = g_stage_frames.load();
+    if (frame != g_stage.frame) { g_stage.frame = frame; g_stage.head = 0; }
+    if (g_stage.head + bytes > StageRing::kSegment) { buf->Unmap(0, &none); return false; }
+    uint64_t off = (frame % StageRing::kSegments) * StageRing::kSegment + g_stage.head;
+    memcpy(g_stage.cpu + off, (uint8_t*)mapped + p.Offset, bytes);
+    buf->Unmap(0, &none);
+    g_stage.head += (bytes + D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT - 1) & ~(uint64_t)(D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT - 1);
+    src->pResource = g_stage.res;
+    src->PlacedFootprint.Offset = off;
+    return true;
+}
+
 void list_copy_texture_region(PcObj l, const void* dst, uint32_t x, uint32_t y, uint32_t z, const void* src, const void* box) {
     // Buffer footprints: the console places them at 256-byte offsets, PC D3D12 requires 512
     // (D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT) and fails the whole list otherwise. Such a
@@ -810,19 +947,24 @@ void list_copy_texture_region(PcObj l, const void* dst, uint32_t x, uint32_t y, 
     D3D12_BOX b{};
     UINT x0, y0;
     if (misaligned_footprint(d)) {
-        if (!rebase_footprint(&d.PlacedFootprint, &x0, &y0)) return;
+        if (!rebase_footprint(&d.PlacedFootprint, &x0, &y0)) { warn_unaligned_copy(d.PlacedFootprint); return; }
         x += x0;
         y += y0;
     }
     if (misaligned_footprint(s)) {
         const D3D12_SUBRESOURCE_FOOTPRINT f = s.PlacedFootprint.Footprint;
-        if (!rebase_footprint(&s.PlacedFootprint, &x0, &y0)) return;
-        b = pb ? *pb : D3D12_BOX{0, 0, 0, f.Width, f.Height, f.Depth};
-        b.left += x0;
-        b.right += x0;
-        b.top += y0;
-        b.bottom += y0;
-        pb = &b;
+        D3D12_PLACED_SUBRESOURCE_FOOTPRINT orig = s.PlacedFootprint;
+        if (rebase_footprint(&s.PlacedFootprint, &x0, &y0)) {
+            b = pb ? *pb : D3D12_BOX{0, 0, 0, f.Width, f.Height, f.Depth};
+            b.left += x0;
+            b.right += x0;
+            b.top += y0;
+            b.bottom += y0;
+            pb = &b;
+        } else if (!stage_footprint(L, &s)) {
+            warn_unaligned_copy(orig);
+            return;
+        }
     }
     L->CopyTextureRegion(&d, x, y, z, &s, pb);
 }
@@ -1327,6 +1469,7 @@ HRESULT_T present(PcObj devObj, PcObj queueObj, PcObj resObj, void* hwndPtr, uin
     }
     bb->Release();
     hr = s.sc->Present(sync, 0);
+    g_stage_frames++;
     update_fps_title(hwnd);
     q->Signal(s.fence, ++s.fenceValue);
     s.slotValue[s.slot] = s.fenceValue;

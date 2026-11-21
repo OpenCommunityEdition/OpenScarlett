@@ -22,6 +22,7 @@ namespace pc {
 // Device and adapter
 HRESULT_T create_device(PcObj* outDevice);
 const char* adapter_name();
+uint64_t adapter_luid();  // the PC adapter's LUID (HighPart << 32 | LowPart)
 // Host capability probe. Filled at device creation.
 struct Caps { bool meshShaders; bool raytracing; bool vrs; bool samplerFeedback; int featureLevel; };
 const Caps& caps();

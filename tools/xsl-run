@@ -19,7 +19,7 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parent.parent
 LAYER_DLLS = ["src/gfx/d3d12_xs.dll", "src/runtime/xgameruntime.dll", "src/input/GameInput.dll", "src/xmem/xmem.dll",
               "src/storage/XCRDAPI.dll", "src/audio/AcpHal.dll", "src/audio/xapu.dll", "src/audio/chad.dll",
-              "src/audio/PIXEvt.dll", "src/audio/XFrontPanelDisplay.dll"]
+              "src/audio/PIXEvt.dll", "src/audio/XFrontPanelDisplay.dll", "src/media/MFPlat.dll"]
 # The title-side xgameruntime.lib loads its DLL with LOAD_LIBRARY_SEARCH_SYSTEM32 (0x800) unless
 # "local services" mode is set, so the runtime must live in System32, as the Game OS provides it.
 # GameInput.dll too: desktop builds (reference images) load it with LOAD_LIBRARY_SEARCH_SYSTEM32.
@@ -126,48 +126,142 @@ def copy_sync(src, dst):
     shutil.copy2(src, dst)
 
 
-def place(src, dst):
-    """Link src into the run directory, or copy it where links are unavailable (Windows without
-    administrator rights or Developer Mode, filesystems such as exFAT)."""
-    if dst.is_symlink():
-        dst.unlink()
-    if not dst.exists():
+def _is_link(p):
+    return p.is_symlink() or (hasattr(p, "is_junction") and p.is_junction())
+
+
+def link(src, dst):
+    """Link src at dst without copying: a symbolic link, else (Windows without administrator
+    rights or Developer Mode) a junction for a directory or a hard link for a file. False if the
+    filesystem allows none of these (exFAT, or a file on another volume)."""
+    try:
+        dst.symlink_to(src.resolve(), target_is_directory=src.is_dir())
+        return True
+    except OSError:
+        pass
+    if WINDOWS:
         try:
-            dst.symlink_to(src.resolve(), target_is_directory=src.is_dir())
-            return
+            if src.is_dir():
+                import _winapi
+                _winapi.CreateJunction(str(src.resolve()), str(dst))
+            else:
+                os.link(src, dst)
+            return True
         except OSError:
             pass
+    return False
+
+
+def place(src, dst):
+    """Link src into the run directory, or copy it where links are unavailable."""
+    if _is_link(dst):
+        if dst.is_symlink() or dst.is_file():
+            dst.unlink()
+        else:
+            os.rmdir(dst)  # a junction: removes the link, not the target
+    if not dst.exists() and link(src, dst):
+        return
     copy_sync(src, dst)
 
 
-def build_run_dir(title_dir, build_dir, run_dir, backend):
+def mirror(src_dir, dst_dir, keep):
+    """Place src_dir's entries in dst_dir; `keep` (a relative path) names the directories that
+    must be real (the executable's, where the layer DLLs go), the rest are linked."""
+    dst_dir.mkdir(parents=True, exist_ok=True)
+    head = keep.parts[0] if keep.parts else None
+    for entry in src_dir.iterdir():
+        dst = dst_dir / entry.name
+        if head is not None and entry.name.lower() == head.lower() and entry.is_dir():
+            if _is_link(dst):  # was linked by an older layout: becomes a real directory
+                dst.unlink() if dst.is_symlink() else os.rmdir(dst)
+            mirror(entry, dst, Path(*keep.parts[1:]))
+        else:
+            place(entry, dst)
+
+
+def package_root(exe):
+    """The title package's root (the directory holding MicrosoftGame.config) above the
+    executable, or the executable's directory. Titles such as Unreal Engine ones keep the
+    executable in a subdirectory and find their content relative to it."""
+    d = exe.parent
+    for _ in range(6):
+        if (d / "MicrosoftGame.config").exists():
+            return d
+        if d.parent == d:
+            break
+        d = d.parent
+    return exe.parent
+
+
+def config_executable(root):
+    """The executable MicrosoftGame.config names (Executable Name="..."), or None."""
+    import re
+    try:
+        text = (root / "MicrosoftGame.config").read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    m = re.search(r'<Executable\b[^>]*\bName="([^"]+)"', text)
+    if not m:
+        return None
+    exe = root / m.group(1).replace("\\", "/")
+    return exe if exe.exists() else None
+
+
+def run_root():
+    """Where run directories live: run/ in the repository, or, on Windows when that filesystem
+    cannot hold links (exFAT), %LOCALAPPDATA%\\OpenScarlett\\run, so a large title is linked rather
+    than copied."""
+    base = REPO / "run"
+    if not WINDOWS:
+        return base
+    base.mkdir(parents=True, exist_ok=True)
+    probe_src, probe = base / ".probe-src", base / ".probe"
+    probe_src.mkdir(exist_ok=True)
+    ok = False
+    try:
+        ok = link(probe_src, probe)
+    finally:
+        if probe.exists() or _is_link(probe):
+            try:
+                probe.unlink() if probe.is_symlink() else os.rmdir(probe)
+            except OSError:
+                pass
+        os.rmdir(probe_src)
+    if ok:
+        return base
+    return Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / "OpenScarlett" / "run"
+
+
+def build_run_dir(title_dir, build_dir, run_dir, backend, exe_rel=Path()):
+    """Mirror the title package (title_dir, its root) into run_dir; exe_rel is the executable's
+    directory relative to it, which gets the layer DLLs. Returns that directory."""
     # On Windows the run directory is kept between runs: copies (where links are unavailable)
     # are then only refreshed.
     if run_dir.exists() and not WINDOWS:
         shutil.rmtree(run_dir)
-    run_dir.mkdir(parents=True, exist_ok=True)
-    for entry in title_dir.iterdir():
-        place(entry, run_dir / entry.name)
+    mirror(title_dir, run_dir, exe_rel)
+    exe_dir = run_dir / exe_rel
     for rel in LAYER_DLLS:
         src = build_dir / rel
         if not src.exists():
             sys.exit(f"[xsl-run] missing layer DLL {src}; build first")
-        dst = run_dir / src.name
+        dst = exe_dir / src.name
         if dst.exists() or dst.is_symlink():
             dst.unlink()  # the layer replaces any same-named DLL shipped with the title
         shutil.copy2(src, dst)
     sdk = REPO / "sdk"
     for name, rel in SDK_DLLS.items():
-        if (sdk / rel).exists() and not (run_dir / name).exists():
-            shutil.copy2(sdk / rel, run_dir / name)
+        if (sdk / rel).exists() and not (exe_dir / name).exists():
+            shutil.copy2(sdk / rel, exe_dir / name)
     for rel in BACKENDS[backend]:
         src = build_dir / rel
         if not src.exists():
             sys.exit(f"[xsl-run] backend {backend}: missing {src} (see docs/backends.md)")
-        dst = run_dir / src.name
+        dst = exe_dir / src.name
         if dst.exists() or dst.is_symlink():
             dst.unlink()
         shutil.copy2(src, dst)
+    return exe_dir
 
 
 def main():
@@ -193,18 +287,23 @@ def main():
     if exe is None:
         exes = sorted(title_dir.glob("*.exe"))
         if len(exes) != 1:
-            sys.exit(f"[xsl-run] pick an executable in {title_dir}: {[e.name for e in exes]}")
-        exe = exes[0]
-    run_dir = REPO / "run" / exe.stem
+            exe = config_executable(title_dir)
+            if exe is None:
+                sys.exit(f"[xsl-run] pick an executable in {title_dir}: {[e.name for e in exes]}")
+        else:
+            exe = exes[0]
+    title_dir = package_root(exe)
+    exe_rel = exe.parent.relative_to(title_dir)
+    run_dir = run_root() / exe.stem
     if WINDOWS:
-        run_windows(a, exe, title_dir, run_dir)
+        run_windows(a, exe, title_dir, run_dir, exe_rel)
         return
     prefix = Path(a.prefix)
     ensure_prefix(prefix, a.device)
     sys32 = prefix / "drive_c" / "windows" / "system32"
     for rel in SYSTEM32_DLLS:
         shutil.copy2(Path(a.build) / rel, sys32 / Path(rel).name)
-    build_run_dir(title_dir, Path(a.build), run_dir, a.backend)
+    exe_dir = build_run_dir(title_dir, Path(a.build), run_dir, a.backend, exe_rel)
     map_drives(prefix, run_dir, exe.stem)
     env = wine_env(prefix, {"XSL_LOG": a.log, "_backend": a.backend})
     cmd = ["wine", exe.name] + a.args
@@ -215,7 +314,7 @@ def main():
         cmd = ["renderdoccmd", "capture", "-w", "--opt-hook-children", "-d", str(run_dir), "-c", str(rdc / exe.stem)] + cmd
     print(f"[xsl-run] {exe.name} as {a.device} on {a.backend} in {run_dir}", file=sys.stderr)
     try:
-        p = subprocess.run(cmd, cwd=run_dir, env=env, timeout=a.timeout or None)
+        p = subprocess.run(cmd, cwd=exe_dir, env=env, timeout=a.timeout or None)
         sys.exit(p.returncode)
     except subprocess.TimeoutExpired:
         subprocess.run(["wineserver", "-k"], env=env)
@@ -223,12 +322,12 @@ def main():
         sys.exit(0)
 
 
-def run_windows(a, exe, title_dir, run_dir):
+def run_windows(a, exe, title_dir, run_dir, exe_rel=Path()):
     """Native Windows: no prefix, no drive letters, the system's D3D12 (or null graphics). The
     console type reaches the title through XSL_CONSOLE_MODE (the layer answers the registry read);
     xgameruntime.dll loads are redirected by the layer to its copy in the run directory."""
     backend = a.backend if a.backend in ("native", "null") else "native"
-    build_run_dir(title_dir, Path(a.build), run_dir, "native")
+    exe_dir = build_run_dir(title_dir, Path(a.build), run_dir, "native", exe_rel)
     env = dict(os.environ)
     env["XSL_LOG"] = a.log
     mode = CONSOLE_MODE[a.device]
@@ -238,7 +337,7 @@ def run_windows(a, exe, title_dir, run_dir):
         env["XSL_NULL_GRAPHICS"] = "1"
     print(f"[xsl-run] {exe.name} as {a.device} on {backend} Direct3D 12 in {run_dir}", file=sys.stderr)
     try:
-        p = subprocess.run([str(run_dir / exe.name)] + a.args, cwd=run_dir, env=env, timeout=a.timeout or None)
+        p = subprocess.run([str(exe_dir / exe.name)] + a.args, cwd=exe_dir, env=env, timeout=a.timeout or None)
         sys.exit(p.returncode)
     except subprocess.TimeoutExpired:
         print("[xsl-run] stopped after timeout", file=sys.stderr)

@@ -20,7 +20,7 @@ namespace {
 // The pinned SDK's own edition: titles at or after it use the native layout.
 constexpr unsigned kPinnedEdition = XSL_PINNED_GXDK_EDITION;
 
-// Looks for "_xbld_edition_sdktype=GXDK,NNNNNN" in the main executable's .xbld section.
+// Looks for "_xbld_edition_sdktype=GXDK,NNNNNN" (or GRDK,) in the main executable's .xbld section.
 unsigned read_edition() {
     if (const char* e = getenv("XSL_GXDK_EDITION")) return (unsigned)strtoul(e, nullptr, 10);
     auto* base = (uint8_t*)GetModuleHandleW(nullptr);
@@ -30,9 +30,12 @@ unsigned read_edition() {
     for (unsigned i = 0; i < nt->FileHeader.NumberOfSections; i++, sec++) {
         if (memcmp(sec->Name, ".xbld", 6) != 0) continue;
         std::string s((const char*)base + sec->VirtualAddress, sec->Misc.VirtualSize);
-        const char key[] = "_xbld_edition_sdktype=GXDK,";
-        size_t at = s.find(key);
-        if (at != std::string::npos) return (unsigned)strtoul(s.c_str() + at + sizeof key - 1, nullptr, 10);
+        // GDK releases up to 2020 name the kit "GRDK"; later ones "GXDK". The edition number
+        // (YYMM00) is the same scale either way.
+        for (const char* key : {"_xbld_edition_sdktype=GXDK,", "_xbld_edition_sdktype=GRDK,"}) {
+            size_t at = s.find(key);
+            if (at != std::string::npos) return (unsigned)strtoul(s.c_str() + at + strlen(key), nullptr, 10);
+        }
     }
     return 0;
 }

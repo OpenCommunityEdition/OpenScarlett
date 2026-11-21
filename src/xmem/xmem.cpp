@@ -12,8 +12,11 @@
 // * XMemAlloc: honours a title's exported __XMemAllocationHooks__ (XMEM_SET_ALLOCATION_HOOKS),
 //   otherwise XMemAllocDefault with the alignment and page size the attributes request.
 #include <windows.h>
+#include <psapi.h>
 
 #include <xmem.h>
+
+#include <cstring>
 
 #include <map>
 #include <mutex>
@@ -118,6 +121,28 @@ PVOID WINAPI XMemVirtualAlloc(PVOID base, SIZE_T size, DWORD type, ULONGLONG fla
             XSL_ERR(CH, "placeholder reservation of %zu bytes failed (%lu)", sz, GetLastError());
         }
         return p;
+    }
+    // Commit inside a 64 KB-page reservation (the console's reserve-then-commit pattern): the
+    // reservation is a placeholder, which VirtualAlloc cannot commit, so fresh zeroed pages are
+    // mapped into each 64 KB unit not mapped yet.
+    if ((type & MEM_COMMIT) && !(type & MEM_RESERVE) && base) {
+        std::lock_guard<std::mutex> g(g_mu);
+        if (in_placeholder((uintptr_t)base)) {
+            uintptr_t start = (uintptr_t)base & ~(uintptr_t)(kPage - 1);
+            uintptr_t end = ((uintptr_t)base + size + kPage - 1) & ~(uintptr_t)(kPage - 1);
+            for (uintptr_t va = start; va < end; va += kPage) {
+                MEMORY_BASIC_INFORMATION mbi{};
+                VirtualQuery((void*)va, &mbi, sizeof mbi);
+                if (mbi.Type == MEM_MAPPED) continue;  // already committed
+                if (g_free.empty() && !grow()) { SetLastError(ERROR_NOT_ENOUGH_MEMORY); return nullptr; }
+                ULONG_PTR page = g_free.back();
+                g_free.pop_back();
+                if (!map_one(va, page)) return nullptr;
+                memset((void*)va, 0, kPage);  // committed memory reads as zero
+            }
+            if (is_graphics(flags, protect)) g_graphics[start] = end - start;
+            return base;
+        }
     }
     // GPU-visible memory is imported into the GPU with 64 KB granularity; keep it 64 KB aligned/sized.
     if (is_graphics(flags, protect) && (type & MEM_COMMIT)) size = (size + kPage - 1) & ~(kPage - 1);
@@ -240,6 +265,25 @@ UINT32 WINAPI xsl_xmem_zero() { return 0; }
 extern "C" {
 ULONGLONG WINAPI xsl_XMemMakeTag(UINT32 tag) { return tag; }
 VOID xsl_XMemSetOption(XMEM_OPTION) {}
+// Title memory as a console reports it: Series X titles get 13.5 GB (here at most 85% of the
+// host's RAM), GPU-optimal memory is 10 GB; usage is the process's private commit.
+BOOL WINAPI XMemGetWorkingSetStatistics(DWORD, PXMEM_WORKING_SET_STATISTICS st) {
+    if (!st) { SetLastError(ERROR_INVALID_PARAMETER); return FALSE; }
+    memset(st, 0, sizeof *st);
+    MEMORYSTATUSEX ms{sizeof ms};
+    GlobalMemoryStatusEx(&ms);
+    SIZE_T limit = (SIZE_T)13824 << 20;
+    if (ms.ullTotalPhys && ms.ullTotalPhys / 100 * 85 < limit) limit = (SIZE_T)(ms.ullTotalPhys / 100 * 85);
+    PROCESS_MEMORY_COUNTERS_EX pmc{};
+    pmc.cb = sizeof pmc;
+    GetProcessMemoryInfo(GetCurrentProcess(), (PPROCESS_MEMORY_COUNTERS)&pmc, sizeof pmc);
+    st->GameLimit = limit;
+    st->GameUsed = pmc.PrivateUsage < limit ? pmc.PrivateUsage : limit;
+    st->GpuOptimalBandwidthLimit = (SIZE_T)10 << 30;
+    st->GameAllocatedPhysicalPageCount = (UINT32)(st->GameUsed / kPage);
+    return TRUE;
+}
+
 BOOL WINAPI xsl_xmem_unsupported() { SetLastError(ERROR_NOT_SUPPORTED); return FALSE; }
 SIZE_T WINAPI xsl_xmem_size_zero() { return 0; }
 }

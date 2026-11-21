@@ -65,6 +65,18 @@ HRESULT D3DAPI D_CheckFeatureSupport(ID3D12Device* d, D3D12_FEATURE f, void* dat
         }
     }
     if (FAILED(hr)) XSL_WARN(CH, "CheckFeatureSupport(feature %d, %u bytes) failed %08lx", (int)f, size, hr);
+    if (f == D3D12_FEATURE_FEATURE_LEVELS && data && size >= sizeof(D3D12_FEATURE_DATA_FEATURE_LEVELS)) {
+        auto* fl = (D3D12_FEATURE_DATA_FEATURE_LEVELS*)data;
+        std::string req;
+        for (UINT i = 0; fl->pFeatureLevelsRequested && i < fl->NumFeatureLevels && i < 8; i++) {
+            char b[16];
+            snprintf(b, sizeof b, " %x", (unsigned)fl->pFeatureLevelsRequested[i]);
+            req += b;
+        }
+        XSL_INFO(CH, "CheckFeatureSupport(FEATURE_LEVELS): requested%s -> max %x (%08lx)", req.c_str(), (unsigned)fl->MaxSupportedFeatureLevel, hr);
+    } else if (f == D3D12_FEATURE_SHADER_MODEL && data) {
+        XSL_INFO(CH, "CheckFeatureSupport(SHADER_MODEL) -> %x (%08lx)", (unsigned)((D3D12_FEATURE_DATA_SHADER_MODEL*)data)->HighestShaderModel, hr);
+    }
     return hr;
 }
 HRESULT D3DAPI D_CreateDescriptorHeap(ID3D12Device* d, const D3D12_DESCRIPTOR_HEAP_DESC* desc, REFIID riid, void** out) {
@@ -297,7 +309,7 @@ HRESULT D3DAPI D_CreateHeap(ID3D12Device* d, const D3D12_HEAP_DESC* desc, REFIID
     PcObj h = nullptr;
     HRESULT hr = pc::create_heap(DPC(d), desc, &h);
     if (FAILED(hr)) return hr;
-    return make_simple(DEV(d), Kind::Heap, h, riid, out);
+    return make_heap(DEV(d), h, desc, riid, out);
 }
 HRESULT D3DAPI D_CreatePlacedResource(ID3D12Device* d, ID3D12Heap* heap, UINT64 off, const D3D12_RESOURCE_DESC* rd, D3D12_RESOURCE_STATES st,
                                       const D3D12_CLEAR_VALUE* cv, REFIID riid, void** out) {
@@ -495,6 +507,24 @@ HRESULT D3DAPI D_WaitFrameEventX(ID3D12Device* d, D3D12XBOX_FRAME_EVENT_TYPE, UI
 
 D3D12Device11_Function_Table g_dev_tbl;
 std::once_flag g_dev_once;
+// Precompiled console state objects (ray-tracing pipelines serialized by the console driver).
+// Their contents are console GPU code, which a PC device cannot load; the call fails cleanly (and
+// reports whether DXIL is present) so the title can fall back or report it.
+HRESULT D3DAPI D_DeserializeStateObjectX(ID3D12Device8*, const void* data, UINT size, ID3D12RootSignature*, UINT flags, REFIID, void** out) {
+    if (out) *out = nullptr;
+    static volatile long n = 0;
+    if (InterlockedIncrement(&n) <= 3) {
+        bool dxil = false;
+        auto* b = (const uint8_t*)data;
+        for (UINT i = 0; b && i + 4 <= size && !dxil; i++)
+            dxil = (b[i] == 'D' && b[i + 1] == 'X' && (b[i + 2] == 'B' || b[i + 2] == 'I') && (b[i + 3] == 'C' || b[i + 3] == 'L')) ||
+                   (b[i] == 'B' && b[i + 1] == 'C' && b[i + 2] == 0xC0 && b[i + 3] == 0xDE);
+        XSL_WARN(CH, "DeserializeStateObjectX: precompiled console state object (%u bytes, flags %x, %s); not loadable on PC", size, flags,
+                 dxil ? "contains DXIL" : "no DXIL inside");
+    }
+    return E_NOTIMPL;
+}
+
 void init_device_table() {
     std::call_once(g_dev_once, [] {
         xsl_fill_default(&g_dev_tbl);
@@ -542,6 +572,7 @@ void init_device_table() {
         t->SetFrameIntervalX = D_SetFrameIntervalX;
         t->ScheduleFrameEventX = D_ScheduleFrameEventX;
         t->WaitFrameEventX = D_WaitFrameEventX;
+        ((D3D12Device8_Function_Table*)&g_dev_tbl)->DeserializeStateObjectX = D_DeserializeStateObjectX;
     });
 }
 }  // namespace
@@ -619,20 +650,24 @@ HRESULT create_device(const D3D12XBOX_CREATE_DEVICE_PARAMETERS* params, REFIID r
 }
 
 // ============================================================================================
-// DXGI: device -> adapter -> output. Titles use these only to name the output that frame
-// intervals are locked to.
+// DXGI: device -> adapter -> output, and the adapter's parent factory. Titles use the output to
+// name what frame intervals are locked to; engines also read the adapter's description and walk
+// adapter -> factory (Unreal Engine).
 // ============================================================================================
 namespace {
 struct DxgiExtra { IGraphicsUnknown* parent; };
 const IID* const kDxgiDeviceIids[] = {&__uuidof(IGraphicsUnknown), &__uuidof(IDXGIObject), &__uuidof(IDXGIDevice), &__uuidof(IDXGIDevice1), &__uuidof(IDXGIDevice2), nullptr};
 const IID* const kDxgiAdapterIids[] = {&__uuidof(IGraphicsUnknown), &__uuidof(IDXGIObject), &__uuidof(IDXGIAdapter), &__uuidof(IDXGIAdapter1), &__uuidof(IDXGIAdapter2), nullptr};
 const IID* const kDxgiOutputIids[] = {&__uuidof(IGraphicsUnknown), &__uuidof(IDXGIObject), &__uuidof(IDXGIOutput), nullptr};
+const IID* const kDxgiFactoryIids[] = {&__uuidof(IGraphicsUnknown), &__uuidof(IDXGIObject), &__uuidof(IDXGIFactory), &__uuidof(IDXGIFactory1), &__uuidof(IDXGIFactory2), nullptr};
 DXGIDevice2_Function_Table g_dxgidev_tbl;
 DXGIAdapter2_Function_Table g_adapter_tbl;
 DXGIOutput_Function_Table g_output_tbl;
+DXGIFactory2_Function_Table g_factory_tbl;
 std::once_flag g_dxgi_once;
 IGraphicsUnknown* g_adapter = nullptr;
 IGraphicsUnknown* g_output = nullptr;
+IGraphicsUnknown* g_factory = nullptr;
 
 void dxgi_unknown(void* t) {
     auto* u = (GraphicsUnknown_Function_Table*)t;
@@ -645,6 +680,44 @@ HRESULT D3DAPI Dxgi_GetAdapter(IDXGIDevice*, IDXGIAdapter** out) {
     *out = (IDXGIAdapter*)g_adapter;
     return S_OK;
 }
+// The adapter as a console reports it: AMD's vendor ID and the Series X's memory split (10 GB
+// GPU-optimal of 16 GB); the LUID is the PC adapter's, which is what it identifies.
+template <class D> void fill_adapter_desc(D* d) {
+    *d = {};
+    wcscpy_s(d->Description, L"AMD Custom GPU (OpenScarlett)");
+    d->VendorId = 0x1002;
+    d->DedicatedVideoMemory = 10ull << 30;
+    d->SharedSystemMemory = 6ull << 30;
+    uint64_t luid = pc::adapter_luid();
+    d->AdapterLuid.LowPart = (DWORD)luid;
+    d->AdapterLuid.HighPart = (LONG)(luid >> 32);
+}
+HRESULT D3DAPI Dxgi_AdapterGetDesc(IDXGIAdapter*, DXGI_ADAPTER_DESC* d) { if (!d) return E_INVALIDARG; fill_adapter_desc(d); return S_OK; }
+HRESULT D3DAPI Dxgi_AdapterGetDesc1(IDXGIAdapter1*, DXGI_ADAPTER_DESC1* d) { if (!d) return E_INVALIDARG; fill_adapter_desc(d); return S_OK; }
+HRESULT D3DAPI Dxgi_AdapterGetDesc2(IDXGIAdapter2*, DXGI_ADAPTER_DESC2* d) { if (!d) return E_INVALIDARG; fill_adapter_desc(d); return S_OK; }
+HRESULT D3DAPI Dxgi_AdapterGetParent(IDXGIObject*, REFIID riid, void** out) {
+    if (!out) return E_INVALIDARG;
+    return QueryInterface(g_factory, riid, out);
+}
+// The DXGI device's and the output's parent: the adapter.
+HRESULT D3DAPI Dxgi_DeviceGetParent(IDXGIObject*, REFIID riid, void** out) {
+    if (!out) return E_INVALIDARG;
+    return QueryInterface(g_adapter, riid, out);
+}
+HRESULT D3DAPI Dxgi_NoParent(IDXGIObject*, REFIID, void** out) {
+    if (out) *out = nullptr;
+    return E_NOINTERFACE;
+}
+HRESULT D3DAPI Dxgi_EnumAdapters(IDXGIFactory*, UINT i, IDXGIAdapter** out) {
+    if (!out) return E_INVALIDARG;
+    if (i > 0) { *out = nullptr; return DXGI_ERROR_NOT_FOUND; }
+    AddRef(g_adapter);
+    *out = (IDXGIAdapter*)g_adapter;
+    return S_OK;
+}
+HRESULT D3DAPI Dxgi_EnumAdapters1(IDXGIFactory1*, UINT i, IDXGIAdapter1** out) { return Dxgi_EnumAdapters(nullptr, i, (IDXGIAdapter**)out); }
+BOOL D3DAPI Dxgi_IsCurrent(IDXGIFactory1*) { return TRUE; }
+HRESULT D3DAPI Dxgi_MakeWindowAssociation(IDXGIFactory*, HWND, UINT) { return S_OK; }
 HRESULT D3DAPI Dxgi_EnumOutputs(IDXGIAdapter*, UINT i, IDXGIOutput** out) {
     if (i > 0) { *out = nullptr; return DXGI_ERROR_NOT_FOUND; }
     AddRef(g_output);
@@ -656,11 +729,25 @@ void init_dxgi() {
         xsl_fill_default(&g_dxgidev_tbl);
         dxgi_unknown(&g_dxgidev_tbl);
         ((DXGIDevice_Function_Table*)&g_dxgidev_tbl)->GetAdapter = Dxgi_GetAdapter;
+        ((DXGIObject_Function_Table*)&g_dxgidev_tbl)->GetParent = Dxgi_DeviceGetParent;
         xsl_fill_default(&g_adapter_tbl);
         dxgi_unknown(&g_adapter_tbl);
+        ((DXGIObject_Function_Table*)&g_adapter_tbl)->GetParent = Dxgi_AdapterGetParent;
         ((DXGIAdapter_Function_Table*)&g_adapter_tbl)->EnumOutputs = Dxgi_EnumOutputs;
+        ((DXGIAdapter_Function_Table*)&g_adapter_tbl)->GetDesc = Dxgi_AdapterGetDesc;
+        ((DXGIAdapter1_Function_Table*)&g_adapter_tbl)->GetDesc1 = Dxgi_AdapterGetDesc1;
+        g_adapter_tbl.GetDesc2 = Dxgi_AdapterGetDesc2;
         xsl_fill_default(&g_output_tbl);
         dxgi_unknown(&g_output_tbl);
+        ((DXGIObject_Function_Table*)&g_output_tbl)->GetParent = Dxgi_DeviceGetParent;  // the adapter, as for the device
+        xsl_fill_default(&g_factory_tbl);
+        dxgi_unknown(&g_factory_tbl);
+        ((DXGIObject_Function_Table*)&g_factory_tbl)->GetParent = Dxgi_NoParent;
+        ((DXGIFactory_Function_Table*)&g_factory_tbl)->EnumAdapters = Dxgi_EnumAdapters;
+        ((DXGIFactory_Function_Table*)&g_factory_tbl)->MakeWindowAssociation = Dxgi_MakeWindowAssociation;
+        ((DXGIFactory1_Function_Table*)&g_factory_tbl)->EnumAdapters1 = Dxgi_EnumAdapters1;
+        ((DXGIFactory1_Function_Table*)&g_factory_tbl)->IsCurrent = Dxgi_IsCurrent;
+        g_factory = make<IDXGIFactory2, DxgiExtra>(Kind::DxgiFactory, &g_factory_tbl, nullptr, nullptr, kDxgiFactoryIids, nullptr);
         g_adapter = make<IDXGIAdapter2, DxgiExtra>(Kind::DxgiAdapter, &g_adapter_tbl, nullptr, nullptr, kDxgiAdapterIids, nullptr);
         g_output = make<IDXGIOutput, DxgiExtra>(Kind::DxgiOutput, &g_output_tbl, nullptr, nullptr, kDxgiOutputIids, nullptr);
     });

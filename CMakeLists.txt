@@ -77,6 +77,7 @@ add_subdirectory(src/xmem)
 add_subdirectory(src/audio)
 add_subdirectory(third_party/zlib)
 add_subdirectory(src/storage)
+add_subdirectory(src/media)
 
 option(XSL_BUILD_SAMPLES "Build Microsoft samples as Series X|S executables" ON)
 if(XSL_BUILD_SAMPLES)

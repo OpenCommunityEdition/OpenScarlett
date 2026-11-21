@@ -7,12 +7,13 @@
 // drive (a standard user may not create folders under C:\Users, and the title would enumerate
 // the whole disk) and T: does not exist.
 //
-// Paths the title's modules pass to the file APIs are therefore mapped: "C:" (Windows only) and
-// "T:" go to per-title folders, <storage>\<title>\Drives\C and ...\T, where <storage> is the
+// Paths the title's modules pass to the file APIs are therefore mapped (Windows; under Wine the
+// launcher maps drive letters): "G:" to the installed package, "C:", "D:" and "T:" to per-title
+// folders, <storage>\<title>\Drives\C, ...\D and ...\T, where <storage> is the
 // layer's storage root (C:\users\Public\OpenScarlett, writable by interactive users). Paths
 // inside the title's own folder, the layer's folder, the system temporary folder or the storage
 // root itself are left alone. XSL_CONSOLE_DRIVES=0 disables the mapping; XSL_FILE_TRACE=1 logs
-// each mapped directory once.
+// each mapped directory once, XSL_FILE_TRACE=2 every path the title opens.
 #include <windows.h>
 #include <tlhelp32.h>
 
@@ -33,7 +34,7 @@
 
 namespace {
 std::wstring g_storage;            // C:\users\Public\OpenScarlett
-std::wstring g_drive_root[2];      // [0] C:, [1] T:  ("" = not mapped)
+std::wstring g_drive_root[26];     // per drive letter, "" = not mapped
 std::wstring g_exempt[3];          // title dir, layer dir, temp dir (lower case, trailing '\')
 
 std::wstring lower(std::wstring s) {
@@ -46,6 +47,22 @@ std::wstring dir_of(HMODULE m) {
     std::wstring s(p, n);
     return s.substr(0, s.find_last_of(L"\\/") + 1);
 }
+// The installed package: the directory holding MicrosoftGame.config, the executable's or one a
+// few levels above it (Unreal Engine titles keep the executable in a subdirectory). No trailing
+// separator.
+std::wstring package_root() {
+    std::wstring exeDir = dir_of(nullptr);
+    std::wstring d = exeDir;
+    for (int i = 0; i < 6 && d.size() > 3; i++) {
+        if (GetFileAttributesW((d + L"MicrosoftGame.config").c_str()) != INVALID_FILE_ATTRIBUTES) {
+            d.pop_back();
+            return d;
+        }
+        d = d.substr(0, d.find_last_of(L"\\/", d.size() - 2) + 1);
+    }
+    exeDir.pop_back();
+    return exeDir;
+}
 void make_dirs(const std::wstring& path) {
     for (size_t i = 3; i <= path.size(); i++)
         if (i == path.size() || path[i] == L'\\') CreateDirectoryW(path.substr(0, i).c_str(), nullptr);
@@ -54,8 +71,10 @@ void make_dirs(const std::wstring& path) {
 // The mapped path, or empty if `p` is not on a mapped drive.
 std::wstring map_path(const wchar_t* p) {
     if (!p || !p[0] || p[1] != L':') return {};
-    int d = (p[0] == L'c' || p[0] == L'C') ? 0 : (p[0] == L't' || p[0] == L'T') ? 1 : -1;
-    if (d < 0 || g_drive_root[d].empty()) return {};
+    wchar_t letter = (wchar_t)towlower(p[0]);
+    if (letter < L'a' || letter > L'z') return {};
+    int d = letter - L'a';
+    if (g_drive_root[d].empty()) return {};
     // Normalise: backslashes, no repeated separators.
     std::wstring rest;
     for (const wchar_t* q = p + 2; *q; q++) {
@@ -63,8 +82,10 @@ std::wstring map_path(const wchar_t* p) {
         if (c == L'\\' && !rest.empty() && rest.back() == L'\\') continue;
         rest += c;
     }
-    if (d == 0) {
-        std::wstring full = lower(std::wstring(L"c:") + rest + L"\\");
+    {
+        // Host paths that happen to be on a mapped letter: the title's, the layer's and the
+        // temporary folder, and the storage root itself.
+        std::wstring full = lower(std::wstring(1, letter) + L":" + rest + L"\\");
         for (const auto& e : g_exempt)
             if (!e.empty() && full.compare(0, e.size(), e) == 0) return {};
         std::wstring st = lower(g_storage) + L"\\";
@@ -99,9 +120,33 @@ const char* mapped(const char* p, std::string& buf) {
     return buf.c_str();
 }
 
+// XSL_FILE_TRACE=2: every path the title's file calls name, once per path, with failures.
+int trace_level() {
+    static int l = [] { char b[4]; return GetEnvironmentVariableA("XSL_FILE_TRACE", b, 4) ? b[0] - '0' : 0; }();
+    return l;
+}
+void trace_open(const char* call, LPCWSTR n, const wchar_t* used, bool ok) {
+    if (trace_level() < 2 || !n) return;
+    static std::mutex mu;
+    static std::set<std::wstring> seen;
+    DWORD e = GetLastError();
+    {
+        std::lock_guard<std::mutex> l(mu);
+        if (seen.size() < 5000 && seen.insert(std::wstring(n) + (ok ? L"+" : L"-")).second) {
+            if (used != n)
+                XSL_INFO(CH, "file: %s %ls -> %ls: %s", call, n, used, ok ? "ok" : "FAILED");
+            else
+                XSL_INFO(CH, "file: %s %ls: %s (error %lu)", call, n, ok ? "ok" : "FAILED", ok ? 0ul : e);
+        }
+    }
+    SetLastError(e);
+}
 HANDLE WINAPI D_CreateFileW(LPCWSTR n, DWORD a, DWORD s, LPSECURITY_ATTRIBUTES sa, DWORD c, DWORD f, HANDLE t) {
     std::wstring b;
-    return CreateFileW(mapped(n, b), a, s, sa, c, f, t);
+    const wchar_t* u = mapped(n, b);
+    HANDLE h = CreateFileW(u, a, s, sa, c, f, t);
+    trace_open("CreateFileW", n, u, h != INVALID_HANDLE_VALUE);
+    return h;
 }
 HANDLE WINAPI D_CreateFile2(LPCWSTR n, DWORD a, DWORD s, DWORD c, LPCREATEFILE2_EXTENDED_PARAMETERS x) {
     std::wstring b;
@@ -121,7 +166,10 @@ BOOL WINAPI D_DeleteFileW(LPCWSTR n) {
 }
 BOOL WINAPI D_GetFileAttributesExW(LPCWSTR n, GET_FILEEX_INFO_LEVELS l, LPVOID i) {
     std::wstring b;
-    return GetFileAttributesExW(mapped(n, b), l, i);
+    const wchar_t* u = mapped(n, b);
+    BOOL r = GetFileAttributesExW(u, l, i);
+    trace_open("GetFileAttributesExW", n, u, r != 0);
+    return r;
 }
 DWORD WINAPI D_GetFileAttributesW(LPCWSTR n) {
     std::wstring b;
@@ -133,7 +181,10 @@ BOOL WINAPI D_SetFileAttributesW(LPCWSTR n, DWORD a) {
 }
 HANDLE WINAPI D_FindFirstFileExW(LPCWSTR n, FINDEX_INFO_LEVELS l, LPVOID d, FINDEX_SEARCH_OPS o, LPVOID f, DWORD fl) {
     std::wstring b;
-    return FindFirstFileExW(mapped(n, b), l, d, o, f, fl);
+    const wchar_t* u = mapped(n, b);
+    HANDLE h = FindFirstFileExW(u, l, d, o, f, fl);
+    trace_open("FindFirstFileExW", n, u, h != INVALID_HANDLE_VALUE);
+    return h;
 }
 HANDLE WINAPI D_FindFirstFileW(LPCWSTR n, LPWIN32_FIND_DATAW d) {
     std::wstring b;
@@ -298,10 +349,19 @@ void install_console_drives() {
     stem = stem.substr(0, stem.find_last_of(L'.'));
     g_storage = L"C:\\users\\Public\\OpenScarlett";
     std::wstring drives = g_storage + L"\\" + stem + L"\\Drives";
-    if (!wine) g_drive_root[0] = drives + L"\\C";
-    g_drive_root[1] = drives + L"\\T";
-    for (const auto& r : g_drive_root)
-        if (!r.empty()) make_dirs(r);
+    // Console drives: G: the installed package (read-only on the console), T: temporary
+    // storage, D: persistent scratch storage, C: the title's system storage. Under Wine the
+    // launcher maps G:, T: and D: as drive letters and C: is the prefix's own drive; T: is
+    // mapped here as well for titles run without the launcher.
+    if (!wine) {
+        std::wstring root = package_root();
+        g_drive_root['g' - 'a'] = root;
+        g_drive_root['c' - 'a'] = drives + L"\\C";
+        g_drive_root['d' - 'a'] = drives + L"\\D";
+    }
+    g_drive_root['t' - 'a'] = drives + L"\\T";
+    for (char l : {'c', 'd', 't'})
+        if (!g_drive_root[l - 'a'].empty()) make_dirs(g_drive_root[l - 'a']);
 
     HMODULE self = nullptr;
     GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
@@ -326,18 +386,20 @@ void install_console_drives() {
         for (BOOL ok = Module32FirstW(snap, &me); ok; ok = Module32NextW(snap, &me)) {
             std::wstring path = me.szExePath, dir = path.substr(0, path.find_last_of(L"\\/") + 1);
             if (_wcsicmp(dir.c_str(), titleDir.c_str()) != 0 || me.hModule == self) continue;
+            // The layer's own DLLs are skipped, except XCRDAPI.dll (DirectStorage), which opens
+            // files by the paths the title gives it.
             bool layer = false;
-            for (const wchar_t* l : {L"xgameruntime.dll", L"GameInput.dll", L"xmem.dll", L"XCRDAPI.dll", L"AcpHal.dll", L"xapu.dll",
-                                     L"chad.dll", L"PIXEvt.dll", L"XFrontPanelDisplay.dll", L"d3d12_xs.dll"})
+            for (const wchar_t* l : {L"xgameruntime.dll", L"GameInput.dll", L"xmem.dll", L"AcpHal.dll", L"xapu.dll", L"chad.dll",
+                                     L"PIXEvt.dll", L"XFrontPanelDisplay.dll", L"d3d12_xs.dll", L"MFPlat.dll"})
                 layer |= _wcsicmp(me.szModule, l) == 0;
             if (!layer) patch_module(me.hModule);
         }
         CloseHandle(snap);
     }
-    if (!g_drive_root[0].empty())
-        XSL_INFO(CH, "console drives: the title's C: is %ls, T: is %ls (XSL_CONSOLE_DRIVES=0 disables)", g_drive_root[0].c_str(),
-                 g_drive_root[1].c_str());
+    if (!wine)
+        XSL_INFO(CH, "console drives: G: %ls, C: %ls, D: %ls, T: %ls (XSL_CONSOLE_DRIVES=0 disables)", g_drive_root['g' - 'a'].c_str(),
+                 g_drive_root['c' - 'a'].c_str(), g_drive_root['d' - 'a'].c_str(), g_drive_root['t' - 'a'].c_str());
     else
-        XSL_INFO(CH, "console drives: the title's T: is %ls; C: is the Wine prefix's own drive", g_drive_root[1].c_str());
+        XSL_INFO(CH, "console drives: T: is %ls; G:, D: and C: are the Wine prefix's drives", g_drive_root['t' - 'a'].c_str());
 }
 }  // namespace xsl::platform

@@ -33,7 +33,7 @@ namespace xs {
 
 enum class Kind : uint32_t {
     Device = 1, Queue, Allocator, List, Fence, Resource, Heap, DescriptorHeap, RootSignature, Pso,
-    DxgiDevice, DxgiAdapter, DxgiOutput, QueryHeap, CommandSignature,
+    DxgiDevice, DxgiAdapter, DxgiOutput, QueryHeap, CommandSignature, DxgiFactory,
 };
 
 struct Device;
@@ -146,6 +146,7 @@ HRESULT make_queue(Device* dev, PcObj pcq, const D3D12_COMMAND_QUEUE_DESC* d, RE
 HRESULT make_allocator(Device* dev, PcObj pca, D3D12_COMMAND_LIST_TYPE t, REFIID riid, void** out);
 HRESULT make_list(Device* dev, PcObj pcl, D3D12_COMMAND_LIST_TYPE t, REFIID riid, void** out);
 HRESULT make_simple(Device* dev, Kind kind, PcObj pc, REFIID riid, void** out);
+HRESULT make_heap(Device* dev, PcObj pc, const D3D12_HEAP_DESC* desc, REFIID riid, void** out);
 HRESULT make_resource(Device* dev, PcObj pcr, REFIID riid, void** out, bool upload = false);
 HRESULT make_descriptor_heap(Device* dev, PcObj pch, const D3D12_DESCRIPTOR_HEAP_DESC* d, REFIID riid, void** out);
 // A title CBV/SRV/UAV heap living in the layer's global shader-visible heap (pc::global_view_alloc).
