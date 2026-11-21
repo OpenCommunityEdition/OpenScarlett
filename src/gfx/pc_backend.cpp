@@ -40,10 +40,26 @@ void dump_debug_messages() {
     }
     g_info->ClearStoredMessages();
 }
+ID3D12Device* g_main_device = nullptr;   // for removal reports from calls that do not pass it
+}  // namespace
+void report_device_removed(ID3D12Device* dev);
+namespace {
+bool g_dred = false;
+// With DRED on: per command list, the pipeline names marked so far (DRED's own breadcrumb contexts
+// need Windows 11; the marker count before the failing op indexes this list).
+std::mutex g_mark_lock;
+std::map<void*, std::vector<std::wstring>> g_marks;
+void* identity(void* p) {   // canonical IUnknown pointer (DRED reports a different interface pointer)
+    IUnknown* u = nullptr;
+    if (!p || FAILED(static_cast<IUnknown*>(p)->QueryInterface(IID_PPV_ARGS(&u)))) return p;
+    u->Release();
+    return u;
+}
 HRESULT logged(HRESULT hr, const char* what) {
     if (FAILED(hr)) {
         XSL_ERR(CH, "%s failed %08lx", what, hr);
         dump_debug_messages();
+        if (hr == DXGI_ERROR_DEVICE_REMOVED) report_device_removed(g_main_device);
     }
     return hr;
 }
@@ -76,22 +92,45 @@ void report_device_removed(ID3D12Device* dev) {
     XSL_ERR(CH, "device removed: reason %08lx", dev->GetDeviceRemovedReason());
     ID3D12DeviceRemovedExtendedData* dred = nullptr;
     if (FAILED(dev->QueryInterface(IID_PPV_ARGS(&dred)))) return;
-    D3D12_DRED_AUTO_BREADCRUMBS_OUTPUT bc{};
-    if (SUCCEEDED(dred->GetAutoBreadcrumbsOutput(&bc))) {
+    ID3D12DeviceRemovedExtendedData1* dred1 = nullptr;
+    D3D12_DRED_AUTO_BREADCRUMBS_OUTPUT1 bc{};
+    if (SUCCEEDED(dred->QueryInterface(IID_PPV_ARGS(&dred1))) && SUCCEEDED(dred1->GetAutoBreadcrumbsOutput1(&bc))) {
         int lists = 0;
         for (auto* n = bc.pHeadAutoBreadcrumbNode; n && lists < 64; n = n->pNext, lists++) {
             UINT done = n->pLastBreadcrumbValue ? *n->pLastBreadcrumbValue : 0;
             if (done >= n->BreadcrumbCount) continue;   // completed
-            XSL_ERR(CH, "DRED: list %ls on queue %ls stopped at op %u of %u", n->pCommandListDebugNameW ? n->pCommandListDebugNameW : L"?",
-                    n->pCommandQueueDebugNameW ? n->pCommandQueueDebugNameW : L"?", done, n->BreadcrumbCount);
-            for (UINT k = done > 3 ? done - 3 : 0; k < n->BreadcrumbCount && k < done + 3; k++)
-                XSL_ERR(CH, "DRED:   %s op %u: %d", k == done ? ">" : " ", k, (int)n->pCommandHistory[k]);
+            XSL_ERR(CH, "DRED: a command list stopped at op %u of %u", done, n->BreadcrumbCount);
+            {
+                UINT marks = 0;
+                for (UINT k = 0; k <= done && k < n->BreadcrumbCount; k++) marks += n->pCommandHistory[k] == D3D12_AUTO_BREADCRUMB_OP_SETMARKER;
+                std::lock_guard<std::mutex> g(g_mark_lock);
+                auto it = g_marks.find(identity((void*)n->pCommandList));
+                if (it != g_marks.end() && marks && marks <= it->second.size())
+                    XSL_ERR(CH, "DRED: pipeline in use: %ls", it->second[marks - 1].c_str());
+                else
+                    XSL_ERR(CH, "DRED: %u markers before the op; list %s (%zu named pipelines), %zu lists tracked", marks,
+                            it == g_marks.end() ? "untracked" : "tracked", it == g_marks.end() ? (size_t)0 : it->second.size(), g_marks.size());
+                if (it != g_marks.end() && !it->second.empty()) XSL_ERR(CH, "DRED: last named pipeline on the list: %ls", it->second.back().c_str());
+            }
+            for (UINT k = done > 3 ? done - 3 : 0; k < n->BreadcrumbCount && k < done + 3; k++) {
+                const wchar_t* ctx = L"";
+                for (UINT c = 0; c < n->BreadcrumbContextsCount; c++)
+                    if (n->pBreadcrumbContexts[c].BreadcrumbIndex <= k) ctx = n->pBreadcrumbContexts[c].pContextString;
+                XSL_ERR(CH, "DRED:   %s op %u: %d  [last marker: %ls]", k == done ? ">" : " ", k, (int)n->pCommandHistory[k], ctx);
+            }
         }
     }
+    if (dred1) dred1->Release();
     D3D12_DRED_PAGE_FAULT_OUTPUT pf{};
     if (SUCCEEDED(dred->GetPageFaultAllocationOutput(&pf)) && pf.PageFaultVA)
         XSL_ERR(CH, "DRED: page fault at GPU VA %llx", (unsigned long long)pf.PageFaultVA);
     dred->Release();
+}
+
+HRESULT_T device_removed_reason(PcObj dev) {
+    HRESULT hr = as<ID3D12Device>(dev)->GetDeviceRemovedReason();
+    if (FAILED(hr)) report_device_removed(as<ID3D12Device>(dev));
+    return hr;
 }
 
 HRESULT_T create_device(PcObj* out) {
@@ -101,7 +140,10 @@ HRESULT_T create_device(PcObj* out) {
         if (SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&ds)))) {
             ds->SetAutoBreadcrumbsEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
             ds->SetPageFaultEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+            ID3D12DeviceRemovedExtendedDataSettings1* ds1 = nullptr;
+            if (SUCCEEDED(ds->QueryInterface(IID_PPV_ARGS(&ds1)))) { ds1->SetBreadcrumbContextEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON); ds1->Release(); }
             ds->Release();
+            g_dred = true;
             XSL_INFO(CH, "DRED enabled (breadcrumbs, page faults)");
         }
     }
@@ -161,6 +203,7 @@ HRESULT_T create_device(PcObj* out) {
         XSL_INFO(CH, "D3D12 debug layer on: its errors are logged after failing calls and command list closes (channel d3d12.debug)");
     }
     *out = dev;
+    g_main_device = (ID3D12Device*)dev;
     return S_OK;
 }
 
@@ -304,6 +347,13 @@ struct ShaderFix {
 };
 }  // namespace
 
+void name_translated(PcObj pso) {   // PC pipelines made from translated shaders are named after them
+    const char* k = translated_keys();
+    if (!pso || !*k) return;
+    wchar_t w[512];
+    swprintf(w, 512, L"xsl %hs", k);
+    as<ID3D12PipelineState>(pso)->SetName(w);
+}
 HRESULT_T create_graphics_pso(PcObj dev, const void* desc, PcObj* out) {
     D3D12_GRAPHICS_PIPELINE_STATE_DESC d = *static_cast<const D3D12_GRAPHICS_PIPELINE_STATE_DESC*>(desc);
     for (UINT i = 0; i < 8; i++)
@@ -314,7 +364,8 @@ HRESULT_T create_graphics_pso(PcObj dev, const void* desc, PcObj* out) {
     d.CachedPSO = {};
     d.NodeMask = 0;
     HRESULT hr = as<ID3D12Device>(dev)->CreateGraphicsPipelineState(&d, IID_PPV_ARGS(reinterpret_cast<ID3D12PipelineState**>(out)));
-    if (FAILED(hr)) XSL_ERR(CH, "CreateGraphicsPipelineState failed %08lx", hr);
+    if (FAILED(hr)) { dump_debug_messages(); XSL_ERR(CH, "CreateGraphicsPipelineState failed %08lx", hr); }
+    if (SUCCEEDED(hr)) name_translated(*out);
     if (hr == DXGI_ERROR_DEVICE_REMOVED) report_device_removed(as<ID3D12Device>(dev));
     return hr;
 }
@@ -326,7 +377,8 @@ HRESULT_T create_compute_pso(PcObj dev, const void* desc, PcObj* out) {
     d.CachedPSO = {};
     d.NodeMask = 0;
     HRESULT hr = as<ID3D12Device>(dev)->CreateComputePipelineState(&d, IID_PPV_ARGS(reinterpret_cast<ID3D12PipelineState**>(out)));
-    if (FAILED(hr)) XSL_ERR(CH, "CreateComputePipelineState failed %08lx", hr);
+    if (FAILED(hr)) { dump_debug_messages(); XSL_ERR(CH, "CreateComputePipelineState failed %08lx", hr); }
+    if (SUCCEEDED(hr)) name_translated(*out);
     if (hr == DXGI_ERROR_DEVICE_REMOVED) report_device_removed(as<ID3D12Device>(dev));
     return hr;
 }
@@ -340,7 +392,8 @@ HRESULT_T create_pso_stream(PcObj dev, void* stream, size_t size, PcObj* out) {
         hr = d2->CreatePipelineState(&d, IID_PPV_ARGS(reinterpret_cast<ID3D12PipelineState**>(out)));
         d2->Release();
     }
-    if (FAILED(hr)) XSL_ERR(CH, "CreatePipelineState (stream, %zu bytes) failed %08lx", size, hr);
+    if (FAILED(hr)) { dump_debug_messages(); XSL_ERR(CH, "CreatePipelineState (stream, %zu bytes) failed %08lx", size, hr); }
+    if (SUCCEEDED(hr)) name_translated(*out);
     if (hr == DXGI_ERROR_DEVICE_REMOVED) report_device_removed(as<ID3D12Device>(dev));
     return hr;
 }
@@ -758,7 +811,14 @@ HRESULT_T create_fence(PcObj dev, uint64_t initial, uint32_t flags, PcObj* out) 
     return logged(as<ID3D12Device>(dev)->CreateFence(initial, (D3D12_FENCE_FLAGS)(flags & 0x7), IID_PPV_ARGS(reinterpret_cast<ID3D12Fence**>(out))), "CreateFence");
 }
 
-uint64_t fence_completed(PcObj f) { return as<ID3D12Fence>(f)->GetCompletedValue(); }
+uint64_t fence_completed(PcObj f) {
+    uint64_t v = as<ID3D12Fence>(f)->GetCompletedValue();
+    if (v == UINT64_MAX) {   // the device was removed
+        ID3D12Device* dev = nullptr;
+        if (SUCCEEDED(as<ID3D12Fence>(f)->GetDevice(IID_PPV_ARGS(&dev)))) { report_device_removed(dev); dev->Release(); }
+    }
+    return v;
+}
 HRESULT_T fence_set_event(PcObj f, uint64_t v, void* e) { return as<ID3D12Fence>(f)->SetEventOnCompletion(v, (HANDLE)e); }
 HRESULT_T fence_signal(PcObj f, uint64_t v) { return as<ID3D12Fence>(f)->Signal(v); }
 
@@ -828,7 +888,13 @@ HRESULT_T list_close(PcObj l) {
     if (g_info && g_info->GetNumStoredMessages()) dump_debug_messages();  // errors recorded into a list that still closed
     return hr;
 }
-HRESULT_T list_reset(PcObj l, PcObj a, PcObj pso) { return logged(L->Reset(as<ID3D12CommandAllocator>(a), as<ID3D12PipelineState>(pso)), "CommandList::Reset"); }
+void list_set_pso(PcObj l, PcObj pso);
+HRESULT_T list_reset(PcObj l, PcObj a, PcObj pso) {
+    if (g_dred) { std::lock_guard<std::mutex> g(g_mark_lock); g_marks[identity(l)].clear(); }
+    HRESULT hr = logged(L->Reset(as<ID3D12CommandAllocator>(a), as<ID3D12PipelineState>(pso)), "CommandList::Reset");
+    if (pso && SUCCEEDED(hr)) list_set_pso(l, pso);   // initial pipeline: marked like SetPipelineState
+    return hr;
+}
 void list_barriers(PcObj l, uint32_t n, const void* b) {
     if (!n) return;
     D3D12_RESOURCE_BARRIER tmp[64];
@@ -860,7 +926,19 @@ void list_viewports(PcObj l, uint32_t n, const void* v) { L->RSSetViewports(n, s
 void list_scissors(PcObj l, uint32_t n, const void* r) { L->RSSetScissorRects(n, static_cast<const D3D12_RECT*>(r)); }
 void list_set_gfx_root_signature(PcObj l, PcObj rs) { L->SetGraphicsRootSignature(as<ID3D12RootSignature>(rs)); }
 void list_set_compute_root_signature(PcObj l, PcObj rs) { L->SetComputeRootSignature(as<ID3D12RootSignature>(rs)); }
-void list_set_pso(PcObj l, PcObj pso) { L->SetPipelineState(as<ID3D12PipelineState>(pso)); }
+void list_set_pso(PcObj l, PcObj pso) {
+    L->SetPipelineState(as<ID3D12PipelineState>(pso));
+    if (g_dred && pso) {   // breadcrumb context: which pipeline the following work uses
+        wchar_t name[128];
+        UINT n = sizeof name;
+        if (SUCCEEDED(as<ID3D12PipelineState>(pso)->GetPrivateData(WKPDID_D3DDebugObjectNameW, &n, name)) && n > 2)
+        {
+            L->SetMarker(0, name, n);
+            std::lock_guard<std::mutex> g(g_mark_lock);
+            g_marks[identity(l)].push_back(name);
+        }
+    }
+}
 void list_ia_topology(PcObj l, int t) { L->IASetPrimitiveTopology((D3D12_PRIMITIVE_TOPOLOGY)t); }
 void list_ia_vbs(PcObj l, uint32_t s, uint32_t n, const void* v) { L->IASetVertexBuffers(s, n, static_cast<const D3D12_VERTEX_BUFFER_VIEW*>(v)); }
 void list_ia_ib(PcObj l, const void* v) { L->IASetIndexBuffer(static_cast<const D3D12_INDEX_BUFFER_VIEW*>(v)); }

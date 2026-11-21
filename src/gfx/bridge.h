@@ -173,9 +173,15 @@ void* buffer_try_map(PcObj res);
 // PC runtime accepts (see dxbc.cpp). Returns false if the blob is not DXBC.
 // A PC ID3DBlob holding a copy of `data` (refcount 1).
 PcObj create_blob(const void* data, size_t size);
+// The PC device's removal reason (S_OK while alive); logs DRED data on the first failure.
+HRESULT_T device_removed_reason(PcObj dev);
 bool sanitize_container(const void* in, size_t inSize, void** out, size_t* outSize);
 // Console machine code -> HLSL -> DXIL for shaders without (usable) DXIL; see native_shaders.cpp.
 bool native_translate(const void* in, size_t inSize, void** out, size_t* outSize);
+// Whether a shader without DXIL failed translation on this thread since reset_untranslated().
+void reset_untranslated();
+const char* translated_keys();   // keys of shaders translated since reset_untranslated()
+bool had_untranslated();
 void free_container(void* p);
 
 }  // namespace pc

@@ -114,6 +114,17 @@ HRESULT D3DAPI D_CreateRootSignature(ID3D12Device* d, UINT, const void* blob, SI
     XSL_TRACE("gfx.cmd", "CreateRootSignature -> %p", rs);
     return make_simple(DEV(d), Kind::RootSignature, rs, riid, out);
 }
+// A pipeline whose console-only shaders cannot be translated yet gets a placeholder PSO (its draws
+// and dispatches are skipped) instead of failing, which titles treat as fatal.
+// XSL_PLACEHOLDER_PSO=0 disables this.
+static HRESULT pso_result(Device* dev, HRESULT hr, PcObj pso, REFIID riid, void** out) {
+    if (SUCCEEDED(hr)) return make_simple(dev, Kind::Pso, pso, riid, out);
+    static const bool on = [] { char b[4]; return !(GetEnvironmentVariableA("XSL_PLACEHOLDER_PSO", b, 4) && b[0] == '0'); }();
+    if (!on || !pc::had_untranslated()) return hr;
+    static volatile long n = 0;
+    if (InterlockedIncrement(&n) <= 5) XSL_WARN(CH, "pipeline with untranslated console shaders: placeholder PSO (its work is skipped)");
+    return make_simple(dev, Kind::Pso, nullptr, riid, out);
+}
 HRESULT D3DAPI D_CreateGraphicsPipelineState(ID3D12Device* d, const D3D12_GRAPHICS_PIPELINE_STATE_DESC* desc, REFIID riid, void** out) {
     if (null_graphics()) return make_simple(DEV(d), Kind::Pso, nullptr, riid, out);
     D3D12_GRAPHICS_PIPELINE_STATE_DESC x = *desc;
@@ -127,9 +138,9 @@ HRESULT D3DAPI D_CreateGraphicsPipelineState(ID3D12Device* d, const D3D12_GRAPHI
     if (x.PrimitiveTopologyType == D3D12XBOX_PRIMITIVE_TOPOLOGY_TYPE_QUAD || x.PrimitiveTopologyType == D3D12XBOX_PRIMITIVE_TOPOLOGY_TYPE_RECT)
         x.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
     PcObj pso = nullptr;
+    pc::reset_untranslated();
     HRESULT hr = pc::create_graphics_pso(DPC(d), &x, &pso);
-    if (FAILED(hr)) return hr;
-    return make_simple(DEV(d), Kind::Pso, pso, riid, out);
+    return pso_result(DEV(d), hr, pso, riid, out);
 }
 HRESULT D3DAPI D_CreateComputePipelineStateX(ID3D12Device* d, const D3D12_COMPUTE_PIPELINE_STATE_DESC* desc, UINT, const D3D12XBOX_EXTENDED_COMPUTE_PIPELINE_STATE_DESC*, REFIID riid,
                                              void** out) {
@@ -137,9 +148,9 @@ HRESULT D3DAPI D_CreateComputePipelineStateX(ID3D12Device* d, const D3D12_COMPUT
     D3D12_COMPUTE_PIPELINE_STATE_DESC x = *desc;
     x.pRootSignature = (ID3D12RootSignature*)P(desc->pRootSignature);
     PcObj pso = nullptr;
+    pc::reset_untranslated();
     HRESULT hr = pc::create_compute_pso(DPC(d), &x, &pso);
-    if (FAILED(hr)) return hr;
-    return make_simple(DEV(d), Kind::Pso, pso, riid, out);
+    return pso_result(DEV(d), hr, pso, riid, out);
 }
 HRESULT D3DAPI D_CreateComputePipelineState(ID3D12Device* d, const D3D12_COMPUTE_PIPELINE_STATE_DESC* desc, REFIID riid, void** out) {
     return D_CreateComputePipelineStateX(d, desc, 0, nullptr, riid, out);
@@ -147,6 +158,7 @@ HRESULT D3DAPI D_CreateComputePipelineState(ID3D12Device* d, const D3D12_COMPUTE
 // Pipeline-state streams: console subobject numbering and contents -> PC.
 HRESULT D3DAPI D_CreatePipelineState(ID3D12Device2* d, const D3D12_PIPELINE_STATE_STREAM_DESC* desc, REFIID riid, void** out) {
     if (null_graphics()) return make_simple(DEV(d), Kind::Pso, nullptr, riid, out);
+    pc::reset_untranslated();
     XSL_TRACE("gfx.cmd", "CreatePipelineState stream %zu bytes", (size_t)desc->SizeInBytes);
     auto align = [](size_t v, size_t a) { return (v + a - 1) & ~(a - 1); };
     const uint8_t* in = (const uint8_t*)desc->pPipelineStateSubobjectStream;
@@ -254,8 +266,7 @@ HRESULT D3DAPI D_CreatePipelineState(ID3D12Device2* d, const D3D12_PIPELINE_STAT
     PcObj pso = nullptr;
     HRESULT hr = pc::create_pso_stream(DPC(d), pcs.data(), pcs.size(), &pso);
     for (void* o : owned) pc::free_container(o);
-    if (FAILED(hr)) return hr;
-    return make_simple(DEV(d), Kind::Pso, pso, riid, out);
+    return pso_result(DEV(d), hr, pso, riid, out);
 }
 HRESULT D3DAPI D_CreateCommandSignature(ID3D12Device* d, const D3D12_COMMAND_SIGNATURE_DESC* desc, ID3D12RootSignature* rs, REFIID riid, void** out) {
     PcObj sig = nullptr;
@@ -383,7 +394,7 @@ HRESULT D3DAPI D_CreateFence(ID3D12Device* d, UINT64 init, D3D12_FENCE_FLAGS f, 
     if (FAILED(hr)) return hr;
     return make_simple(DEV(d), Kind::Fence, fence, riid, out);
 }
-HRESULT D3DAPI D_GetDeviceRemovedReason(ID3D12Device*) { return S_OK; }
+HRESULT D3DAPI D_GetDeviceRemovedReason(ID3D12Device* d) { return pc::device_removed_reason(DPC(d)); }
 // Frame statistics, per frame-pipeline token (QPC times). Origin events come from WaitFrameEventX,
 // present times from PresentX, GPU completion from the frame-latency fence (observed on query, so it
 // can trail the real completion slightly); display times equal GPU completion (no scan-out feedback).

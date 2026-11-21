@@ -19,6 +19,7 @@ namespace gpucode {
 
 struct TranslateOptions {
     bool comments = true;        // instruction text as comments in the HLSL
+    bool stencil_export = false; // SV_StencilRef output (PC GPUs without PSSpecifiedStencilRef reject it)
 };
 
 struct TranslateResult {

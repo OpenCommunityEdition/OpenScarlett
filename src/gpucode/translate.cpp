@@ -117,7 +117,8 @@ struct Translator {
     bool vs_pos = false;
     bool uses_codedata = false;
     unsigned ms_max_verts = 256, ms_max_prims = 256, ms_lds = 0;
-    bool merged_vs = false;   // vertex shader compiled as a merged (ES/GS or primitive) stage
+    bool merged_vs = false;
+    bool uses_clipcull = false;   // vertex shader compiled as a merged (ES/GS or primitive) stage
     unsigned user_end() const {   // first SGPR after the user arguments (PS: primitive mask)
         unsigned e = c.kind == ProgramKind::CS ? 4 : 8;
         for (auto& a : meta.args)
@@ -777,6 +778,31 @@ struct Translator {
     }
 
     std::string res_decl(const Res& r) const;
+    // Vertex-output system values written through position exports.
+    std::string sysv_outputs(const std::vector<SigElem>& v) const {
+        std::string o;
+        unsigned clip = 0, cull = 0;
+        for (auto& e : v) {
+            if (e.sysval == 4) o += "  uint rtai_ : SV_RenderTargetArrayIndex;\n";
+            if (e.sysval == 5) o += "  uint vpi_ : SV_ViewportArrayIndex;\n";
+            if (e.sysval == 2) clip += __builtin_popcount(e.mask);
+            if (e.sysval == 3) cull += __builtin_popcount(e.mask);
+        }
+        if (clip) o += fmt("  float%s clip_ : SV_ClipDistance;\n", clip > 1 ? std::to_string(std::min(clip, 4u)).c_str() : "");
+        if (cull) o += fmt("  float%s cull_ : SV_CullDistance;\n", cull > 1 ? std::to_string(std::min(cull, 4u)).c_str() : "");
+        return o;
+    }
+    std::string clipcull_copy() const {   // after the program: distances into the output struct
+        unsigned clip = 0, cull = 0;
+        for (auto& e : osg) {
+            if (e.sysval == 2) clip += __builtin_popcount(e.mask);
+            if (e.sysval == 3) cull += __builtin_popcount(e.mask);
+        }
+        std::string o;
+        for (unsigned i = 0; i < std::min(clip, 4u); i++) o += clip > 1 ? fmt("O.clip_[%u] = clipcull_[%u]; ", i, i) : fmt("O.clip_ = clipcull_[%u]; ", i);
+        for (unsigned i = 0; i < std::min(cull, 4u); i++) o += cull > 1 ? fmt("O.cull_[%u] = clipcull_[%u]; ", i, clip + i) : fmt("O.cull_ = clipcull_[%u]; ", clip + i);
+        return o;
+    }
     void link_arrays() {
         for (auto& r : res) {
             if (r.dyn || r.kind == ResKind::Counter || r.kind == ResKind::StaticSampler || r.param >= rs.params.size()) continue;
@@ -2078,9 +2104,17 @@ bool Translator::emit_exp(const Instr& in, size_t idx) {
             line("}");
         } else if (t == 8) {
             line("if (kexec) {");
-            if (in.exp_en & 1) { ps_depth = true; line("  O.depth_ = " + comp[0] + ";"); }
-            if (in.exp_en & 2) { ps_stencil = true; line("  O.stencil_ = asuint(" + comp[1] + ");"); }
-            if (in.exp_en & 4) { ps_mask = true; line("  O.mask_ = asuint(" + comp[2] + ");"); }
+            bool sig_depth = osg.empty();
+            for (auto& e : osg) sig_depth |= starts(e.name, "SV_Depth");
+            if ((in.exp_en & 1) && sig_depth) { ps_depth = true; line("  O.depth_ = " + comp[0] + ";"); }
+            // Stencil and sample-mask slots are written only when the signature has those outputs
+            // (the export's enable mask can cover slots the shader does not output).
+            bool sig_st = osg.empty(), sig_cov = osg.empty();
+            for (auto& e : osg) { sig_st |= e.name == "SV_StencilRef"; sig_cov |= e.name == "SV_Coverage"; }
+            // Shader-written stencil (SV_StencilRef) is optional on PC and missing on NVIDIA GPUs; it
+            // is dropped unless TranslateOptions::stencil_export is set.
+            if ((in.exp_en & 2) && sig_st && opt.stencil_export) { ps_stencil = true; line("  O.stencil_ = asuint(" + comp[1] + ");"); }
+            if ((in.exp_en & 4) && sig_cov) { ps_mask = true; line("  O.mask_ = asuint(" + comp[2] + ");"); }
             line("}");
         } else if (t != 9) {
             return fail(fmt("pixel export target %u not supported", t));
@@ -2106,7 +2140,27 @@ bool Translator::emit_exp(const Instr& in, size_t idx) {
         }
         if (t >= 13 && t <= 15) {
             if (!in.exp_en) return true;
-            return fail(fmt("vertex export pos%u (clip/cull distances, point size) not supported yet", t - 12));
+            // pos1 is the misc vector when the outputs have a render-target array or viewport index
+            // (z = array index, w = viewport index; AMD's layout), then clip and cull distances.
+            bool misc = false;
+            for (auto& e : osg) misc |= e.sysval == 4 || e.sysval == 5;
+            unsigned k = t - 13;
+            if (misc && k == 0) {
+                line("if (kexec) {");
+                for (auto& e : osg) {
+                    if (e.sysval == 4 && (in.exp_en & 4)) line("  O.rtai_ = asuint(" + comp[2] + ");");
+                    if (e.sysval == 5 && (in.exp_en & 8)) line("  O.vpi_ = asuint(" + comp[3] + ");");
+                }
+                line("}");
+                return true;
+            }
+            unsigned cv = k - (misc ? 1 : 0);   // clip/cull vector index (4 distances each)
+            line("if (kexec) {");
+            for (int j = 0; j < 4; j++)
+                if ((in.exp_en >> j) & 1) line(fmt("  clipcull_[%u] = %s;", cv * 4 + j, comp[j].c_str()));
+            line("}");
+            uses_clipcull = true;
+            return true;
         }
         if (t >= 32 && t < 64) {
             unsigned p = t - 32;
@@ -2280,7 +2334,9 @@ std::string Translator::generate() {
     }
     const size_t nb = block_start.size();
     if (!loops) line(fmt("bool reach[%zu]; [unroll] for (uint i_ = 0u; i_ < %zuu; i_++) reach[i_] = false; reach[0] = true;", nb + 1, nb + 1));
-    else line("uint pc = 0u;\n  [loop] for (;;) {\n  [forcecase] switch (pc) {");
+    // The guard bounds the block transitions so a mistranslated loop ends the shader instead of
+    // hanging the GPU (which removes the PC device).
+    else line("uint pc = 0u, guard_ = 0u;\n  [loop] for (;;) {\n  if (++guard_ > (1u << 22)) RETURN;\n  [forcecase] switch (pc) {");
     // Blocks not reachable from the entry (data after the last instruction) are not emitted.
     std::vector<bool> live(nb, false);
     {
@@ -2455,7 +2511,10 @@ std::string Translator::generate() {
             h << "  " << (w > 1 ? fmt("%s%u", b, w) : std::string(b)) << " o" << e.reg << "_" << __builtin_ctz(e.mask) << " : " << sem(e) << ";\n";
         }
         if (!pos_in_sig) h << "  float4 pos_ : SV_Position;\n";
-        h << "};\n#define RETURN return O\n";
+        h << sysv_outputs(sorted(osg));
+        h << "};\n";
+        if (uses_clipcull) h << "static float clipcull_[8];\n#define RETURN { " << clipcull_copy() << "return O; }\n";
+        else h << "#define RETURN return O\n";
         h << "\nVSOut main(VSIn I) {\n  VSOut O = (VSOut)0;\n";
         init += "  v0 = I.vid_;\n";
         if (!vs_fetch) init += "  v3 = I.iid_;\n";
@@ -2474,7 +2533,9 @@ std::string Translator::generate() {
             h << "  " << (w > 1 ? fmt("%s%u", b, w) : std::string(b)) << " o" << e.reg << "_" << __builtin_ctz(e.mask) << " : " << sem(e) << ";\n";
         }
         if (!pos_in_sig) h << "  float4 pos_ : SV_Position;\n";
+        h << sysv_outputs(sorted(osg));
         h << "};\n";
+        h << (uses_clipcull ? "static float clipcull_[8];\n" : "");
         h << "groupshared uint ms_counts_;\nstatic MSV O;\nstatic uint prim_;\nstatic bool hasv_, hasp_;\n#define RETURN return\n";
         h << "\nvoid prog(uint3 gid_, uint gi_) {\n";
         unsigned nt = meta.numthreads[0] * meta.numthreads[1] * meta.numthreads[2];
@@ -2503,6 +2564,7 @@ std::string Translator::generate() {
         h << "  if (gi_ == 0u) ms_counts_ = 0u;\n  GroupMemoryBarrierWithGroupSync();\n";
         h << "  O = (MSV)0; prim_ = 0u; hasv_ = false; hasp_ = false;\n";
         h << "  prog(gid_, gi_);\n  GroupMemoryBarrierWithGroupSync();\n";
+        if (uses_clipcull) h << "  " << clipcull_copy() << "\n";
         h << "  uint nv = min(ms_counts_ & 0xfffu, " << ms_max_verts << "u), np = min(ms_counts_ >> 12, " << ms_max_prims << "u);\n";
         h << "  SetMeshOutputCounts(nv, np);\n";
         h << "  if (gi_ < nv) verts[gi_] = O;   // unexported slots stay zero\n";

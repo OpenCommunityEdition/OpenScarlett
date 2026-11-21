@@ -75,7 +75,7 @@ std::vector<uint8_t> with_root_signature(const std::vector<uint8_t>& dxil, const
     parts.push_back({gpucode::fourcc("RTS0"), *rs});
     return build_container(parts, dxil.data());
 }
-constexpr const char* kVersion = "gpucode-3";
+constexpr const char* kVersion = "gpucode-6";
 
 int mode() {
     static int m = [] {
@@ -192,7 +192,13 @@ void dump(uint64_t key, const void* in, size_t n, const std::string& hlsl, const
 
 std::mutex g_lock;
 std::set<uint64_t> g_failed;
+thread_local bool t_untranslated = false;   // a shader without DXIL could not be translated
+thread_local std::string t_keys;             // translated shaders since reset (pipeline names)
 }  // namespace
+
+void reset_untranslated() { t_untranslated = false; t_keys.clear(); }
+bool had_untranslated() { return t_untranslated; }
+const char* translated_keys() { return t_keys.c_str(); }
 
 bool native_translate(const void* in, size_t n, void** out, size_t* outSize) {
     if (mode() == 0) return false;
@@ -211,7 +217,7 @@ bool native_translate(const void* in, size_t n, void** out, size_t* outSize) {
     uint64_t key = fnv(kVersion, strlen(kVersion), fnv(in, n));
     {
         std::lock_guard<std::mutex> g(g_lock);
-        if (g_failed.count(key)) return false;
+        if (g_failed.count(key)) { t_untranslated = !c.has_bitcode; return false; }
     }
     wchar_t name[32];
     swprintf(name, 32, L"%016llx.dxil", (unsigned long long)key);
@@ -227,6 +233,7 @@ bool native_translate(const void* in, size_t n, void** out, size_t* outSize) {
             XSL_WARN(CH, "shader %016llx: no usable root signature in the container (%s)", (unsigned long long)key, err.c_str());
             std::lock_guard<std::mutex> g(g_lock);
             g_failed.insert(key);
+            t_untranslated = !c.has_bitcode;
             return false;
         }
         gpucode::TranslateResult r = gpucode::translate(c, rs);
@@ -235,6 +242,7 @@ bool native_translate(const void* in, size_t n, void** out, size_t* outSize) {
             dump(key, in, n, "", r.error);
             std::lock_guard<std::mutex> g(g_lock);
             g_failed.insert(key);
+            t_untranslated = !c.has_bitcode;
             return false;
         }
         std::string log;
@@ -243,6 +251,7 @@ bool native_translate(const void* in, size_t n, void** out, size_t* outSize) {
             dump(key, in, n, r.hlsl, "");
             std::lock_guard<std::mutex> g(g_lock);
             g_failed.insert(key);
+            t_untranslated = !c.has_bitcode;
             return false;
         }
         dxil = with_root_signature(dxil, c);
@@ -250,6 +259,9 @@ bool native_translate(const void* in, size_t n, void** out, size_t* outSize) {
         if (!cpath.empty()) write_file(cpath, dxil.data(), dxil.size());
         XSL_INFO(CH, "shader %016llx (%s, wave%u): translated to %s", (unsigned long long)key, gpucode::kind_name(c.kind), r.wave_size, r.profile.c_str());
     }
+    char kb[24];
+    snprintf(kb, sizeof kb, "%s%016llx", t_keys.empty() ? "" : " ", (unsigned long long)key);
+    t_keys += kb;
     void* o = malloc(dxil.size());
     memcpy(o, dxil.data(), dxil.size());
     *out = o;
