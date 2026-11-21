@@ -64,6 +64,12 @@ struct Meta {
     // Compute: COMPUTE_PGM_RSRC2 fields (AMD's public register layout) and the thread-group size.
     uint32_t rsrc2 = 0;
     uint32_t numthreads[3] = {1, 1, 1};
+    // Pixel shaders (962-dword header): SPI_PS_INPUT_ENA (AMD's public register layout), the
+    // interpolated inputs ({signature register, component mask, flat}), colour-target mask and
+    // depth-export control.
+    uint32_t ps_input_ena = 0, cb_shader_mask = 0, db_shader_control = 0;
+    struct PsInput { uint32_t reg, mask; bool flat; };
+    std::vector<PsInput> ps_inputs;
     std::vector<UserArg> args;
     std::vector<ResRecord> resources;
     unsigned user_sgprs() const { return (rsrc2 >> 1) & 31; }

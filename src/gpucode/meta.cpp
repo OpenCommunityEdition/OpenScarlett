@@ -74,6 +74,16 @@ bool parse_meta(const Container& c, Meta& m, std::string* err) {
         m.rsrc2 = w(78);
         for (int k = 0; k < 3; k++) m.numthreads[k] = w(79 + k);
     }
+    if (c.kind == ProgramKind::PS && m.header_dwords == 962) {
+        m.ps_input_ena = w(146);
+        m.cb_shader_mask = w(148);
+        m.db_shader_control = w(147);
+        uint32_t ni = w(142);
+        for (uint32_t k = 0; k < ni && k < 32; k++) {
+            uint32_t a = w(78 + 2 * k), b = w(79 + 2 * k);
+            m.ps_inputs.push_back({(a >> 8) & 0xff, (a >> 16) & 0xf, (b >> 24) == 1});
+        }
+    }
     // Records follow the s_code_end padding: 5 dwords each, ending with {0, 0, ~0, 0, x}.
     size_t i = c.code_end / 4;
     while (i < n && w(i) == 0xBF9F0000) i++;

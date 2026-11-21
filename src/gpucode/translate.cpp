@@ -59,12 +59,13 @@ struct Res {
     uint32_t param = 0, offset = 0;     // root parameter and byte offset in its table (or root)
     uint32_t root_hi_or = 0;            // root descriptors: bits the shader ORed into word 1
     int dim = -1;                       // images: MIMG dim
+    bool cube_array = false;
     bool dyn = false;                   // array indexed at run time
     int alias = -1;                     // static access to an element of resource array `alias`
     unsigned alias_index = 0;
     int counter_of = -1;                // Counter: the structured buffer whose hidden counter this is
     unsigned array = 0;                 // array size (0: unbounded) when dyn
-    bool is_uint = false, is_sint = false, cmp_sampler = false;
+    bool is_uint = false, is_sint = false, cmp_sampler = false, scalar = false;
     unsigned comps = 4;
     std::string name;
 };
@@ -99,8 +100,27 @@ struct Translator {
     }
 
     // ---- setup ------------------------------------------------------------------------------
+    std::vector<PsvResource> psv;
+    const PsvResource* psv_find(bool sampler, bool cbv, bool uav, uint32_t reg, uint32_t space) const {
+        for (auto& p : psv) {
+            bool cls = sampler ? p.type == 1 : cbv ? p.type == 2 : uav ? (p.type >= 6 && p.type <= 9) : (p.type >= 3 && p.type <= 5);
+            if (cls && p.space == space && reg >= p.lo && reg <= p.hi) return &p;
+        }
+        return nullptr;
+    }
+    // Refines a resource's kind and image dimension from PSV0 when the container has it.
+    void refine(Res& r) const {
+        const PsvResource* p = psv_find(r.kind == ResKind::Sampler, r.kind == ResKind::CBuffer, r.uav, r.reg, r.space);
+        if (!p || !p->kind) return;
+        static const int kdim[10] = {-1, 0, 1, 6, 2, 3, 4, 5, 7, 3};
+        if (p->kind >= 1 && p->kind <= 9) { r.kind = ResKind::Image; r.dim = kdim[p->kind]; r.cube_array = p->kind == 9; }
+        else if (p->kind == 10) r.kind = ResKind::TypedBuf;
+        else if (p->kind == 11) r.kind = ResKind::RawBuf;
+        else if (p->kind == 12 && r.kind != ResKind::StructBuf) { r.kind = ResKind::StructBuf; if (!r.stride) r.stride = 4; }
+    }
     bool load() {
         std::string e;
+        if (auto* pp = c.part("PSV0")) psv = parse_psv0(*pp);
         if (!parse_meta(c, meta, &e)) return fail("metadata: " + e);
         code = c.code();
         ins = decode_all(code.data(), code.size());
@@ -379,6 +399,7 @@ struct Translator {
         return false;
     }
     int add_res(Res r) {
+        if (r.kind != ResKind::Counter && r.kind != ResKind::StaticSampler) refine(r);
         for (size_t i = 0; i < res.size(); i++)
             if (res[i].param == r.param && res[i].offset == r.offset && res[i].kind == r.kind && res[i].uav == r.uav) return int(i);
         r.name = fmt("R%zu", res.size());
@@ -509,10 +530,16 @@ struct Translator {
     void resolve(size_t i, const SState& st) {
         const Instr& in = ins[i];
         std::string n = in.name;
-        if (in.fmt == Fmt::MUBUF || in.fmt == Fmt::MTBUF) res_of[i] = resource(st, in.srsrc, 4, in, false);
+        if (in.fmt == Fmt::MUBUF || in.fmt == Fmt::MTBUF) {
+            int r = resource(st, in.srsrc, 4, in, false);
+            res_of[i] = r;
+            if (r >= 0 && has(n, "_atomic_") && res[r].kind == ResKind::TypedBuf) { res[r].scalar = true; res[r].is_uint = true; }
+        }
         else if (in.fmt == Fmt::MIMG) {
             bool bvh = has(n, "bvh");
-            res_of[i] = resource(st, in.srsrc, bvh ? 4 : 8, in, false);
+            int r = resource(st, in.srsrc, bvh ? 4 : 8, in, false);
+            res_of[i] = r;
+            if (r >= 0 && starts(n, "image_atomic")) res[r].is_uint = true;
             if (starts(n, "image_sample") || starts(n, "image_gather4") || n == "image_get_lod") {
                 std::string keep = res_index.count(i) ? res_index[i] : "";
                 res_index.erase(i);
@@ -897,7 +924,13 @@ bool Translator::emit_smem(const Instr& in, size_t idx) {
     std::string n = in.name;
     unsigned cnt = has(n, "x16") ? 16 : has(n, "x8") ? 8 : has(n, "x4") ? 4 : has(n, "x2") ? 2 : 1;
     if (starts(n, "s_dcache") || n == "s_memtime" || n == "s_memrealtime" || n == "s_gl1_inv") {
-        if (n == "s_memtime" || n == "s_memrealtime") { write_s(in.sdata, "0u"); write_s(in.sdata + 1, "0u"); }
+        // HLSL has no GPU clock: a per-invocation counter that advances 1024 ticks per read keeps
+        // time-based loops finite.
+        if (n == "s_memtime" || n == "s_memrealtime") {
+            line("memtime_ += 1024u;");
+            write_s(in.sdata, "uint(memtime_)");
+            write_s(in.sdata + 1, "uint(memtime_ >> 32)");
+        }
         return true;
     }
     if (starts(n, "s_load_dword")) {
@@ -916,13 +949,17 @@ bool Translator::emit_smem(const Instr& in, size_t idx) {
         if (R.dyn) return fail(n + ": scalar loads from resource arrays not supported");
         std::string off = in.soffset == src::kNull ? fmt("%uu", uint32_t(in.offset_imm)) : fmt("(%s + %uu)", rd(in.soffset, in).c_str(), uint32_t(in.offset_imm));
         if (R.offset) off = fmt("(%s + %uu)", off.c_str(), R.offset);
+        // The destination may overlap the offset register: compute the address first.
+        line(fmt("{ uint sa_ = %s;", off.c_str()));
+        out << "  ";
         for (unsigned k = 0; k < cnt; k++) {
-            std::string a = fmt("(%s + %uu)", off.c_str(), 4 * k);
+            std::string a = fmt("(sa_ + %uu)", 4 * k);
             if (R.kind == ResKind::CBuffer) write_s(in.sdata + k, fmt("cbload(%s_d, %s)", R.name.c_str(), a.c_str()));
             else if (R.kind == ResKind::RawBuf) write_s(in.sdata + k, fmt("%s.Load(%s & ~3u)", R.name.c_str(), a.c_str()));
             else if (R.kind == ResKind::StructBuf) write_s(in.sdata + k, fmt("%s[%s / %uu].w[(%s %% %uu) >> 2]", R.name.c_str(), a.c_str(), R.stride, a.c_str(), R.stride));
             else return fail(fmt("%s at 0x%x: scalar load from unsupported resource", in.name, in.offset));
         }
+        line("}");
         return true;
     }
     return fail(fmt("%s at 0x%x not supported", in.name, in.offset));
@@ -1431,9 +1468,11 @@ bool Translator::emit_mubuf(const Instr& in, size_t idx) {
         if (in.offen) el = fmt("(%s + %s / 4u)", el.c_str(), voff.c_str());
         if (atomic) {
             R.is_uint = true;
+            R.scalar = true;
         }
         if (starts(n, "buffer_load_format") || starts(n, "tbuffer_load_format")) {
-            line(fmt("if (kexec) { %s t_ = %s[%s];", R.is_uint ? "uint4" : "float4", RN.c_str(), el.c_str()));
+            if (R.scalar) line(fmt("if (kexec) { uint4 t_ = uint4(%s[%s], 0u, 0u, 1u);", RN.c_str(), el.c_str()));
+            else line(fmt("if (kexec) { %s t_ = %s[%s];", R.is_uint ? "uint4" : "float4", RN.c_str(), el.c_str()));
             static const char* c4 = "xyzw";
             for (unsigned k = 0; k < cnt; k++) line(fmt("  %s = %s(t_.%c);", V(in.vdata + k).c_str(), R.is_uint ? "uint" : "asuint", c4[k]));
             line("}");
@@ -1442,7 +1481,8 @@ bool Translator::emit_mubuf(const Instr& in, size_t idx) {
         if (starts(n, "buffer_store_format") || starts(n, "tbuffer_store_format")) {
             std::string v;
             for (unsigned k = 0; k < 4; k++) v += (k ? ", " : "") + (k < cnt ? (R.is_uint ? V(in.vdata + k) : "asfloat(" + V(in.vdata + k) + ")") : std::string(R.is_uint ? "0u" : "0.0"));
-            line(fmt("if (kexec) %s[%s] = %s4(%s);", RN.c_str(), el.c_str(), R.is_uint ? "uint" : "float", v.c_str()));
+            if (R.scalar) line(fmt("if (kexec) %s[%s] = %s;", RN.c_str(), el.c_str(), V(in.vdata).c_str()));
+            else line(fmt("if (kexec) %s[%s] = %s4(%s);", RN.c_str(), el.c_str(), R.is_uint ? "uint" : "float", v.c_str()));
             return true;
         }
         if (atomic) {
@@ -1579,7 +1619,8 @@ bool Translator::emit_mimg(const Instr& in, size_t idx) {
     const std::string RN = rn(idx, r);
     if (R.kind != ResKind::Image) return fail(fmt("%s at 0x%x: not an image resource", in.name, in.offset));
     if (R.dim < 0) R.dim = in.dim;
-    else if (R.dim != in.dim) return fail(fmt("%s at 0x%x: image used with two dimensions", in.name, in.offset));
+    else if (R.dim != in.dim && !(R.dim == 3 && in.dim == 5) && !(R.dim == 5 && in.dim == 3))
+        return fail(fmt("%s at 0x%x: image used with two dimensions", in.name, in.offset));
     if (in.a16 || in.d16) return fail(n + ": 16-bit addresses or data not supported yet");
     // Address registers.
     std::vector<std::string> ad;
@@ -1838,10 +1879,11 @@ std::string Translator::res_decl(const Res& r) const {
     case ResKind::CBuffer: return fmt("cbuffer CB_%s %s { uint4 %s_d[4096]; };", r.name.c_str(), reg.c_str(), r.name.c_str());
     case ResKind::RawBuf: return fmt("%sByteAddressBuffer %s%s %s;", rw, r.name.c_str(), arr.c_str(), reg.c_str());
     case ResKind::StructBuf: return fmt("struct E_%s { uint w[%u]; };\n%sStructuredBuffer<E_%s> %s%s %s;", r.name.c_str(), std::max(1u, r.stride / 4), rw, r.name.c_str(), r.name.c_str(), arr.c_str(), reg.c_str());
-    case ResKind::TypedBuf: return fmt("%sBuffer<%s4> %s%s %s;", rw, r.is_uint ? "uint" : "float", r.name.c_str(), arr.c_str(), reg.c_str());
+    case ResKind::TypedBuf: return fmt("%sBuffer<%s%s> %s%s %s;", rw, r.is_uint ? "uint" : "float", r.scalar ? "" : "4", r.name.c_str(), arr.c_str(), reg.c_str());
     case ResKind::Image: {
         int dim = r.dim < 0 ? 1 : r.dim;
         std::string t = std::string(r.uav ? "RWTexture" : "Texture") + (dim == 3 ? std::string("Cube") : dim == 4 ? "1DArray" : dim == 5 ? "2DArray" : dim == 6 ? "2DMS" : dim == 7 ? "2DMSArray" : kDimName[dim]);
+        if (dim == 3 && r.cube_array) t = r.uav ? "RWTexture2DArray" : "TextureCubeArray";
         if (r.uav && dim == 3) t = "RWTexture2DArray";
         return fmt("%s<%s4> %s%s %s;", t.c_str(), r.is_uint ? "uint" : "float", r.name.c_str(), arr.c_str(), reg.c_str());
     }
@@ -1853,6 +1895,7 @@ std::string Translator::res_decl(const Res& r) const {
 
 const char* kPrelude = R"(
 static uint L;
+static uint64_t memtime_ = 0;
 bool lanebit(uint lo, uint hi) { return L < 32u ? ((lo >> L) & 1u) != 0u : ((hi >> (L - 32u)) & 1u) != 0u; }
 bool lanebit1(uint lo) { return ((lo >> (L & 31u)) & 1u) != 0u; }
 uint2 ballot2(bool b) { uint4 r = WaveActiveBallot(b); return r.xy; }
@@ -1910,7 +1953,7 @@ float3 cube_dir(float s, float t, float f) {
 // Cross-lane reads (exact within one PC wave).
 uint xlane(uint v, uint src) { uint r = 0u; [unroll] for (uint k = 0u; k < WAVE; k++) { uint t = WaveReadLaneAt(v, k); if (src == k) r = t; } return r; }
 uint xlane_bc(uint v, uint src, bool bc) { uint r = xlane(v, src & (WAVE - 1u)); return src == 0xffffffffu ? (bc ? 0u : v) : r; }
-uint cbload(uint4 d[4096], uint a) { return d[(a >> 4) & 4095u][(a >> 2) & 3u]; }
+#define cbload(d, a) (d)[((a) >> 4) & 4095u][((a) >> 2) & 3u]
 )";
 
 const char* kQuadPrelude = R"(

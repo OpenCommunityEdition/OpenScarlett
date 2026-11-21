@@ -18,6 +18,22 @@ constexpr uint32_t fourcc(const char* s) {
 enum class ProgramKind : int { PS = 0, VS = 1, GS = 2, HS = 3, DS = 4, CS = 5, Lib = 6, MS = 13, AS = 14, Unknown = -1 };
 const char* kind_name(ProgramKind k);
 
+// One element of an input/output signature part (ISG1/OSG1).
+struct SigElem {
+    std::string name;
+    uint32_t index = 0, sysval = 0, comptype = 0, reg = 0, stream = 0, minprec = 0;
+    uint8_t mask = 0, rwmask = 0;
+    bool is_float() const { return comptype == 3 || comptype == 0; }
+    bool is_sint() const { return comptype == 2; }
+};
+std::vector<SigElem> parse_signature(const std::vector<uint8_t>& part);
+
+// Resource binding from the pipeline-state-validation part (PSV0): type (1 sampler, 2 CBV, 3/4/5
+// SRV typed/raw/structured, 6/7/8/9 UAV typed/raw/structured/structured with counter) and kind
+// (1 Texture1D ... 9 TextureCubeArray, 10 typed buffer, 11 raw buffer, 12 structured buffer).
+struct PsvResource { uint32_t type, space, lo, hi, kind; };
+std::vector<PsvResource> parse_psv0(const std::vector<uint8_t>& part);
+
 struct Container {
     std::map<uint32_t, std::vector<uint8_t>> parts;   // fourcc -> part body
     ProgramKind kind = ProgramKind::Unknown;

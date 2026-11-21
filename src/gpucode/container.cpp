@@ -75,6 +75,46 @@ bool locate_code(const uint8_t* b, size_t size, size_t& begin, size_t& body, siz
     return true;
 }
 
+std::vector<SigElem> parse_signature(const std::vector<uint8_t>& b) {
+    std::vector<SigElem> v;
+    if (b.size() < 8) return v;
+    uint32_t count = rd32(b.data()), off = rd32(b.data() + 4);
+    for (uint32_t i = 0; i < count && off + 32ull * (i + 1) <= b.size(); i++) {
+        const uint8_t* e = b.data() + off + 32 * i;
+        SigElem s;
+        s.stream = rd32(e);
+        uint32_t name = rd32(e + 4);
+        s.index = rd32(e + 8);
+        s.sysval = rd32(e + 12);
+        s.comptype = rd32(e + 16);
+        s.reg = rd32(e + 20);
+        s.mask = e[24];
+        s.rwmask = e[25];
+        s.minprec = rd32(e + 28);
+        if (name < b.size()) s.name = std::string(reinterpret_cast<const char*>(b.data() + name), strnlen(reinterpret_cast<const char*>(b.data() + name), b.size() - name));
+        v.push_back(s);
+    }
+    return v;
+}
+
+std::vector<PsvResource> parse_psv0(const std::vector<uint8_t>& b) {
+    std::vector<PsvResource> v;
+    if (b.size() < 4) return v;
+    size_t p = 4 + rd32(b.data());
+    if (p + 4 > b.size()) return v;
+    uint32_t count = rd32(b.data() + p);
+    p += 4;
+    if (!count || p + 4 > b.size()) return v;
+    uint32_t sz = rd32(b.data() + p);
+    p += 4;
+    if (sz < 16) return v;
+    for (uint32_t i = 0; i < count && p + sz * (i + 1ull) <= b.size(); i++) {
+        const uint8_t* e = b.data() + p + sz * i;
+        v.push_back({rd32(e), rd32(e + 4), rd32(e + 8), rd32(e + 12), sz >= 20 ? rd32(e + 16) : 0});
+    }
+    return v;
+}
+
 std::vector<uint32_t> Container::code() const {
     std::vector<uint32_t> v((code_end - body_begin) / 4);
     if (!v.empty()) memcpy(v.data(), precompiled.data() + body_begin, v.size() * 4);
