@@ -42,6 +42,10 @@ void dump_debug_messages() {
     g_info->ClearStoredMessages();
 }
 ID3D12Device* g_main_device = nullptr;   // for removal reports from calls that do not pass it
+struct RsTrack { PcObj gfx = nullptr, cs = nullptr, pso = nullptr; };
+std::mutex g_rs_mu;
+std::map<PcObj, std::pair<PcObj, bool>> g_pso_rs;
+std::map<PcObj, RsTrack> g_list_rs;
 // Indirect-argument record ring (readback memory stays readable after device removal).
 constexpr uint32_t kEiSlots = 65536, kEiBytes = 48;
 ID3D12Resource* g_ei_rb = nullptr;
@@ -109,8 +113,21 @@ void report_device_removed(ID3D12Device* dev) {
         // on the reported list: it may be gone).
         int waiting = 0, n_lists = 0;
         bool shown_waiting = false;
+        std::deque<std::wstring> anames;   // names for nodes without a wide one (stable addresses)
         for (int pass = 0; pass < 2; pass++, n_lists = 0)
-            for (auto* n = bc.pHeadAutoBreadcrumbNode; n && n_lists < 4096; n = n->pNext, n_lists++) {
+            for (auto* n0 = bc.pHeadAutoBreadcrumbNode; n0 && n_lists < 4096; n0 = n0->pNext, n_lists++) {
+                D3D12_AUTO_BREADCRUMB_NODE1 nn = *n0;
+                if (!nn.pCommandListDebugNameW && !nn.pCommandListDebugNameA) {   // match the list pointer (not dereferenced)
+                    std::lock_guard<std::mutex> g(g_mark_lock);
+                    auto it = g_list_name.find((void*)nn.pCommandList);
+                    if (it != g_list_name.end()) { anames.push_back(it->second); nn.pCommandListDebugNameW = anames.back().c_str(); }
+                }
+                if (!nn.pCommandListDebugNameW && nn.pCommandListDebugNameA) {
+                    std::string a = nn.pCommandListDebugNameA;
+                    anames.emplace_back(a.begin(), a.end());
+                    nn.pCommandListDebugNameW = anames.back().c_str();
+                }
+                auto* n = &nn;
                 UINT done = n->pLastBreadcrumbValue ? *n->pLastBreadcrumbValue : 0;
                 if (done >= n->BreadcrumbCount) continue;   // completed
                 if (pass == 0 && done == 0) { waiting++; continue; }
@@ -122,13 +139,16 @@ void report_device_removed(ID3D12Device* dev) {
                 if (n->pCommandListDebugNameW && g_ei_map && !g_ei_info.empty()) {
                     std::wstring nm = n->pCommandListDebugNameW;
                     if (size_t sp = nm.find(L" (debug layer"); sp != std::wstring::npos) nm.resize(sp);
-                    int shown = 0;
-                    for (uint32_t k = 0; k < kEiSlots && shown < 6; k++) {
-                        if (g_ei_info[k].list != nm) continue;
+                    std::vector<uint32_t> mine;
+                    for (uint32_t k = 0; k < kEiSlots; k++)
+                        if (g_ei_info[k].list == nm) mine.push_back(k);
+                    // slots are handed out in recording order: the last ones precede the stop
+                    std::sort(mine.begin(), mine.end());
+                    for (size_t q = mine.size() > 4 ? mine.size() - 4 : 0; q < mine.size(); q++) {
+                        uint32_t k = mine[q];
                         const uint32_t* e = g_ei_map + k * (kEiBytes / 4);
-                        XSL_ERR(CH, "DRED:   indirect args of this list (buffer %p + %llu): %08x %08x %08x %08x", g_ei_info[k].res,
-                                (unsigned long long)g_ei_info[k].off, e[0], e[1], e[2], e[3]);
-                        shown++;
+                        XSL_ERR(CH, "DRED:   indirect args of this list (#%u, buffer %p + %llu): %08x %08x %08x %08x %08x", k, g_ei_info[k].res,
+                                (unsigned long long)g_ei_info[k].off, e[0], e[1], e[2], e[3], e[4]);
                     }
                 }
                 if (n->pCommandListDebugNameW) {
@@ -360,7 +380,14 @@ void global_view_free(uint32_t offset, uint32_t count) {
     g_gv_free[offset] = count;
 }
 void add_ref(PcObj o) { if (o) as<IUnknown>(o)->AddRef(); }
-void set_name(PcObj o, const wchar_t* name) { if (o && name) as<ID3D12Object>(o)->SetName(name); }
+void set_name(PcObj o, const wchar_t* name) {
+    if (!o || !name) return;
+    if (g_dred) {   // command lists keep the recording names DRED reports are matched by
+        std::lock_guard<std::mutex> g(g_mark_lock);
+        if (g_list_name.count(o)) return;
+    }
+    as<ID3D12Object>(o)->SetName(name);
+}
 
 HRESULT_T create_queue(PcObj dev, const void* desc, PcObj* out) {
     D3D12_COMMAND_QUEUE_DESC d = *static_cast<const D3D12_COMMAND_QUEUE_DESC*>(desc);
@@ -475,7 +502,7 @@ HRESULT_T create_compute_pso(PcObj dev, const void* desc, PcObj* out) {
     d.CachedPSO = {};
     d.NodeMask = 0;
     HRESULT hr = as<ID3D12Device>(dev)->CreateComputePipelineState(&d, IID_PPV_ARGS(reinterpret_cast<ID3D12PipelineState**>(out)));
-    if (FAILED(hr)) { dump_debug_messages(); XSL_ERR(CH, "CreateComputePipelineState failed %08lx", hr); }
+    if (FAILED(hr)) { dump_debug_messages(); XSL_ERR(CH, "CreateComputePipelineState failed %08lx (translated shaders: %s)", hr, translated_keys()); }
     if (SUCCEEDED(hr)) name_translated(*out);
     if (hr == DXGI_ERROR_DEVICE_REMOVED) report_device_removed(as<ID3D12Device>(dev));
     return hr;
@@ -996,6 +1023,16 @@ void name_recording(PcObj l) {
         swprintf(b, 64, L"xsl list %p #%llu", l, (unsigned long long)++gen);   // one name per recording
         L->SetName(b);
         g_list_name[l] = b;
+        // DRED may report another interface pointer of the same list: record those too.
+        static const IID* iids[] = {&__uuidof(ID3D12CommandList), &__uuidof(ID3D12GraphicsCommandList), &__uuidof(ID3D12GraphicsCommandList1),
+                                    &__uuidof(ID3D12GraphicsCommandList4), &__uuidof(ID3D12GraphicsCommandList6), &__uuidof(IUnknown)};
+        for (const IID* iid : iids) {
+            void* q = nullptr;
+            if (SUCCEEDED(as<IUnknown>(l)->QueryInterface(*iid, &q)) && q) {
+                g_list_name[q] = b;
+                static_cast<IUnknown*>(q)->Release();
+            }
+        }
         g_marks[b];
         g_mark_order.push_back(b);
         while (g_mark_order.size() > 8192) { g_marks.erase(g_mark_order.front()); g_mark_order.pop_front(); }
@@ -1003,6 +1040,7 @@ void name_recording(PcObj l) {
 }
 HRESULT_T list_reset(PcObj l, PcObj a, PcObj pso) {
     name_recording(l);
+    if (g_info) { std::lock_guard<std::mutex> g(g_rs_mu); g_list_rs.erase(l); }
     HRESULT hr = logged(L->Reset(as<ID3D12CommandAllocator>(a), as<ID3D12PipelineState>(pso)), "CommandList::Reset");
     if (pso && SUCCEEDED(hr)) list_set_pso(l, pso);   // initial pipeline: marked like SetPipelineState
     return hr;
@@ -1036,9 +1074,37 @@ void list_clear_dsv(PcObj l, uint64_t dsv, uint32_t f, float d, uint8_t s, uint3
 }
 void list_viewports(PcObj l, uint32_t n, const void* v) { L->RSSetViewports(n, static_cast<const D3D12_VIEWPORT*>(v)); }
 void list_scissors(PcObj l, uint32_t n, const void* r) { L->RSSetScissorRects(n, static_cast<const D3D12_RECT*>(r)); }
-void list_set_gfx_root_signature(PcObj l, PcObj rs) { L->SetGraphicsRootSignature(as<ID3D12RootSignature>(rs)); }
-void list_set_compute_root_signature(PcObj l, PcObj rs) { L->SetComputeRootSignature(as<ID3D12RootSignature>(rs)); }
+void note_pso_rs(PcObj pso, PcObj rs, bool compute) {
+    if (!g_info || !pso) return;
+    std::lock_guard<std::mutex> g(g_rs_mu);
+    g_pso_rs[pso] = {rs, compute};
+}
+void list_set_gfx_root_signature(PcObj l, PcObj rs) {
+    if (g_info) { std::lock_guard<std::mutex> g(g_rs_mu); g_list_rs[l].gfx = rs; }
+    L->SetGraphicsRootSignature(as<ID3D12RootSignature>(rs));
+}
+void list_set_compute_root_signature(PcObj l, PcObj rs) {
+    if (g_info) { std::lock_guard<std::mutex> g(g_rs_mu); g_list_rs[l].cs = rs; }
+    L->SetComputeRootSignature(as<ID3D12RootSignature>(rs));
+}
+static void check_rs(PcObj l, const char* what) {
+    std::lock_guard<std::mutex> g(g_rs_mu);
+    auto t = g_list_rs.find(l);
+    if (t == g_list_rs.end()) return;
+    auto p = g_pso_rs.find(t->second.pso);
+    if (p == g_pso_rs.end()) return;
+    PcObj bound = p->second.second ? t->second.cs : t->second.gfx;
+    if (bound == p->second.first) return;
+    static volatile long n = 0;
+    if (InterlockedIncrement(&n) > 12) return;
+    wchar_t name[128] = L"?";
+    UINT sz = sizeof name;
+    as<ID3D12PipelineState>(t->second.pso)->GetPrivateData(WKPDID_D3DDebugObjectNameW, &sz, name);
+    XSL_WARN(CH, "%s: %s pipeline %ls made with root signature %p, list has %p bound", what, p->second.second ? "compute" : "graphics", name,
+             p->second.first, bound);
+}
 void list_set_pso(PcObj l, PcObj pso) {
+    if (g_info) { std::lock_guard<std::mutex> g(g_rs_mu); g_list_rs[l].pso = pso; }
     L->SetPipelineState(as<ID3D12PipelineState>(pso));
     if (g_dred && pso) {   // breadcrumb context: which pipeline the following work uses
         wchar_t name[128];
@@ -1129,6 +1195,7 @@ void list_rt_copy(PcObj l, uint64_t dst, uint64_t src, uint32_t mode) {
     if (auto* l4 = list4(l)) l4->CopyRaytracingAccelerationStructure(dst, src, (D3D12_RAYTRACING_ACCELERATION_STRUCTURE_COPY_MODE)mode);
 }
 void list_execute_indirect(PcObj l, PcObj sig, uint32_t max, PcObj args, uint64_t ao, PcObj cnt, uint64_t co) {
+    if (g_info) check_rs(l, "ExecuteIndirect");
     L->ExecuteIndirect(as<ID3D12CommandSignature>(sig), max, as<ID3D12Resource>(args), ao, as<ID3D12Resource>(cnt), co);
 }
 void list_clear_uav_uint(PcObj l, uint64_t g, uint64_t c, PcObj r, const uint32_t* v, uint32_t n, const void* rects) {

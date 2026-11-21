@@ -118,6 +118,9 @@ void list_execute_indirect(PcObj l, PcObj sig, uint32_t max, PcObj args, uint64_
 // XSL_D3D12_DRED: copies the first argument bytes (and the count) of an ExecuteIndirect to memory the
 // device-removed report prints; the buffers must be in a state that allows copying from them.
 bool dred_on();
+// Diagnostics (XSL_D3D12_DEBUG): the root signature each pipeline was made with, checked against
+// the list's bound one at ExecuteIndirect.
+void note_pso_rs(PcObj pso, PcObj rs, bool compute);
 // Ray-tracing acceleration structures. Descriptions are PC layouts with PC addresses (the
 // geometry array layout, never pointers).
 void rt_prebuild_info(PcObj dev, const void* inputs, void* info);

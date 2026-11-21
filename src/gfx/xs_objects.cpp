@@ -761,10 +761,14 @@ void D3DAPI L_ExecuteIndirect(ID3D12GraphicsCommandList* l, ID3D12CommandSignatu
         if (nb) pc::list_barriers(LPC(l), nb, bar);
         if (nb && bar[0].Transition.pResource == (ID3D12Resource*)P(args) && pc::dred_on())
             pc::list_record_indirect(LPC(l), P(args), ao, nb == 2 ? P(cnt) : nullptr, co);
-        else if (pc::dred_on()) {
+    }
+    if (!nb && pc::dred_on()) {
+        {
             // Arguments already in a read state the title chose: add COPY_SOURCE around the record.
             uint32_t* st = tracked_state(lx(l), args, false);
-            if (st && *st != UINT32_MAX && (*st & D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT) && !(*st & D3D12_RESOURCE_STATE_UNORDERED_ACCESS)) {
+            uint32_t assumed = D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT;   // untracked: where a correct title left it
+            if (!st || *st == UINT32_MAX) st = &assumed;
+            if ((*st & D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT) && !(*st & D3D12_RESOURCE_STATE_UNORDERED_ACCESS)) {
                 D3D12_RESOURCE_BARRIER x{};
                 x.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
                 x.Transition.pResource = (ID3D12Resource*)P(args);

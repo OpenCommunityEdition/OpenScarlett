@@ -142,6 +142,7 @@ HRESULT D3DAPI D_CreateGraphicsPipelineState(ID3D12Device* d, const D3D12_GRAPHI
     PcObj pso = nullptr;
     pc::reset_untranslated();
     HRESULT hr = pc::create_graphics_pso(DPC(d), &x, &pso);
+    if (SUCCEEDED(hr)) pc::note_pso_rs(pso, x.pRootSignature, false);
     return pso_result(DEV(d), hr, pso, riid, out);
 }
 HRESULT D3DAPI D_CreateComputePipelineStateX(ID3D12Device* d, const D3D12_COMPUTE_PIPELINE_STATE_DESC* desc, UINT, const D3D12XBOX_EXTENDED_COMPUTE_PIPELINE_STATE_DESC*, REFIID riid,
@@ -152,6 +153,7 @@ HRESULT D3DAPI D_CreateComputePipelineStateX(ID3D12Device* d, const D3D12_COMPUT
     PcObj pso = nullptr;
     pc::reset_untranslated();
     HRESULT hr = pc::create_compute_pso(DPC(d), &x, &pso);
+    if (SUCCEEDED(hr)) pc::note_pso_rs(pso, x.pRootSignature, true);
     return pso_result(DEV(d), hr, pso, riid, out);
 }
 HRESULT D3DAPI D_CreateComputePipelineState(ID3D12Device* d, const D3D12_COMPUTE_PIPELINE_STATE_DESC* desc, REFIID riid, void** out) {
@@ -166,6 +168,8 @@ HRESULT D3DAPI D_CreatePipelineState(ID3D12Device2* d, const D3D12_PIPELINE_STAT
     const uint8_t* in = (const uint8_t*)desc->pPipelineStateSubobjectStream;
     std::vector<uint8_t> pcs;
     std::vector<void*> owned;  // sanitized shader containers, freed after creation
+    bool saw_rs = false, stream_cs = false;
+    PcObj stream_rs = nullptr;
     pcs.reserve(desc->SizeInBytes + 64);
     size_t cur_al = 8;  // alignment of the payload being copied (d3dx12 subobject layout)
     auto emit = [&](uint32_t pcType, const void* payload, size_t len) {
@@ -221,6 +225,8 @@ HRESULT D3DAPI D_CreatePipelineState(ID3D12Device2* d, const D3D12_PIPELINE_STAT
         } else if (type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE) {
             ID3D12RootSignature* rs;
             memcpy(&rs, p, sizeof rs);
+            saw_rs = rs != nullptr;
+            stream_rs = P(rs);
             PcObj prs = P(rs);
             emit(0, &prs, sizeof prs);
         } else if (type <= D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CS || type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS ||
@@ -228,6 +234,7 @@ HRESULT D3DAPI D_CreatePipelineState(ID3D12Device2* d, const D3D12_PIPELINE_STAT
             D3D12_SHADER_BYTECODE bc;
             memcpy(&bc, p, sizeof bc);
             bool mesh = type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS || type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS;
+            if (type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CS) stream_cs = true;
             if (mesh && bc.pShaderBytecode && !pc::caps().meshShaders) {
                 static volatile long warned = 0;
                 if (InterlockedIncrement(&warned) <= 3)
@@ -265,8 +272,13 @@ HRESULT D3DAPI D_CreatePipelineState(ID3D12Device2* d, const D3D12_PIPELINE_STAT
         }
         off = align(pay + len, 8);
     }
+    if (!saw_rs) {
+        static volatile long n = 0;
+        if (InterlockedIncrement(&n) <= 5) XSL_INFO(CH, "pipeline stream without a root signature (the shaders' embedded one is used)");
+    }
     PcObj pso = nullptr;
     HRESULT hr = pc::create_pso_stream(DPC(d), pcs.data(), pcs.size(), &pso);
+    if (SUCCEEDED(hr)) pc::note_pso_rs(pso, stream_rs, stream_cs);
     for (void* o : owned) pc::free_container(o);
     return pso_result(DEV(d), hr, pso, riid, out);
 }

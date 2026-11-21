@@ -313,7 +313,7 @@ struct Translator {
                 setd(in.dst + 1, AV::top());
             } else {
                 setd(in.dst, AV::top());
-                if (ends(n, "_b64") || has(n, "saveexec")) setd(in.dst + 1, AV::top());
+                if (wide_dst(n) || has(n, "saveexec_b64")) setd(in.dst + 1, AV::top());
             }
             break;
         }
@@ -352,7 +352,7 @@ struct Translator {
                 r = AV::cst(x.a - y.a);
             }
             setd(in.dst, r);
-            if (ends(n, "_b64") || n == "s_bfe_u64" || n == "s_bfe_i64") setd(in.dst + 1, AV::top());
+            if (wide_dst(n) || n == "s_bfe_u64" || n == "s_bfe_i64") setd(in.dst + 1, AV::top());
             break;
         }
         case Fmt::SOPK: {
@@ -410,16 +410,17 @@ struct Translator {
             if ((in.fmt == Fmt::VOP1 || in.fmt == Fmt::VOP2 || (in.fmt == Fmt::VOP3 && in.op >= 256) || in.fmt == Fmt::VOP3P) &&
                 n != "v_writelane_b32" && n != "v_readlane_b32" && n != "v_readfirstlane_b32" && !st.spill.empty())
                 for (auto it = st.spill.begin(); it != st.spill.end();) it = (it->first >> 8) == in.dst ? st.spill.erase(it) : std::next(it);
+            // Lane masks are one SGPR in wave32 code, a pair in wave64 code.
             if (in.fmt == Fmt::VOP3 && in.op < 256) {            // compare: mask in the vdst field
                 setd(in.dst, AV::top());
-                setd(in.dst + 1, AV::top());
+                if (W == 64) setd(in.dst + 1, AV::top());
             } else if (in.fmt == Fmt::VOP3 && (has(n, "_co_") || starts(n, "v_div_scale") || starts(n, "v_mad_u64") || starts(n, "v_mad_i64"))) {
                 setd(in.sdst, AV::top());
-                setd(in.sdst + 1, AV::top());
+                if (W == 64) setd(in.sdst + 1, AV::top());
             }
             if (in.fmt == Fmt::VOPC || (in.fmt == Fmt::VOP2 && has(n, "_co_"))) {
                 st[106] = AV::top();
-                st[107] = AV::top();
+                if (W == 64) st[107] = AV::top();
             }
             break;
         }
@@ -512,6 +513,12 @@ struct Translator {
     // Typed buffers and images: HLSL needs a component type, which on the console is the view's
     // format (unknown here). Values a shader stores or loads are mostly produced or consumed by
     // integer or float ALU code; the majority decides (float when nothing is known).
+    // 64-bit scalar ops whose destination is a pair (s_bcnt/s_ff/s_flbit *_i32_b64 write 32 bits;
+    // compares and s_bitcmp only SCC).
+    static bool wide_dst(const std::string& n) {
+        if (!ends(n, "_b64")) return false;
+        return !(has(n, "_i32_b64") || has(n, "_u32_b64") || starts(n, "s_bitcmp") || starts(n, "s_cmp"));
+    }
     static bool valu(const Instr& x) {
         return x.name && (x.fmt == Fmt::VOP1 || x.fmt == Fmt::VOP2 || x.fmt == Fmt::VOP3P || (x.fmt == Fmt::VOP3 && x.op >= 256)) &&
                strncmp(x.name, "v_cmp", 5) && strcmp(x.name, "v_readlane_b32") && strcmp(x.name, "v_readfirstlane_b32");
@@ -734,6 +741,10 @@ struct Translator {
     void resolve(size_t i, const SState& st) {
         const Instr& in = ins[i];
         if (!in.name) return;
+        // XSL_DBG_AT=<hex offset>: print the scalar analysis state at that instruction (debugging).
+        static const long dbg_at = getenv("XSL_DBG_AT") ? (long)strtoul(getenv("XSL_DBG_AT"), nullptr, 16) : -1;
+        if (dbg_at >= 0 && (long)in.offset == dbg_at)
+            for (int r = 0; r < 24; r++) fprintf(stderr, "s%d: k%d a%u b%u c%u d%u\n", r, int(st[r].k), st[r].a, st[r].b, st[r].c, st[r].d);
         std::string n = in.name;
         if (in.fmt == Fmt::MUBUF || in.fmt == Fmt::MTBUF) {
             int r = resource(st, in.srsrc, 4, in, false);
