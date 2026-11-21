@@ -3,8 +3,8 @@ add_compile_definitions(UNICODE _UNICODE)
 # d3d12_xs.dll: console Direct3D 12.X over PC Direct3D 12.
 
 # PC half: Windows SDK headers only.
-add_library(xsl_gfx_pc STATIC pc_backend.cpp dxbc.cpp)
-target_link_libraries(xsl_gfx_pc PUBLIC xsl_common d3d12 dxgi)
+add_library(xsl_gfx_pc STATIC pc_backend.cpp dxbc.cpp native_shaders.cpp)
+target_link_libraries(xsl_gfx_pc PUBLIC xsl_common d3d12 dxgi xsl_gpucode)
 # dxcapi_xs.h (IDxcPdbUtils) for expanding slim shader PDBs; the DLL itself is loaded at run time.
 target_include_directories(xsl_gfx_pc PRIVATE "${GXDK_ROOT}/xbox/include/devpctools/gen9")
 

@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: MIT
+# Pipeline differential test (tier 2): run each built sample twice on the layer, once with its DXIL
+# and once with every shader that has precompiled code forced through the translator
+# (XSL_NATIVE_SHADERS=1), capture the same frame, and compare.
+# Usage: tools/gpucode/ab-samples [outdir] [frame] [sample-name-regex]
+set -u
+here=$(cd "$(dirname "$0")/../.." && pwd)
+out=${1:-$here/build/ab-results}
+frame=${2:-60}
+pat=${3:-.}
+mkdir -p "$out"
+for exe in "$here"/build/samples/*/*.exe; do
+  name=$(basename "$exe" .exe)
+  [[ "$name" =~ $pat ]] || continue
+  rm -f "$out/$name".{ref,nat}.bmp
+  XSL_CAPTURE="Z:$out/$name.ref.bmp@$frame" "$here/tools/xsl-run" --timeout 15 "$exe" > "$out/$name.ref.log" 2>&1
+  rm -rf "$out/cache-$name"
+  XSL_NATIVE_SHADERS=1 XSL_SHADER_CACHE="Z:$out/cache-$name" XSL_CAPTURE="Z:$out/$name.nat.bmp@$frame" \
+    "$here/tools/xsl-run" --timeout 15 "$exe" > "$out/$name.nat.log" 2>&1
+  ok=$(grep -c "gfx.native:info.*translated" "$out/$name.nat.log")
+  no=$(grep -c "not translated\|does not compile" "$out/$name.nat.log")
+  cmp=$(python3 "$here/tools/gpucode/bmpdiff.py" "$out/$name.ref.bmp" "$out/$name.nat.bmp" 2>&1)
+  printf '%-26s translated=%-3s untranslated=%-3s %s\n' "$name" "$ok" "$no" "$cmp"
+done

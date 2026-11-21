@@ -172,6 +172,8 @@ void* buffer_try_map(PcObj res);
 // Shader containers: rewrite an Xbox-compiled DXBC container into a form the
 // PC runtime accepts (see dxbc.cpp). Returns false if the blob is not DXBC.
 bool sanitize_container(const void* in, size_t inSize, void** out, size_t* outSize);
+// Console machine code -> HLSL -> DXIL for shaders without (usable) DXIL; see native_shaders.cpp.
+bool native_translate(const void* in, size_t inSize, void** out, size_t* outSize);
 void free_container(void* p);
 
 }  // namespace pc

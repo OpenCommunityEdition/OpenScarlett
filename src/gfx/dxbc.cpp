@@ -284,6 +284,7 @@ void dxbc_checksum(const uint8_t* data, size_t size, uint32_t out[4]) {
 namespace pc {
 
 bool sanitize_container(const void* in, size_t inSize, void** out, size_t* outSize) {
+    if (native_translate(in, inSize, out, outSize)) return true;
     auto* d = static_cast<const uint8_t*>(in);
     if (inSize < 32 || rd32(d) != fourcc("DXBC")) return false;
     uint32_t total = rd32(d + 24), count = rd32(d + 28);

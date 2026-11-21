@@ -1,0 +1,20 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# gpucode: console GPU machine code -> HLSL. Host-independent; builds inside the layer (clang-cl, Windows
+# target) and standalone on the build host for fast tests:  cmake -S src/gpucode -B build-native
+cmake_minimum_required(VERSION 3.24)
+if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
+  project(gpucode LANGUAGES C CXX)
+  set(CMAKE_CXX_STANDARD 20)
+  set(CMAKE_CXX_STANDARD_REQUIRED ON)
+  set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+endif()
+if(NOT TARGET xsl_zlib)
+  add_subdirectory("${CMAKE_CURRENT_SOURCE_DIR}/../../third_party/zlib" zlib)
+endif()
+add_library(xsl_gpucode STATIC decode.cpp container.cpp meta.cpp translate.cpp)
+target_include_directories(xsl_gpucode PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}")
+target_link_libraries(xsl_gpucode PUBLIC xsl_zlib)
+if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
+  add_executable(xsl-gpucode tool/main.cpp)
+  target_link_libraries(xsl-gpucode PRIVATE xsl_gpucode)
+endif()

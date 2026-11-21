@@ -20,6 +20,8 @@ REPO = Path(__file__).resolve().parent.parent
 LAYER_DLLS = ["src/gfx/d3d12_xs.dll", "src/runtime/xgameruntime.dll", "src/input/GameInput.dll", "src/xmem/xmem.dll",
               "src/storage/XCRDAPI.dll", "src/audio/AcpHal.dll", "src/audio/xapu.dll", "src/audio/chad.dll",
               "src/audio/PIXEvt.dll", "src/audio/XFrontPanelDisplay.dll", "src/media/MFPlat.dll"]
+# The PC shader compiler, for shaders shipped without DXIL (src/gfx/native_shaders.cpp); optional.
+OPTIONAL_DLLS = ["deps/dxc-pc/bin/x64/dxcompiler.dll", "deps/dxc-pc/bin/x64/dxil.dll"]
 # The title-side xgameruntime.lib loads its DLL with LOAD_LIBRARY_SEARCH_SYSTEM32 (0x800) unless
 # "local services" mode is set, so the runtime must live in System32, as the Game OS provides it.
 # GameInput.dll too: desktop builds (reference images) load it with LOAD_LIBRARY_SEARCH_SYSTEM32.
@@ -249,6 +251,13 @@ def build_run_dir(title_dir, build_dir, run_dir, backend, exe_rel=Path()):
         if dst.exists() or dst.is_symlink():
             dst.unlink()  # the layer replaces any same-named DLL shipped with the title
         shutil.copy2(src, dst)
+    for rel in OPTIONAL_DLLS:
+        src = build_dir / rel
+        if src.exists():
+            dst = exe_dir / src.name
+            if dst.exists() or dst.is_symlink():
+                dst.unlink()
+            shutil.copy2(src, dst)
     sdk = REPO / "sdk"
     for name, rel in SDK_DLLS.items():
         if (sdk / rel).exists() and not (exe_dir / name).exists():

@@ -68,6 +68,8 @@ add_custom_command(
 add_custom_target(xsl_gen DEPENDS "${XSL_GEN_DIR}/xs_tables.h" "${XSL_GEN_DIR}/xs_abi_layouts.h")
 
 add_subdirectory(src/common)
+add_subdirectory(third_party/zlib)
+add_subdirectory(src/gpucode)
 add_subdirectory(src/platform)
 add_subdirectory(src/gfx)
 add_subdirectory(third_party/libHttpClient-task)
@@ -75,7 +77,6 @@ add_subdirectory(src/runtime)
 add_subdirectory(src/input)
 add_subdirectory(src/xmem)
 add_subdirectory(src/audio)
-add_subdirectory(third_party/zlib)
 add_subdirectory(src/storage)
 add_subdirectory(src/media)
 
