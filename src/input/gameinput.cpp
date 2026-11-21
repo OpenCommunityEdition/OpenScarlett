@@ -184,11 +184,19 @@ DWORD WINAPI raw_thread(void*) {
     wc.hInstance = GetModuleHandleW(nullptr);
     wc.lpszClassName = L"xsl_gameinput_raw";
     RegisterClassW(&wc);
-    HWND h = CreateWindowExW(0, wc.lpszClassName, L"", 0, 0, 0, 0, 0, HWND_MESSAGE, nullptr, wc.hInstance, nullptr);
+    // A hidden top-level window: Windows delivers RIDEV_INPUTSINK raw input to it in the
+    // background (a message-only window did not receive any on Windows 10).
+    HWND h = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE, wc.lpszClassName, L"", WS_POPUP, 0, 0, 0, 0, nullptr, nullptr,
+                             wc.hInstance, nullptr);
     RAWINPUTDEVICE rid{0x01, 0x02, RIDEV_INPUTSINK, h};  // generic desktop / mouse
-    if (!RegisterRawInputDevices(&rid, 1, sizeof rid)) {
-        rid.dwFlags = 0;  // message-only windows may refuse INPUTSINK; foreground delivery still works
-        RegisterRawInputDevices(&rid, 1, sizeof rid);
+    BOOL ok = RegisterRawInputDevices(&rid, 1, sizeof rid);
+    if (!ok) {
+        DWORD e = GetLastError();
+        rid.dwFlags = 0;
+        ok = RegisterRawInputDevices(&rid, 1, sizeof rid);
+        XSL_WARN(CH, "raw mouse input with INPUTSINK refused (%lu); foreground-only registration %s", e, ok ? "ok" : "failed too");
+    } else {
+        XSL_INFO(CH, "raw mouse input registered");
     }
     MSG msg;
     while (GetMessageW(&msg, nullptr, 0, 0) > 0) DispatchMessageW(&msg);
@@ -220,6 +228,13 @@ void mouse_state(GameInputMouseState* s) {
         b = g_buttons;
         for (int i = 0; i < 5; i++)
             if (g_press_until[i] > t) b |= 1u << i;
+        // Also the button state itself, in case raw input does not arrive.
+        const int vks[5] = {VK_LBUTTON, VK_RBUTTON, VK_MBUTTON, VK_XBUTTON1, VK_XBUTTON2};
+        bool swapped = GetSystemMetrics(SM_SWAPBUTTON) != 0;
+        for (int i = 0; i < 5; i++) {
+            int vk = swapped && i < 2 ? vks[1 - i] : vks[i];
+            if (down(vk)) b |= 1u << i;
+        }
         POINT p;
         RECT r;
         if (GetCursorPos(&p) && ScreenToClient(fg, &p) && GetClientRect(fg, &r) && r.right > 0 && r.bottom > 0) {

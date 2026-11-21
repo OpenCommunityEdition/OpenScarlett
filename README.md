@@ -80,6 +80,8 @@ Copy `build/` (the layer DLLs), `tools/xsl-run` and the SDK runtime DLLs it list
 python tools\xsl-run path\to\Title
 ```
 
+or double-click `tools\xsl-run.cmd` (it asks for the title folder), or drag a title folder onto it.
+
 The launcher builds a run directory (symlinks, or copies on filesystems without them, refreshed
 on later runs). System32 and the registry are never modified: the layer redirects the title's
 loads of `xgameruntime.dll` to its own copy and answers the console-type registry read from

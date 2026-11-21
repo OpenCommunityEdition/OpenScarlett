@@ -2,6 +2,8 @@
 // Synthetic Series X|S title: user sign-in and game saves through the SDK's thunks.
 #include <windows.h>
 
+#include <d3d12_xs.h>
+
 #include <XGameRuntimeInit.h>
 #include <XGameSave.h>
 #include <XTaskQueue.h>
@@ -15,6 +17,10 @@ static int g_failures = 0;
 #define CHECK(cond) do { if (!(cond)) { std::printf("FAIL %s:%d %s\n", __FILE__, __LINE__, #cond); g_failures++; } else std::printf("ok   %s\n", #cond); } while (0)
 
 int main() {
+    // A d3d12_xs.dll import, as every console title has: its DllMain installs the layer's platform
+    // redirects (on Windows, the xgameruntime.dll load).
+    volatile auto flags = D3D12XboxGetProcessDebugFlags();
+    (void)flags;
     CHECK(SUCCEEDED(XGameRuntimeInitialize()));
     XTaskQueueHandle q = nullptr;
     XTaskQueueCreate(XTaskQueueDispatchMode::ThreadPool, XTaskQueueDispatchMode::Manual, &q);

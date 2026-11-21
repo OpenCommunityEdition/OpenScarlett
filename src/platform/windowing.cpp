@@ -5,8 +5,14 @@
 // so the mismatch is invisible there; on a PC, DefWindowProcW reads the ANSI caption as UTF-16
 // and the title bar shows garbage. When the title imports DefWindowProcW, its ANSI class
 // registrations are made Unicode, which is what that window procedure expects.
+//
+// Closing. Console titles have no quit path (the system terminates them), so they ignore
+// WM_CLOSE and the window's close button did nothing. The layer wraps the window procedures of
+// the title's classes and ends the process on WM_CLOSE (XSL_CLOSE_EXITS=0 passes it through).
 #include <windows.h>
 
+#include <map>
+#include <mutex>
 #include <string>
 
 #include "xsl/log.h"
@@ -22,7 +28,50 @@ std::wstring widen(const char* s) {
     return w;
 }
 
+std::mutex g_mu;
+std::map<ATOM, WNDPROC> g_procs;  // title class -> its window procedure
+
+LRESULT CALLBACK close_wrapper(HWND h, UINT m, WPARAM w, LPARAM l) {
+    WNDPROC orig = nullptr;
+    {
+        std::lock_guard<std::mutex> g(g_mu);
+        auto it = g_procs.find((ATOM)GetClassLongPtrW(h, GCW_ATOM));
+        if (it != g_procs.end()) orig = it->second;
+    }
+    if (m == WM_CLOSE) {
+        static bool exits = [] { char b[4]; return !(GetEnvironmentVariableA("XSL_CLOSE_EXITS", b, 4) && b[0] == '0'); }();
+        if (exits) {
+            XSL_INFO("platform", "window closed: ending the title");
+            TerminateProcess(GetCurrentProcess(), 0);
+        }
+    }
+    return orig ? CallWindowProcW(orig, h, m, w, l) : DefWindowProcW(h, m, w, l);
+}
+
+bool g_ansi_as_unicode = false;
+
+ATOM remember(ATOM atom, WNDPROC proc) {
+    if (atom) {
+        std::lock_guard<std::mutex> g(g_mu);
+        g_procs[atom] = proc;
+    }
+    return atom;
+}
+
+ATOM WINAPI Xsl_RegisterClassExW(const WNDCLASSEXW* a) {
+    if (!a) return RegisterClassExW(a);
+    WNDCLASSEXW w = *a;
+    w.lpfnWndProc = close_wrapper;
+    return remember(RegisterClassExW(&w), a->lpfnWndProc);
+}
+
 ATOM WINAPI Xsl_RegisterClassExA(const WNDCLASSEXA* a) {
+    if (!a) return RegisterClassExA(a);
+    if (!g_ansi_as_unicode) {
+        WNDCLASSEXA c = *a;
+        c.lpfnWndProc = close_wrapper;
+        return remember(RegisterClassExA(&c), a->lpfnWndProc);
+    }
     WNDCLASSEXW w{};
     w.cbSize = sizeof w;
     w.style = a->style;
@@ -37,10 +86,11 @@ ATOM WINAPI Xsl_RegisterClassExA(const WNDCLASSEXA* a) {
     std::wstring cls = widen(a->lpszClassName), menu = widen(a->lpszMenuName);
     w.lpszClassName = IS_INTRESOURCE(a->lpszClassName) ? (LPCWSTR)a->lpszClassName : cls.c_str();
     w.lpszMenuName = IS_INTRESOURCE(a->lpszMenuName) ? (LPCWSTR)a->lpszMenuName : (menu.empty() ? nullptr : menu.c_str());
+    w.lpfnWndProc = close_wrapper;
     ATOM atom = RegisterClassExW(&w);
     XSL_INFO("platform", "window class '%s' registered as Unicode (title uses DefWindowProcW)",
              IS_INTRESOURCE(a->lpszClassName) ? "#atom" : a->lpszClassName);
-    return atom;
+    return remember(atom, a->lpfnWndProc);
 }
 
 bool imports(HMODULE m, const char* func) {
@@ -60,7 +110,12 @@ bool imports(HMODULE m, const char* func) {
 
 namespace xsl::platform {
 void install_windowing(HMODULE exe) {
-    if (!imports(exe, "DefWindowProcW") || imports(exe, "DefWindowProcA")) return;
+    // Consoles have no hung-window detection, and titles do long blocking work on their window
+    // thread (world generation, network lookups). On Windows a window that pumps no messages for
+    // 5 s is replaced by a "Not Responding" ghost that offers to kill the title.
+    DisableProcessWindowsGhosting();
+    g_ansi_as_unicode = imports(exe, "DefWindowProcW") && !imports(exe, "DefWindowProcA");
     patch_import(exe, "", "RegisterClassExA", (void*)Xsl_RegisterClassExA);
+    patch_import(exe, "", "RegisterClassExW", (void*)Xsl_RegisterClassExW);
 }
 }  // namespace xsl::platform
