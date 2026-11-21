@@ -112,11 +112,16 @@ HRESULT_T create_device(PcObj* out) {
         // The layer probes whether resources can be mapped (unified-memory emulation); the
         // refusals on default heaps are expected, so they are not stored.
         D3D12_MESSAGE_ID deny[] = {(D3D12_MESSAGE_ID)822};
+        // Only errors are kept: the store is capped, and warnings would fill it long before the
+        // error that matters.
+        D3D12_MESSAGE_SEVERITY keep[] = {D3D12_MESSAGE_SEVERITY_CORRUPTION, D3D12_MESSAGE_SEVERITY_ERROR};
         D3D12_INFO_QUEUE_FILTER f{};
+        f.AllowList.NumSeverities = 2;
+        f.AllowList.pSeverityList = keep;
         f.DenyList.NumIDs = 1;
         f.DenyList.pIDList = deny;
         g_info->AddStorageFilterEntries(&f);
-        XSL_INFO(CH, "D3D12 debug layer on: its messages are logged after failing calls (channel d3d12.debug)");
+        XSL_INFO(CH, "D3D12 debug layer on: its errors are logged after failing calls and command list closes (channel d3d12.debug)");
     }
     *out = dev;
     return S_OK;
@@ -389,6 +394,22 @@ MappableDefault mappable_default(ID3D12Device* dev) {
     return m;
 }
 
+// Console memory is CPU-cached and coherent; a PC UPLOAD heap is write-combined, where CPU reads
+// are uncached and two orders of magnitude slower. Titles (and the layer's constant-buffer
+// re-alignment, which copies from the title's buffers at bind time) read their upload memory, so
+// UPLOAD heaps become write-back system memory: the same memory pool, read by the GPU over the
+// bus as before, but cached for the CPU. XSL_UPLOAD_CACHED=0 keeps PC UPLOAD heaps.
+bool cached_upload(D3D12_HEAP_PROPERTIES* hp) {
+    static bool on = [] { char b[4]; return !(GetEnvironmentVariableA("XSL_UPLOAD_CACHED", b, 4) && b[0] == '0'); }();
+    if (!on || hp->Type != D3D12_HEAP_TYPE_UPLOAD) return false;
+    hp->Type = D3D12_HEAP_TYPE_CUSTOM;
+    hp->CPUPageProperty = D3D12_CPU_PAGE_PROPERTY_WRITE_BACK;
+    hp->MemoryPoolPreference = D3D12_MEMORY_POOL_L0;
+    static volatile long once = 0;
+    if (!InterlockedExchange(&once, 1)) XSL_INFO(CH, "UPLOAD heaps are CPU-cached system memory, as on the console (XSL_UPLOAD_CACHED=0 disables)");
+    return true;
+}
+
 HRESULT_T create_committed_resource(PcObj dev, const void* heapProps, uint32_t heapFlags, const void* desc,
                                     uint32_t state, const void* clear, PcObj* out) {
     D3D12_RESOURCE_DESC d = clean_desc(desc);
@@ -421,6 +442,7 @@ HRESULT_T create_committed_resource(PcObj dev, const void* heapProps, uint32_t h
     }
     D3D12_RESOURCE_STATES st = pc_state(state);
     if (hp.Type == D3D12_HEAP_TYPE_UPLOAD) st = D3D12_RESOURCE_STATE_GENERIC_READ;
+    if (d.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER && cached_upload(&hp)) st = D3D12_RESOURCE_STATE_GENERIC_READ;
     else if (hp.Type == D3D12_HEAP_TYPE_READBACK) st = D3D12_RESOURCE_STATE_COPY_DEST;
     HRESULT hr = as<ID3D12Device>(dev)->CreateCommittedResource(&hp, clean_heap_flags(heapFlags), &d, st, cv,
                                                                 IID_PPV_ARGS(reinterpret_cast<ID3D12Resource**>(out)));
@@ -511,6 +533,20 @@ HRESULT_T create_heap(PcObj dev, const void* desc, PcObj* out) {
     D3D12_HEAP_DESC d = *static_cast<const D3D12_HEAP_DESC*>(desc);
     d.Flags = clean_heap_flags(d.Flags);
     d.Properties.CreationNodeMask = d.Properties.VisibleNodeMask = 0;
+    // Upload heaps (PC upload heaps hold buffers only, so the custom heap places the same resources);
+    // the PC upload heap is used if the custom one cannot be created.
+    if (d.Properties.Type == D3D12_HEAP_TYPE_UPLOAD) {
+        D3D12_HEAP_PROPERTIES hp = d.Properties;
+        if (cached_upload(&hp)) {
+            D3D12_HEAP_DESC c = d;
+            c.Properties = hp;
+            ID3D12Heap* h = nullptr;
+            if (SUCCEEDED(as<ID3D12Device>(dev)->CreateHeap(&c, IID_PPV_ARGS(&h)))) {
+                *out = h;
+                return S_OK;
+            }
+        }
+    }
     return logged(as<ID3D12Device>(dev)->CreateHeap(&d, IID_PPV_ARGS(reinterpret_cast<ID3D12Heap**>(out))), "CreateHeap");
 }
 HRESULT_T create_placed_resource(PcObj dev, PcObj heap, uint64_t offset, const void* desc, uint32_t state, const void* clear, PcObj* out) {
@@ -631,7 +667,11 @@ uint64_t res_gpu_va(PcObj r) { return as<ID3D12Resource>(r)->GetGPUVirtualAddres
 HRESULT_T alloc_reset(PcObj a) { return logged(as<ID3D12CommandAllocator>(a)->Reset(), "CommandAllocator::Reset"); }
 
 #define L as<ID3D12GraphicsCommandList>(l)
-HRESULT_T list_close(PcObj l) { return logged(L->Close(), "CommandList::Close"); }
+HRESULT_T list_close(PcObj l) {
+    HRESULT hr = logged(L->Close(), "CommandList::Close");
+    if (g_info && g_info->GetNumStoredMessages()) dump_debug_messages();  // errors recorded into a list that still closed
+    return hr;
+}
 HRESULT_T list_reset(PcObj l, PcObj a, PcObj pso) { return logged(L->Reset(as<ID3D12CommandAllocator>(a), as<ID3D12PipelineState>(pso)), "CommandList::Reset"); }
 void list_barriers(PcObj l, uint32_t n, const void* b) {
     if (!n) return;
@@ -705,12 +745,86 @@ void list_gfx_root_uav(PcObj l, uint32_t i, uint64_t va) { L->SetGraphicsRootUno
 void list_compute_root_uav(PcObj l, uint32_t i, uint64_t va) { L->SetComputeRootUnorderedAccessView(i, va); }
 void list_gfx_root_constants(PcObj l, uint32_t i, uint32_t n, const void* d, uint32_t o) { L->SetGraphicsRoot32BitConstants(i, n, d, o); }
 void list_compute_root_constants(PcObj l, uint32_t i, uint32_t n, const void* d, uint32_t o) { L->SetComputeRoot32BitConstants(i, n, d, o); }
+// Bytes per element and block width (1, or 4 for block-compressed) of a DXGI format; {0, 0} for
+// formats this does not know.
+struct FormatSize { UINT bytes, block; };
+FormatSize format_size(DXGI_FORMAT f) {
+    UINT v = (UINT)f;
+    if (v >= 1 && v <= 4) return {16, 1};
+    if (v >= 5 && v <= 8) return {12, 1};
+    if (v >= 9 && v <= 22) return {8, 1};
+    if ((v >= 23 && v <= 47) || v == 67 || (v >= 87 && v <= 93)) return {4, 1};
+    if ((v >= 48 && v <= 59) || v == 85 || v == 86 || v == 115) return {2, 1};
+    if (v >= 60 && v <= 64) return {1, 1};
+    if ((v >= 70 && v <= 72) || (v >= 79 && v <= 81)) return {8, 4};
+    if ((v >= 73 && v <= 78) || (v >= 82 && v <= 84) || (v >= 94 && v <= 99)) return {16, 4};
+    return {0, 0};
+}
+bool misaligned_footprint(const D3D12_TEXTURE_COPY_LOCATION& c) {
+    return c.Type == D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT && c.PlacedFootprint.Offset % D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT;
+}
+// Moves the footprint's offset down to the placement alignment, growing it by the rows and
+// texels that now precede the data; *x0, *y0 (texels) is where the original data starts in it.
+bool rebase_footprint(D3D12_PLACED_SUBRESOURCE_FOOTPRINT* p, UINT* x0, UINT* y0) {
+    D3D12_SUBRESOURCE_FOOTPRINT& f = p->Footprint;
+    UINT64 delta = p->Offset % D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT;
+    FormatSize fs = format_size(f.Format);
+    bool ok = fs.bytes && f.RowPitch;
+    UINT rows = 0, cols = 0;
+    if (ok) {
+        rows = (UINT)(delta / f.RowPitch);
+        UINT rem = (UINT)(delta % f.RowPitch);
+        cols = rem / fs.bytes;
+        UINT widthBlocks = (f.Width + fs.block - 1) / fs.block;
+        ok = rem % fs.bytes == 0 && (UINT64)(widthBlocks + cols) * fs.bytes <= f.RowPitch && (rows == 0 || f.Depth == 1);
+    }
+    if (!ok) {
+        static volatile long n = 0;
+        if (InterlockedIncrement(&n) <= 4)
+            XSL_WARN(CH, "texture copy with a buffer footprint at offset %llu (format %d, %ux%u, pitch %u) cannot be realigned: skipped",
+                     (unsigned long long)p->Offset, (int)f.Format, f.Width, f.Height, f.RowPitch);
+        return false;
+    }
+    p->Offset -= delta;
+    *x0 = cols * fs.block;
+    *y0 = rows * fs.block;
+    f.Width += *x0;
+    f.Height += *y0;
+    static volatile long once = 0;
+    if (!InterlockedExchange(&once, 1))
+        XSL_INFO(CH, "texture copies with buffer footprints at 256-byte offsets are realigned to D3D12's 512 (first: offset %llu, "
+                     "pitch %u, shifted %u rows, %u texels)", (unsigned long long)(p->Offset + delta), f.RowPitch, *y0, *x0);
+    return true;
+}
 void list_copy_buffer_region(PcObj l, PcObj dst, uint64_t doff, PcObj src, uint64_t soff, uint64_t n) {
     L->CopyBufferRegion(as<ID3D12Resource>(dst), doff, as<ID3D12Resource>(src), soff, n);
 }
 void list_copy_texture_region(PcObj l, const void* dst, uint32_t x, uint32_t y, uint32_t z, const void* src, const void* box) {
-    L->CopyTextureRegion(static_cast<const D3D12_TEXTURE_COPY_LOCATION*>(dst), x, y, z, static_cast<const D3D12_TEXTURE_COPY_LOCATION*>(src),
-                         static_cast<const D3D12_BOX*>(box));
+    // Buffer footprints: the console places them at 256-byte offsets, PC D3D12 requires 512
+    // (D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT) and fails the whole list otherwise. Such a
+    // footprint is rebased to the aligned offset below it, and the copy region shifted by the
+    // difference (whole rows, or texels within the row padding), which addresses the same bytes.
+    D3D12_TEXTURE_COPY_LOCATION d = *static_cast<const D3D12_TEXTURE_COPY_LOCATION*>(dst);
+    D3D12_TEXTURE_COPY_LOCATION s = *static_cast<const D3D12_TEXTURE_COPY_LOCATION*>(src);
+    const D3D12_BOX* pb = static_cast<const D3D12_BOX*>(box);
+    D3D12_BOX b{};
+    UINT x0, y0;
+    if (misaligned_footprint(d)) {
+        if (!rebase_footprint(&d.PlacedFootprint, &x0, &y0)) return;
+        x += x0;
+        y += y0;
+    }
+    if (misaligned_footprint(s)) {
+        const D3D12_SUBRESOURCE_FOOTPRINT f = s.PlacedFootprint.Footprint;
+        if (!rebase_footprint(&s.PlacedFootprint, &x0, &y0)) return;
+        b = pb ? *pb : D3D12_BOX{0, 0, 0, f.Width, f.Height, f.Depth};
+        b.left += x0;
+        b.right += x0;
+        b.top += y0;
+        b.bottom += y0;
+        pb = &b;
+    }
+    L->CopyTextureRegion(&d, x, y, z, &s, pb);
 }
 void list_copy_resource(PcObj l, PcObj dst, PcObj src) { L->CopyResource(as<ID3D12Resource>(dst), as<ID3D12Resource>(src)); }
 void list_resolve_subresource(PcObj l, PcObj dst, uint32_t ds, PcObj src, uint32_t ss, int fmt) {

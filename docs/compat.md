@@ -50,12 +50,24 @@ zlib, BCPack, zlib+BCPack; error records; cancellation; fence signals) — all p
 
 | Title | GDK edition | Status | Notes |
 |---|---|---|---|
-| Minecraft Preview 1.18.3064.0 (Series X\|S, unmodified executable) | GXDK 220300 (March 2022) | **Main menu renders correctly** (loading screen, panorama, skin preview), silent; also natively on Windows 10 (RTX 5090, ~60 FPS, no D3D12 errors) | Needs the 220300 edition files (docs/sdk-editions.md). Input: DualSense/XInput pads, keyboard and mouse through GameInput (mouse captured while focused). Known gaps: no audio (silent ACP); speech synthesis and game streaming unimplemented; CPU writes to mapped GPU-only textures stay on a CPU shadow (only render targets seen so far). Fixed on the way: constants bound at 16-byte offsets in default-heap buffers were not re-aligned (skin preview and loading-screen logo invisible). |
+| Minecraft Preview 1.18.3064.0 (Series X\|S, unmodified executable) | GXDK 220300 (March 2022) | **Playable**: worlds are created, saved and played (Linux and natively on Windows 10, RTX 5090, ~60 FPS in-world, no D3D12 errors), silent | Needs the 220300 edition files (docs/sdk-editions.md). Input: DualSense/XInput pads, keyboard and mouse through GameInput (mouse captured while focused). Known gaps: no audio (silent ACP); speech synthesis and game streaming unimplemented; CPU writes to mapped GPU-only textures stay on a CPU shadow (only render targets seen so far). Fixed on the way: constants bound at 16-byte offsets in default-heap buffers were not re-aligned (skin preview and loading-screen logo invisible); texture copies with 256-byte-aligned buffer footprints removed the device on Windows when a world loaded; CPU reads of write-combined upload memory held the world at ~3 FPS. |
 
 ## Back-end findings
 
 - **Constant-buffer alignment**: console `D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT` is 16 (PC 256).
-  Unaligned root CBVs are re-pointed into a 256-aligned ring (`XSL_CBV_REALIGN=0` disables).
+  Unaligned root CBVs are re-pointed into a 256-aligned ring (`XSL_CBV_REALIGN=0` disables). The ring
+  grows per frame in 16 MB chunks (Minecraft's worlds bind well over 4096 such constants a frame).
+- **Texture placement alignment**: console buffer footprints for `CopyTextureRegion` may sit at 256-byte
+  offsets; PC D3D12 requires 512 and fails the command list (device removed at the next submission; Vulkan
+  does not enforce it). Misaligned footprints are rebased to the aligned offset below and the copy region
+  shifted by whole rows or by texels within the row padding.
+- **Upload memory**: console memory is CPU-cached; a PC UPLOAD heap is write-combined (or device-local
+  BAR memory under vkd3d-proton), where CPU reads are uncached. The CBV re-alignment reads title buffers
+  at bind time, so UPLOAD heaps are created as write-back system memory (`XSL_UPLOAD_CACHED=0` disables).
+- **Display size**: titles size display planes from their window's client area, which on a console is the
+  output resolution. A PC window's client area is smaller (title bar, taskbar), and planes of that size
+  next to 1080p targets meant mismatched resolves and copies; the title's `GetClientRect` reports the
+  console size and the swap chain stretches it onto the window.
 - **Descriptor heaps**: on the console every CBV/SRV/UAV heap is GPU-visible and descriptor tables may
   point into any of them; samples rely on it. The layer keeps one shader-visible heap and gives each
   title heap a range (`XSL_DESCRIPTOR_HEAP_SIZE`, `XSL_UNIFIED_DESCRIPTORS=0`).

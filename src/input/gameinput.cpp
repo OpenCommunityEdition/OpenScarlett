@@ -28,6 +28,7 @@
 #include <string>
 #include <vector>
 
+#include "xsl/display.h"
 #include "xsl/log.h"
 
 #define CH "input"
@@ -248,7 +249,14 @@ void mouse_state(GameInputMouseState* s) {
             if ((p.x == 0 && rawdx < 0) || (p.x == r.right - 1 && rawdx > 0)) g_extra_x += rawdx - (p.x - g_last_client.x);
             if ((p.y == 0 && rawdy < 0) || (p.y == r.bottom - 1 && rawdy > 0)) g_extra_y += rawdy - (p.y - g_last_client.y);
             g_last_client = p;
-            POINT rep{(LONG)(p.x + g_extra_x), (LONG)(p.y + g_extra_y)};
+            // In the title's coordinates: its window reports the console display size.
+            LONG dw, dh;
+            LONG sx = p.x, sy = p.y;
+            if (xsl::display_size(&dw, &dh)) {
+                sx = (LONG)((int64_t)p.x * dw / r.right);
+                sy = (LONG)((int64_t)p.y * dh / r.bottom);
+            }
+            POINT rep{(LONG)(sx + g_extra_x), (LONG)(sy + g_extra_y)};
             static bool trace = [] { char b[4]; return GetEnvironmentVariableA("XSL_INPUT_TRACE", b, 4) && b[0] == '1'; }();
             if (trace && (rep.x != g_report.x || rep.y != g_report.y))
                 XSL_INFO(CH, "mouse at client %ld,%ld (extra %lld,%lld) -> position %ld,%ld", p.x, p.y, (long long)g_extra_x,

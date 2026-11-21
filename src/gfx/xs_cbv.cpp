@@ -15,6 +15,7 @@
 // range with a persistent CPU mapping so the source bytes can be found.
 #include <map>
 #include <mutex>
+#include <vector>
 
 #include "xs_cbv.h"
 
@@ -26,18 +27,54 @@ struct UploadRange { uint64_t size; uint8_t* cpu; };
 std::mutex g_mu;
 std::map<uint64_t, UploadRange> g_upload;  // GPU VA start -> range
 
-constexpr uint64_t kSegment = 16ull << 20;  // per in-flight frame
-constexpr uint32_t kSegments = 4;          // > maximum supported frame latency + 1
-constexpr uint64_t kCopyBytes = 4096;      // bytes copied per rebind (shader CB size is not known here)
+constexpr uint64_t kChunk = 16ull << 20;     // ring memory is added in chunks of this size
+constexpr uint64_t kMaxChunks = 32;          // per segment (512 MB)
+constexpr uint32_t kSegments = 4;            // one per in-flight frame; > maximum frame latency + 1
+constexpr uint64_t kCopyBytes = 4096;        // bytes copied per rebind (shader CB size is not known here)
 
-struct Ring {
+struct Chunk {
     PcObj res = nullptr;
     uint8_t* cpu = nullptr;
     uint64_t gpu = 0;
+};
+// Each presented frame uses one segment; a segment grows by chunks when a frame binds more
+// constants than it holds, and keeps them for later frames.
+struct Segment {
+    std::vector<Chunk> chunks;
+    size_t cur = 0;     // chunk being filled
+    uint64_t head = 0;  // offset in it
+};
+struct Ring {
+    Segment seg[kSegments];
     uint64_t frame = UINT64_MAX;
-    uint64_t head = 0;
-    std::map<uint64_t, uint64_t> seen;  // source VA -> ring offset, this frame
+    std::map<uint64_t, uint64_t> seen;  // source VA -> ring GPU VA, this frame
 } g_ring;
+
+bool add_chunk(Device* dev, Segment& sg) {
+    DeviceExtra* de = dev_extra(dev);
+    D3D12_HEAP_PROPERTIES hp{D3D12_HEAP_TYPE_UPLOAD};
+    D3D12_RESOURCE_DESC rd{};
+    rd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    rd.Width = kChunk;
+    rd.Height = rd.DepthOrArraySize = rd.MipLevels = 1;
+    rd.SampleDesc.Count = 1;
+    rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    Chunk c;
+    if (FAILED(pc::create_committed_resource(de->pcDevice, &hp, 0, &rd, 0x8c3, nullptr, &c.res))) return false;
+    D3D12_RANGE none{0, 0};
+    void* p = nullptr;
+    pc::res_map(c.res, 0, &none, &p);
+    c.cpu = (uint8_t*)p;
+    c.gpu = pc::res_gpu_va(c.res);
+    sg.chunks.push_back(c);
+    static bool first = true;
+    if (first) {
+        first = false;
+        XSL_INFO(CH, "constant buffers bound at console (16-byte) alignment are re-aligned through a ring (%llu MB chunks)",
+                 (unsigned long long)(kChunk >> 20));
+    }
+    return true;
+}
 }  // namespace
 
 void cbv_track_upload(PcObj pcRes, uint64_t va, uint64_t size) {
@@ -62,45 +99,35 @@ uint64_t cbv_fix_root(Device* dev, uint64_t va) {
     if (va >= it->first + it->second.size) goto untracked;
     {
         DeviceExtra* de = dev_extra(dev);
-        if (!g_ring.res) {
-            D3D12_HEAP_PROPERTIES hp{D3D12_HEAP_TYPE_UPLOAD};
-            D3D12_RESOURCE_DESC rd{};
-            rd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-            rd.Width = kSegment * kSegments;
-            rd.Height = rd.DepthOrArraySize = rd.MipLevels = 1;
-            rd.SampleDesc.Count = 1;
-            rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-            if (FAILED(pc::create_committed_resource(de->pcDevice, &hp, 0, &rd, 0x8c3, nullptr, &g_ring.res))) return va;
-            D3D12_RANGE none{0, 0};
-            void* p = nullptr;
-            pc::res_map(g_ring.res, 0, &none, &p);
-            g_ring.cpu = (uint8_t*)p;
-            g_ring.gpu = pc::res_gpu_va(g_ring.res);
-            XSL_INFO(CH, "constant buffers bound at console (16-byte) alignment are re-aligned through a %llu MB ring",
-                     (unsigned long long)(kSegment * kSegments >> 20));
-        }
         // One segment per presented frame; PresentX bounds frames in flight below kSegments.
         uint64_t frame = de->presentCount;
-        if (frame != g_ring.frame) { g_ring.frame = frame; g_ring.head = 0; g_ring.seen.clear(); }
+        Segment& sg = g_ring.seg[frame % kSegments];
+        if (frame != g_ring.frame) { g_ring.frame = frame; sg.cur = 0; sg.head = 0; g_ring.seen.clear(); }
         // The same constants bound twice in a frame (one per draw is common) share one copy, which is
         // safe because titles write constants before recording the bind.
-        if (auto s = g_ring.seen.find(va); s != g_ring.seen.end()) return g_ring.gpu + s->second;
-        uint64_t avail = it->first + it->second.size - va;
-        uint64_t n = avail < kCopyBytes ? avail : kCopyBytes;
-        uint64_t off = (frame % kSegments) * kSegment + g_ring.head;
-        if (g_ring.head + kCopyBytes > kSegment) {
-            XSL_WARN(CH, "constant-buffer ring segment full; binding unaligned address");
+        if (auto s = g_ring.seen.find(va); s != g_ring.seen.end()) return s->second;
+        if (sg.cur < sg.chunks.size() && sg.head + kCopyBytes > kChunk) { sg.cur++; sg.head = 0; }
+        if (sg.cur >= sg.chunks.size() && (sg.chunks.size() >= kMaxChunks || !add_chunk(dev, sg))) {
+            static volatile long warned = 0;
+            if (InterlockedIncrement(&warned) <= 1)
+                XSL_WARN(CH, "constant-buffer ring full (%llu MB this frame); binding unaligned addresses",
+                         (unsigned long long)(sg.chunks.size() * kChunk >> 20));
             return va;
         }
-        memcpy(g_ring.cpu + off, it->second.cpu + (va - it->first), n);
-        g_ring.seen[va] = off;
+        Chunk& c = sg.chunks[sg.cur];
+        uint64_t avail = it->first + it->second.size - va;
+        uint64_t n = avail < kCopyBytes ? avail : kCopyBytes;
+        uint64_t off = sg.head;
+        memcpy(c.cpu + off, it->second.cpu + (va - it->first), n);
+        g_ring.seen[va] = c.gpu + off;
         const float* f = (const float*)(it->second.cpu + (va - it->first));
         if (log_enabled("gfx.cbv", Level::Trace)) {
-            XSL_TRACE("gfx.cbv", "rebind %llx (+%llu bytes avail) -> ring+%llx: %g %g %g %g | %g %g %g %g | %g %g %g %g", (unsigned long long)va,
-                      (unsigned long long)avail, (unsigned long long)off, f[0], f[1], f[2], f[3], f[4], f[5], f[6], f[7], f[8], f[9], f[10], f[11]);
+            XSL_TRACE("gfx.cbv", "rebind %llx (+%llu bytes avail) -> ring chunk %zu+%llx: %g %g %g %g | %g %g %g %g | %g %g %g %g",
+                      (unsigned long long)va, (unsigned long long)avail, sg.cur, (unsigned long long)off, f[0], f[1], f[2], f[3], f[4],
+                      f[5], f[6], f[7], f[8], f[9], f[10], f[11]);
         }
-        g_ring.head += (n + 255) & ~255ull;
-        return g_ring.gpu + off;
+        sg.head += (n + 255) & ~255ull;
+        return c.gpu + off;
     }
 untracked:
     static volatile long warned = 0;

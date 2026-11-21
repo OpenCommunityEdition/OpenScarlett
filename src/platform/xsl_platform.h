@@ -14,4 +14,6 @@ void apply_user_patches();
 // Redirect title loads of xgameruntime.dll to the layer's copy and answer the ConsoleMode registry
 // read from XSL_CONSOLE_MODE (host_windows.cpp).
 void install_host_redirects();
+// XSL_NET_TRACE=1: log the module's socket calls (net_trace.cpp).
+void install_net_trace(HMODULE module);
 }

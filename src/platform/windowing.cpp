@@ -9,12 +9,16 @@
 // Closing. Console titles have no quit path (the system terminates them), so they ignore
 // WM_CLOSE and the window's close button did nothing. The layer wraps the window procedures of
 // the title's classes and ends the process on WM_CLOSE (XSL_CLOSE_EXITS=0 passes it through).
+//
+// Client area. The title's GetClientRect on its own windows reports the console display size
+// (xsl/display.h); the swap chain stretches the title's planes onto the real window.
 #include <windows.h>
 
 #include <map>
 #include <mutex>
 #include <string>
 
+#include "xsl/display.h"
 #include "xsl/log.h"
 #include "xsl_platform.h"
 
@@ -93,6 +97,25 @@ ATOM WINAPI Xsl_RegisterClassExA(const WNDCLASSEXA* a) {
     return remember(atom, a->lpfnWndProc);
 }
 
+BOOL WINAPI Xsl_GetClientRect(HWND h, LPRECT r) {
+    BOOL ok = GetClientRect(h, r);
+    LONG w, ht;
+    if (!ok || !r || !xsl::display_size(&w, &ht)) return ok;
+    bool title;
+    {
+        std::lock_guard<std::mutex> g(g_mu);
+        title = g_procs.count((ATOM)GetClassLongPtrW(h, GCW_ATOM)) != 0;
+    }
+    if (title && !(GetWindowLongPtrW(h, GWL_STYLE) & WS_CHILD)) {
+        static LONG once;
+        if (!InterlockedExchange(&once, 1))
+            XSL_INFO("platform", "window client area %ldx%ld reported to the title as the console's %ldx%ld (XSL_DISPLAY_SIZE)",
+                     r->right - r->left, r->bottom - r->top, w, ht);
+        *r = {0, 0, w, ht};
+    }
+    return ok;
+}
+
 bool imports(HMODULE m, const char* func) {
     auto* base = (BYTE*)m;
     auto* nt = (IMAGE_NT_HEADERS64*)(base + ((IMAGE_DOS_HEADER*)base)->e_lfanew);
@@ -117,5 +140,6 @@ void install_windowing(HMODULE exe) {
     g_ansi_as_unicode = imports(exe, "DefWindowProcW") && !imports(exe, "DefWindowProcA");
     patch_import(exe, "", "RegisterClassExA", (void*)Xsl_RegisterClassExA);
     patch_import(exe, "", "RegisterClassExW", (void*)Xsl_RegisterClassExW);
+    patch_import(exe, "", "GetClientRect", (void*)Xsl_GetClientRect);
 }
 }  // namespace xsl::platform
