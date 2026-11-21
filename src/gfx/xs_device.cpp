@@ -507,18 +507,30 @@ HRESULT D3DAPI D_WaitFrameEventX(ID3D12Device* d, D3D12XBOX_FRAME_EVENT_TYPE, UI
 
 D3D12Device11_Function_Table g_dev_tbl;
 std::once_flag g_dev_once;
-// Precompiled console state objects (ray-tracing pipelines serialized by the console driver).
-// Their contents are console GPU code, which a PC device cannot load; the call fails cleanly (and
-// reports whether DXIL is present) so the title can fall back or report it.
+// Precompiled console state objects (ray-tracing pipelines serialized by the console driver):
+// export names, serialized root signatures and console GPU code, no DXIL, so a PC device cannot
+// load them. The call fails cleanly; XSL_DUMP_STATE_OBJECTS=<dir> saves the blobs for study.
 HRESULT D3DAPI D_DeserializeStateObjectX(ID3D12Device8*, const void* data, UINT size, ID3D12RootSignature*, UINT flags, REFIID, void** out) {
     if (out) *out = nullptr;
+    // XSL_DUMP_STATE_OBJECTS=<dir>: write each serialized state object there (format study).
+    char dir[MAX_PATH];
+    if (data && GetEnvironmentVariableA("XSL_DUMP_STATE_OBJECTS", dir, sizeof dir)) {
+        static volatile long k = 0;
+        long i = InterlockedIncrement(&k);
+        if (i <= 64) {
+            char path[MAX_PATH + 32];
+            snprintf(path, sizeof path, "%s\\stateobj_%03ld_flags%x.bin", dir, i, flags);
+            HANDLE f = CreateFileA(path, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, 0, nullptr);
+            if (f != INVALID_HANDLE_VALUE) { DWORD w; WriteFile(f, data, size, &w, nullptr); CloseHandle(f); }
+        }
+    }
     static volatile long n = 0;
     if (InterlockedIncrement(&n) <= 3) {
+        // DXIL is LLVM bitcode ("BC" C0 DE); the serialized root signatures inside are DXBC
+        // containers too, so the container magic alone does not mean DXIL.
         bool dxil = false;
         auto* b = (const uint8_t*)data;
-        for (UINT i = 0; b && i + 4 <= size && !dxil; i++)
-            dxil = (b[i] == 'D' && b[i + 1] == 'X' && (b[i + 2] == 'B' || b[i + 2] == 'I') && (b[i + 3] == 'C' || b[i + 3] == 'L')) ||
-                   (b[i] == 'B' && b[i + 1] == 'C' && b[i + 2] == 0xC0 && b[i + 3] == 0xDE);
+        for (UINT i = 0; b && i + 4 <= size && !dxil; i++) dxil = b[i] == 'B' && b[i + 1] == 'C' && b[i + 2] == 0xC0 && b[i + 3] == 0xDE;
         XSL_WARN(CH, "DeserializeStateObjectX: precompiled console state object (%u bytes, flags %x, %s); not loadable on PC", size, flags,
                  dxil ? "contains DXIL" : "no DXIL inside");
     }

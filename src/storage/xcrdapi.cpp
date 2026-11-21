@@ -314,6 +314,22 @@ private:
         if (InterlockedIncrement(&n) <= 5) XSL_WARN(CH, "DirectStorage command %d failed %08lx", (int)c.type, hr);
     }
 
+    // XSL_DSTORAGE_TRACE=1: each request (first 400): source, sizes, options, the first output
+    // bytes and the result.
+    static void trace_request(const Command& c, HRESULT hr) {
+        static bool on = [] { char b[4]; return GetEnvironmentVariableA("XSL_DSTORAGE_TRACE", b, 4) && b[0] == '1'; }();
+        static volatile long n = 0;
+        if (!on || InterlockedIncrement(&n) > 400) return;
+        const DSTORAGE_REQUEST& r = c.request;
+        char head[40] = "";
+        if (SUCCEEDED(hr) && !r.Options.DestinationIsPhysicalPages && r.Destination && r.DestinationSize)
+            for (UINT32 i = 0; i < 8 && i < r.DestinationSize; i++)
+                snprintf(head + i * 3, sizeof head - i * 3, "%02x ", ((const uint8_t*)r.Destination)[i]);
+        XSL_INFO(CH, "dstorage: %ls @%llu src %u -> dst %u (opts %llx, intermediate %u, name %s): %08lx [%s]",
+                 c.file ? c.file->path().c_str() : L"(memory)", (unsigned long long)r.FileOffset, r.SourceSize, r.DestinationSize,
+                 (unsigned long long)r.Options.AsUINT64, r.IntermediateSize, r.Name ? r.Name : "-", hr, head);
+    }
+
     HRESULT execute(const DSTORAGE_REQUEST& r, File* file) {
         const auto& o = r.Options;
         if (o.BcpackMode != DSTORAGE_BCPACK_MODE_NONE && !bcpack()) return E_DSTORAGE_INVALID_BCPACK_MODE;
@@ -388,6 +404,7 @@ private:
             switch (c.type) {
                 case DSTORAGE_COMMAND_TYPE_REQUEST: {
                     HRESULT hr = execute(c.request, c.file);
+                    trace_request(c, hr);
                     if (FAILED(hr)) {
                         if (SUCCEEDED(batch)) batch = hr;
                         std::lock_guard<std::mutex> g(m_mu);
@@ -449,7 +466,12 @@ public:
         return hr;
     }
     HRESULT OpenFile(const WCHAR* path, REFIID riid, void** ppv) override {
-        HANDLE h = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+        // Console paths (g:/...) are mapped to host paths by d3d12_xs.dll's console drives.
+        using MapFn = bool (*)(const wchar_t*, wchar_t*, size_t);
+        static MapFn map = (MapFn)GetProcAddress(GetModuleHandleW(L"d3d12_xs.dll"), "xsl_map_console_path");
+        WCHAR host[MAX_PATH * 2];
+        const WCHAR* use = (map && map(path, host, MAX_PATH * 2)) ? host : path;
+        HANDLE h = CreateFileW(use, GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
         if (h == INVALID_HANDLE_VALUE) {
             DWORD e = GetLastError();
             XSL_WARN(CH, "OpenFile '%ls' failed (%lu)", path, e);

@@ -141,16 +141,36 @@ void trace_open(const char* call, LPCWSTR n, const wchar_t* used, bool ok) {
     }
     SetLastError(e);
 }
+// Unbuffered I/O: the console's file system serves unbuffered reads at any offset and size; on
+// Windows FILE_FLAG_NO_BUFFERING requires sector-aligned ones and fails the rest, so a title's
+// unaligned reads (Unreal Engine's pak reads) came back empty. Title handles are opened buffered.
+DWORD buffered(DWORD flags) {
+    if (flags & FILE_FLAG_NO_BUFFERING) {
+        static volatile long once = 0;
+        if (!InterlockedExchange(&once, 1)) XSL_INFO(CH, "title files opened unbuffered are opened buffered (console reads need no alignment)");
+        flags &= ~(DWORD)FILE_FLAG_NO_BUFFERING;
+    }
+    return flags;
+}
 HANDLE WINAPI D_CreateFileW(LPCWSTR n, DWORD a, DWORD s, LPSECURITY_ATTRIBUTES sa, DWORD c, DWORD f, HANDLE t) {
     std::wstring b;
     const wchar_t* u = mapped(n, b);
-    HANDLE h = CreateFileW(u, a, s, sa, c, f, t);
+    HANDLE h = CreateFileW(u, a, s, sa, c, buffered(f), t);
     trace_open("CreateFileW", n, u, h != INVALID_HANDLE_VALUE);
     return h;
 }
 HANDLE WINAPI D_CreateFile2(LPCWSTR n, DWORD a, DWORD s, DWORD c, LPCREATEFILE2_EXTENDED_PARAMETERS x) {
     std::wstring b;
-    return CreateFile2(mapped(n, b), a, s, c, x);
+    const wchar_t* u = mapped(n, b);
+    CREATEFILE2_EXTENDED_PARAMETERS ext;
+    if (x) {
+        ext = *x;
+        ext.dwFileFlags = buffered(ext.dwFileFlags);
+        x = &ext;
+    }
+    HANDLE h = CreateFile2(u, a, s, c, x);
+    trace_open("CreateFile2", n, u, h != INVALID_HANDLE_VALUE);
+    return h;
 }
 BOOL WINAPI D_CreateDirectoryW(LPCWSTR n, LPSECURITY_ATTRIBUTES sa) {
     std::wstring b;
@@ -226,6 +246,38 @@ BOOL WINAPI D_SetFileInformationByHandle(HANDLE h, FILE_INFO_BY_HANDLE_CLASS c, 
         }
     }
     return SetFileInformationByHandle(h, c, info, size);
+}
+// XSL_FILE_TRACE=3: reads from .pak files (offset, size, how they completed), first 300.
+bool pak_handle(HANDLE h) {
+    wchar_t p[MAX_PATH * 2];
+    DWORD n = GetFinalPathNameByHandleW(h, p, MAX_PATH * 2, 0);
+    return n > 4 && n < MAX_PATH * 2 && _wcsicmp(p + n - 4, L".pak") == 0;
+}
+BOOL WINAPI D_ReadFile(HANDLE h, LPVOID buf, DWORD size, LPDWORD got, LPOVERLAPPED ov) {
+    BOOL r = ReadFile(h, buf, size, got, ov);
+    DWORD e = GetLastError();
+    if (trace_level() >= 3 && pak_handle(h)) {
+        static volatile long n = 0;
+        if (InterlockedIncrement(&n) <= 300) {
+            unsigned long long off = ov ? ((unsigned long long)ov->OffsetHigh << 32 | ov->Offset) : ~0ull;
+            XSL_INFO(CH, "pak read @%llu size %lu: %s (error %lu, got %lu)", off, size, r ? "ok" : "pending/failed", r ? 0ul : e,
+                     got ? *got : 0ul);
+        }
+    }
+    SetLastError(e);
+    return r;
+}
+BOOL WINAPI D_GetOverlappedResult(HANDLE h, LPOVERLAPPED ov, LPDWORD got, BOOL wait) {
+    BOOL r = GetOverlappedResult(h, ov, got, wait);
+    DWORD e = GetLastError();
+    if (trace_level() >= 3 && pak_handle(h)) {
+        static volatile long n = 0;
+        if (InterlockedIncrement(&n) <= 300)
+            XSL_INFO(CH, "pak read @%llu completed: %s, %lu bytes (error %lu)", ((unsigned long long)ov->OffsetHigh << 32 | ov->Offset),
+                     r ? "ok" : "FAILED", got ? *got : 0ul, r ? 0ul : e);
+    }
+    SetLastError(e);
+    return r;
 }
 // CRT: the title's own CRT (ucrtbase) is called, so FILE objects and errno stay in the CRT
 // instance the title uses.
@@ -318,6 +370,8 @@ void patch_module(HMODULE m) {
         {"GetDiskFreeSpaceExW", (void*)D_GetDiskFreeSpaceExW},
         {"GetDiskFreeSpaceW", (void*)D_GetDiskFreeSpaceW},
         {"SetFileInformationByHandle", (void*)D_SetFileInformationByHandle},
+        {"ReadFile", (void*)D_ReadFile},
+        {"GetOverlappedResult", (void*)D_GetOverlappedResult},
         {"_wfopen", (void*)D__wfopen},
         {"_wfopen_s", (void*)D__wfopen_s},
         {"_wfsopen", (void*)D__wfsopen},
@@ -335,6 +389,16 @@ void patch_module(HMODULE m) {
     for (auto& e : t) patch_import(m, "", e.fn, e.p);
 }
 }  // namespace
+
+// For the layer's DLLs that open files on the title's behalf (XCRDAPI.dll): the host path for a
+// console path, written to `out` (capacity in characters). Returns false (out untouched) when the
+// path is not on a mapped drive.
+extern "C" __declspec(dllexport) bool xsl_map_console_path(const wchar_t* path, wchar_t* out, size_t capacity) {
+    std::wstring m = map_path(path);
+    if (m.empty() || m.size() + 1 > capacity) return false;
+    memcpy(out, m.c_str(), (m.size() + 1) * sizeof(wchar_t));
+    return true;
+}
 
 namespace xsl::platform {
 void install_console_drives() {
@@ -386,11 +450,11 @@ void install_console_drives() {
         for (BOOL ok = Module32FirstW(snap, &me); ok; ok = Module32NextW(snap, &me)) {
             std::wstring path = me.szExePath, dir = path.substr(0, path.find_last_of(L"\\/") + 1);
             if (_wcsicmp(dir.c_str(), titleDir.c_str()) != 0 || me.hModule == self) continue;
-            // The layer's own DLLs are skipped, except XCRDAPI.dll (DirectStorage), which opens
-            // files by the paths the title gives it.
+            // The layer's own DLLs are skipped; XCRDAPI.dll (DirectStorage), which opens files by the
+            // paths the title gives it, maps them through xsl_map_console_path.
             bool layer = false;
-            for (const wchar_t* l : {L"xgameruntime.dll", L"GameInput.dll", L"xmem.dll", L"AcpHal.dll", L"xapu.dll", L"chad.dll",
-                                     L"PIXEvt.dll", L"XFrontPanelDisplay.dll", L"d3d12_xs.dll", L"MFPlat.dll"})
+            for (const wchar_t* l : {L"xgameruntime.dll", L"GameInput.dll", L"xmem.dll", L"XCRDAPI.dll", L"AcpHal.dll", L"xapu.dll",
+                                     L"chad.dll", L"PIXEvt.dll", L"XFrontPanelDisplay.dll", L"d3d12_xs.dll", L"MFPlat.dll"})
                 layer |= _wcsicmp(me.szModule, l) == 0;
             if (!layer) patch_module(me.hModule);
         }
