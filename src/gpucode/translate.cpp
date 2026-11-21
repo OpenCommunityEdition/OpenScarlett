@@ -512,7 +512,7 @@ struct Translator {
 
     // Typed buffers and images: HLSL needs a component type, which on the console is the view's
     // format (unknown here). Values a shader stores or loads are mostly produced or consumed by
-    // integer or float ALU code; the majority decides (float when nothing is known).
+    // integer or float ALU code; the majority decides (no evidence: integer for buffers, float for images).
     // 64-bit scalar ops whose destination is a pair (s_bcnt/s_ff/s_flbit *_i32_b64 write 32 bits;
     // compares and s_bitcmp only SCC).
     static bool wide_dst(const std::string& n) {
@@ -584,8 +584,10 @@ struct Translator {
             if (in.d16) continue;
             for (unsigned k = 0; k < cnt; k++) vote[r] += store ? producer_kind(i, in.vdata + k, 0) : consumer_kind(i, in.vdata + k);
         }
+        // Typed buffers only moved through (constants, raw loads, zeros) stay integers: indirect
+        // arguments and counters are written that way. Images keep float without evidence.
         for (auto& [r, v] : vote)
-            if (v > 0) res[r].is_uint = true;
+            if (v > 0 || (v == 0 && res[r].kind == ResKind::TypedBuf)) res[r].is_uint = true;
     }
 
     const ResRecord* record(uint32_t param, uint32_t where, uint32_t offset_dw, bool any_offset = false) const {

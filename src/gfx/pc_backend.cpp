@@ -142,9 +142,14 @@ void report_device_removed(ID3D12Device* dev) {
                     std::vector<uint32_t> mine;
                     for (uint32_t k = 0; k < kEiSlots; k++)
                         if (g_ei_info[k].list == nm) mine.push_back(k);
-                    // slots are handed out in recording order: the last ones precede the stop
+                    // slots are handed out in recording order: the n-th ExecuteIndirect of the list
+                    // (counted in its breadcrumbs up to the stop) is the n-th record
                     std::sort(mine.begin(), mine.end());
-                    for (size_t q = mine.size() > 4 ? mine.size() - 4 : 0; q < mine.size(); q++) {
+                    size_t nth = 0;
+                    for (UINT q = 0; q <= done && q < n->BreadcrumbCount; q++) nth += n->pCommandHistory[q] == D3D12_AUTO_BREADCRUMB_OP_EXECUTEINDIRECT;
+                    size_t lo = nth > 2 ? nth - 2 : 0, hi = std::min(mine.size(), nth + 1);
+                    if (nth) XSL_ERR(CH, "DRED:   the stop is ExecuteIndirect %zu of the list's %zu", nth, mine.size());
+                    for (size_t q = lo; q < hi; q++) {
                         uint32_t k = mine[q];
                         const uint32_t* e = g_ei_map + k * (kEiBytes / 4);
                         XSL_ERR(CH, "DRED:   indirect args of this list (#%u, buffer %p + %llu): %08x %08x %08x %08x %08x", k, g_ei_info[k].res,
