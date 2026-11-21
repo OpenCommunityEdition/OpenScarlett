@@ -883,7 +883,27 @@ HRESULT_T create_placed_resource(PcObj dev, PcObj heap, uint64_t offset, const v
                                                        IID_PPV_ARGS(reinterpret_cast<ID3D12Resource**>(out))), "CreatePlacedResource");
 }
 
+// XSL_TRACE_WRITERS=1: which pipeline last drew into each render target (the presented image's
+// writer is logged at present).
+static bool trace_writers() { static bool on = env_on("XSL_TRACE_WRITERS"); return on; }
+std::mutex g_wr_mu;
+std::map<uint64_t, PcObj> g_rtv_res;              // PC RTV handle -> resource
+std::map<PcObj, PcObj> g_wr_rt0, g_wr_pso;        // list -> render target 0, pipeline
+std::map<PcObj, std::pair<PcObj, uint64_t>> g_wr_last;   // resource -> (pipeline, draws)
+std::map<PcObj, uint64_t> g_wr_frame;                     // resource -> present count of its last draw
+std::atomic<uint64_t> g_wr_present{0};   // presents so far (writer tracing)
+static void note_draw(PcObj l) {
+    if (!trace_writers()) return;
+    std::lock_guard<std::mutex> g(g_wr_mu);
+    auto rt = g_wr_rt0.find(l);
+    if (rt == g_wr_rt0.end() || !rt->second) return;
+    auto& w = g_wr_last[rt->second];
+    w.first = g_wr_pso.count(l) ? g_wr_pso[l] : nullptr;
+    w.second++;
+    g_wr_frame[rt->second] = g_wr_present.load();
+}
 void create_rtv(PcObj dev, PcObj res, const void* desc, uint64_t h) {
+    if (trace_writers()) { std::lock_guard<std::mutex> g(g_wr_mu); g_rtv_res[h] = res; }
     D3D12_RENDER_TARGET_VIEW_DESC t;
     as<ID3D12Device>(dev)->CreateRenderTargetView(as<ID3D12Resource>(res), view_fix(res, desc, t), cpu(h));
 }
@@ -1086,6 +1106,11 @@ void list_om_set_render_targets(PcObj l, uint32_t n, const uint64_t* rtvs, int s
     D3D12_CPU_DESCRIPTOR_HANDLE r[8];
     uint32_t cnt = single ? (n ? 1 : 0) : n;
     for (uint32_t i = 0; i < cnt && i < 8; i++) r[i] = cpu(rtvs[i]);
+    if (trace_writers()) {
+        std::lock_guard<std::mutex> g(g_wr_mu);
+        auto it = cnt ? g_rtv_res.find(rtvs[0]) : g_rtv_res.end();
+        g_wr_rt0[l] = it == g_rtv_res.end() ? nullptr : it->second;
+    }
     D3D12_CPU_DESCRIPTOR_HANDLE d = dsv ? cpu(*dsv) : D3D12_CPU_DESCRIPTOR_HANDLE{};
     L->OMSetRenderTargets(n, n ? r : nullptr, single, dsv ? &d : nullptr);
 }
@@ -1125,6 +1150,7 @@ static void check_rs(PcObj l, const char* what) {
              p->second.first, bound);
 }
 void list_set_pso(PcObj l, PcObj pso) {
+    if (trace_writers()) { std::lock_guard<std::mutex> g(g_wr_mu); g_wr_pso[l] = pso; }
     if (g_info) { std::lock_guard<std::mutex> g(g_rs_mu); g_list_rs[l].pso = pso; }
     L->SetPipelineState(as<ID3D12PipelineState>(pso));
     if (g_dred && pso) {   // breadcrumb context: which pipeline the following work uses
@@ -1142,8 +1168,8 @@ void list_set_pso(PcObj l, PcObj pso) {
 void list_ia_topology(PcObj l, int t) { L->IASetPrimitiveTopology((D3D12_PRIMITIVE_TOPOLOGY)t); }
 void list_ia_vbs(PcObj l, uint32_t s, uint32_t n, const void* v) { L->IASetVertexBuffers(s, n, static_cast<const D3D12_VERTEX_BUFFER_VIEW*>(v)); }
 void list_ia_ib(PcObj l, const void* v) { L->IASetIndexBuffer(static_cast<const D3D12_INDEX_BUFFER_VIEW*>(v)); }
-void list_draw(PcObj l, uint32_t a, uint32_t b, uint32_t c, uint32_t d) { L->DrawInstanced(a, b, c, d); }
-void list_draw_indexed(PcObj l, uint32_t a, uint32_t b, uint32_t c, int32_t d, uint32_t e) { L->DrawIndexedInstanced(a, b, c, d, e); }
+void list_draw(PcObj l, uint32_t a, uint32_t b, uint32_t c, uint32_t d) { note_draw(l); L->DrawInstanced(a, b, c, d); }
+void list_draw_indexed(PcObj l, uint32_t a, uint32_t b, uint32_t c, int32_t d, uint32_t e) { note_draw(l); L->DrawIndexedInstanced(a, b, c, d, e); }
 void list_dispatch(PcObj l, uint32_t x, uint32_t y, uint32_t z) { L->Dispatch(x, y, z); }
 void list_dispatch_mesh(PcObj l, uint32_t x, uint32_t y, uint32_t z) {
     if (!g_caps.meshShaders) return;
@@ -1575,7 +1601,8 @@ uint64_t g_present_count = 0;
 
 // XSL_CAPTURE=<path.bmp>[@frame]: write the presented plane of one frame (default 60) to a BMP.
 // Used to check rendering against reference images without a screen grab.
-void capture_plane(ID3D12Device* dev, ID3D12CommandQueue* q, ID3D12Resource* res, const char* path) {
+void capture_plane(ID3D12Device* dev, ID3D12CommandQueue* q, ID3D12Resource* res, const char* path,
+                   D3D12_RESOURCE_STATES state = D3D12_RESOURCE_STATE_PRESENT) {
     D3D12_RESOURCE_DESC rd = res->GetDesc();
     D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp{};
     UINT64 total = 0;
@@ -1595,7 +1622,7 @@ void capture_plane(ID3D12Device* dev, ID3D12CommandQueue* q, ID3D12Resource* res
     dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&f));
     D3D12_RESOURCE_BARRIER b{};
     b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-    b.Transition = {res, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_COPY_SOURCE};
+    b.Transition = {res, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, state, D3D12_RESOURCE_STATE_COPY_SOURCE};
     l->ResourceBarrier(1, &b);
     D3D12_TEXTURE_COPY_LOCATION dst{rb, D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, {}};
     dst.PlacedFootprint = fp;
@@ -1613,7 +1640,21 @@ void capture_plane(ID3D12Device* dev, ID3D12CommandQueue* q, ID3D12Resource* res
     CloseHandle(e);
     void* p = nullptr;
     D3D12_RANGE r{0, (SIZE_T)total};
-    if (SUCCEEDED(rb->Map(0, &r, &p))) {
+    if (SUCCEEDED(rb->Map(0, &r, &p)) && !path) {   // statistics only: share of non-zero texels
+        UINT w = fp.Footprint.Width, h = fp.Footprint.Height;
+        size_t bpt = fp.Footprint.RowPitch / (w ? w : 1) >= 8 ? 8 : 4, nz = 0, n = 0;
+        uint32_t mx = 0;
+        for (UINT y = 0; y < h; y += 7)
+            for (UINT x = 0; x < w; x += 7, n++) {
+                auto* t = (uint8_t*)p + fp.Offset + (size_t)y * fp.Footprint.RowPitch + x * bpt;
+                uint32_t v = bpt == 4 ? (t[0] | t[1] << 8 | t[2] << 16) : (t[0] | t[1] << 8 | t[2] << 16 | t[3] << 24 | t[4] | t[5]);
+                if (v) nz++;
+                mx = std::max<uint32_t>(mx, t[0] | t[1] | t[2]);
+            }
+        XSL_INFO(CH, "%s stats (present %llu, %llux%u format %d): %.1f%% non-zero, max byte %u", state == D3D12_RESOURCE_STATE_PRESENT ? "plane" : "target",
+                 (unsigned long long)g_present_count, (unsigned long long)rd.Width, rd.Height, rd.Format, n ? 100.0 * nz / n : 0.0, mx);
+        rb->Unmap(0, nullptr);
+    } else if (p) {
         UINT w = fp.Footprint.Width, h = fp.Footprint.Height;
         bool rgba = rd.Format == DXGI_FORMAT_R8G8B8A8_UNORM || rd.Format == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB || rd.Format == DXGI_FORMAT_R8G8B8A8_TYPELESS;
         FILE* out = fopen(path, "wb");
@@ -1860,6 +1901,20 @@ HRESULT_T null_present(void* hwnd) {
     return S_OK;
 }
 HRESULT_T present(PcObj devObj, PcObj queueObj, PcObj resObj, void* hwndPtr, uint32_t sync, uint32_t colorSpace) {
+    if (trace_writers()) {
+        static uint64_t n = 0;
+        if (++n % 60 == 0) {
+            std::lock_guard<std::mutex> g(g_wr_mu);
+            auto it = g_wr_last.find(resObj);
+            wchar_t name[128] = L"(none)";
+            if (it != g_wr_last.end() && it->second.first) {
+                UINT sz = sizeof name;
+                if (FAILED(as<ID3D12PipelineState>(it->second.first)->GetPrivateData(WKPDID_D3DDebugObjectNameW, &sz, name))) wcscpy(name, L"(unnamed)");
+            }
+            XSL_INFO(CH, "present %llu: image %p last drawn by %ls (%llu draws so far)", (unsigned long long)n, resObj, name,
+                     it == g_wr_last.end() ? 0ull : (unsigned long long)it->second.second);
+        }
+    }
     auto* dev = as<ID3D12Device>(devObj);
     auto* q = as<ID3D12CommandQueue>(queueObj);
     auto* res = as<ID3D12Resource>(resObj);
@@ -1958,6 +2013,30 @@ HRESULT_T present(PcObj devObj, PcObj queueObj, PcObj resObj, void* hwndPtr, uin
             }
         }
         ++g_present_count;
+        g_wr_present = g_present_count;
+        // XSL_PLANE_STATS=<n>: every n presents, log how much of the title's plane is non-black.
+        static uint64_t statsEvery = [] { char b[16]; return GetEnvironmentVariableA("XSL_PLANE_STATS", b, sizeof b) ? _strtoui64(b, nullptr, 10) : 0ull; }();
+        if (statsEvery && g_present_count % statsEvery == 0) capture_plane(dev, q, res, nullptr);
+        // XSL_RT_STATS=<present> (with XSL_TRACE_WRITERS=1): every 2D render target drawn during
+        // the frame before that present, with the pipeline that drew it last.
+        static uint64_t rtAt = [] { char b[16]; return GetEnvironmentVariableA("XSL_RT_STATS", b, sizeof b) ? _strtoui64(b, nullptr, 10) : 0ull; }();
+        if (rtAt && g_present_count == rtAt) {
+            std::vector<std::pair<PcObj, PcObj>> targets;
+            {
+                std::lock_guard<std::mutex> g(g_wr_mu);
+                for (auto& [r, f] : g_wr_frame)
+                    if (f + 1 >= g_present_count) targets.push_back({r, g_wr_last[r].first});
+            }
+            for (auto& [r, pso] : targets) {
+                auto* tr = as<ID3D12Resource>(r);
+                if (tr == res || tr->GetDesc().Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || tr->GetDesc().SampleDesc.Count > 1) continue;
+                wchar_t name[128] = L"(unnamed)";
+                UINT sz = sizeof name;
+                if (pso) as<ID3D12PipelineState>(pso)->GetPrivateData(WKPDID_D3DDebugObjectNameW, &sz, name);
+                XSL_INFO(CH, "render target %p last drawn by %ls:", r, name);
+                capture_plane(dev, q, tr, nullptr, D3D12_RESOURCE_STATE_RENDER_TARGET);
+            }
+        }
         if (cap[0] && g_present_count >= capFrame && g_present_count < capFrame + capCount) {
             char path[MAX_PATH];
             if (capCount > 1) {

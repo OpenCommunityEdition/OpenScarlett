@@ -1057,6 +1057,13 @@ HRESULT D3DAPI Q_PresentX(ID3D12CommandQueue* q, UINT planes, const D3D12XBOX_PR
     if (!de->window) { XSL_WARN(CH, "PresentX: no title window yet"); return S_OK; }
     XSL_TRACE("gfx.cmd", "PresentX planes=%u res %p", planes, (void*)p->ppResources[0]);
     if (planes > 1) XSL_TRACE(CH, "PresentX: %u planes, presenting plane 0 only", planes);
+    {
+        static volatile long n = 0;
+        if (planes > 1 && InterlockedIncrement(&n) <= 3)
+            for (UINT i = 0; i < planes; i++)
+                XSL_INFO(CH, "PresentX plane %u: %u resources, first %p, color space %d, flags %#x", i, p[i].ResourceCount,
+                         p[i].ResourceCount ? (void*)p[i].ppResources[0] : nullptr, (int)p[i].ColorSpace, (unsigned)p[i].Flags);
+    }
     // Swap chains need a direct queue; titles may present from a compute queue (FramePacing does).
     PcObj presentQ = pc_of(q);
     if (ex<ID3D12CommandQueue, QueueExtra>(q)->desc.Type != D3D12_COMMAND_LIST_TYPE_DIRECT) {
