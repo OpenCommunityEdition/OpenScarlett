@@ -506,6 +506,13 @@ D3D12XBOX_RESOURCE_BARRIER_ACTIONS D3DAPI L_ResourceBarrier(ID3D12GraphicsComman
                     XSL_WARN(CH, "dropping console-only barrier type %d", (int)x.Type);
                     continue;
             }
+            if (x.Type == D3D12_RESOURCE_BARRIER_TYPE_TRANSITION && (b[base + i].Transition.StateBefore == 0x200 || b[base + i].Transition.StateAfter == 0x200 ||
+                                                                      ((b[base + i].Transition.StateBefore | b[base + i].Transition.StateAfter) & 0x200))) {
+                static volatile long n = 0;
+                if (InterlockedIncrement(&n) <= 40)
+                    XSL_INFO(CH, "indirect-arg barrier list %p res %p %x -> %x flags %x", (void*)l, (void*)b[base + i].Transition.pResource,
+                             b[base + i].Transition.StateBefore, b[base + i].Transition.StateAfter, b[base + i].Flags);
+            }
             if (x.Type == D3D12_RESOURCE_BARRIER_TYPE_TRANSITION)
                 XSL_TRACE("gfx.cmd", "list %p barrier res %p %x -> %x", (void*)l, (void*)b[base + i].Transition.pResource,
                           b[base + i].Transition.StateBefore, b[base + i].Transition.StateAfter);
@@ -603,6 +610,11 @@ void D3DAPI L_DrawIndexedInstanced(ID3D12GraphicsCommandList* l, UINT a, UINT b,
     pc::list_draw_indexed(LPC(l), a, b, c, d, e);
 }
 void D3DAPI L_Dispatch(ID3D12GraphicsCommandList* l, UINT x, UINT y, UINT z) {
+    static bool diag = [] { char b[4]; return GetEnvironmentVariableA("XSL_D3D12_DEBUG", b, 4) && b[0] != '0'; }();
+    if (diag && (uint64_t)x * y * z > (1u << 18)) {
+        static volatile long n = 0;
+        if (InterlockedIncrement(&n) <= 20) XSL_INFO(CH, "large Dispatch(%u, %u, %u) on list %p", x, y, z, (void*)l);
+    }
     if (!null_graphics() && !lx(l)->placeholderPso) pc::list_dispatch(LPC(l), x, y, z);
 }
 // Console lists have no heap binding: descriptor tables address descriptors directly. The layer's
@@ -710,6 +722,15 @@ void D3DAPI L_FlushPipelineX(ID3D12GraphicsCommandList* l, D3D12XBOX_FLUSH, D3D1
 void D3DAPI L_ExecuteIndirect(ID3D12GraphicsCommandList* l, ID3D12CommandSignature* sig, UINT max, ID3D12Resource* args, UINT64 ao,
                               ID3D12Resource* cnt, UINT64 co) {
     if (null_graphics() || lx(l)->placeholderPso) return;   // placeholder PSO: its work is skipped
+    static bool diag = [] { char b[4]; return GetEnvironmentVariableA("XSL_D3D12_DEBUG", b, 4) && b[0] != '0'; }();
+    if (diag) {
+        static volatile long n = 0;
+        if (InterlockedIncrement(&n) <= 40) {
+            uint32_t* st = tracked_state(lx(l), args, false);
+            XSL_INFO(CH, "ExecuteIndirect list %p args %p (state in this list: %s%x) count %p", (void*)l, (void*)args,
+                     st ? "" : "untracked ", st ? *st : 0u, (void*)cnt);
+        }
+    }
     pc::list_execute_indirect(LPC(l), P(sig), max, P(args), ao, P(cnt), co);
 }
 void D3DAPI L_ClearUAVUint(ID3D12GraphicsCommandList* l, D3D12_GPU_DESCRIPTOR_HANDLE g, D3D12_CPU_DESCRIPTOR_HANDLE c, ID3D12Resource* r,

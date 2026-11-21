@@ -20,6 +20,13 @@ namespace gpucode {
 struct TranslateOptions {
     bool comments = true;        // instruction text as comments in the HLSL
     bool stencil_export = false; // SV_StencilRef output (PC GPUs without PSSpecifiedStencilRef reject it)
+    // Wave64 compute code on a PC whose waves have 32 lanes: each PC thread runs two console lanes
+    // (L and L+32), which keeps wave64 lane masks and cross-lane operations exact. False when the
+    // PC runs 64-lane waves.
+    bool wave64_dual = true;
+    unsigned loop_guard = 1u << 22;  // dispatcher iterations before a lane gives up (runaway loops)
+    bool wave_size_attr = false;
+    bool barrier_sync = true;        // false: s_barrier without the group sync (debugging hangs) // the PC runtime takes shader model 6.6 ([WaveSize] on compute)
 };
 
 struct TranslateResult {

@@ -66,6 +66,7 @@ struct Res {
     uint32_t reg = 0, space = 0, stride = 0;
     uint32_t param = 0, offset = 0;     // root parameter and byte offset in its table (or root)
     uint32_t root_hi_or = 0;            // root descriptors: bits the shader ORed into word 1
+    uint32_t addr_off = 0;              // root descriptors: bytes the shader added to the address
     int dim = -1;                       // images: MIMG dim
     bool cube_array = false;
     bool dyn = false;                   // array indexed at run time
@@ -109,7 +110,8 @@ struct Translator {
 
     // ---- setup ------------------------------------------------------------------------------
     std::vector<PsvResource> psv;
-    std::vector<SigElem> isg, osg;
+    std::vector<SigElem> isg, osg, psg;   // input, output, primitive (mesh per-primitive) signatures
+    bool has_prims() const { for (auto& e : psg) if (e.sysval == 0) return true; return false; }
     // Pixel shaders: barycentric VGPR -> interpolation mode; console attribute -> mode used.
     std::map<unsigned, std::string> bary_mode;
     std::map<unsigned, std::string> attr_mode;
@@ -125,7 +127,10 @@ struct Translator {
     bool uses_codedata = false;
     unsigned ms_max_verts = 256, ms_max_prims = 256, ms_lds = 0;
     bool merged_vs = false;
-    bool uses_clipcull = false;   // vertex shader compiled as a merged (ES/GS or primitive) stage
+    bool uses_clipcull = false;
+    // Wave64-on-wave32 mode (compute/mesh): each PC thread runs console lanes L and L+32 (copy 0/1).
+    bool dual = false, want_dual = false;
+    int cp = -1;   // vertex shader compiled as a merged (ES/GS or primitive) stage
     unsigned user_end() const {   // first SGPR after the user arguments (PS: primitive mask)
         unsigned e = c.kind == ProgramKind::CS ? 4 : 8;
         for (auto& a : meta.args)
@@ -154,6 +159,7 @@ struct Translator {
         if (auto* pp = c.part("PSV0")) psv = parse_psv0(*pp);
         if (auto* pp = c.part("ISG1")) isg = parse_signature(*pp);
         if (auto* pp = c.part("OSG1")) osg = parse_signature(*pp);
+        if (auto* pp = c.part("PSG1")) psg = parse_signature(*pp);
         if (!parse_meta(c, meta, &e)) return fail("metadata: " + e);
         if (c.kind == ProgramKind::MS) {
             // Mesh shaders run as merged (primitive) shaders: argument locations are 8 SGPRs higher.
@@ -166,6 +172,10 @@ struct Translator {
                 ms_max_prims = rd(12) >> 16;
                 for (int k = 0; k < 3; k++) meta.numthreads[k] = rd(36 + 4 * k);
             }
+            // PC mesh shaders have at most 128 threads: larger console groups run two console lanes
+            // per PC thread (wave64 on wave32).
+            unsigned nt = meta.numthreads[0] * meta.numthreads[1] * meta.numthreads[2];
+            if (nt > 128) want_dual = true;
         }
         if (c.kind == ProgramKind::PS) {
             // Initial VGPRs in SPI_PS_INPUT_ENA order (AMD's public register layout).
@@ -206,6 +216,15 @@ struct Translator {
             std::string n = in.name;
             if (ends(n, "_b64") && (in.dst == 126 || in.src0 == 126 || in.src1 == 126) && in.fmt != Fmt::VOP3) W = 64;
             if (has(n, "saveexec_b64") || has(n, "wrexec_b64")) W = 64;
+        }
+        if (c.kind == ProgramKind::CS && W == 64 && opt.wave64_dual) {
+            unsigned nt = meta.numthreads[0] * meta.numthreads[1] * meta.numthreads[2];
+            if (nt % 64 == 0) dual = true;   // partial console waves: single-lane mapping (approximate)
+        }
+        if (want_dual) {
+            unsigned nt = meta.numthreads[0] * meta.numthreads[1] * meta.numthreads[2];
+            if (W != 64 || nt % 64 || nt > 256) return fail(fmt("mesh shader with %u threads (wave%u) not supported", nt, W));
+            dual = true;
         }
         return true;
     }
@@ -599,6 +618,7 @@ struct Translator {
             r.reg = p.reg;
             r.space = p.space;
             r.root_hi_or = w1.k == AV::RootHi ? w1.c : 0;
+            r.addr_off = boff;
             const ResRecord* rec = record(param, 1, 0, true);
             if (p.type == ParamType::CBV) r.kind = ResKind::CBuffer;
             else {
@@ -701,8 +721,10 @@ struct Translator {
     }
     std::string V(unsigned r) {
         max_v = std::max(max_v, r + 1);
+        if (dual) return fmt("v%u_%d", r, cp < 0 ? 0 : cp);
         return "v" + std::to_string(r);
     }
+    std::string Vc(unsigned r, int c) { max_v = std::max(max_v, r + 1); return fmt("v%u_%d", r, c); }
     std::string mask_bool(unsigned r) const {   // this lane's bit of the mask held in SGPR r
         if (r == src::kExecLo) return "kexec";
         if (r == 106) return "kvcc";
@@ -763,11 +785,24 @@ struct Translator {
         sync_mask_from_int(r);
     }
     void sync_mask_from_int(unsigned r) {
+        if (dual) {   // masks are exact wave64 integers: derive both copies' bits
+            if (r == src::kExecLo || r == src::kExecHi) line("kexec_0 = lanebitL(s126, s127, LP_); kexec_1 = lanebitL(s126, s127, LP_ + 32u);");
+            else if (r == 106 || r == 107) line("kvcc_0 = lanebitL(s106, s107, LP_); kvcc_1 = lanebitL(s106, s107, LP_ + 32u);");
+            return;
+        }
         if (r == src::kExecLo || r == src::kExecHi) line(W == 64 ? "kexec = lanebit(s126, s127);" : "kexec = lanebit1(s126);");
         else if (r == 106 || r == 107) line(W == 64 ? "kvcc = lanebit(s106, s107);" : "kvcc = lanebit1(s106);");
     }
     void write_mask(unsigned r, const std::string& b) {   // r: mask register (pair base); b: this lane's bit
         if (r == src::kNull) return;
+        if (dual) {   // this copy's half of the wave64 mask
+            const char* half = cp == 1 ? "hi" : "lo";
+            unsigned reg = r == src::kExecLo ? 126 : r;
+            if (r == src::kExecLo) line("kexec = " + b + ";");
+            else if (r == 106) line("kvcc = " + b + ";");
+            if (reg < kNumS) line(fmt("%s = ballot2(%s).x;   // %s half", S(reg + (cp == 1 ? 1 : 0)).c_str(), r == src::kExecLo ? "kexec" : r == 106 ? "kvcc" : ("(" + b + ")").c_str(), half));
+            return;
+        }
         if (r == src::kExecLo) {
             line("kexec = " + b + ";");
             line(W == 64 ? "{ uint2 b_ = ballot2(kexec); s126 = b_.x; s127 = b_.y; }" : "s126 = ballot2(kexec).x;");
@@ -780,7 +815,12 @@ struct Translator {
         }
     }
     void write_v(unsigned r, const std::string& v, bool pred = true) {
-        line((pred ? "if (kexec) " : "") + V(r) + " = " + v + ";");
+        // Cross-lane reads are evaluated by every lane (outside the EXEC predicate), so the lanes
+        // they read from are active on the PC as well.
+        if (pred && (v.find("xlane") != std::string::npos || v.find("WaveReadLaneAt") != std::string::npos || v.find("quadperm") != std::string::npos))
+            line("{ uint x_ = " + v + "; if (kexec) " + V(r) + " = x_; }");
+        else
+            line((pred ? "if (kexec) " : "") + V(r) + " = " + v + ";");
     }
 
     // ---- instruction emission ---------------------------------------------------------------
@@ -794,9 +834,40 @@ struct Translator {
     bool emit_exp(const Instr& in, size_t idx);
     bool emit_global(const Instr& in, size_t idx);
     std::string attr_value(unsigned attr, unsigned chan, const std::string& mode);
+    bool per_lane(const Instr& in) const {
+        switch (in.fmt) {
+        case Fmt::VOP1: case Fmt::VOP2: case Fmt::VOPC: case Fmt::VOP3: case Fmt::VOP3P:
+            return strcmp(in.name, "v_readlane_b32") && strcmp(in.name, "v_readfirstlane_b32");
+        case Fmt::VINTRP: case Fmt::DS: case Fmt::MUBUF: case Fmt::MTBUF: case Fmt::MIMG: case Fmt::GLOBAL: case Fmt::FLAT:
+        case Fmt::SCRATCH: case Fmt::EXP:
+            return true;
+        default:
+            return false;
+        }
+    }
     bool emit(const Instr& in, size_t idx) {
         if (!in.name) return fail(fmt("unknown %s opcode %u at 0x%x", fmt_name(in.fmt), in.op, in.offset));
-        if (opt.comments) out << "  // " << fmt("%04x", in.offset) << ": " << disasm(in) << "\n";
+        if (dual && per_lane(in)) {
+            // Once per console lane copy: L/LG = console lane, EXEC/VCC bits and captured outputs renamed.
+            static const char* names[] = {"kexec", "kvcc", "O", "P", "prim_", "hasv_", "hasp_", "clipcull_"};
+            bool ok = true;
+            for (int c = 0; c < 2 && ok; c++) {
+                cp = c;
+                out << fmt("  L = LP_ + %du; LG = L;\n", 32 * c);
+                for (auto nm : names) out << "#define " << nm << " " << nm << "_" << c << "\n";
+                ok = emit1(in, idx);
+                for (auto nm : names) out << "#undef " << nm << "\n";
+            }
+            cp = -1;
+            return ok;
+        }
+        cp = 0;
+        bool ok = emit1(in, idx);
+        cp = -1;
+        return ok;
+    }
+    bool emit1(const Instr& in, size_t idx) {
+        if (opt.comments && cp <= 0) out << "  // " << fmt("%04x", in.offset) << ": " << disasm(in) << "\n";
         switch (in.fmt) {
         case Fmt::SOP1: case Fmt::SOP2: case Fmt::SOPC: case Fmt::SOPK: case Fmt::SOPP: return emit_salu(in, idx);
         case Fmt::VOP1: case Fmt::VOP2: case Fmt::VOPC: case Fmt::VOP3: case Fmt::VOP3P: return emit_valu(in, idx);
@@ -873,12 +944,18 @@ bool Translator::emit_salu(const Instr& in, size_t idx) {
         std::string k = rd(e, in);
         return W == 64 ? fmt("lanebit(%s, %s)", k.c_str(), rd_hi(e, in).c_str()) : fmt("lanebit1(%s)", k.c_str());
     };
-    auto logic_mask = [&](unsigned d, const std::string& iv_lo, const std::string& iv_hi, const std::string& bv) {
+    auto logic_mask = [&](unsigned d, const std::string& iv_lo, const std::string& iv_hi, const std::string& bv, bool set_scc = true) {
+        const char* sc = set_scc ? " scc = (lo_ | hi_) != 0u;" : "";
+        if (dual) {
+            line(fmt("{ uint lo_ = %s, hi_ = %s;%s %s = lo_; %s = hi_; }", iv_lo.c_str(), iv_hi.c_str(), sc, S(d).c_str(), S(d + 1).c_str()));
+            sync_mask_from_int(d);
+            return;
+        }
         // Integer view and lane bit of a mask result; SCC = result != 0.
-        if (W == 64) line(fmt("{ uint lo_ = %s, hi_ = %s; bool k_ = %s; scc = (lo_ | hi_) != 0u; %s = lo_; %s = hi_;%s }",
-                              iv_lo.c_str(), iv_hi.c_str(), bv.c_str(), S(d).c_str(), S(d + 1).c_str(),
+        if (W == 64) line(fmt("{ uint lo_ = %s, hi_ = %s; bool k_ = %s;%s %s = lo_; %s = hi_;%s }",
+                              iv_lo.c_str(), iv_hi.c_str(), bv.c_str(), sc, S(d).c_str(), S(d + 1).c_str(),
                               d == src::kExecLo ? " kexec = k_;" : d == 106 ? " kvcc = k_;" : ""));
-        else line(fmt("{ uint lo_ = %s; bool k_ = %s; scc = lo_ != 0u; %s = lo_;%s }", iv_lo.c_str(), bv.c_str(), S(d).c_str(),
+        else line(fmt("{ uint lo_ = %s; bool k_ = %s;%s %s = lo_;%s }", iv_lo.c_str(), bv.c_str(), set_scc ? " scc = lo_ != 0u;" : "", S(d).c_str(),
                       d == src::kExecLo ? " kexec = k_;" : d == 106 ? " kvcc = k_;" : ""));
     };
     if (in.fmt == Fmt::SOPP) {
@@ -890,7 +967,7 @@ bool Translator::emit_salu(const Instr& in, size_t idx) {
         for (auto p : nops)
             if (n == p) return true;
         if (n == "s_barrier") {
-            line("GroupMemoryBarrierWithGroupSync();");
+            line(opt.barrier_sync ? "GroupMemoryBarrierWithGroupSync();" : "GroupMemoryBarrier();");
             return true;
         }
         if (n == "s_sendmsg" || n == "s_sendmsghalt") {
@@ -942,7 +1019,7 @@ bool Translator::emit_salu(const Instr& in, size_t idx) {
         if (n == "s_mov_b32") { write_s(d, a()); return true; }
         if (n == "s_mov_b64") {
             if (d == src::kExecLo || d == 106 || in.src0 == src::kExecLo || in.src0 == 106)
-                logic_mask(d, a(), rd_hi(in.src0, in), bit(in.src0));
+                logic_mask(d, a(), rd_hi(in.src0, in), bit(in.src0), false);   // s_mov does not write SCC
             else
                 line(fmt("%s = %s; %s = %s;", S(d).c_str(), a().c_str(), S(d + 1).c_str(), rd_hi(in.src0, in).c_str()));
             return true;
@@ -956,7 +1033,7 @@ bool Translator::emit_salu(const Instr& in, size_t idx) {
             if (W == 64) line(fmt("{ uint lo_ = %s, hi_ = %s; %s = lo_; %s = hi_; scc = (lo_ | hi_) != 0u; }", lo.c_str(), hi.c_str(), S(d).c_str(), S(d + 1).c_str()));
             else line(fmt("{ uint lo_ = %s; %s = lo_; scc = lo_ != 0u; }", lo.c_str(), S(d).c_str()));
             // Helper lanes: on PC they always execute, so whole-quad mode makes this lane live.
-            if (d == src::kExecLo) line("kexec = true;");
+            if (d == src::kExecLo && !dual) line("kexec = true;");
             else sync_mask_from_int(d);
             return true;
         }
@@ -1001,6 +1078,13 @@ bool Translator::emit_salu(const Instr& in, size_t idx) {
             ib = mk(sb, "kexec", true);
             if (il.empty()) return fail(n + " not supported");
             bool wr = has(n, "wrexec");
+            if (dual) {
+                line(fmt("{ uint ol_ = s126, oh_ = s127; uint lo_ = %s, hi_ = %s; s126 = lo_; s127 = hi_; scc = (lo_ | hi_) != 0u; %s = %s; %s = %s; }",
+                         il.c_str(), ih.c_str(), S(d).c_str(), wr ? "lo_" : "ol_", S(d + 1).c_str(), wr ? "hi_" : "oh_"));
+                sync_mask_from_int(126);
+                if (d == 106) sync_mask_from_int(106);
+                return true;
+            }
             if (W == 64)
                 line(fmt("{ uint ol_ = s126, oh_ = s127; uint lo_ = %s, hi_ = %s; bool k_ = %s; s126 = lo_; s127 = hi_; kexec = k_; scc = (lo_ | hi_) != 0u; %s = %s; %s = %s; }",
                          il.c_str(), ih.c_str(), ib.c_str(), S(d).c_str(), wr ? "lo_" : "ol_", S(d + 1).c_str(), wr ? "hi_" : "oh_"));
@@ -1113,7 +1197,7 @@ bool Translator::emit_smem(const Instr& in, size_t idx) {
         const Res& R = res[r];
         if (R.dyn) return fail(n + ": scalar loads from resource arrays not supported");
         std::string off = in.soffset == src::kNull ? fmt("%uu", uint32_t(in.offset_imm)) : fmt("(%s + %uu)", rd(in.soffset, in).c_str(), uint32_t(in.offset_imm));
-        if (R.offset) off = fmt("(%s + %uu)", off.c_str(), R.offset);
+        if (R.addr_off) off = fmt("(%s + %uu)", off.c_str(), R.addr_off);
         // The destination may overlap the offset register: compute the address first.
         line(fmt("{ uint sa_ = %s;", off.c_str()));
         out << "  ";
@@ -1318,7 +1402,8 @@ bool Translator::emit_valu(const Instr& in, size_t idx) {
         }
         if (x) {
             line(fmt("kexec = kexec && (%s);", e.c_str()));
-            line(W == 64 ? "{ uint2 b_ = ballot2(kexec); s126 = b_.x; s127 = b_.y; }" : "s126 = ballot2(kexec).x;");
+            if (dual) line(fmt("%s = ballot2(kexec).x;", cp == 1 ? "s127" : "s126"));
+            else line(W == 64 ? "{ uint2 b_ = ballot2(kexec); s126 = b_.x; s127 = b_.y; }" : "s126 = ballot2(kexec).x;");
         } else {
             unsigned m = in.sdwa && in.sdwa_f.sd ? in.sdwa_f.sdst : mask_dst();
             write_mask(m, fmt("kexec && (%s)", e.c_str()));
@@ -1327,6 +1412,13 @@ bool Translator::emit_valu(const Instr& in, size_t idx) {
     }
 
     // ---- lane ops ----
+    if (dual && (n == "v_readfirstlane_b32" || n == "v_readlane_b32") && in.src0 >= src::kVgpr0) {
+        unsigned r = in.src0 - src::kVgpr0;
+        std::string lane = n == "v_readlane_b32" ? fmt("(%s & 63u)", rd(se[1], in).c_str()) : std::string("first_lane64(s126, s127)");
+        write_s(dst, fmt("readlane64(%s, %s, %s)", Vc(r, 0).c_str(), Vc(r, 1).c_str(), lane.c_str()));
+        uses_wave = true;
+        return true;
+    }
     if (n == "v_readfirstlane_b32") { write_s(dst, fmt("WaveReadLaneAt(%s, first_lane(kexec))", src_bits(0, 'u').c_str())); uses_wave = true; return true; }
     if (n == "v_readlane_b32") { write_s(dst, fmt("WaveReadLaneAt(%s, %s & %uu)", src_bits(0, 'u').c_str(), rd(se[1], in).c_str(), W - 1)); uses_wave = true; return true; }
     if (n == "v_writelane_b32") { line(fmt("if (L == (%s & %uu)) %s = %s;", rd(se[1], in).c_str(), W - 1, V(dst).c_str(), rd(se[0], in).c_str())); return true; }
@@ -1616,7 +1708,7 @@ bool Translator::emit_mubuf(const Instr& in, size_t idx) {
     std::string so = rd(in.soffset, in);
     uint32_t stride = R.kind == ResKind::StructBuf ? R.stride : ((R.root_hi_or >> 16) & 0x3fff);
     if (R.kind == ResKind::CBuffer && in.idxen) stride = (R.root_hi_or >> 16) & 0x3fff;
-    std::string addr = fmt("(%s + %s + %uu)", voff.c_str(), so.c_str(), uint32_t(in.offset_imm) + R.offset);
+    std::string addr = fmt("(%s + %s + %uu)", voff.c_str(), so.c_str(), uint32_t(in.offset_imm) + R.addr_off);
     if (in.idxen && R.kind != ResKind::TypedBuf) addr = fmt("(%s + %s * %uu)", addr.c_str(), vidx.c_str(), stride);
     bool store = has(n, "_store_");
     bool atomic = has(n, "_atomic_");
@@ -1953,6 +2045,11 @@ bool Translator::emit_ds(const Instr& in, size_t idx) {
         }
         return true;
     }
+    if (n == "ds_bpermute_b32" && dual) {
+        write_v(in.dst, fmt("xlane64(%s, %s, (%s >> 2) & 63u)", Vc(in.data0, 0).c_str(), Vc(in.data0, 1).c_str(), a.c_str()));
+        uses_wave = true;
+        return true;
+    }
     if (n == "ds_bpermute_b32") { write_v(in.dst, fmt("xlane(%s, (%s >> 2) & %uu)", V(in.data0).c_str(), a.c_str(), W - 1)); uses_wave = true; return true; }
     if (n == "ds_permute_b32") return fail("ds_permute_b32 not supported");
     if (n == "ds_read_b32" || n == "ds_load_b32") { write_v(in.dst, fmt("lds[%s >> 2]", a.c_str())); return true; }
@@ -2204,7 +2301,28 @@ bool Translator::emit_exp(const Instr& in, size_t idx) {
             for (auto& e : osg)
                 if (e.sysval == 0 && std::find(regs.begin(), regs.end(), e.reg) == regs.end()) regs.push_back(e.reg);
             std::sort(regs.begin(), regs.end());
-            if (p >= regs.size()) return true;   // exported but not consumed by the signature
+            if (p >= regs.size()) {
+                // Mesh shaders: parameters after the vertex outputs are the per-primitive outputs of
+                // the exporting thread's primitive (primitive signature, register order).
+                std::vector<unsigned> pregs;
+                for (auto& e : psg)
+                    if (e.sysval == 0 && std::find(pregs.begin(), pregs.end(), e.reg) == pregs.end()) pregs.push_back(e.reg);
+                std::sort(pregs.begin(), pregs.end());
+                unsigned q = p - unsigned(regs.size());
+                if (c.kind != ProgramKind::MS || q >= pregs.size()) return true;   // exported but not consumed
+                line("if (kexec) {");
+                for (auto& e : psg) {
+                    if (e.sysval != 0 || e.reg != pregs[q]) continue;
+                    unsigned first = unsigned(__builtin_ctz(e.mask));
+                    for (int k = 0; k < 4; k++) {
+                        if (!((e.mask >> k) & 1) || !en(k)) continue;
+                        std::string v = e.is_float() ? comp[k] : "asuint(" + comp[k] + ")";
+                        line(fmt("  P.p%u_%u.%c = %s;", e.reg, first, "xyzw"[k - first], v.c_str()));
+                    }
+                }
+                line("}");
+                return true;
+            }
             unsigned reg = regs[p];
             line("if (kexec) {");
             for (auto& e : osg) {
@@ -2329,7 +2447,14 @@ float3 cube_dir(float s, float t, float f) {
   if (face == 4u) return float3(u, -v, 1.0); return float3(-u, -v, -1.0);
 }
 // Cross-lane reads (exact within one PC wave).
-uint xlane(uint v, uint src) { uint r = 0u; [unroll] for (uint k = 0u; k < WAVE; k++) { uint t = WaveReadLaneAt(v, k); if (src == k) r = t; } return r; }
+#ifndef XL_N
+#define XL_N WAVE
+#endif
+uint xlane(uint v, uint src) { uint r = 0u; [unroll] for (uint k = 0u; k < XL_N; k++) { uint t = WaveReadLaneAt(v, k); if ((src % XL_N) == k) r = t; } return r; }
+bool lanebitL(uint lo, uint hi, uint l) { return l < 32u ? ((lo >> l) & 1u) != 0u : ((hi >> (l - 32u)) & 1u) != 0u; }
+uint first_lane64(uint lo, uint hi) { return lo != 0u ? firstbitlow(lo) : (hi != 0u ? 32u + firstbitlow(hi) : 0u); }
+uint xlane64(uint v0, uint v1, uint src) { uint a = xlane(v0, src & 31u), b = xlane(v1, src & 31u); return src < 32u ? a : b; }
+uint readlane64(uint v0, uint v1, uint l) { return l < 32u ? WaveReadLaneAt(v0, l) : WaveReadLaneAt(v1, l - 32u); }
 uint xlane_bc(uint v, uint src, bool bc) { uint r = xlane(v, src & (WAVE - 1u)); return src == 0xffffffffu ? (bc ? 0u : v) : r; }
 #define cbload(d, a) (d)[((a) >> 4) & 4095u][((a) >> 2) & 3u]
 )";
@@ -2370,7 +2495,7 @@ std::string Translator::generate() {
     if (!loops) line(fmt("bool reach[%zu]; [unroll] for (uint i_ = 0u; i_ < %zuu; i_++) reach[i_] = false; reach[0] = true;", nb + 1, nb + 1));
     // The guard bounds the block transitions so a mistranslated loop ends the shader instead of
     // hanging the GPU (which removes the PC device).
-    else line("uint pc = 0u, guard_ = 0u;\n  [loop] for (;;) {\n  if (++guard_ > (1u << 22)) RETURN;\n  [forcecase] switch (pc) {");
+    else line(fmt("uint pc = 0u, guard_ = 0u;\n  [loop] for (;;) {\n  if (++guard_ > %uu) RETURN;\n  [forcecase] switch (pc) {", opt.loop_guard));
     // Blocks not reachable from the entry (data after the last instruction) are not emitted.
     std::vector<bool> live(nb, false);
     {
@@ -2425,6 +2550,7 @@ std::string Translator::generate() {
     std::ostringstream h;
     h << "// Translated by OpenScarlett gpucode from console GPU machine code.\n";
     h << "#define WAVE " << W << "u\n";
+    if (dual) h << "#define XL_N 32u   // wave64 on wave32: cross-lane reads stay within a 32-lane half\n";
     for (auto& r : res)
         if (r.kind != ResKind::Counter && r.alias < 0) h << res_decl(r) << "\n";
     // Root constants passed in user SGPRs.
@@ -2463,7 +2589,27 @@ std::string Translator::generate() {
         return v;
     };
     std::string init;   // stage-specific initialisation of registers
-    if (c.kind == ProgramKind::CS) {
+    if (c.kind == ProgramKind::CS && dual) {
+        // PC thread gi_ (32-lane waves) runs console threads t0 = (gi_/32)*64 + gi_%32 and t0 + 32
+        // of the console group (flattened x-fastest, as the console packs waves).
+        unsigned nx = meta.numthreads[0], ny = meta.numthreads[1], nt = nx * ny * meta.numthreads[2];
+        h << "#define RETURN return\n";
+        h << "\n" << (opt.wave_size_attr ? "[WaveSize(32)]\n" : "") << "[numthreads(" << nt / 2 << ", 1, 1)]\n";
+        h << "void main(uint3 gid_ : SV_GroupID, uint gi_ : SV_GroupIndex) {\n";
+        unsigned s = meta.user_sgprs();
+        for (int k = 0; k < 3; k++)
+            if (meta.tgid_en(k)) init += fmt("  s%u = gid_.%c;\n", s++, "xyz"[k]);
+        if (meta.tg_size_en()) init += fmt("  s%u = (gi_ / 32u) << 6;   // console wave id in group (TG_SIZE)\n", s++);
+        init += "  uint t0_ = (gi_ / 32u) * 64u + gi_ % 32u;\n";
+        for (int cc = 0; cc < 2; cc++) {
+            std::string t = cc ? "(t0_ + 32u)" : "t0_";
+            for (unsigned k = 0; k < meta.tid_comps(); k++) {
+                std::string ex = k == 0 ? fmt("%s %% %uu", t.c_str(), nx) : k == 1 ? fmt("(%s / %uu) %% %uu", t.c_str(), nx, ny) : fmt("%s / %uu", t.c_str(), nx * ny);
+                init += fmt("  v%u_%d = %s;\n", k, cc, ex.c_str());
+            }
+        }
+        max_v = std::max(max_v, meta.tid_comps());
+    } else if (c.kind == ProgramKind::CS) {
         h << "#define RETURN return\n";
         h << "\n[numthreads(" << meta.numthreads[0] << ", " << meta.numthreads[1] << ", " << meta.numthreads[2] << ")]\n";
         h << "void main(uint3 gid_ : SV_GroupID, uint3 tid_ : SV_GroupThreadID, uint gi_ : SV_GroupIndex) {\n";
@@ -2569,39 +2715,85 @@ std::string Translator::generate() {
         if (!pos_in_sig) h << "  float4 pos_ : SV_Position;\n";
         h << sysv_outputs(sorted(osg));
         h << "};\n";
+        if (has_prims()) {
+            // Per-primitive outputs (system values other than these are left at their defaults).
+            h << "struct MSP {\n";
+            for (auto& e : sorted(psg)) {
+                if (e.sysval != 0) continue;
+                unsigned w = unsigned(__builtin_popcount(e.mask));
+                const char* b = e.comptype == 1 ? "uint" : e.comptype == 2 ? "int" : "float";
+                h << "  " << (w > 1 ? fmt("%s%u", b, w) : std::string(b)) << " p" << e.reg << "_" << __builtin_ctz(e.mask) << " : " << sem(e) << ";\n";
+            }
+            h << "};\n" << (dual ? "static MSP P_0, P_1;\n" : "static MSP P;\n");
+        }
         h << (uses_clipcull ? "static float clipcull_[8];\n" : "");
-        h << "groupshared uint ms_counts_;\nstatic MSV O;\nstatic uint prim_;\nstatic bool hasv_, hasp_;\n#define RETURN return\n";
-        h << "\nvoid prog(uint3 gid_, uint gi_) {\n";
         unsigned nt = meta.numthreads[0] * meta.numthreads[1] * meta.numthreads[2];
-        init += fmt("  s3 = ((gi_ / WAVE) << 24) | min(WAVE, %uu - (gi_ / WAVE) * WAVE);   // wave id, threads in wave\n", nt);
-        init += fmt("  v5 = gid_.x * %uu + gi_;   // flat thread id in the dispatch\n", nt);
+        if (dual) {
+            h << "groupshared uint ms_counts_;\nstatic MSV O_0, O_1;\nstatic uint prim__0, prim__1;\nstatic bool hasv__0, hasv__1, hasp__0, hasp__1;\n";
+            if (uses_clipcull) h << "static float clipcull__0[8], clipcull__1[8];\n";
+            h << "#define RETURN return\n\nvoid prog(uint3 gid_, uint gi_) {\n";
+            // PC thread gi_ (32-lane waves) runs console threads t0 = (gi_/32)*64 + gi_%32 and t0 + 32.
+            init += fmt("  s3 = ((gi_ / 32u) << 24) | min(64u, %uu - (gi_ / 32u) * 64u);   // console wave id, threads in wave\n", nt);
+            init += fmt("  { uint t0_ = (gi_ / 32u) * 64u + gi_ %% 32u; v5_0 = gid_.x * %uu + t0_; v5_1 = v5_0 + 32u; }\n", nt);
+        } else {
+            h << "groupshared uint ms_counts_;\nstatic MSV O;\nstatic uint prim_;\nstatic bool hasv_, hasp_;\n#define RETURN return\n";
+            h << "\nvoid prog(uint3 gid_, uint gi_) {\n";
+            init += fmt("  s3 = ((gi_ / WAVE) << 24) | min(WAVE, %uu - (gi_ / WAVE) * WAVE);   // wave id, threads in wave\n", nt);
+            init += fmt("  v5 = gid_.x * %uu + gi_;   // flat thread id in the dispatch\n", nt);
+        }
     }
-    h << "  L = WaveGetLaneIndex();\n";
-    h << (c.kind == ProgramKind::CS || c.kind == ProgramKind::MS ? "  LG = gi_ % WAVE;\n" : "  LG = L;\n");
+    if (dual) h << "  uint LP_ = WaveGetLaneIndex();   // PC lane; console lanes LP_ and LP_ + 32\n  L = LP_; LG = L;\n";
+    else {
+        h << "  L = WaveGetLaneIndex();\n";
+        h << (c.kind == ProgramKind::CS || c.kind == ProgramKind::MS ? "  LG = gi_ % WAVE;\n" : "  LG = L;\n");
+    }
     h << "  uint snull = 0u;\n";
     for (unsigned i = 0; i < kNumS; i++) h << (i % 16 == 0 ? "  uint " : ", ") << "s" << i << " = 0u" << (i % 16 == 15 ? ";\n" : "");
-    const unsigned nv = std::max(max_v, 4u);
-    for (unsigned i = 0; i < nv; i++) h << (i % 16 == 0 ? "  uint " : ", ") << "v" << i << " = 0u" << (i % 16 == 15 || i + 1 == nv ? ";\n" : "");
-    h << "  bool scc = false, kexec = true, kvcc = false;\n";
+    const unsigned nv = std::max(max_v, 6u);
+    for (int c = 0; c < (dual ? 2 : 1); c++)
+        for (unsigned i = 0; i < nv; i++)
+            h << (i % 16 == 0 ? "  uint " : ", ") << "v" << i << (dual ? fmt("_%d", c) : std::string()) << " = 0u" << (i % 16 == 15 || i + 1 == nv ? ";\n" : "");
+    h << (dual ? "  bool scc = false, kexec_0 = true, kexec_1 = true, kvcc_0 = false, kvcc_1 = false;\n" : "  bool scc = false, kexec = true, kvcc = false;\n");
     for (size_t d : dyn_loads) h << "  uint dyn" << d << " = 0u;\n";
     for (auto& a : meta.args) {
         if (a.kind != 0 || a.loc >= 32 || a.param >= rs.params.size() || rs.params[a.param].type != ParamType::Constants) continue;
         for (unsigned k = 0; k < a.size; k++) h << fmt("  s%u = RC%u_d[%u][%u];\n", a.loc + k, a.param, k / 4, k % 4);
     }
-    h << "  { uint2 b_ = ballot2(true); s126 = b_.x; s127 = " << (W == 64 ? "b_.y" : "0u") << "; }\n";
+    if (dual) h << "  s126 = ballot2(true).x; s127 = s126;\n";
+    else h << "  { uint2 b_ = ballot2(true); s126 = b_.x; s127 = " << (W == 64 ? "b_.y" : "0u") << "; }\n";
     h << init;
     h << body.str();
     h << "}\n";
-    if (c.kind == ProgramKind::MS) {
-        h << "\n[outputtopology(\"triangle\")]\n[numthreads(" << meta.numthreads[0] << ", " << meta.numthreads[1] << ", " << meta.numthreads[2] << ")]\n";
-        h << "void main(uint gi_ : SV_GroupIndex, uint3 gid_ : SV_GroupID, out vertices MSV verts[" << ms_max_verts << "], out indices uint3 tris[" << ms_max_prims << "]) {\n";
+    if (c.kind == ProgramKind::MS && dual) {
+        unsigned nt = meta.numthreads[0] * meta.numthreads[1] * meta.numthreads[2];
+        // Mesh shaders cannot request a wave size; the dual mapping assumes 32-lane waves (NVIDIA;
+        // other GPUs choose their mesh wave size).
+        h << "\n[outputtopology(\"triangle\")]\n[numthreads(" << nt / 2 << ", 1, 1)]\n";
+        h << "void main(uint gi_ : SV_GroupIndex, uint3 gid_ : SV_GroupID, out vertices MSV verts[" << ms_max_verts << "], out indices uint3 tris[" << ms_max_prims << "]" << (has_prims() ? fmt(", out primitives MSP prims[%u]", ms_max_prims) : std::string()) << ") {\n";
         h << "  if (gi_ == 0u) ms_counts_ = 0u;\n  GroupMemoryBarrierWithGroupSync();\n";
+        if (has_prims()) h << "  P_0 = (MSP)0; P_1 = (MSP)0;\n";
+        h << "  O_0 = (MSV)0; O_1 = (MSV)0; prim__0 = 0u; prim__1 = 0u; hasp__0 = false; hasp__1 = false; hasv__0 = false; hasv__1 = false;\n";
+        h << "  prog(gid_, gi_);\n  GroupMemoryBarrierWithGroupSync();\n";
+        h << "  uint nv = min(ms_counts_ & 0xfffu, " << ms_max_verts << "u), np = min(ms_counts_ >> 12, " << ms_max_prims << "u);\n";
+        h << "  SetMeshOutputCounts(nv, np);\n";
+        h << "  uint t0 = (gi_ / 32u) * 64u + gi_ % 32u, t1 = t0 + 32u;\n";
+        h << "  if (t0 < nv) verts[t0] = O_0;\n  if (t1 < nv) verts[t1] = O_1;\n";
+        if (has_prims()) h << "  if (t0 < np) prims[t0] = P_0;\n  if (t1 < np) prims[t1] = P_1;\n";
+        h << "  if (t0 < np) tris[t0] = (hasp__0 && (prim__0 >> 31) == 0u) ? uint3(prim__0 & 0x3ffu, (prim__0 >> 10) & 0x3ffu, (prim__0 >> 20) & 0x3ffu) : uint3(0u, 0u, 0u);\n";
+        h << "  if (t1 < np) tris[t1] = (hasp__1 && (prim__1 >> 31) == 0u) ? uint3(prim__1 & 0x3ffu, (prim__1 >> 10) & 0x3ffu, (prim__1 >> 20) & 0x3ffu) : uint3(0u, 0u, 0u);\n";
+        h << "}\n";
+    } else if (c.kind == ProgramKind::MS) {
+        h << "\n[outputtopology(\"triangle\")]\n[numthreads(" << meta.numthreads[0] << ", " << meta.numthreads[1] << ", " << meta.numthreads[2] << ")]\n";
+        h << "void main(uint gi_ : SV_GroupIndex, uint3 gid_ : SV_GroupID, out vertices MSV verts[" << ms_max_verts << "], out indices uint3 tris[" << ms_max_prims << "]" << (has_prims() ? fmt(", out primitives MSP prims[%u]", ms_max_prims) : std::string()) << ") {\n";
+        h << "  if (gi_ == 0u) ms_counts_ = 0u;\n  GroupMemoryBarrierWithGroupSync();\n";
+        if (has_prims()) h << "  P = (MSP)0;\n";
         h << "  O = (MSV)0; prim_ = 0u; hasv_ = false; hasp_ = false;\n";
         h << "  prog(gid_, gi_);\n  GroupMemoryBarrierWithGroupSync();\n";
         if (uses_clipcull) h << "  " << clipcull_copy() << "\n";
         h << "  uint nv = min(ms_counts_ & 0xfffu, " << ms_max_verts << "u), np = min(ms_counts_ >> 12, " << ms_max_prims << "u);\n";
         h << "  SetMeshOutputCounts(nv, np);\n";
         h << "  if (gi_ < nv) verts[gi_] = O;   // unexported slots stay zero\n";
+        if (has_prims()) h << "  if (gi_ < np) prims[gi_] = P;\n";
         h << "  if (gi_ < np) tris[gi_] = (hasp_ && (prim_ >> 31) == 0u) ? uint3(prim_ & 0x3ffu, (prim_ >> 10) & 0x3ffu, (prim_ >> 20) & 0x3ffu) : uint3(0u, 0u, 0u);\n";
         h << "}\n";
     }
@@ -2636,7 +2828,7 @@ TranslateResult translate(const Container& c, const RootSig& rs, const Translate
         return r;
     }
     r.ok = true;
-    if (c.kind == ProgramKind::CS) r.profile = t.uses_quad ? "cs_6_6" : "cs_6_0";
+    if (c.kind == ProgramKind::CS) r.profile = t.uses_quad || (t.dual && opt.wave_size_attr) ? "cs_6_6" : "cs_6_0";
     else if (c.kind == ProgramKind::PS) r.profile = "ps_6_0";
     else if (c.kind == ProgramKind::MS) r.profile = "ms_6_5";
     else r.profile = "vs_6_0";

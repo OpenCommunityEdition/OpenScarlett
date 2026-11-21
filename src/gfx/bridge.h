@@ -24,8 +24,10 @@ HRESULT_T create_device(PcObj* outDevice);
 const char* adapter_name();
 uint64_t adapter_luid();  // the PC adapter's LUID (HighPart << 32 | LowPart)
 // Host capability probe. Filled at device creation.
-struct Caps { bool meshShaders; bool raytracing; bool vrs; bool samplerFeedback; int featureLevel; };
+struct Caps { bool meshShaders; bool raytracing; bool vrs; bool samplerFeedback; int featureLevel; unsigned waveMin, waveMax; };
 const Caps& caps();
+// PC wave widths and shader model 6.6 support (shader translation picks the lane mapping).
+void set_host_waves(unsigned min_lanes, unsigned max_lanes, bool sm66);
 // PC stand-in for a console format that PC GPUs cannot render to (0 = none needed).
 int format_stand_in(int format);
 void release(PcObj o);

@@ -8,6 +8,8 @@
 // XSL_SHADER_CACHE=<dir> overrides the cache directory (%LOCALAPPDATA%\OpenScarlett\shadercache).
 // XSL_DUMP_SHADERS=<dir> writes each translated container and its HLSL.
 // XSL_NATIVE_STAGES=VS,PS,... limits translation to those stages (testing).
+// XSL_SKIP_SHADERS=<key,...> treats those shaders as untranslatable (debugging GPU hangs).
+// XSL_LOOP_GUARD=<n> ends a shader invocation after n loop iterations (default 4M; runaway loops).
 #include <windows.h>
 
 #include <cstdio>
@@ -75,7 +77,7 @@ std::vector<uint8_t> with_root_signature(const std::vector<uint8_t>& dxil, const
     parts.push_back({gpucode::fourcc("RTS0"), *rs});
     return build_container(parts, dxil.data());
 }
-constexpr const char* kVersion = "gpucode-6";
+constexpr const char* kVersion = "gpucode-13";
 
 int mode() {
     static int m = [] {
@@ -198,6 +200,13 @@ thread_local std::string t_keys;             // translated shaders since reset (
 
 void reset_untranslated() { t_untranslated = false; t_keys.clear(); }
 bool had_untranslated() { return t_untranslated; }
+static unsigned g_host_wave_min = 32, g_host_wave_max = 32;
+static bool g_host_sm66 = false;
+void set_host_waves(unsigned min_lanes, unsigned max_lanes, bool sm66) {
+    g_host_wave_min = min_lanes;
+    g_host_wave_max = max_lanes;
+    g_host_sm66 = sm66;
+}
 const char* translated_keys() { return t_keys.c_str(); }
 
 bool native_translate(const void* in, size_t n, void** out, size_t* outSize) {
@@ -213,8 +222,24 @@ bool native_translate(const void* in, size_t n, void** out, size_t* outSize) {
         return false;
     }
     if (c.has_bitcode && mode() != 1) return false;
-    if (const char* st = getenv("XSL_NATIVE_STAGES"); st && *st && !strstr(st, gpucode::kind_name(c.kind))) return false;
+    if (const char* st = getenv("XSL_NATIVE_STAGES"); st && *st && !strstr(st, gpucode::kind_name(c.kind))) {
+        t_untranslated = !c.has_bitcode;   // excluded stage: like an untranslatable shader (placeholder pipeline)
+        static volatile long w = 0;
+        if (InterlockedIncrement(&w) <= 3) XSL_INFO(CH, "%s shader excluded by XSL_NATIVE_STAGES (DXIL program: %d)", gpucode::kind_name(c.kind), (int)c.has_bitcode);
+        return false;
+    }
     uint64_t key = fnv(kVersion, strlen(kVersion), fnv(in, n));
+    if (const char* g = getenv("XSL_LOOP_GUARD"); g && *g) key = fnv(g, strlen(g), key);   // changes the output
+    if (getenv("XSL_NO_BARRIER_SYNC")) key = fnv("nb", 2, key);
+    if (const char* sk = getenv("XSL_SKIP_SHADERS"); sk && *sk) {   // debugging: these keys become placeholders
+        char k[20];
+        snprintf(k, sizeof k, "%016llx", (unsigned long long)key);
+        if (strstr(sk, k)) {
+            XSL_INFO(CH, "shader %s skipped (XSL_SKIP_SHADERS)", k);
+            t_untranslated = !c.has_bitcode;
+            return false;
+        }
+    }
     {
         std::lock_guard<std::mutex> g(g_lock);
         if (g_failed.count(key)) { t_untranslated = !c.has_bitcode; return false; }
@@ -236,7 +261,14 @@ bool native_translate(const void* in, size_t n, void** out, size_t* outSize) {
             t_untranslated = !c.has_bitcode;
             return false;
         }
-        gpucode::TranslateResult r = gpucode::translate(c, rs);
+        gpucode::TranslateOptions o;
+        // 32-lane PC waves run console wave64 code two lanes per thread; without shader model 6.6
+        // the wave size cannot be requested, so that needs a GPU whose waves are always 32 lanes.
+        o.wave_size_attr = g_host_sm66;
+        if (const char* g = getenv("XSL_LOOP_GUARD"); g && *g) o.loop_guard = (unsigned)strtoul(g, nullptr, 0);
+        if (getenv("XSL_NO_BARRIER_SYNC")) o.barrier_sync = false;
+        o.wave64_dual = g_host_wave_min <= 32 && (g_host_wave_max <= 32 || g_host_sm66);
+        gpucode::TranslateResult r = gpucode::translate(c, rs, o);
         if (!r.ok) {
             XSL_WARN(CH, "shader %016llx (%s): not translated: %s", (unsigned long long)key, gpucode::kind_name(c.kind), r.error.c_str());
             dump(key, in, n, "", r.error);

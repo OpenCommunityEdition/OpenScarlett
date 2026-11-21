@@ -9,6 +9,7 @@
 #include <cstring>
 #include <map>
 #include <set>
+#include <deque>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -48,13 +49,10 @@ bool g_dred = false;
 // With DRED on: per command list, the pipeline names marked so far (DRED's own breadcrumb contexts
 // need Windows 11; the marker count before the failing op indexes this list).
 std::mutex g_mark_lock;
-std::map<void*, std::vector<std::wstring>> g_marks;
-void* identity(void* p) {   // canonical IUnknown pointer (DRED reports a different interface pointer)
-    IUnknown* u = nullptr;
-    if (!p || FAILED(static_cast<IUnknown*>(p)->QueryInterface(IID_PPV_ARGS(&u)))) return p;
-    u->Release();
-    return u;
-}
+std::map<std::wstring, std::vector<std::wstring>> g_marks;   // list debug name -> pipelines marked since Reset
+std::map<void*, std::wstring> g_list_name;   // list -> current recording's name
+std::deque<std::wstring> g_mark_order;      // oldest recordings are forgotten first
+std::wstring list_key(void* l) { auto it = g_list_name.find(l); return it == g_list_name.end() ? std::wstring() : it->second; }
 HRESULT logged(HRESULT hr, const char* what) {
     if (FAILED(hr)) {
         XSL_ERR(CH, "%s failed %08lx", what, hr);
@@ -95,30 +93,41 @@ void report_device_removed(ID3D12Device* dev) {
     ID3D12DeviceRemovedExtendedData1* dred1 = nullptr;
     D3D12_DRED_AUTO_BREADCRUMBS_OUTPUT1 bc{};
     if (SUCCEEDED(dred->QueryInterface(IID_PPV_ARGS(&dred1))) && SUCCEEDED(dred1->GetAutoBreadcrumbsOutput1(&bc))) {
-        int lists = 0;
-        for (auto* n = bc.pHeadAutoBreadcrumbNode; n && lists < 64; n = n->pNext, lists++) {
-            UINT done = n->pLastBreadcrumbValue ? *n->pLastBreadcrumbValue : 0;
-            if (done >= n->BreadcrumbCount) continue;   // completed
-            XSL_ERR(CH, "DRED: a command list stopped at op %u of %u", done, n->BreadcrumbCount);
-            {
-                UINT marks = 0;
-                for (UINT k = 0; k <= done && k < n->BreadcrumbCount; k++) marks += n->pCommandHistory[k] == D3D12_AUTO_BREADCRUMB_OP_SETMARKER;
-                std::lock_guard<std::mutex> g(g_mark_lock);
-                auto it = g_marks.find(identity((void*)n->pCommandList));
-                if (it != g_marks.end() && marks && marks <= it->second.size())
-                    XSL_ERR(CH, "DRED: pipeline in use: %ls", it->second[marks - 1].c_str());
-                else
-                    XSL_ERR(CH, "DRED: %u markers before the op; list %s (%zu named pipelines), %zu lists tracked", marks,
-                            it == g_marks.end() ? "untracked" : "tracked", it == g_marks.end() ? (size_t)0 : it->second.size(), g_marks.size());
-                if (it != g_marks.end() && !it->second.empty()) XSL_ERR(CH, "DRED: last named pipeline on the list: %ls", it->second.back().c_str());
+        // Lists that started but did not finish first (the hang), then a count of those queued
+        // behind them. The pipeline names come from the breadcrumb contexts of SetMarker (no calls
+        // on the reported list: it may be gone).
+        int waiting = 0, n_lists = 0;
+        bool shown_waiting = false;
+        for (int pass = 0; pass < 2; pass++, n_lists = 0)
+            for (auto* n = bc.pHeadAutoBreadcrumbNode; n && n_lists < 4096; n = n->pNext, n_lists++) {
+                UINT done = n->pLastBreadcrumbValue ? *n->pLastBreadcrumbValue : 0;
+                if (done >= n->BreadcrumbCount) continue;   // completed
+                if (pass == 0 && done == 0) { waiting++; continue; }
+                if (pass == 1 && done != 0) continue;
+                if (pass == 1 && shown_waiting) break;    // print one not-started list only
+                if (pass == 1) shown_waiting = true;
+                XSL_ERR(CH, "DRED: a command list (queue %ls) stopped at op %u of %u", n->pCommandQueueDebugNameW ? n->pCommandQueueDebugNameW : L"?",
+                        done, n->BreadcrumbCount);
+                if (n->pCommandListDebugNameW) {
+                    UINT marks = 0;
+                    for (UINT k = 0; k <= done && k < n->BreadcrumbCount; k++) marks += n->pCommandHistory[k] == D3D12_AUTO_BREADCRUMB_OP_SETMARKER;
+                    std::lock_guard<std::mutex> g(g_mark_lock);
+                    std::wstring nm = n->pCommandListDebugNameW;
+                    if (size_t sp = nm.find(L" (debug layer"); sp != std::wstring::npos) nm.resize(sp);
+                    auto it = g_marks.find(nm);
+                    if (it != g_marks.end() && marks && marks <= it->second.size())
+                        XSL_ERR(CH, "DRED: pipeline in use: %ls (marker %u of %zu)", it->second[marks - 1].c_str(), marks, it->second.size());
+                    else
+                        XSL_ERR(CH, "DRED: list %ls: %u markers, %s", n->pCommandListDebugNameW, marks, it == g_marks.end() ? "no history" : "history mismatch");
+                }
+                for (UINT k = done > 4 ? done - 4 : 0; k < n->BreadcrumbCount && k < done + 3; k++) {
+                    const wchar_t* ctx = L"";
+                    for (UINT c = 0; c < n->BreadcrumbContextsCount; c++)
+                        if (n->pBreadcrumbContexts[c].BreadcrumbIndex <= k) ctx = n->pBreadcrumbContexts[c].pContextString;
+                    XSL_ERR(CH, "DRED:   %s op %u: %d  [last marker: %ls]", k == done ? ">" : " ", k, (int)n->pCommandHistory[k], ctx ? ctx : L"");
+                }
             }
-            for (UINT k = done > 3 ? done - 3 : 0; k < n->BreadcrumbCount && k < done + 3; k++) {
-                const wchar_t* ctx = L"";
-                for (UINT c = 0; c < n->BreadcrumbContextsCount; c++)
-                    if (n->pBreadcrumbContexts[c].BreadcrumbIndex <= k) ctx = n->pBreadcrumbContexts[c].pContextString;
-                XSL_ERR(CH, "DRED:   %s op %u: %d  [last marker: %ls]", k == done ? ">" : " ", k, (int)n->pCommandHistory[k], ctx);
-            }
-        }
+        XSL_ERR(CH, "DRED: %d unfinished lists had not started", waiting);
     }
     if (dred1) dred1->Release();
     D3D12_DRED_PAGE_FAULT_OUTPUT pf{};
@@ -173,19 +182,26 @@ HRESULT_T create_device(PcObj* out) {
     D3D12_FEATURE_DATA_D3D12_OPTIONS7 o7{};
     D3D12_FEATURE_DATA_D3D12_OPTIONS5 o5{};
     D3D12_FEATURE_DATA_D3D12_OPTIONS6 o6{};
+    D3D12_FEATURE_DATA_D3D12_OPTIONS1 o1{};
     D3D_FEATURE_LEVEL fls[] = {D3D_FEATURE_LEVEL_12_2, D3D_FEATURE_LEVEL_12_1, D3D_FEATURE_LEVEL_12_0, D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0};
     D3D12_FEATURE_DATA_FEATURE_LEVELS fl{5, fls, D3D_FEATURE_LEVEL_11_0};
     dev->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS7, &o7, sizeof o7);
     dev->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS5, &o5, sizeof o5);
     dev->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS6, &o6, sizeof o6);
     dev->CheckFeatureSupport(D3D12_FEATURE_FEATURE_LEVELS, &fl, sizeof fl);
+    dev->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS1, &o1, sizeof o1);
+    g_caps.waveMin = o1.WaveLaneCountMin ? o1.WaveLaneCountMin : 32;
+    g_caps.waveMax = o1.WaveLaneCountMax ? o1.WaveLaneCountMax : 32;
+    D3D12_FEATURE_DATA_SHADER_MODEL sm{D3D_SHADER_MODEL_6_6};
+    if (FAILED(dev->CheckFeatureSupport(D3D12_FEATURE_SHADER_MODEL, &sm, sizeof sm))) sm.HighestShaderModel = D3D_SHADER_MODEL_6_0;
+    set_host_waves(g_caps.waveMin, g_caps.waveMax, sm.HighestShaderModel >= D3D_SHADER_MODEL_6_6);
     g_caps.meshShaders = o7.MeshShaderTier != D3D12_MESH_SHADER_TIER_NOT_SUPPORTED;
     g_caps.samplerFeedback = o7.SamplerFeedbackTier != D3D12_SAMPLER_FEEDBACK_TIER_NOT_SUPPORTED;
     g_caps.raytracing = o5.RaytracingTier != D3D12_RAYTRACING_TIER_NOT_SUPPORTED;
     g_caps.vrs = o6.VariableShadingRateTier != D3D12_VARIABLE_SHADING_RATE_TIER_NOT_SUPPORTED;
     g_caps.featureLevel = fl.MaxSupportedFeatureLevel;
-    XSL_INFO(CH, "host caps: feature level %x, mesh shaders %s, ray tracing %s, VRS %s, sampler feedback %s", g_caps.featureLevel,
-             g_caps.meshShaders ? "yes" : "NO", g_caps.raytracing ? "yes" : "NO", g_caps.vrs ? "yes" : "NO", g_caps.samplerFeedback ? "yes" : "NO");
+    XSL_INFO(CH, "host caps: feature level %x, shader model %x, waves %u-%u lanes, mesh shaders %s, ray tracing %s, VRS %s, sampler feedback %s", g_caps.featureLevel,
+             (unsigned)sm.HighestShaderModel, g_caps.waveMin, g_caps.waveMax, g_caps.meshShaders ? "yes" : "NO", g_caps.raytracing ? "yes" : "NO", g_caps.vrs ? "yes" : "NO", g_caps.samplerFeedback ? "yes" : "NO");
     if (env_on("XSL_D3D12_DEBUG") && SUCCEEDED(dev->QueryInterface(IID_PPV_ARGS(&g_info)))) {
         g_info->SetMessageCountLimit(4096);
         // The layer probes whether resources can be mapped (unified-memory emulation); the
@@ -890,7 +906,17 @@ HRESULT_T list_close(PcObj l) {
 }
 void list_set_pso(PcObj l, PcObj pso);
 HRESULT_T list_reset(PcObj l, PcObj a, PcObj pso) {
-    if (g_dred) { std::lock_guard<std::mutex> g(g_mark_lock); g_marks[identity(l)].clear(); }
+    if (g_dred) {   // the debug name lets a DRED report find the list's marker history
+        static uint64_t gen = 0;
+        std::lock_guard<std::mutex> g(g_mark_lock);
+        wchar_t b[64];
+        swprintf(b, 64, L"xsl list %p #%llu", l, (unsigned long long)++gen);   // one name per recording
+        L->SetName(b);
+        g_list_name[l] = b;
+        g_marks[b];
+        g_mark_order.push_back(b);
+        while (g_mark_order.size() > 8192) { g_marks.erase(g_mark_order.front()); g_mark_order.pop_front(); }
+    }
     HRESULT hr = logged(L->Reset(as<ID3D12CommandAllocator>(a), as<ID3D12PipelineState>(pso)), "CommandList::Reset");
     if (pso && SUCCEEDED(hr)) list_set_pso(l, pso);   // initial pipeline: marked like SetPipelineState
     return hr;
@@ -935,7 +961,8 @@ void list_set_pso(PcObj l, PcObj pso) {
         {
             L->SetMarker(0, name, n);
             std::lock_guard<std::mutex> g(g_mark_lock);
-            g_marks[identity(l)].push_back(name);
+            auto it = g_marks.find(list_key(l));
+            if (it != g_marks.end()) it->second.push_back(name);
         }
     }
 }
