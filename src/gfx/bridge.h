@@ -115,6 +115,10 @@ void list_draw_indexed(PcObj l, uint32_t ipi, uint32_t inst, uint32_t si, int32_
 void list_dispatch(PcObj l, uint32_t x, uint32_t y, uint32_t z);
 void list_dispatch_mesh(PcObj l, uint32_t x, uint32_t y, uint32_t z);
 void list_execute_indirect(PcObj l, PcObj sig, uint32_t max, PcObj args, uint64_t argOff, PcObj count, uint64_t countOff);
+// XSL_D3D12_DRED: copies the first argument bytes (and the count) of an ExecuteIndirect to memory the
+// device-removed report prints; the buffers must be in a state that allows copying from them.
+bool dred_on();
+void list_record_indirect(PcObj l, PcObj args, uint64_t argOff, PcObj count, uint64_t countOff);
 void list_clear_uav_uint(PcObj l, uint64_t gpu, uint64_t cpu, PcObj res, const uint32_t* v, uint32_t n, const void* rects);
 void list_clear_uav_float(PcObj l, uint64_t gpu, uint64_t cpu, PcObj res, const float* v, uint32_t n, const void* rects);
 // Writes a 32-bit value to a GPU VA once prior work completes (MARKER_OUT) or immediately (MARKER_IN).

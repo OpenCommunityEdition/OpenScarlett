@@ -141,6 +141,16 @@ int main(int argc, char** argv) {
             if (sscanf(p, "StructuredBuffer<E_R%d>", &n) == 1 && q && sscanf(q, "register(%c%d, space%d)", &kind, &r, &sp) == 3)
                 stride_of[std::string(1, kind) + std::to_string(r) + "/" + std::to_string(sp)] = words.count(n) ? words[n] : 4;
         }
+        for (const char* p = s; (p = strstr(p, "Buffer<")); p++) {   // typed buffers (Buffer<T>, RWBuffer<T>)
+            if (p > s && (p[-1] == 'd' || p[-1] == 'e')) continue;   // StructuredBuffer<, ...
+            const char* q = strstr(p, "register(");
+            const char* nl = strchr(p, '\n');
+            int r, sp;
+            char kind;
+            if (!q || (nl && q > nl)) continue;
+            if (sscanf(q, "register(%c%d, space%d)", &kind, &r, &sp) == 3)
+                uint_tex[std::string(1, kind) + std::to_string(r) + "/" + std::to_string(sp)] = !strncmp(p + 7, "uint", 4) || !strncmp(p + 7, "int", 3);
+        }
         for (const char* p = s; (p = strstr(p, "Texture")); p++) {
             const char* lt = strchr(p, '<');
             const char* q = strstr(p, "register(");
@@ -252,7 +262,8 @@ int main(int argc, char** argv) {
                     unsigned stride = kind == 12 ? (stride_of.count(key) ? stride_of[key] : 4) : 4;
                     UINT n = (UINT)((1u << 20) / stride);
                     bool raw = kind == 11 || kind == 0;
-                    DXGI_FORMAT f = raw ? DXGI_FORMAT_R32_TYPELESS : kind == 10 ? DXGI_FORMAT_R32_UINT : DXGI_FORMAT_UNKNOWN;
+                    bool tu = uint_tex.count(key) ? uint_tex[key] : true;
+                    DXGI_FORMAT f = raw ? DXGI_FORMAT_R32_TYPELESS : kind == 10 ? (tu ? DXGI_FORMAT_R32_UINT : DXGI_FORMAT_R32_FLOAT) : DXGI_FORMAT_UNKNOWN;
                     if (uav) {
                         D3D12_UNORDERED_ACCESS_VIEW_DESC v{};
                         v.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;

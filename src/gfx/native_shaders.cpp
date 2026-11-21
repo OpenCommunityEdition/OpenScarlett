@@ -9,7 +9,7 @@
 // XSL_DUMP_SHADERS=<dir> writes each translated container and its HLSL.
 // XSL_NATIVE_STAGES=VS,PS,... limits translation to those stages (testing).
 // XSL_SKIP_SHADERS=<key,...> treats those shaders as untranslatable (debugging GPU hangs).
-// XSL_LOOP_GUARD=<n> ends a shader invocation after n loop iterations (default 4M; runaway loops).
+// XSL_LOOP_GUARD=<n> ends a shader invocation after n loop iterations (default 64K, 4M with barriers; runaway loops).
 #include <windows.h>
 
 #include <cstdio>
@@ -77,7 +77,7 @@ std::vector<uint8_t> with_root_signature(const std::vector<uint8_t>& dxil, const
     parts.push_back({gpucode::fourcc("RTS0"), *rs});
     return build_container(parts, dxil.data());
 }
-constexpr const char* kVersion = "gpucode-14";
+constexpr const char* kVersion = "gpucode-16";
 
 int mode() {
     static int m = [] {
@@ -265,7 +265,7 @@ bool native_translate(const void* in, size_t n, void** out, size_t* outSize) {
         // 32-lane PC waves run console wave64 code two lanes per thread; without shader model 6.6
         // the wave size cannot be requested, so that needs a GPU whose waves are always 32 lanes.
         o.wave_size_attr = g_host_sm66;
-        if (const char* g = getenv("XSL_LOOP_GUARD"); g && *g) o.loop_guard = (unsigned)strtoul(g, nullptr, 0);
+        if (const char* g = getenv("XSL_LOOP_GUARD"); g && *g) o.loop_guard = o.loop_guard_barrier = (unsigned)strtoul(g, nullptr, 0);
         if (getenv("XSL_NO_BARRIER_SYNC")) o.barrier_sync = false;
         o.wave64_dual = g_host_wave_min <= 32 && (g_host_wave_max <= 32 || g_host_sm66);
         gpucode::TranslateResult r = gpucode::translate(c, rs, o);

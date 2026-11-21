@@ -8,6 +8,8 @@
 #include <vector>
 
 #include "xs_object.h"
+#include "xs_cbv.h"
+#include "xs_unified.h"
 
 void xsl_fixed_time_install();   // fixed_time.cpp (global namespace)
 
@@ -269,6 +271,15 @@ HRESULT D3DAPI D_CreatePipelineState(ID3D12Device2* d, const D3D12_PIPELINE_STAT
     return pso_result(DEV(d), hr, pso, riid, out);
 }
 HRESULT D3DAPI D_CreateCommandSignature(ID3D12Device* d, const D3D12_COMMAND_SIGNATURE_DESC* desc, ID3D12RootSignature* rs, REFIID riid, void** out) {
+    if (desc) {
+        static volatile long n = 0;
+        if (InterlockedIncrement(&n) <= 40) {
+            char t[160] = "";
+            for (UINT i = 0; i < desc->NumArgumentDescs && i < 8; i++)
+                snprintf(t + strlen(t), sizeof t - strlen(t), " %d", (int)desc->pArgumentDescs[i].Type);
+            XSL_INFO(CH, "CreateCommandSignature: stride %u, %u arguments (types%s), root signature %p", desc->ByteStride, desc->NumArgumentDescs, t, (void*)rs);
+        }
+    }
     PcObj sig = nullptr;
     HRESULT hr = pc::create_command_signature(DPC(d), desc, P(rs), &sig);
     if (FAILED(hr)) { XSL_ERR(CH, "CreateCommandSignature failed %08lx", hr); return hr; }
@@ -357,6 +368,14 @@ void D3DAPI D_CreateUAV(ID3D12Device* d, ID3D12Resource* r, ID3D12Resource* c, c
     write_view(h.ptr, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, [&](uint64_t ph) { pc::create_uav(DPC(d), P(r), P(c), v, ph); });
 }
 void D3DAPI D_CreateCBV(ID3D12Device* d, const D3D12_CONSTANT_BUFFER_VIEW_DESC* v, D3D12_CPU_DESCRIPTOR_HANDLE h) {
+    // Console CBVs need 16-byte alignment, PC ones 256: unaligned views point at an aligned copy.
+    D3D12_CONSTANT_BUFFER_VIEW_DESC x;
+    if (v && v->BufferLocation) {
+        x = *v;
+        x.BufferLocation = gpu_va(DEV(d), v->BufferLocation);
+        if (x.BufferLocation & 255) x.BufferLocation = cbv_fix_view(DEV(d), v->BufferLocation, x.BufferLocation, v->SizeInBytes);
+        v = &x;
+    }
     write_view(h.ptr, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, [&](uint64_t ph) { pc::create_cbv(DPC(d), v, ph); });
 }
 void D3DAPI D_CreateSampler(ID3D12Device* d, const D3D12_SAMPLER_DESC* v, D3D12_CPU_DESCRIPTOR_HANDLE h) { pc::create_sampler(DPC(d), v, h.ptr); }

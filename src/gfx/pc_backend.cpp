@@ -42,6 +42,13 @@ void dump_debug_messages() {
     g_info->ClearStoredMessages();
 }
 ID3D12Device* g_main_device = nullptr;   // for removal reports from calls that do not pass it
+// Indirect-argument record ring (readback memory stays readable after device removal).
+constexpr uint32_t kEiSlots = 65536, kEiBytes = 48;
+ID3D12Resource* g_ei_rb = nullptr;
+uint32_t* g_ei_map = nullptr;
+volatile long g_ei_next = 0;
+struct EiInfo { std::wstring list; void* res; uint64_t off; };
+std::vector<EiInfo> g_ei_info;   // per slot, CPU side
 }  // namespace
 void report_device_removed(ID3D12Device* dev);
 namespace {
@@ -53,6 +60,10 @@ std::map<std::wstring, std::vector<std::wstring>> g_marks;   // list debug name 
 std::map<void*, std::wstring> g_list_name;   // list -> current recording's name
 std::deque<std::wstring> g_mark_order;      // oldest recordings are forgotten first
 std::wstring list_key(void* l) { auto it = g_list_name.find(l); return it == g_list_name.end() ? std::wstring() : it->second; }
+// Any call that reports device removal triggers the DRED report (once).
+void note_removed(HRESULT hr) {
+    if (hr == DXGI_ERROR_DEVICE_REMOVED || hr == DXGI_ERROR_DEVICE_HUNG || hr == DXGI_ERROR_DEVICE_RESET) report_device_removed(g_main_device);
+}
 HRESULT logged(HRESULT hr, const char* what) {
     if (FAILED(hr)) {
         XSL_ERR(CH, "%s failed %08lx", what, hr);
@@ -108,6 +119,18 @@ void report_device_removed(ID3D12Device* dev) {
                 if (pass == 1) shown_waiting = true;
                 XSL_ERR(CH, "DRED: a command list (queue %ls) stopped at op %u of %u", n->pCommandQueueDebugNameW ? n->pCommandQueueDebugNameW : L"?",
                         done, n->BreadcrumbCount);
+                if (n->pCommandListDebugNameW && g_ei_map && !g_ei_info.empty()) {
+                    std::wstring nm = n->pCommandListDebugNameW;
+                    if (size_t sp = nm.find(L" (debug layer"); sp != std::wstring::npos) nm.resize(sp);
+                    int shown = 0;
+                    for (uint32_t k = 0; k < kEiSlots && shown < 6; k++) {
+                        if (g_ei_info[k].list != nm) continue;
+                        const uint32_t* e = g_ei_map + k * (kEiBytes / 4);
+                        XSL_ERR(CH, "DRED:   indirect args of this list (buffer %p + %llu): %08x %08x %08x %08x", g_ei_info[k].res,
+                                (unsigned long long)g_ei_info[k].off, e[0], e[1], e[2], e[3]);
+                        shown++;
+                    }
+                }
                 if (n->pCommandListDebugNameW) {
                     UINT marks = 0;
                     for (UINT k = 0; k <= done && k < n->BreadcrumbCount; k++) marks += n->pCommandHistory[k] == D3D12_AUTO_BREADCRUMB_OP_SETMARKER;
@@ -115,11 +138,16 @@ void report_device_removed(ID3D12Device* dev) {
                     std::wstring nm = n->pCommandListDebugNameW;
                     if (size_t sp = nm.find(L" (debug layer"); sp != std::wstring::npos) nm.resize(sp);
                     auto it = g_marks.find(nm);
-                    if (it != g_marks.end() && marks && marks <= it->second.size())
+                    if (it != g_marks.end() && marks && marks <= it->second.size()) {
                         XSL_ERR(CH, "DRED: pipeline in use: %ls (marker %u of %zu)", it->second[marks - 1].c_str(), marks, it->second.size());
+                        for (UINT m = marks > 8 ? marks - 8 : 0; m < marks; m++) XSL_ERR(CH, "DRED:   marker %u: %ls", m + 1, it->second[m].c_str());
+                    }
                     else
                         XSL_ERR(CH, "DRED: list %ls: %u markers, %s", n->pCommandListDebugNameW, marks, it == g_marks.end() ? "no history" : "history mismatch");
                 }
+                std::string hist;
+                for (UINT k = done > 40 ? done - 40 : 0; k <= done && k < n->BreadcrumbCount; k++) hist += " " + std::to_string((int)n->pCommandHistory[k]);
+                XSL_ERR(CH, "DRED:   ops up to the stop:%s", hist.c_str());
                 for (UINT k = done > 4 ? done - 4 : 0; k < n->BreadcrumbCount && k < done + 3; k++) {
                     const wchar_t* ctx = L"";
                     for (UINT c = 0; c < n->BreadcrumbContextsCount; c++)
@@ -130,6 +158,16 @@ void report_device_removed(ID3D12Device* dev) {
         XSL_ERR(CH, "DRED: %d unfinished lists had not started", waiting);
     }
     if (dred1) dred1->Release();
+    if (g_ei_map) {   // last indirect arguments seen by the GPU (0xcdcdcdcd: copy did not run)
+        long last = g_ei_next;
+        int shown = 0;
+        for (long k = last; k > std::max(0L, last - (long)kEiSlots) && shown < 8; k--) {   // newest copies that ran
+            const uint32_t* e = g_ei_map + (k % kEiSlots) * (kEiBytes / 4);
+            if (e[0] == 0xcdcdcdcdu && e[1] == 0xcdcdcdcdu) continue;
+            shown++;
+            XSL_ERR(CH, "DRED: indirect args #%ld: %08x %08x %08x %08x %08x %08x %08x %08x count %08x", k, e[0], e[1], e[2], e[3], e[4], e[5], e[6], e[7], e[8]);
+        }
+    }
     D3D12_DRED_PAGE_FAULT_OUTPUT pf{};
     if (SUCCEEDED(dred->GetPageFaultAllocationOutput(&pf)) && pf.PageFaultVA)
         XSL_ERR(CH, "DRED: page fault at GPU VA %llx", (unsigned long long)pf.PageFaultVA);
@@ -296,9 +334,16 @@ HRESULT_T create_queue(PcObj dev, const void* desc, PcObj* out) {
 HRESULT_T create_allocator(PcObj dev, int type, PcObj* out) {
     return logged(as<ID3D12Device>(dev)->CreateCommandAllocator((D3D12_COMMAND_LIST_TYPE)type, IID_PPV_ARGS(reinterpret_cast<ID3D12CommandAllocator**>(out))), "CreateCommandAllocator");
 }
+void name_recording(PcObj l);
+void list_set_pso(PcObj l, PcObj pso);
 HRESULT_T create_list(PcObj dev, int type, PcObj alloc, PcObj pso, PcObj* out) {
-    return logged(as<ID3D12Device>(dev)->CreateCommandList(0, (D3D12_COMMAND_LIST_TYPE)type, as<ID3D12CommandAllocator>(alloc),
-                                                    as<ID3D12PipelineState>(pso), IID_PPV_ARGS(reinterpret_cast<ID3D12GraphicsCommandList**>(out))), "CreateCommandList");
+    HRESULT hr = logged(as<ID3D12Device>(dev)->CreateCommandList(0, (D3D12_COMMAND_LIST_TYPE)type, as<ID3D12CommandAllocator>(alloc),
+                                                           as<ID3D12PipelineState>(pso), IID_PPV_ARGS(reinterpret_cast<ID3D12GraphicsCommandList**>(out))), "CreateCommandList");
+    if (SUCCEEDED(hr)) {   // a new list is recording: name it like a Reset
+        name_recording(*out);
+        if (pso && g_dred) list_set_pso(*out, pso);
+    }
+    return hr;
 }
 HRESULT_T create_descriptor_heap(PcObj dev, const void* desc, PcObj* out) {
     D3D12_DESCRIPTOR_HEAP_DESC d = *static_cast<const D3D12_DESCRIPTOR_HEAP_DESC*>(desc);
@@ -408,7 +453,7 @@ HRESULT_T create_pso_stream(PcObj dev, void* stream, size_t size, PcObj* out) {
         hr = d2->CreatePipelineState(&d, IID_PPV_ARGS(reinterpret_cast<ID3D12PipelineState**>(out)));
         d2->Release();
     }
-    if (FAILED(hr)) { dump_debug_messages(); XSL_ERR(CH, "CreatePipelineState (stream, %zu bytes) failed %08lx", size, hr); }
+    if (FAILED(hr)) { dump_debug_messages(); XSL_ERR(CH, "CreatePipelineState (stream, %zu bytes) failed %08lx", size, hr); note_removed(hr); }
     if (SUCCEEDED(hr)) name_translated(*out);
     if (hr == DXGI_ERROR_DEVICE_REMOVED) report_device_removed(as<ID3D12Device>(dev));
     return hr;
@@ -650,6 +695,7 @@ HRESULT_T create_committed_resource(PcObj dev, const void* heapProps, uint32_t h
                     "samples %u/%u heap %d cpu %d pool %d heapflags %x state %x)", hr, d.Dimension, (unsigned long long)d.Width, d.Height,
                 d.DepthOrArraySize, d.MipLevels, d.Format, d.Flags, d.Layout, (unsigned long long)d.Alignment, d.SampleDesc.Count,
                 d.SampleDesc.Quality, hp.Type, hp.CPUPageProperty, hp.MemoryPoolPreference, clean_heap_flags(heapFlags), state);
+        note_removed(hr);
     return hr;
 }
 HRESULT_T create_reserved_resource(PcObj dev, const void* desc, uint32_t state, const void* clear, PcObj* out) {
@@ -905,7 +951,7 @@ HRESULT_T list_close(PcObj l) {
     return hr;
 }
 void list_set_pso(PcObj l, PcObj pso);
-HRESULT_T list_reset(PcObj l, PcObj a, PcObj pso) {
+void name_recording(PcObj l) {
     if (g_dred) {   // the debug name lets a DRED report find the list's marker history
         static uint64_t gen = 0;
         std::lock_guard<std::mutex> g(g_mark_lock);
@@ -917,6 +963,9 @@ HRESULT_T list_reset(PcObj l, PcObj a, PcObj pso) {
         g_mark_order.push_back(b);
         while (g_mark_order.size() > 8192) { g_marks.erase(g_mark_order.front()); g_mark_order.pop_front(); }
     }
+}
+HRESULT_T list_reset(PcObj l, PcObj a, PcObj pso) {
+    name_recording(l);
     HRESULT hr = logged(L->Reset(as<ID3D12CommandAllocator>(a), as<ID3D12PipelineState>(pso)), "CommandList::Reset");
     if (pso && SUCCEEDED(hr)) list_set_pso(l, pso);   // initial pipeline: marked like SetPipelineState
     return hr;
@@ -976,6 +1025,34 @@ void list_dispatch_mesh(PcObj l, uint32_t x, uint32_t y, uint32_t z) {
     if (!g_caps.meshShaders) return;
     ID3D12GraphicsCommandList6* l6 = nullptr;
     if (SUCCEEDED(L->QueryInterface(IID_PPV_ARGS(&l6)))) { l6->DispatchMesh(x, y, z); l6->Release(); }
+}
+bool dred_on() { return g_dred; }
+void list_record_indirect(PcObj l, PcObj args, uint64_t ao, PcObj cnt, uint64_t co) {
+    if (!g_dred || !g_main_device) return;
+    static std::once_flag once;
+    std::call_once(once, [] {
+        D3D12_HEAP_PROPERTIES hp{D3D12_HEAP_TYPE_READBACK};
+        D3D12_RESOURCE_DESC rd{};
+        rd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        rd.Width = (uint64_t)kEiSlots * kEiBytes;
+        rd.Height = rd.DepthOrArraySize = rd.MipLevels = 1;
+        rd.SampleDesc.Count = 1;
+        rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        if (SUCCEEDED(g_main_device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&g_ei_rb))))
+            g_ei_rb->Map(0, nullptr, (void**)&g_ei_map);
+    });
+    if (!g_ei_map) return;
+    uint32_t slot = (uint32_t)InterlockedIncrement(&g_ei_next) % kEiSlots;
+    {
+        std::lock_guard<std::mutex> g(g_mark_lock);
+        if (g_ei_info.empty()) g_ei_info.resize(kEiSlots);
+        g_ei_info[slot] = {list_key(l), args, ao};
+    }
+    memset(g_ei_map + slot * (kEiBytes / 4), 0xcd, kEiBytes);
+    ID3D12Resource* a = as<ID3D12Resource>(args);
+    uint64_t n = std::min<uint64_t>(32, a->GetDesc().Width - std::min(ao, a->GetDesc().Width));
+    if (n) L->CopyBufferRegion(g_ei_rb, (uint64_t)slot * kEiBytes, a, ao, n);
+    if (cnt) L->CopyBufferRegion(g_ei_rb, (uint64_t)slot * kEiBytes + 32, as<ID3D12Resource>(cnt), co, 4);
 }
 void list_execute_indirect(PcObj l, PcObj sig, uint32_t max, PcObj args, uint64_t ao, PcObj cnt, uint64_t co) {
     L->ExecuteIndirect(as<ID3D12CommandSignature>(sig), max, as<ID3D12Resource>(args), ao, as<ID3D12Resource>(cnt), co);

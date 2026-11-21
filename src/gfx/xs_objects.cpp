@@ -725,13 +725,64 @@ void D3DAPI L_ExecuteIndirect(ID3D12GraphicsCommandList* l, ID3D12CommandSignatu
     static bool diag = [] { char b[4]; return GetEnvironmentVariableA("XSL_D3D12_DEBUG", b, 4) && b[0] != '0'; }();
     if (diag) {
         static volatile long n = 0;
-        if (InterlockedIncrement(&n) <= 40) {
+        if (InterlockedIncrement(&n) <= 400) {
             uint32_t* st = tracked_state(lx(l), args, false);
-            XSL_INFO(CH, "ExecuteIndirect list %p args %p (state in this list: %s%x) count %p", (void*)l, (void*)args,
-                     st ? "" : "untracked ", st ? *st : 0u, (void*)cnt);
+            XSL_INFO(CH, "ExecuteIndirect list %p sig %p max %u args %p+%llu (state in this list: %s%x) count %p", (void*)l, (void*)sig, max, (void*)args,
+                     (unsigned long long)ao, st ? "" : "untracked ", st ? *st : 0u, (void*)cnt);
+        }
+    }
+    // Console titles may run ExecuteIndirect on arguments a compute pass just wrote without moving
+    // them to INDIRECT_ARGUMENT in the same list (the PC debug layer finds them in UNORDERED_ACCESS).
+    // On PC the indirect fetch may then read stale data (garbage group counts hang the GPU), so a
+    // buffer this list has not made indirect could be transitioned around the call
+    // (XSL_EI_TRANSITION=1; experimental: the state assumed for buffers this list never transitioned
+    // can be wrong).
+    static bool fix = [] { char b[4]; return GetEnvironmentVariableA("XSL_EI_TRANSITION", b, 4) && b[0] == '1'; }();
+    D3D12_RESOURCE_BARRIER bar[2];
+    UINT nb = 0;
+    if (fix) {
+        ID3D12Resource* rs[2] = {args, cnt};
+        for (ID3D12Resource* r : rs) {
+            if (!r) continue;
+            uint32_t* st = tracked_state(lx(l), r, false);
+            uint32_t before = st && *st != UINT32_MAX ? *st : (uint32_t)D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+            if (before & D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT) continue;
+            if (before != D3D12_RESOURCE_STATE_UNORDERED_ACCESS) continue;   // a read state set by the title: leave it
+            if (nb && bar[0].Transition.pResource == (ID3D12Resource*)P(r)) continue;
+            D3D12_RESOURCE_BARRIER& x = bar[nb++];
+            x = {};
+            x.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            x.Transition.pResource = (ID3D12Resource*)P(r);
+            x.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+            x.Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+            x.Transition.StateAfter = pc::dred_on() ? D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT | D3D12_RESOURCE_STATE_COPY_SOURCE
+                                                    : D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT;
+        }
+        if (nb) pc::list_barriers(LPC(l), nb, bar);
+        if (nb && bar[0].Transition.pResource == (ID3D12Resource*)P(args) && pc::dred_on())
+            pc::list_record_indirect(LPC(l), P(args), ao, nb == 2 ? P(cnt) : nullptr, co);
+        else if (pc::dred_on()) {
+            // Arguments already in a read state the title chose: add COPY_SOURCE around the record.
+            uint32_t* st = tracked_state(lx(l), args, false);
+            if (st && *st != UINT32_MAX && (*st & D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT) && !(*st & D3D12_RESOURCE_STATE_UNORDERED_ACCESS)) {
+                D3D12_RESOURCE_BARRIER x{};
+                x.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+                x.Transition.pResource = (ID3D12Resource*)P(args);
+                x.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+                x.Transition.StateBefore = (D3D12_RESOURCE_STATES)*st;
+                x.Transition.StateAfter = (D3D12_RESOURCE_STATES)(*st | D3D12_RESOURCE_STATE_COPY_SOURCE);
+                if (x.Transition.StateBefore != x.Transition.StateAfter) pc::list_barriers(LPC(l), 1, &x);
+                pc::list_record_indirect(LPC(l), P(args), ao, nullptr, 0);
+                std::swap(x.Transition.StateBefore, x.Transition.StateAfter);
+                if (x.Transition.StateBefore != x.Transition.StateAfter) pc::list_barriers(LPC(l), 1, &x);
+            }
         }
     }
     pc::list_execute_indirect(LPC(l), P(sig), max, P(args), ao, P(cnt), co);
+    if (nb) {
+        for (UINT i = 0; i < nb; i++) std::swap(bar[i].Transition.StateBefore, bar[i].Transition.StateAfter);
+        pc::list_barriers(LPC(l), nb, bar);
+    }
 }
 void D3DAPI L_ClearUAVUint(ID3D12GraphicsCommandList* l, D3D12_GPU_DESCRIPTOR_HANDLE g, D3D12_CPU_DESCRIPTOR_HANDLE c, ID3D12Resource* r,
                            const UINT v[4], UINT n, const D3D12_RECT* rects) {

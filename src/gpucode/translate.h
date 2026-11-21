@@ -24,7 +24,11 @@ struct TranslateOptions {
     // (L and L+32), which keeps wave64 lane masks and cross-lane operations exact. False when the
     // PC runs 64-lane waves.
     bool wave64_dual = true;
-    unsigned loop_guard = 1u << 22;  // dispatcher iterations before a lane gives up (runaway loops)
+    // Dispatcher iterations before an invocation gives up (runaway loops, e.g. walking a linked list
+    // with a cycle in bad data, would otherwise reset the PC's GPU). Shaders with barriers use the
+    // larger limit: a wave that stops early would leave the others waiting at the barrier.
+    unsigned loop_guard = 1u << 16;
+    unsigned loop_guard_barrier = 1u << 22;
     bool wave_size_attr = false;
     bool barrier_sync = true;        // false: s_barrier without the group sync (debugging hangs) // the PC runtime takes shader model 6.6 ([WaveSize] on compute)
 };

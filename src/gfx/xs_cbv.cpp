@@ -18,6 +18,7 @@
 #include <vector>
 
 #include "xs_cbv.h"
+#include "xs_unified.h"
 
 using xsl::Level;
 using xsl::log_enabled;
@@ -133,6 +134,63 @@ untracked:
     static volatile long warned = 0;
     if (InterlockedIncrement(&warned) <= 3) XSL_WARN(CH, "root CBV %llx is not 256-aligned and not in a tracked upload buffer", (unsigned long long)va);
     return va;
+}
+
+// Copies `n` bytes from `src` into this frame's ring segment; 0 if the ring is full.
+static uint64_t ring_copy(Device* dev, const uint8_t* src, uint64_t n) {
+    DeviceExtra* de = dev_extra(dev);
+    uint64_t frame = de->presentCount;
+    Segment& sg = g_ring.seg[frame % kSegments];
+    if (frame != g_ring.frame) { g_ring.frame = frame; sg.cur = 0; sg.head = 0; g_ring.seen.clear(); }
+    if (sg.cur < sg.chunks.size() && sg.head + n > kChunk) { sg.cur++; sg.head = 0; }
+    if (sg.cur >= sg.chunks.size() && (sg.chunks.size() >= kMaxChunks || !add_chunk(dev, sg))) return 0;
+    Chunk& c = sg.chunks[sg.cur];
+    uint64_t off = sg.head;
+    memcpy(c.cpu + off, src, n);
+    sg.head += (n + 255) & ~255ull;
+    return c.gpu + off;
+}
+
+uint64_t cbv_fix_view(Device* dev, uint64_t title_va, uint64_t gpu, uint64_t size) {
+    static bool enabled = [] { char b[4]; return !(GetEnvironmentVariableA("XSL_CBV_REALIGN", b, 4) && b[0] == '0'); }();
+    if (!enabled || (gpu & 255) == 0 || gpu == 0) return gpu;
+    size = size ? (size + 15) & ~15ull : 256;
+    if (size > 65536) size = 65536;
+    // Source bytes: unified memory (the title's address is the CPU address) or a mapped upload buffer.
+    const uint8_t* src = nullptr;
+    uint64_t avail = 0;
+    UnifiedRef u;
+    if (unified_lookup(dev, title_va, &u)) {
+        src = (const uint8_t*)(uintptr_t)title_va;
+        avail = size;   // the view lies inside the allocation (the title made it)
+    }
+    std::lock_guard<std::mutex> g(g_mu);
+    if (!src) {
+        auto it = g_upload.upper_bound(gpu);
+        if (it != g_upload.begin()) {
+            --it;
+            if (gpu < it->first + it->second.size) {
+                src = it->second.cpu + (gpu - it->first);
+                avail = it->first + it->second.size - gpu;
+            }
+        }
+    }
+    if (!src) {
+        static volatile long warned = 0;
+        if (InterlockedIncrement(&warned) <= 3) XSL_WARN(CH, "constant buffer view %llx is not 256-aligned and its memory is not CPU-visible", (unsigned long long)gpu);
+        return gpu;
+    }
+    uint64_t n = size < avail ? size : avail;
+    uint64_t r = ring_copy(dev, src, n);
+    if (!r) {
+        static volatile long warned = 0;
+        if (InterlockedIncrement(&warned) <= 1) XSL_WARN(CH, "constant-buffer ring full; constant buffer views stay unaligned");
+        return gpu;
+    }
+    static volatile long once = 0;
+    if (!InterlockedExchange(&once, 1))
+        XSL_INFO(CH, "constant buffer views at console alignment point at copies taken when the view is created");
+    return r;
 }
 
 }  // namespace xs

@@ -506,6 +506,79 @@ struct Translator {
                 step(st, ins[i]);
             }
         }
+        infer_typed_components();
+    }
+
+    // Typed buffers and images: HLSL needs a component type, which on the console is the view's
+    // format (unknown here). Values a shader stores or loads are mostly produced or consumed by
+    // integer or float ALU code; the majority decides (float when nothing is known).
+    static bool valu(const Instr& x) {
+        return x.name && (x.fmt == Fmt::VOP1 || x.fmt == Fmt::VOP2 || x.fmt == Fmt::VOP3P || (x.fmt == Fmt::VOP3 && x.op >= 256)) &&
+               strncmp(x.name, "v_cmp", 5) && strcmp(x.name, "v_readlane_b32") && strcmp(x.name, "v_readfirstlane_b32");
+    }
+    static int op_kind(const char* nm) {   // +1 integer, -1 float, 0 data movement
+        std::string n = nm;
+        if (starts(n, "v_cvt_f32_") || starts(n, "v_cvt_f16_") || starts(n, "v_cvt_pk")) return -1;
+        if (starts(n, "v_cvt_")) return 1;
+        if (n == "v_mov_b32" || n == "v_cndmask_b32" || starts(n, "v_mov_b32")) return 0;
+        if (has(n, "_f32") || has(n, "_f16") || has(n, "_f64")) return -1;
+        return 1;
+    }
+    int const_kind(uint16_t src, uint32_t lit) {
+        if (src >= 129 && src <= 208) return 1;                // inline integers (0 is neutral)
+        if (src >= 240 && src <= 248) return -1;               // inline floats
+        if (src == src::kLiteral) {
+            uint32_t e = (lit >> 23) & 0xff;
+            return lit != 0 && e >= 100 && e <= 160 ? -1 : 1;  // plausible float magnitude
+        }
+        return 0;
+    }
+    int producer_kind(size_t at, unsigned reg, int depth) {
+        for (size_t j = at; j-- > 0 && at - j < 256;) {
+            const Instr& x = ins[j];
+            if (!valu(x) || x.dst != reg) continue;
+            int k = op_kind(x.name);
+            if (k || depth > 3) return k;
+            uint16_t srcs[2] = {x.src0, x.src1};
+            int v = 0;
+            for (int q = 0; q < (strcmp(x.name, "v_cndmask_b32") ? 1 : 2); q++) {
+                uint16_t sv = srcs[q];
+                if (sv >= src::kVgpr0) v += producer_kind(j, sv - src::kVgpr0, depth + 1);
+                else v += const_kind(sv, x.literal);
+            }
+            return v > 0 ? 1 : v < 0 ? -1 : 0;
+        }
+        return 0;
+    }
+    int consumer_kind(size_t at, unsigned reg) {
+        for (size_t j = at + 1; j < ins.size() && j - at < 256; j++) {
+            const Instr& x = ins[j];
+            if (!valu(x)) continue;
+            uint16_t r = uint16_t(src::kVgpr0 + reg);
+            if (x.src0 == r || x.src1 == r || x.src2 == r) {
+                int k = op_kind(x.name);
+                if (k) return k;
+            }
+            if (x.dst == reg) return 0;   // overwritten before a typed use
+        }
+        return 0;
+    }
+    void infer_typed_components() {
+        std::map<int, int> vote;
+        for (auto& [i, r] : res_of) {
+            if (r < 0) continue;
+            Res& R = res[r];
+            if ((R.kind != ResKind::TypedBuf && R.kind != ResKind::Image) || R.is_uint) continue;
+            const Instr& in = ins[i];
+            std::string n = in.name;
+            bool store = has(n, "store"), load = has(n, "load");
+            if (starts(n, "image_sample") || starts(n, "image_gather") || (!store && !load)) continue;
+            unsigned cnt = in.fmt == Fmt::MIMG ? unsigned(__builtin_popcount(in.dmask)) : ends(n, "_xyzw") ? 4 : ends(n, "_xyz") ? 3 : ends(n, "_xy") ? 2 : 1;
+            if (in.d16) continue;
+            for (unsigned k = 0; k < cnt; k++) vote[r] += store ? producer_kind(i, in.vdata + k, 0) : consumer_kind(i, in.vdata + k);
+        }
+        for (auto& [r, v] : vote)
+            if (v > 0) res[r].is_uint = true;
     }
 
     const ResRecord* record(uint32_t param, uint32_t where, uint32_t offset_dw, bool any_offset = false) const {
@@ -2598,7 +2671,12 @@ std::string Translator::generate() {
     if (!loops) line(fmt("bool reach[%zu]; [unroll] for (uint i_ = 0u; i_ < %zuu; i_++) reach[i_] = false; reach[0] = true;", nb + 1, nb + 1));
     // The guard bounds the block transitions so a mistranslated loop ends the shader instead of
     // hanging the GPU (which removes the PC device).
-    else line(fmt("uint pc = 0u, guard_ = 0u;\n  [loop] for (;;) {\n  if (++guard_ > %uu) RETURN;\n  [forcecase] switch (pc) {", opt.loop_guard));
+    else {
+        bool barriers = false;
+        for (auto& i : ins) barriers |= i.name && !strcmp(i.name, "s_barrier");
+        line(fmt("uint pc = 0u, guard_ = 0u;\n  [loop] for (;;) {\n  if (++guard_ > %uu) RETURN;\n  [forcecase] switch (pc) {",
+                 barriers ? opt.loop_guard_barrier : opt.loop_guard));
+    }
     // Blocks not reachable from the entry (data after the last instruction) are not emitted.
     std::vector<bool> live(nb, false);
     {
