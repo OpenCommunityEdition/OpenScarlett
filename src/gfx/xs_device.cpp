@@ -3,6 +3,7 @@
 #include <condition_variable>
 #include <deque>
 #include <thread>
+#include <array>
 #include <mutex>
 #include <vector>
 
@@ -510,9 +511,115 @@ HRESULT D3DAPI D_WaitFrameEventX(ID3D12Device* d, D3D12XBOX_FRAME_EVENT_TYPE, UI
 D3D12Device11_Function_Table g_dev_tbl;
 std::once_flag g_dev_once;
 // Precompiled console state objects (ray-tracing pipelines serialized by the console driver):
-// export names, serialized root signatures and console GPU code, no DXIL, so a PC device cannot
-// load them. The call fails cleanly; XSL_DUMP_STATE_OBJECTS=<dir> saves the blobs for study.
-HRESULT D3DAPI D_DeserializeStateObjectX(ID3D12Device8*, const void* data, UINT size, ID3D12RootSignature*, UINT flags, REFIID, void** out) {
+// export names, serialized root signatures and console GPU code, no DXIL. Until ray tracing is
+// translated (plan step R1), the layer returns an inert state object (step R0): shader
+// identifiers are distinct per export, stack sizes are 0, and DispatchRays does nothing, so the
+// title's raster and compute work runs. XSL_DUMP_STATE_OBJECTS=<dir> saves the blobs for study.
+namespace {
+D3D12StateObject_Function_Table g_so_tbl;
+D3D12StateObjectProperties_Function_Table g_sop_tbl;
+std::once_flag g_so_once;
+struct SoExtra {};
+struct SopExtra {
+    std::mutex lock;
+    std::vector<std::pair<std::wstring, std::array<uint8_t, 64>>> ids;
+};
+// The console ray-tracing pipeline's compute PSO: an inert PSO (no PC pipeline) created on first use.
+void D3DAPI SO_GetPipelineStateX(ID3D12StateObject* so, ID3D12PipelineState** out) {
+    if (!out) return;
+    *out = nullptr;
+    auto*& p = *(ID3D12PipelineState**)&hdr(so)->user[1];
+    if (!p) make_simple(hdr(so)->device, Kind::Pso, nullptr, __uuidof(ID3D12PipelineState), (void**)&p);
+    if (p) { AddRef((IGraphicsUnknown*)p); *out = p; }   // the state object keeps its reference
+}
+const void* D3DAPI SOP_GetShaderIdentifier(ID3D12StateObjectProperties* self, LPCWSTR name) {
+    auto* e = ex<ID3D12StateObjectProperties, SopExtra>(self);
+    std::lock_guard<std::mutex> g(e->lock);
+    std::wstring n = name ? name : L"";
+    for (auto& [k, v] : e->ids)
+        if (k == n) return v.data();
+    std::array<uint8_t, 64> id{};
+    uint64_t h = 1469598103934665603ull;
+    for (wchar_t c : n) h = (h ^ uint64_t(c)) * 1099511628211ull;
+    memcpy(id.data(), &h, 8);
+    id[8] = uint8_t(e->ids.size() + 1);
+    e->ids.push_back({n, id});
+    return e->ids.back().second.data();   // std::vector growth: entries are reserved below
+}
+UINT64 D3DAPI SOP_GetShaderStackSize(ID3D12StateObjectProperties*, LPCWSTR) { return 0; }
+UINT64 D3DAPI SOP_GetPipelineStackSize(ID3D12StateObjectProperties*) { return 0; }
+void D3DAPI SOP_SetPipelineStackSize(ID3D12StateObjectProperties*, UINT64) {}
+void D3DAPI SOP_GetInformationX(ID3D12StateObjectProperties*, UINT64 flags, D3D12XBOX_RAYTRACING_INFORMATION* info) {
+    if (!info) return;
+    memset(info, 0, sizeof *info);
+    if (flags == D3D12XBOX_RAYTRACING_INFORMATION_FLAG_GET_EXPORT_TABLE) {
+        // No exports are reported until state objects are translated (plan step R1).
+        D3D12XBOX_RAYTRACING_INFORMATION_EXPORT_TABLE t{};
+        info->GenericData = (ID3DBlob*)make_pc_blob(pc::create_blob(&t, sizeof t));
+    }
+}
+void destroy_props(IGraphicsUnknown* self) { ex<ID3D12StateObjectProperties, SopExtra>((ID3D12StateObjectProperties*)self)->~SopExtra(); }
+}  // namespace
+
+HRESULT make_inert_state_object(Device* dev, REFIID riid, void** out) {
+    std::call_once(g_so_once, [] {
+        xsl_fill_default(&g_so_tbl);
+        install_device_child_base(&g_so_tbl);
+        g_so_tbl.GetPipelineStateX = SO_GetPipelineStateX;
+        xsl_fill_default(&g_sop_tbl);
+        install_object_base(&g_sop_tbl);
+        g_sop_tbl.GetShaderIdentifier = SOP_GetShaderIdentifier;
+        g_sop_tbl.GetShaderStackSize = SOP_GetShaderStackSize;
+        g_sop_tbl.GetPipelineStackSize = SOP_GetPipelineStackSize;
+        g_sop_tbl.SetPipelineStackSize = SOP_SetPipelineStackSize;
+        g_sop_tbl.GetInformationX = SOP_GetInformationX;
+    });
+    static const IID* so_iids[] = {&__uuidof(ID3D12StateObject), &__uuidof(ID3D12Pageable), &__uuidof(ID3D12DeviceChild),
+                                   &__uuidof(ID3D12Object), &__uuidof(IGraphicsUnknown), nullptr};
+    static const IID* sop_iids[] = {&__uuidof(ID3D12StateObjectProperties), &__uuidof(IGraphicsUnknown), nullptr};
+    auto* so = make<ID3D12StateObject, SoExtra>(Kind::StateObject, &g_so_tbl, nullptr, dev, so_iids, nullptr);
+    auto* sop = make<ID3D12StateObjectProperties, SopExtra>(Kind::StateObjectProperties, &g_sop_tbl, nullptr, dev, sop_iids, destroy_props);
+    ex<ID3D12StateObjectProperties, SopExtra>(sop)->ids.reserve(65536);
+    hdr(so)->user[0] = (uint64_t)sop;
+    hdr(sop)->user[0] = (uint64_t)so;
+    HRESULT hr = QueryInterface((IGraphicsUnknown*)so, riid, out);
+    Release((IGraphicsUnknown*)so);
+    return hr;
+}
+
+// Acceleration-structure sizes for the inert ray-tracing path: modest fixed sizes, so titles
+// allocate buffers they will never fill (builds are no-ops until ray tracing is translated).
+void D3DAPI D_GetRaytracingAccelerationStructurePrebuildInfo(ID3D12Device5*, const D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS*,
+                                                             D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO* info) {
+    if (!info) return;
+    info->ResultDataMaxSizeInBytes = 64 * 1024;
+    info->ScratchDataSizeInBytes = 64 * 1024;
+    info->UpdateScratchDataSizeInBytes = 64 * 1024;
+}
+
+void D3DAPI D_GetRaytracingAccelerationStructurePrebuildInfoX(ID3D12Device8*, const D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS* in,
+                                                              const D3D12XBOX_XDXR_STREAM_DESC*, D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO* info) {
+    D_GetRaytracingAccelerationStructurePrebuildInfo(nullptr, in, info);
+}
+
+// DXR libraries compiled to DXIL become console code only when the pipeline is created; until
+// that is translated (plan step R1), CreateStateObject also returns an inert state object.
+HRESULT D3DAPI D_CreateStateObject(ID3D12Device5* d, const D3D12_STATE_OBJECT_DESC* desc, REFIID riid, void** out) {
+    if (out) *out = nullptr;
+    static volatile long n = 0;
+    if (InterlockedIncrement(&n) <= 3)
+        XSL_WARN(CH, "CreateStateObject (type %d, %u subobjects): ray tracing not translated yet; inert state object returned",
+                 desc ? (int)desc->Type : -1, desc ? desc->NumSubobjects : 0);
+    if (!out) return S_FALSE;
+    return make_inert_state_object(DEV(d), riid, out);
+}
+HRESULT D3DAPI D_AddToStateObject(ID3D12Device7* d, const D3D12_STATE_OBJECT_DESC*, ID3D12StateObject*, REFIID riid, void** out) {
+    if (out) *out = nullptr;
+    if (!out) return S_FALSE;
+    return make_inert_state_object(DEV(d), riid, out);
+}
+
+HRESULT D3DAPI D_DeserializeStateObjectX(ID3D12Device8* d, const void* data, UINT size, ID3D12RootSignature*, UINT flags, REFIID riid, void** out) {
     if (out) *out = nullptr;
     // XSL_DUMP_STATE_OBJECTS=<dir>: write each serialized state object there (format study).
     char dir[MAX_PATH];
@@ -527,16 +634,10 @@ HRESULT D3DAPI D_DeserializeStateObjectX(ID3D12Device8*, const void* data, UINT 
         }
     }
     static volatile long n = 0;
-    if (InterlockedIncrement(&n) <= 3) {
-        // DXIL is LLVM bitcode ("BC" C0 DE); the serialized root signatures inside are DXBC
-        // containers too, so the container magic alone does not mean DXIL.
-        bool dxil = false;
-        auto* b = (const uint8_t*)data;
-        for (UINT i = 0; b && i + 4 <= size && !dxil; i++) dxil = b[i] == 'B' && b[i + 1] == 'C' && b[i + 2] == 0xC0 && b[i + 3] == 0xDE;
-        XSL_WARN(CH, "DeserializeStateObjectX: precompiled console state object (%u bytes, flags %x, %s); not loadable on PC", size, flags,
-                 dxil ? "contains DXIL" : "no DXIL inside");
-    }
-    return E_NOTIMPL;
+    if (InterlockedIncrement(&n) <= 3)
+        XSL_WARN(CH, "DeserializeStateObjectX: console ray-tracing pipeline (%u bytes, flags %x) not translated yet; inert state object returned (ray tracing disabled)", size, flags);
+    if (!out) return S_FALSE;
+    return make_inert_state_object(DEV(d), riid, out);
 }
 
 void init_device_table() {
@@ -587,6 +688,10 @@ void init_device_table() {
         t->ScheduleFrameEventX = D_ScheduleFrameEventX;
         t->WaitFrameEventX = D_WaitFrameEventX;
         ((D3D12Device8_Function_Table*)&g_dev_tbl)->DeserializeStateObjectX = D_DeserializeStateObjectX;
+        ((D3D12Device5_Function_Table*)&g_dev_tbl)->CreateStateObject = D_CreateStateObject;
+        ((D3D12Device7_Function_Table*)&g_dev_tbl)->AddToStateObject = D_AddToStateObject;
+        ((D3D12Device5_Function_Table*)&g_dev_tbl)->GetRaytracingAccelerationStructurePrebuildInfo = D_GetRaytracingAccelerationStructurePrebuildInfo;
+        ((D3D12Device8_Function_Table*)&g_dev_tbl)->GetRaytracingAccelerationStructurePrebuildInfoX = D_GetRaytracingAccelerationStructurePrebuildInfoX;
     });
 }
 }  // namespace

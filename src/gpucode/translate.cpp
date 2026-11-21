@@ -587,7 +587,7 @@ struct Translator {
             bool bvh = has(n, "bvh");
             int r = resource(st, in.srsrc, bvh ? 4 : 8, in, false);
             res_of[i] = r;
-            if (r >= 0 && starts(n, "image_atomic")) res[r].is_uint = true;
+            if (r >= 0 && starts(n, "image_atomic")) { res[r].is_uint = true; res[r].scalar = true; }
             if (starts(n, "image_sample") || starts(n, "image_gather4") || n == "image_get_lod") {
                 std::string keep = res_index.count(i) ? res_index[i] : "";
                 res_index.erase(i);
@@ -916,10 +916,10 @@ bool Translator::emit_salu(const Instr& in, size_t idx) {
     // SOP2
     const unsigned d = in.dst;
     const std::string D = S(d);
-    if (n == "s_add_u32") { line(fmt("{ uint64_t r_ = uint64_t(%s) + uint64_t(%s); %s = uint(r_); scc = (r_ >> 32) != 0; }", a().c_str(), b().c_str(), D.c_str())); sync_mask_from_int(d); return true; }
-    if (n == "s_addc_u32") { line(fmt("{ uint64_t r_ = uint64_t(%s) + uint64_t(%s) + (scc ? 1 : 0); %s = uint(r_); scc = (r_ >> 32) != 0; }", a().c_str(), b().c_str(), D.c_str())); sync_mask_from_int(d); return true; }
+    if (n == "s_add_u32") { line(fmt("{ uint x_ = %s, r_ = x_ + %s; %s = r_; scc = r_ < x_; }", a().c_str(), b().c_str(), D.c_str())); sync_mask_from_int(d); return true; }
+    if (n == "s_addc_u32") { line(fmt("{ uint x_ = %s, t_ = x_ + %s, r_ = t_ + (scc ? 1u : 0u); scc = t_ < x_ || r_ < t_; %s = r_; }", a().c_str(), b().c_str(), D.c_str())); sync_mask_from_int(d); return true; }
     if (n == "s_sub_u32") { line(fmt("{ uint x_ = %s, y_ = %s; %s = x_ - y_; scc = y_ > x_; }", a().c_str(), b().c_str(), D.c_str())); sync_mask_from_int(d); return true; }
-    if (n == "s_subb_u32") { line(fmt("{ uint64_t x_ = %s, y_ = uint64_t(%s) + (scc ? 1 : 0); %s = uint(x_ - y_); scc = y_ > x_; }", a().c_str(), b().c_str(), D.c_str())); sync_mask_from_int(d); return true; }
+    if (n == "s_subb_u32") { line(fmt("{ uint x_ = %s, y_ = %s, t_ = x_ - y_; bool c_ = scc; scc = y_ > x_ || (c_ && t_ == 0u); %s = t_ - (c_ ? 1u : 0u); }", a().c_str(), b().c_str(), D.c_str())); sync_mask_from_int(d); return true; }
     if (n == "s_add_i32" || n == "s_sub_i32") {
         const char* o = n == "s_add_i32" ? "+" : "-";
         line(fmt("{ int x_ = int(%s), y_ = int(%s); int r_ = int(uint(x_) %s uint(y_)); scc = %s; %s = uint(r_); }", a().c_str(), b().c_str(), o,
@@ -928,8 +928,8 @@ bool Translator::emit_salu(const Instr& in, size_t idx) {
         return true;
     }
     if (n == "s_mul_i32") { write_s(d, fmt("(%s * %s)", a().c_str(), b().c_str())); return true; }
-    if (n == "s_mul_hi_u32") { write_s(d, fmt("uint((uint64_t(%s) * uint64_t(%s)) >> 32)", a().c_str(), b().c_str())); return true; }
-    if (n == "s_mul_hi_i32") { write_s(d, fmt("uint(uint64_t(int64_t(int(%s)) * int64_t(int(%s))) >> 32)", a().c_str(), b().c_str())); return true; }
+    if (n == "s_mul_hi_u32") { write_s(d, fmt("mulhi_u(%s, %s)", a().c_str(), b().c_str())); return true; }
+    if (n == "s_mul_hi_i32") { write_s(d, fmt("uint(mulhi_i(int(%s), int(%s)))", a().c_str(), b().c_str())); return true; }
     if (n == "s_min_u32" || n == "s_max_u32") { const char* f = n == "s_min_u32" ? "min" : "max"; line(fmt("{ uint x_ = %s, y_ = %s; %s = %s(x_, y_); scc = %s; }", a().c_str(), b().c_str(), D.c_str(), f, n == "s_min_u32" ? "x_ < y_" : "x_ > y_")); return true; }
     if (n == "s_min_i32" || n == "s_max_i32") { const char* f = n == "s_min_i32" ? "min" : "max"; line(fmt("{ int x_ = int(%s), y_ = int(%s); %s = uint(%s(x_, y_)); scc = %s; }", a().c_str(), b().c_str(), D.c_str(), f, n == "s_min_i32" ? "x_ < y_" : "x_ > y_")); return true; }
     if (n == "s_cselect_b32") { write_s(d, fmt("(scc ? %s : %s)", a().c_str(), b().c_str())); return true; }
@@ -970,7 +970,7 @@ bool Translator::emit_salu(const Instr& in, size_t idx) {
     if (n == "s_absdiff_i32") { line(fmt("%s = uint(abs(int(%s) - int(%s))); scc = %s != 0u;", D.c_str(), a().c_str(), b().c_str(), D.c_str())); return true; }
     if (starts(n, "s_lshl") && ends(n, "_add_u32")) {
         int sh = n[6] - '0';
-        line(fmt("{ uint64_t r_ = (uint64_t(%s) << %d) + uint64_t(%s); %s = uint(r_); scc = (r_ >> 32) != 0; }", a().c_str(), sh, b().c_str(), D.c_str()));
+        line(fmt("{ uint x_ = %s, s_ = x_ << %d, r_ = s_ + %s; scc = (x_ >> %d) != 0u || r_ < s_; %s = r_; }", a().c_str(), sh, b().c_str(), 32 - sh, D.c_str()));
         return true;
     }
     if (n == "s_pack_ll_b32_b16") { write_s(d, fmt("((%s & 0xffffu) | (%s << 16))", a().c_str(), b().c_str())); return true; }
@@ -1250,13 +1250,11 @@ bool Translator::emit_valu(const Instr& in, size_t idx) {
 
     // ---- carries (VOP2 uses VCC, VOP3b uses sdst / src2) ----
     if (n == "v_add_co_u32" || n == "v_sub_co_u32" || n == "v_subrev_co_u32") {
-        std::string a = rd(se[0], in), b = rd(se[1], in);
+        std::string a = src_bits(0, 'u'), b = src_bits(1, 'u');
         if (n == "v_subrev_co_u32") std::swap(a, b);
         bool add = n == "v_add_co_u32";
-        line(fmt("{ uint64_t r_ = %s; bool c_ = %s;", add ? fmt("uint64_t(%s) + uint64_t(%s)", src_bits(0, 'u').c_str(), src_bits(1, 'u').c_str()).c_str()
-                                                         : fmt("uint64_t(%s) - uint64_t(%s)", a.c_str(), b.c_str()).c_str(),
-                 add ? "(r_ >> 32) != 0" : fmt("%s > %s", b.c_str(), a.c_str()).c_str()));
-        line(fmt("  if (kexec) %s = uint(r_);", V(dst).c_str()));
+        line(fmt("{ uint x_ = %s, y_ = %s; uint r_ = %s; bool c_ = %s;", a.c_str(), b.c_str(), add ? "x_ + y_" : "x_ - y_", add ? "r_ < x_" : "y_ > x_"));
+        line(fmt("  if (kexec) %s = r_;", V(dst).c_str()));
         out << "  ";
         write_mask(mask_dst(), "kexec && c_");
         line("}");
@@ -1267,10 +1265,9 @@ bool Translator::emit_valu(const Instr& in, size_t idx) {
         if (n == "v_subrev_co_ci_u32") std::swap(a, b);
         bool add = n == "v_add_co_ci_u32";
         std::string ci = mask_src(2);
-        line(fmt("{ uint64_t c0_ = %s ? 1 : 0; uint64_t r_ = %s; bool c_ = %s;", ci.c_str(),
-                 add ? fmt("uint64_t(%s) + uint64_t(%s) + c0_", a.c_str(), b.c_str()).c_str() : fmt("uint64_t(%s) - uint64_t(%s) - c0_", a.c_str(), b.c_str()).c_str(),
-                 add ? "(r_ >> 32) != 0" : fmt("(uint64_t(%s) + c0_) > uint64_t(%s)", b.c_str(), a.c_str()).c_str()));
-        line(fmt("  if (kexec) %s = uint(r_);", V(dst).c_str()));
+        if (add) line(fmt("{ uint x_ = %s, t_ = x_ + %s; uint r_ = t_ + (%s ? 1u : 0u); bool c_ = t_ < x_ || r_ < t_;", a.c_str(), b.c_str(), ci.c_str()));
+        else line(fmt("{ uint x_ = %s, y_ = %s, t_ = x_ - y_; bool ci_ = %s; uint r_ = t_ - (ci_ ? 1u : 0u); bool c_ = y_ > x_ || (ci_ && t_ == 0u);", a.c_str(), b.c_str(), ci.c_str()));
+        line(fmt("  if (kexec) %s = r_;", V(dst).c_str()));
         out << "  ";
         write_mask(vop3 ? in.sdst : 106u, "kexec && c_");
         line("}");
@@ -1278,13 +1275,13 @@ bool Translator::emit_valu(const Instr& in, size_t idx) {
     }
     if (n == "v_mad_u64_u32" || n == "v_mad_i64_i32") {
         bool u = n == "v_mad_u64_u32";
-        std::string e = u ? fmt("uint64_t(%s) * uint64_t(%s) + %s", rd(se[0], in).c_str(), rd(se[1], in).c_str(), rd64(se[2], in).c_str())
-                          : fmt("uint64_t(int64_t(int(%s)) * int64_t(int(%s)) + int64_t(%s))", rd(se[0], in).c_str(), rd(se[1], in).c_str(), rd64(se[2], in).c_str());
-        wv64(e);
+        std::string x = rd(se[0], in), y = rd(se[1], in), cl = rd(se[2], in), ch = rd_hi(se[2], in);
+        line(fmt("{ uint x_ = %s, y_ = %s; uint lo_ = x_ * y_, hi_ = %s; uint l2_ = lo_ + %s; hi_ += %s + (l2_ < lo_ ? 1u : 0u);",
+                 x.c_str(), y.c_str(), u ? "mulhi_u(x_, y_)" : "uint(mulhi_i(int(x_), int(y_)))", cl.c_str(), ch.c_str()));
+        line(fmt("  if (kexec) { %s = l2_; %s = hi_; } }", V(dst).c_str(), V(dst + 1).c_str()));
         if (in.sdst != src::kNull) write_mask(in.sdst, "false");
         return true;
     }
-
     // ---- division helpers: the scale/fmas/fixup sequence computes num/den; fixup does it exactly ----
     if (n == "v_div_scale_f32") { wv(fin('f', src(0, 'f'))); write_mask(in.sdst, "false"); return true; }
     if (n == "v_div_scale_f64") { wv64("asuint64(" + src(0, 'd') + ")"); write_mask(in.sdst, "false"); return true; }
@@ -1335,12 +1332,12 @@ bool Translator::emit_valu(const Instr& in, size_t idx) {
         {"v_add_u32", 'u', "uu", "a + b"}, {"v_sub_u32", 'u', "uu", "a - b"}, {"v_subrev_u32", 'u', "uu", "b - a"},
         {"v_add_nc_i32", 'u', "uu", "a + b"}, {"v_sub_nc_i32", 'u', "uu", "a - b"},
         {"v_mul_lo_u32", 'u', "uu", "a * b"}, {"v_mul_lo_i32", 'u', "uu", "a * b"},
-        {"v_mul_hi_u32", 'u', "uu", "uint((uint64_t(a) * uint64_t(b)) >> 32)"},
-        {"v_mul_hi_i32", 'u', "ii", "uint(uint64_t(int64_t(a) * int64_t(b)) >> 32)"},
+        {"v_mul_hi_u32", 'u', "uu", "mulhi_u(a, b)"},
+        {"v_mul_hi_i32", 'u', "ii", "uint(mulhi_i(a, b))"},
         {"v_mul_u32_u24", 'u', "uu", "(a & 0xffffffu) * (b & 0xffffffu)"},
         {"v_mul_i32_i24", 'u', "uu", "uint((int(a << 8) >> 8) * (int(b << 8) >> 8))"},
-        {"v_mul_hi_u32_u24", 'u', "uu", "uint((uint64_t(a & 0xffffffu) * uint64_t(b & 0xffffffu)) >> 32)"},
-        {"v_mul_hi_i32_i24", 'u', "uu", "uint(uint64_t(int64_t(int(a << 8) >> 8) * int64_t(int(b << 8) >> 8)) >> 32)"},
+        {"v_mul_hi_u32_u24", 'u', "uu", "mulhi_u(a & 0xffffffu, b & 0xffffffu)"},
+        {"v_mul_hi_i32_i24", 'u', "uu", "uint(mulhi_i(int(a << 8) >> 8, int(b << 8) >> 8))"},
         {"v_mad_u32_u24", 'u', "uuu", "(a & 0xffffffu) * (b & 0xffffffu) + c"},
         {"v_mad_i32_i24", 'u', "uuu", "uint((int(a << 8) >> 8) * (int(b << 8) >> 8)) + c"},
         {"v_mad_u32_u16", 'u', "uuu", "(a & 0xffffu) * (b & 0xffffu) + c"},
@@ -1724,7 +1721,8 @@ bool Translator::emit_mimg(const Instr& in, size_t idx) {
         return s + ")";
     };
     auto write_result = [&](const std::string& vec4) {
-        line(fmt("if (kexec) { %s t_ = %s;", R.is_uint ? "uint4" : "float4", vec4.c_str()));
+        if (R.scalar) line(fmt("if (kexec) { uint4 t_ = uint4(%s, 0u, 0u, 1u);", vec4.c_str()));
+        else line(fmt("if (kexec) { %s t_ = %s;", R.is_uint ? "uint4" : "float4", vec4.c_str()));
         unsigned o = 0;
         for (int b = 0; b < 4; b++)
             if ((in.dmask >> b) & 1) line(fmt("  %s = %s(t_.%c);", V(in.vdata + o++).c_str(), R.is_uint ? "uint" : "asuint", sw[b]));
@@ -1800,7 +1798,8 @@ bool Translator::emit_mimg(const Instr& in, size_t idx) {
             std::string e = ((in.dmask >> b) & 1) ? V(in.vdata + o++) : std::string("0u");
             v += (b ? ", " : "") + (R.is_uint ? e : "asfloat(" + e + ")");
         }
-        line(fmt("if (kexec) %s[%s] = %s4(%s);", RN.c_str(), icoord(nc, "").c_str(), R.is_uint ? "uint" : "float", v.c_str()));
+        if (R.scalar) line(fmt("if (kexec) %s[%s] = %s;", RN.c_str(), icoord(nc, "").c_str(), V(in.vdata).c_str()));
+        else line(fmt("if (kexec) %s[%s] = %s4(%s);", RN.c_str(), icoord(nc, "").c_str(), R.is_uint ? "uint" : "float", v.c_str()));
         return true;
     }
     if (starts(n, "image_atomic_")) {
@@ -2114,7 +2113,7 @@ std::string Translator::res_decl(const Res& r) const {
         std::string t = std::string(r.uav ? "RWTexture" : "Texture") + (dim == 3 ? std::string("Cube") : dim == 4 ? "1DArray" : dim == 5 ? "2DArray" : dim == 6 ? "2DMS" : dim == 7 ? "2DMSArray" : kDimName[dim]);
         if (dim == 3 && r.cube_array) t = r.uav ? "RWTexture2DArray" : "TextureCubeArray";
         if (r.uav && dim == 3) t = "RWTexture2DArray";
-        return fmt("%s<%s4> %s%s %s;", t.c_str(), r.is_uint ? "uint" : "float", r.name.c_str(), arr.c_str(), reg.c_str());
+        return fmt("%s<%s%s> %s%s %s;", t.c_str(), r.is_uint ? "uint" : "float", r.scalar ? "" : "4", r.name.c_str(), arr.c_str(), reg.c_str());
     }
     case ResKind::Sampler: case ResKind::StaticSampler:
         return fmt("%s %s%s %s;", r.cmp_sampler ? "SamplerComparisonState" : "SamplerState", r.name.c_str(), arr.c_str(), reg.c_str());
@@ -2125,6 +2124,14 @@ std::string Translator::res_decl(const Res& r) const {
 const char* kPrelude = R"(
 static uint L;
 static uint64_t memtime_ = 0;
+// 32x32 -> high 32 bits without 64-bit integer multiplies (some PC drivers reject those).
+uint mulhi_u(uint a, uint b) {
+  uint al = a & 0xffffu, ah = a >> 16, bl = b & 0xffffu, bh = b >> 16;
+  uint ll = al * bl, lh = al * bh, hl = ah * bl, hh = ah * bh;
+  uint mid = (ll >> 16) + (lh & 0xffffu) + (hl & 0xffffu);
+  return hh + (lh >> 16) + (hl >> 16) + (mid >> 16);
+}
+int mulhi_i(int a, int b) { uint h = mulhi_u(uint(a), uint(b)); if (a < 0) h -= uint(b); if (b < 0) h -= uint(a); return int(h); }
 bool lanebit(uint lo, uint hi) { return L < 32u ? ((lo >> L) & 1u) != 0u : ((hi >> (L - 32u)) & 1u) != 0u; }
 bool lanebit1(uint lo) { return ((lo >> (L & 31u)) & 1u) != 0u; }
 uint2 ballot2(bool b) { uint4 r = WaveActiveBallot(b); return r.xy; }

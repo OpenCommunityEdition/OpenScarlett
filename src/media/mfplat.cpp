@@ -11,6 +11,7 @@
 #include <mfapi.h>
 #include <mfidl.h>
 
+#include <cstring>
 #include <string>
 
 #include "xsl/log.h"
@@ -48,9 +49,23 @@ void resolve() {
 // IMFDXGIDeviceManager::ResetDevice). The title passes its console D3D12 device; PC Media
 // Foundation accepts it only if it is a PC device, so a refusal leaves the manager without a
 // device and Media Foundation decodes in software, which the title is told succeeded.
+// Console objects made by d3d12_xs.dll carry a 64-byte header in front of the interface:
+// magic 'XSLO' (dword 0) and the PC object they front (pointer at offset 8; src/gfx/xs_object.h).
+static IUnknown* pc_device_of(IUnknown* device) {
+    if (!device) return nullptr;
+    const char* h = reinterpret_cast<const char*>(device) - 64;
+    uint32_t magic;
+    memcpy(&magic, h, 4);
+    if (magic != 0x4F4C5358) return device;   // not a layer object: pass through
+    IUnknown* pc;
+    memcpy(&pc, h + 8, sizeof pc);
+    return pc;
+}
+
 extern "C" HRESULT WINAPI MFResetDXGIDeviceManagerX(IMFDXGIDeviceManager* manager, IUnknown* device, UINT token) {
     if (!manager) return E_POINTER;
-    HRESULT hr = manager->ResetDevice(device, token);
+    // PC Media Foundation needs the PC device, not the console object fronting it.
+    HRESULT hr = manager->ResetDevice(pc_device_of(device), token);
     if (FAILED(hr)) {
         static LONG once;
         if (!InterlockedExchange(&once, 1))

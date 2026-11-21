@@ -75,7 +75,7 @@ std::vector<uint8_t> with_root_signature(const std::vector<uint8_t>& dxil, const
     parts.push_back({gpucode::fourcc("RTS0"), *rs});
     return build_container(parts, dxil.data());
 }
-constexpr const char* kVersion = "gpucode-2";
+constexpr const char* kVersion = "gpucode-3";
 
 int mode() {
     static int m = [] {
@@ -197,7 +197,15 @@ std::set<uint64_t> g_failed;
 bool native_translate(const void* in, size_t n, void** out, size_t* outSize) {
     if (mode() == 0) return false;
     gpucode::Container c;
-    if (!gpucode::read_container(in, n, c) || !c.has_native) return false;
+    if (!gpucode::read_container(in, n, c)) return false;
+    if (!c.has_native) {
+        if (!c.has_bitcode && c.part("DXIL")) {
+            static volatile long w = 0;
+            if (InterlockedIncrement(&w) <= 5)
+                XSL_WARN(CH, "shader (%s) has neither DXIL nor precompiled code the translator can read (%zu bytes)", gpucode::kind_name(c.kind), n);
+        }
+        return false;
+    }
     if (c.has_bitcode && mode() != 1) return false;
     if (const char* st = getenv("XSL_NATIVE_STAGES"); st && *st && !strstr(st, gpucode::kind_name(c.kind))) return false;
     uint64_t key = fnv(kVersion, strlen(kVersion), fnv(in, n));
@@ -209,7 +217,9 @@ bool native_translate(const void* in, size_t n, void** out, size_t* outSize) {
     swprintf(name, 32, L"%016llx.dxil", (unsigned long long)key);
     std::wstring cpath = cache_dir().empty() ? L"" : cache_dir() + name;
     std::vector<uint8_t> dxil;
-    if (cpath.empty() || !read_file(cpath, dxil)) {
+    bool cached = !cpath.empty() && read_file(cpath, dxil);
+    if (cached) XSL_INFO(CH, "shader %016llx (%s): from cache", (unsigned long long)key, gpucode::kind_name(c.kind));
+    if (!cached) {
         const auto* rsp = c.part("RTS0");
         gpucode::RootSig rs;
         std::string err;

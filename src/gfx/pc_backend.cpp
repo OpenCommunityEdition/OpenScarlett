@@ -68,8 +68,43 @@ bool env_on(const char* name) {
 }
 }  // namespace
 
+// XSL_D3D12_DRED=1: device-removed extended data (automatic breadcrumbs, page faults), logged once
+// when the device is found removed.
+void report_device_removed(ID3D12Device* dev) {
+    static volatile long once = 0;
+    if (!dev || InterlockedExchange(&once, 1)) return;
+    XSL_ERR(CH, "device removed: reason %08lx", dev->GetDeviceRemovedReason());
+    ID3D12DeviceRemovedExtendedData* dred = nullptr;
+    if (FAILED(dev->QueryInterface(IID_PPV_ARGS(&dred)))) return;
+    D3D12_DRED_AUTO_BREADCRUMBS_OUTPUT bc{};
+    if (SUCCEEDED(dred->GetAutoBreadcrumbsOutput(&bc))) {
+        int lists = 0;
+        for (auto* n = bc.pHeadAutoBreadcrumbNode; n && lists < 64; n = n->pNext, lists++) {
+            UINT done = n->pLastBreadcrumbValue ? *n->pLastBreadcrumbValue : 0;
+            if (done >= n->BreadcrumbCount) continue;   // completed
+            XSL_ERR(CH, "DRED: list %ls on queue %ls stopped at op %u of %u", n->pCommandListDebugNameW ? n->pCommandListDebugNameW : L"?",
+                    n->pCommandQueueDebugNameW ? n->pCommandQueueDebugNameW : L"?", done, n->BreadcrumbCount);
+            for (UINT k = done > 3 ? done - 3 : 0; k < n->BreadcrumbCount && k < done + 3; k++)
+                XSL_ERR(CH, "DRED:   %s op %u: %d", k == done ? ">" : " ", k, (int)n->pCommandHistory[k]);
+        }
+    }
+    D3D12_DRED_PAGE_FAULT_OUTPUT pf{};
+    if (SUCCEEDED(dred->GetPageFaultAllocationOutput(&pf)) && pf.PageFaultVA)
+        XSL_ERR(CH, "DRED: page fault at GPU VA %llx", (unsigned long long)pf.PageFaultVA);
+    dred->Release();
+}
+
 HRESULT_T create_device(PcObj* out) {
     HRESULT hr;
+    if (env_on("XSL_D3D12_DRED")) {
+        ID3D12DeviceRemovedExtendedDataSettings* ds = nullptr;
+        if (SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&ds)))) {
+            ds->SetAutoBreadcrumbsEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+            ds->SetPageFaultEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+            ds->Release();
+            XSL_INFO(CH, "DRED enabled (breadcrumbs, page faults)");
+        }
+    }
     if (env_on("XSL_D3D12_DEBUG")) {
         ID3D12Debug* dbg = nullptr;
         if (SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&dbg)))) { dbg->EnableDebugLayer(); dbg->Release(); }
@@ -224,6 +259,28 @@ uint64_t heap_gpu_start(PcObj h) {
     return as<ID3D12DescriptorHeap>(h)->GetGPUDescriptorHandleForHeapStart().ptr;
 }
 
+namespace {
+struct ByteBlob final : ID3DBlob {
+    volatile LONG ref = 1;
+    std::vector<uint8_t> data;
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** out) override {
+        if (!out) return E_POINTER;
+        if (IsEqualGUID(riid, __uuidof(IUnknown)) || IsEqualGUID(riid, __uuidof(ID3DBlob))) { AddRef(); *out = this; return S_OK; }
+        *out = nullptr;
+        return E_NOINTERFACE;
+    }
+    ULONG STDMETHODCALLTYPE AddRef() override { return InterlockedIncrement(&ref); }
+    ULONG STDMETHODCALLTYPE Release() override { ULONG n = InterlockedDecrement(&ref); if (!n) delete this; return n; }
+    LPVOID STDMETHODCALLTYPE GetBufferPointer() override { return data.data(); }
+    SIZE_T STDMETHODCALLTYPE GetBufferSize() override { return data.size(); }
+};
+}  // namespace
+PcObj create_blob(const void* data, size_t size) {
+    auto* b = new ByteBlob;
+    b->data.assign((const uint8_t*)data, (const uint8_t*)data + size);
+    return (PcObj)static_cast<ID3DBlob*>(b);
+}
+
 HRESULT_T create_root_signature(PcObj dev, const void* blob, size_t size, PcObj* out) {
     void* clean = nullptr;
     size_t cleanSize = 0;
@@ -258,6 +315,7 @@ HRESULT_T create_graphics_pso(PcObj dev, const void* desc, PcObj* out) {
     d.NodeMask = 0;
     HRESULT hr = as<ID3D12Device>(dev)->CreateGraphicsPipelineState(&d, IID_PPV_ARGS(reinterpret_cast<ID3D12PipelineState**>(out)));
     if (FAILED(hr)) XSL_ERR(CH, "CreateGraphicsPipelineState failed %08lx", hr);
+    if (hr == DXGI_ERROR_DEVICE_REMOVED) report_device_removed(as<ID3D12Device>(dev));
     return hr;
 }
 HRESULT_T create_compute_pso(PcObj dev, const void* desc, PcObj* out) {
@@ -269,6 +327,7 @@ HRESULT_T create_compute_pso(PcObj dev, const void* desc, PcObj* out) {
     d.NodeMask = 0;
     HRESULT hr = as<ID3D12Device>(dev)->CreateComputePipelineState(&d, IID_PPV_ARGS(reinterpret_cast<ID3D12PipelineState**>(out)));
     if (FAILED(hr)) XSL_ERR(CH, "CreateComputePipelineState failed %08lx", hr);
+    if (hr == DXGI_ERROR_DEVICE_REMOVED) report_device_removed(as<ID3D12Device>(dev));
     return hr;
 }
 
@@ -282,6 +341,7 @@ HRESULT_T create_pso_stream(PcObj dev, void* stream, size_t size, PcObj* out) {
         d2->Release();
     }
     if (FAILED(hr)) XSL_ERR(CH, "CreatePipelineState (stream, %zu bytes) failed %08lx", size, hr);
+    if (hr == DXGI_ERROR_DEVICE_REMOVED) report_device_removed(as<ID3D12Device>(dev));
     return hr;
 }
 HRESULT_T import_host_memory(PcObj dev, void* base, uint64_t size, PcObj* res, uint64_t* gpuVa) {
@@ -417,6 +477,13 @@ template <class D> const D* view_fix(PcObj res, const void* desc, D& tmp) {
 D3D12_RESOURCE_DESC clean_desc(const void* desc) {
     D3D12_RESOURCE_DESC d = *static_cast<const D3D12_RESOURCE_DESC*>(desc);
     d.Flags = (D3D12_RESOURCE_FLAGS)(d.Flags & 0xBF);  // PC flags only; Xbox compression/DCC bits dropped
+    // The console allows unordered access to depth-stencil resources; PC D3D12 does not. The UAV
+    // flag is dropped (UAVs onto such resources become null descriptors, see create_uav).
+    if ((d.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL) && (d.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)) {
+        static volatile long n = 0;
+        if (InterlockedIncrement(&n) <= 2) XSL_WARN(CH, "depth-stencil resource with unordered access (console only): UAV flag dropped");
+        d.Flags = (D3D12_RESOURCE_FLAGS)(d.Flags & ~D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+    }
     if (d.Layout > D3D12_TEXTURE_LAYOUT_64KB_STANDARD_SWIZZLE) d.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
     return d;
 }
@@ -628,6 +695,15 @@ void create_srv(PcObj dev, PcObj res, const void* desc, uint64_t h) {
     as<ID3D12Device>(dev)->CreateShaderResourceView(as<ID3D12Resource>(res), view_fix(res, desc, t), cpu(h));
 }
 void create_uav(PcObj dev, PcObj res, PcObj counter, const void* desc, uint64_t h) {
+    if (res && !(as<ID3D12Resource>(res)->GetDesc().Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)) {
+        // e.g. a depth-stencil resource whose UAV flag was dropped: null view of the requested dimension
+        D3D12_UNORDERED_ACCESS_VIEW_DESC nd{};
+        nd.Format = DXGI_FORMAT_R32_FLOAT;
+        nd.ViewDimension = desc ? static_cast<const D3D12_UNORDERED_ACCESS_VIEW_DESC*>(desc)->ViewDimension : D3D12_UAV_DIMENSION_TEXTURE2D;
+        if (nd.ViewDimension == D3D12_UAV_DIMENSION_BUFFER) nd.Format = DXGI_FORMAT_R32_TYPELESS, nd.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
+        as<ID3D12Device>(dev)->CreateUnorderedAccessView(nullptr, nullptr, &nd, cpu(h));
+        return;
+    }
     D3D12_UNORDERED_ACCESS_VIEW_DESC t;
     as<ID3D12Device>(dev)->CreateUnorderedAccessView(as<ID3D12Resource>(res), as<ID3D12Resource>(counter), view_fix(res, desc, t), cpu(h));
 }
@@ -641,6 +717,10 @@ void create_cbv(PcObj dev, const void* desc, uint64_t h) {
     if (p) {
         d = *p;
         d.SizeInBytes = (d.SizeInBytes + 255) & ~255u;
+        if ((d.BufferLocation & 255) && getenv("XSL_CBV_ALIGN_DOWN")) {   // experiment: legal view, shifted contents
+            d.SizeInBytes = UINT((d.SizeInBytes + (d.BufferLocation & 255) + 255) & ~255ull);
+            d.BufferLocation &= ~255ull;
+        }
         if (d.BufferLocation & 255) {
             static volatile long n = 0;
             if (InterlockedIncrement(&n) <= 3)

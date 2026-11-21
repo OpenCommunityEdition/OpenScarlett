@@ -39,6 +39,14 @@ HRESULT D3DAPI QueryInterface(IGraphicsUnknown* self, REFIID riid, void** out) {
     for (const IID* const* p = h->iids; p && *p; p++) {
         if (IsEqualGUID(riid, **p)) { AddRef(self); *out = self; return S_OK; }
     }
+    // State objects: ID3D12StateObjectProperties is a second object (header user[0] links them).
+    if ((h->kind == Kind::StateObject && IsEqualGUID(riid, __uuidof(ID3D12StateObjectProperties))) ||
+        (h->kind == Kind::StateObjectProperties && IsEqualGUID(riid, __uuidof(ID3D12StateObject)))) {
+        auto* other = (IGraphicsUnknown*)h->user[0];
+        AddRef(other);
+        *out = other;
+        return S_OK;
+    }
     if (h->kind == Kind::Device && (IsEqualGUID(riid, __uuidof(IDXGIDevice)) || IsEqualGUID(riid, __uuidof(IDXGIDevice1)) ||
                                     IsEqualGUID(riid, __uuidof(IDXGIDevice2)) || IsEqualGUID(riid, __uuidof(IDXGIObject)))) {
         return create_dxgi_device((Device*)self, out);
@@ -152,6 +160,23 @@ HRESULT D3DAPI Pso_GetCachedBlob(ID3D12PipelineState* pso, ID3DBlob** out) {
     *out = (ID3DBlob*)make_pc_blob(b);
     return S_OK;
 }
+// Console-only pipeline information. Translated pipelines have no console code objects: the symbol
+// table is empty and no scratch memory is needed.
+HRESULT D3DAPI Pso_GetInformationX(ID3D12PipelineState*, D3D12XBOX_PIPELINE_STATE_INFORMATION_TYPE type, UINT64, ID3DBlob** out) {
+    if (!out) return E_POINTER;
+    *out = nullptr;
+    if (type == D3D12XBOX_PIPELINE_STATE_INFORMATION_TYPE_SYMBOL_TABLE) {
+        D3D12XBOX_SHADER_SYMBOL_LIST l{};
+        *out = (ID3DBlob*)make_pc_blob(pc::create_blob(&l, sizeof l));
+        return S_OK;
+    }
+    if (type == D3D12XBOX_PIPELINE_STATE_INFORMATION_TYPE_SCRATCH_SIZE_PER_WAVE_IN_UNITS_OF_256DW) {
+        UINT z = 0;
+        *out = (ID3DBlob*)make_pc_blob(pc::create_blob(&z, sizeof z));
+        return S_OK;
+    }
+    return E_INVALIDARG;
+}
 std::once_flag g_simple_once;
 // Memory heaps keep the description the title created them with: the PC heap's may differ (upload
 // heaps are created as write-back custom heaps, console-only flags are dropped).
@@ -170,6 +195,7 @@ void init_simple_tables() {
         xsl_fill_default(&g_pso_tbl);
         install_device_child_base(&g_pso_tbl);
         g_pso_tbl.GetCachedBlob = Pso_GetCachedBlob;
+        g_pso_tbl.GetInformationX = Pso_GetInformationX;
         xsl_fill_default(&g_heap_tbl);
         install_device_child_base(&g_heap_tbl);
         g_heap_tbl.HeapTable.GetDesc = Heap_GetDesc;

@@ -34,6 +34,7 @@ namespace xs {
 enum class Kind : uint32_t {
     Device = 1, Queue, Allocator, List, Fence, Resource, Heap, DescriptorHeap, RootSignature, Pso,
     DxgiDevice, DxgiAdapter, DxgiOutput, QueryHeap, CommandSignature, DxgiFactory,
+    StateObject, StateObjectProperties,
 };
 
 struct Device;
@@ -70,6 +71,8 @@ XSL_ABI_TABLE(D3D12PipelineState)
 XSL_ABI_TABLE(D3D12Heap1)
 XSL_ABI_TABLE(D3D12CommandSignature)
 XSL_ABI_TABLE(D3D12QueryHeap)
+XSL_ABI_TABLE(D3D12StateObject)
+XSL_ABI_TABLE(D3D12StateObjectProperties)
 
 // `table` is the pinned SDK's layout; titles of older GDK editions get it rearranged (xs_abi.h).
 template <class I, class Extra, class Table>

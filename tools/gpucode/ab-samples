@@ -26,4 +26,5 @@ for exe in "$here"/build/samples/*/*.exe; do
   no=$(grep -c "not translated\|does not compile" "$out/$name.nat.log")
   cmp=$(python3 "$here/tools/gpucode/bmpdiff.py" "$out/$name.ref.bmp" "$out/$name.nat.bmp" 2>&1)
   printf '%-26s translated=%-3s untranslated=%-3s %s\n' "$name" "$ok" "$no" "$cmp"
+  [ "${AB_KEEP:-0}" = 1 ] || rm -rf "$out/$name".{ref,nat}.bmp "$out/cache-$name"   # captures are large
 done
