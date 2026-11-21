@@ -1429,8 +1429,14 @@ bool Translator::emit_valu(const Instr& in, size_t idx) {
         if (in.sdwa && in.fmt != Fmt::VOPC && in.sdwa_f.dst_sel < 6) {
             unsigned sel = in.sdwa_f.dst_sel, sh = sel < 4 ? sel * 8 : (sel - 4) * 16, w = sel < 4 ? 8 : 16;
             unsigned m = ((1u << w) - 1) << sh;
-            std::string keep = in.sdwa_f.dst_unused == 2 ? fmt("(%s & 0x%xu)", V(dst).c_str(), ~m) : "0u";
-            v = fmt("(((%s) << %u) & 0x%xu) | %s", v.c_str(), sh, m, keep.c_str());
+            // dst_unused: 0 pads with zeros, 1 sign-extends the field upwards, 2 keeps the old bits.
+            if (in.sdwa_f.dst_unused == 1) {
+                unsigned up = 32 - sh - w;
+                v = fmt("uint(int((((%s) << %u) & 0x%xu) << %u) >> %u)", v.c_str(), sh, m, up, up);
+            } else {
+                std::string keep = in.sdwa_f.dst_unused == 2 ? fmt("(%s & 0x%xu)", V(dst).c_str(), ~m) : "0u";
+                v = fmt("(((%s) << %u) & 0x%xu) | %s", v.c_str(), sh, m, keep.c_str());
+            }
         }
         write_v(dst, v);
     };
@@ -1607,12 +1613,12 @@ bool Translator::emit_valu(const Instr& in, size_t idx) {
         // f32
         {"v_add_f32", 'f', "ff", "a + b"}, {"v_sub_f32", 'f', "ff", "a - b"}, {"v_subrev_f32", 'f', "ff", "b - a"},
         {"v_mul_f32", 'f', "ff", "a * b"}, {"v_mul_legacy_f32", 'f', "ff", "mul_legacy(a, b)"},
-        {"v_fma_f32", 'f', "fff", "mad(a, b, c)"}, {"v_mad_f32", 'f', "fff", "mad(a, b, c)"},
-        {"v_fma_legacy_f32", 'f', "fff", "mad_legacy(a, b, c)"}, {"v_mad_legacy_f32", 'f', "fff", "mad_legacy(a, b, c)"},
-        {"v_fmac_f32", 'f', "ffD", "mad(a, b, d)"}, {"v_mac_f32", 'f', "ffD", "mad(a, b, d)"},
-        {"v_fmac_legacy_f32", 'f', "ffD", "mad_legacy(a, b, d)"}, {"v_mac_legacy_f32", 'f', "ffD", "mad_legacy(a, b, d)"},
-        {"v_madak_f32", 'f', "ff", "mad(a, b, Kf)"}, {"v_fmaak_f32", 'f', "ff", "mad(a, b, Kf)"},
-        {"v_madmk_f32", 'f', "ff", "mad(a, Kf, b)"}, {"v_fmamk_f32", 'f', "ff", "mad(a, Kf, b)"},
+        {"v_fma_f32", 'f', "fff", "mad(a, b, c)"}, {"v_mad_f32", 'f', "fff", "umad(a, b, c)"},
+        {"v_fma_legacy_f32", 'f', "fff", "fma_legacy(a, b, c)"}, {"v_mad_legacy_f32", 'f', "fff", "mad_legacy(a, b, c)"},
+        {"v_fmac_f32", 'f', "ffD", "mad(a, b, d)"}, {"v_mac_f32", 'f', "ffD", "umad(a, b, d)"},
+        {"v_fmac_legacy_f32", 'f', "ffD", "fma_legacy(a, b, d)"}, {"v_mac_legacy_f32", 'f', "ffD", "mad_legacy(a, b, d)"},
+        {"v_madak_f32", 'f', "ff", "umad(a, b, Kf)"}, {"v_fmaak_f32", 'f', "ff", "mad(a, b, Kf)"},
+        {"v_madmk_f32", 'f', "ff", "umad(a, Kf, b)"}, {"v_fmamk_f32", 'f', "ff", "mad(a, Kf, b)"},
         {"v_min_f32", 'f', "ff", "min(a, b)"}, {"v_max_f32", 'f', "ff", "max(a, b)"},
         {"v_min3_f32", 'f', "fff", "min(min(a, b), c)"}, {"v_max3_f32", 'f', "fff", "max(max(a, b), c)"},
         {"v_med3_f32", 'f', "fff", "med3f(a, b, c)"},
@@ -1690,8 +1696,8 @@ bool Translator::emit_valu(const Instr& in, size_t idx) {
         {"v_ashrrev_i64", 'U', "uI", "uint64_t(b >> (a & 63u))"},
         // f16
         {"v_add_f16", 'h', "hh", "a + b"}, {"v_sub_f16", 'h', "hh", "a - b"}, {"v_subrev_f16", 'h', "hh", "b - a"},
-        {"v_mul_f16", 'h', "hh", "a * b"}, {"v_fma_f16", 'h', "hhh", "mad(a, b, c)"}, {"v_mad_f16", 'h', "hhh", "mad(a, b, c)"},
-        {"v_fmac_f16", 'h', "hhE", "mad(a, b, d)"}, {"v_mac_f16", 'h', "hhE", "mad(a, b, d)"},
+        {"v_mul_f16", 'h', "hh", "a * b"}, {"v_fma_f16", 'h', "hhh", "mad(a, b, c)"}, {"v_mad_f16", 'h', "hhh", "umad(a, b, c)"},
+        {"v_fmac_f16", 'h', "hhE", "mad(a, b, d)"}, {"v_mac_f16", 'h', "hhE", "umad(a, b, d)"},
         {"v_fmaak_f16", 'h', "hh", "mad(a, b, Kh)"}, {"v_fmamk_f16", 'h', "hh", "mad(a, Kh, b)"},
         {"v_min_f16", 'h', "hh", "min(a, b)"}, {"v_max_f16", 'h', "hh", "max(a, b)"},
         {"v_min3_f16", 'h', "hhh", "min(min(a, b), c)"}, {"v_max3_f16", 'h', "hhh", "max(max(a, b), c)"}, {"v_med3_f16", 'h', "hhh", "med3f(a, b, c)"},
@@ -1739,7 +1745,14 @@ bool Translator::emit_valu(const Instr& in, size_t idx) {
         else if (dt == 'U') wv64(r);
         else if (dt == 'h') wv16(fin('h', r));
         else if (dt == 'W' || dt == 'S') wv16("uint(" + r + ") & 0xffffu");
-        else wv(fin(dt, r));
+        else if (dt == 'f' && !has(o.e, "mad(")) {
+            // The console does not contract separate multiplies and adds: keep the PC compiler
+            // from fusing this result into a later operation (real FMAs use mad and may fuse).
+            std::string f = fin('f', r);   // asuint(float(...))
+            line(fmt("{ precise float pf_ = asfloat(%s);", f.c_str()));
+            wv("asuint(pf_)");
+            line("}");
+        } else wv(fin(dt, r));
         return true;
     }
     // Packed 16-bit (VOP3P).
@@ -2195,7 +2208,6 @@ bool Translator::emit_ds(const Instr& in, size_t idx) {
     std::string n = in.name;
     uses_lds = true;
     std::string a = fmt("(%s + %uu)", V(in.vaddr).c_str(), uint32_t(in.offset_imm) | (uint32_t(in.gds_offset1) << 8));
-    std::string a0 = fmt("(%s + %uu)", V(in.vaddr).c_str(), uint32_t(in.offset_imm));
     if (in.gds) return fail(n + " with GDS not supported");
     if (n == "ds_swizzle_b32") {
         uint32_t off = uint32_t(in.offset_imm) | (uint32_t(in.gds_offset1) << 8);
@@ -2211,12 +2223,14 @@ bool Translator::emit_ds(const Instr& in, size_t idx) {
         }
         return true;
     }
-    if (n == "ds_bpermute_b32" && dual) {
-        write_v(in.dst, fmt("xlane64(%s, %s, (%s >> 2) & 63u)", Vc(in.data0, 0).c_str(), Vc(in.data0, 1).c_str(), a.c_str()));
+    if (n == "ds_bpermute_b32") {
+        // Wave64 permutes within each 32-lane half: source = (lane & 32) | ((addr >> 2) & 31); an
+        // inactive source lane reads 0. In the two-lane mapping a half is one copy's PC wave.
+        std::string srcl = dual || W == 32 ? fmt("((%s >> 2) & 31u)", a.c_str()) : fmt("((L & 32u) | ((%s >> 2) & 31u))", a.c_str());
+        write_v(in.dst, fmt("bperm(%s, %s, kexec)", V(in.data0).c_str(), srcl.c_str()));
         uses_wave = true;
         return true;
     }
-    if (n == "ds_bpermute_b32") { write_v(in.dst, fmt("xlane(%s, (%s >> 2) & %uu)", V(in.data0).c_str(), a.c_str(), W - 1)); uses_wave = true; return true; }
     if (n == "ds_permute_b32") return fail("ds_permute_b32 not supported");
     if (n == "ds_read_b32" || n == "ds_load_b32") { write_v(in.dst, fmt("lds[%s >> 2]", a.c_str())); return true; }
     if (n == "ds_read_b64" || n == "ds_read_b96" || n == "ds_read_b128") {
@@ -2286,9 +2300,9 @@ bool Translator::emit_ds(const Instr& in, size_t idx) {
         std::string val = V(in.data0);
         if (k == "sub") val = "(0u - " + val + ")";
         line(fmt("if (kexec) { %s o_;", sgn ? "int" : "uint"));
-        if (k == "cmpst") line(fmt("  InterlockedCompareExchange(lds[%s >> 2], %s, %s, o_);", a0.c_str(), V(in.data0).c_str(), V(in.data1).c_str()));
-        else if (sgn) line(fmt("  { int t_; %s(ldsi[%s >> 2], int(%s), t_); o_ = t_; }", p[1], a0.c_str(), val.c_str()));
-        else line(fmt("  %s(lds[%s >> 2], %s, o_);", p[1], a0.c_str(), val.c_str()));
+        if (k == "cmpst") line(fmt("  InterlockedCompareExchange(lds[%s >> 2], %s, %s, o_);", a.c_str(), V(in.data0).c_str(), V(in.data1).c_str()));
+        else if (sgn) line(fmt("  { int t_; %s(ldsi[%s >> 2], int(%s), t_); o_ = t_; }", p[1], a.c_str(), val.c_str()));
+        else line(fmt("  %s(lds[%s >> 2], %s, o_);", p[1], a.c_str(), val.c_str()));
         if (rtn) line(fmt("  %s = uint(o_);", V(in.dst).c_str()));
         line("}");
         if (sgn) return fail(n + " (signed LDS atomics) not supported yet");
@@ -2445,8 +2459,9 @@ bool Translator::emit_exp(const Instr& in, size_t idx) {
             if (misc && k == 0) {
                 line("if (kexec) {");
                 for (auto& e : osg) {
-                    if (e.sysval == 4 && (in.exp_en & 4)) line("  O.rtai_ = asuint(" + comp[2] + ");");
-                    if (e.sysval == 5 && (in.exp_en & 8)) line("  O.vpi_ = asuint(" + comp[3] + ");");
+                    // Misc vector z: render-target array index in bits 10:0, viewport index in 19:16.
+                    if (e.sysval == 4 && (in.exp_en & 4)) line("  O.rtai_ = asuint(" + comp[2] + ") & 0x7ffu;");
+                    if (e.sysval == 5 && (in.exp_en & 4)) line("  O.vpi_ = (asuint(" + comp[2] + ") >> 16) & 0xfu;");
                 }
                 line("}");
                 return true;
@@ -2566,7 +2581,8 @@ uint ff1_64(uint lo, uint hi) { return lo != 0u ? firstbitlow(lo) : (hi != 0u ? 
 uint flbit_i32(uint x) { int v = int(x); if (v == 0 || v == -1) return 0xffffffffu; return 31u - firstbithigh(v < 0 ? ~x : x); }
 uint wqm32(uint x) { uint r = 0u; [unroll] for (uint q = 0u; q < 32u; q += 4u) if (((x >> q) & 15u) != 0u) r |= 15u << q; return r; }
 float mul_legacy(float a, float b) { return (a == 0.0f || b == 0.0f) ? 0.0f : a * b; }
-float mad_legacy(float a, float b, float c) { return mul_legacy(a, b) + c; }
+float mad_legacy(float a, float b, float c) { precise float p = mul_legacy(a, b); precise float r = p + c; return r; }   // unfused
+float fma_legacy(float a, float b, float c) { return (a == 0.0f || b == 0.0f) ? c : mad(a, b, c); }                       // fused
 uint cvt_u32(float f) { return (f != f || f <= 0.0f) ? 0u : (f >= 4294967040.0f ? 0xffffffffu : (uint)f); }
 int cvt_i32(float f) { return f != f ? 0 : (f <= -2147483648.0f ? int(0x80000000u) : (f >= 2147483520.0f ? 0x7fffffff : (int)f)); }
 uint bfe_u(uint x, uint o, uint w) { if (w == 0u) return 0u; uint v = x >> o; return w >= 32u ? v : v & ((1u << w) - 1u); }
@@ -2642,6 +2658,9 @@ float3 cube_dir(float s, float t, float f) {
 uint xlane(uint v, uint src) { uint r = 0u; [unroll] for (uint k = 0u; k < XL_N; k++) { uint t = WaveReadLaneAt(v, k); if ((src % XL_N) == k) r = t; } return r; }
 bool lanebitL(uint lo, uint hi, uint l) { return l < 32u ? ((lo >> l) & 1u) != 0u : ((hi >> (l - 32u)) & 1u) != 0u; }
 uint first_lane64(uint lo, uint hi) { return lo != 0u ? firstbitlow(lo) : (hi != 0u ? 32u + firstbitlow(hi) : 0u); }
+// v_mad/v_mac (not v_fma): the product is rounded before the add.
+float umad(float a, float b, float c) { precise float p = a * b; precise float r = p + c; return r; }
+uint bperm(uint v, uint src, bool act) { uint r = xlane(v, src), on = xlane(act ? 1u : 0u, src); return on != 0u ? r : 0u; }
 uint xlane64(uint v0, uint v1, uint src) { uint a = xlane(v0, src & 31u), b = xlane(v1, src & 31u); return src < 32u ? a : b; }
 uint readlane64(uint v0, uint v1, uint l) { return l < 32u ? WaveReadLaneAt(v0, l) : WaveReadLaneAt(v1, l - 32u); }
 uint xlane_bc(uint v, uint src, bool bc) { uint r = xlane(v, src & (WAVE - 1u)); return src == 0xffffffffu ? (bc ? 0u : v) : r; }
@@ -2799,7 +2818,7 @@ std::string Translator::generate() {
         unsigned s = meta.user_sgprs();
         for (int k = 0; k < 3; k++)
             if (meta.tgid_en(k)) init += fmt("  s%u = gid_.%c;\n", s++, "xyz"[k]);
-        if (meta.tg_size_en()) init += fmt("  s%u = (gi_ / 32u) << 6;   // console wave id in group (TG_SIZE)\n", s++);
+        if (meta.tg_size_en()) init += fmt("  s%u = ((gi_ / 32u) << 6) | %uu;   // TG_SIZE: console wave id, wave count\n", s++, (nt + 63) / 64);
         init += "  uint t0_ = (gi_ / 32u) * 64u + gi_ % 32u;\n";
         for (int cc = 0; cc < 2; cc++) {
             std::string t = cc ? "(t0_ + 32u)" : "t0_";
@@ -2816,7 +2835,10 @@ std::string Translator::generate() {
         unsigned s = meta.user_sgprs();
         for (int k = 0; k < 3; k++)
             if (meta.tgid_en(k)) init += fmt("  s%u = gid_.%c;\n", s++, "xyz"[k]);
-        if (meta.tg_size_en()) init += fmt("  s%u = (gi_ / WAVE) << 6;   // wave id in group (TG_SIZE)\n", s++);
+        if (meta.tg_size_en()) {
+            unsigned nt = meta.numthreads[0] * meta.numthreads[1] * meta.numthreads[2];
+            init += fmt("  s%u = ((gi_ / WAVE) << 6) | %uu;   // TG_SIZE: wave id in group, wave count\n", s++, (nt + W - 1) / W);
+        }
         for (unsigned k = 0; k < meta.tid_comps(); k++) init += fmt("  v%u = tid_.%c;\n", k, "xyz"[k]);
     } else if (c.kind == ProgramKind::PS) {
         h << "struct PSIn {\n";
@@ -2979,8 +3001,8 @@ std::string Translator::generate() {
         h << "  uint t0 = (gi_ / 32u) * 64u + gi_ % 32u, t1 = t0 + 32u;\n";
         h << "  if (t0 < nv) verts[t0] = O_0;\n  if (t1 < nv) verts[t1] = O_1;\n";
         if (has_prims()) h << "  if (t0 < np) prims[t0] = P_0;\n  if (t1 < np) prims[t1] = P_1;\n";
-        h << "  if (t0 < np) tris[t0] = (hasp__0 && (prim__0 >> 31) == 0u) ? uint3(prim__0 & 0x3ffu, (prim__0 >> 10) & 0x3ffu, (prim__0 >> 20) & 0x3ffu) : uint3(0u, 0u, 0u);\n";
-        h << "  if (t1 < np) tris[t1] = (hasp__1 && (prim__1 >> 31) == 0u) ? uint3(prim__1 & 0x3ffu, (prim__1 >> 10) & 0x3ffu, (prim__1 >> 20) & 0x3ffu) : uint3(0u, 0u, 0u);\n";
+        h << "  if (t0 < np) tris[t0] = (hasp__0 && (prim__0 >> 31) == 0u) ? uint3(prim__0 & 0x1ffu, (prim__0 >> 10) & 0x1ffu, (prim__0 >> 20) & 0x1ffu) : uint3(0u, 0u, 0u);\n";
+        h << "  if (t1 < np) tris[t1] = (hasp__1 && (prim__1 >> 31) == 0u) ? uint3(prim__1 & 0x1ffu, (prim__1 >> 10) & 0x1ffu, (prim__1 >> 20) & 0x1ffu) : uint3(0u, 0u, 0u);\n";
         h << "}\n";
     } else if (c.kind == ProgramKind::MS) {
         h << "\n[outputtopology(\"triangle\")]\n[numthreads(" << meta.numthreads[0] << ", " << meta.numthreads[1] << ", " << meta.numthreads[2] << ")]\n";
@@ -2994,7 +3016,7 @@ std::string Translator::generate() {
         h << "  SetMeshOutputCounts(nv, np);\n";
         h << "  if (gi_ < nv) verts[gi_] = O;   // unexported slots stay zero\n";
         if (has_prims()) h << "  if (gi_ < np) prims[gi_] = P;\n";
-        h << "  if (gi_ < np) tris[gi_] = (hasp_ && (prim_ >> 31) == 0u) ? uint3(prim_ & 0x3ffu, (prim_ >> 10) & 0x3ffu, (prim_ >> 20) & 0x3ffu) : uint3(0u, 0u, 0u);\n";
+        h << "  if (gi_ < np) tris[gi_] = (hasp_ && (prim_ >> 31) == 0u) ? uint3(prim_ & 0x1ffu, (prim_ >> 10) & 0x1ffu, (prim_ >> 20) & 0x1ffu) : uint3(0u, 0u, 0u);\n";
         h << "}\n";
     }
     return h.str();
