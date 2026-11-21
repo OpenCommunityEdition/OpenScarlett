@@ -1,0 +1,32 @@
+#!/bin/sh
+# SPDX-License-Identifier: MIT
+# Tier-1 translator tests: each kernel in tests/gpucode/kernels is compiled with the console
+# compiler (sdk/GXDK/bin/Scarlett/dxc.exe, under Wine), translated by xsl-gpucode and compiled for
+# PC; the reference is the same kernel (or <name>_ref.hlsl) compiled directly for PC. The output
+# directory holds both, dispatch_check.exe and run.cmd, which runs every kernel on a Windows PC and
+# compares the two (exit code 0: all match).
+# Usage: tools/gpucode/tier1 <outdir>   (needs build/ and build-native/ built)
+set -e
+out=${1:?usage: tier1 <outdir>}
+root=$(cd "$(dirname "$0")/../.." && pwd)
+export WINEPREFIX=${WINEPREFIX:-$root/build/wineprefix-tools} WINEDEBUG=-all
+xdxc="$root/sdk/GXDK/bin/Scarlett/dxc.exe"
+pdxc="$root/build/deps/dxc-pc/bin/x64/dxc.exe"
+k="$root/tests/gpucode/kernels"
+mkdir -p "$out"
+cp "$root/build/tests/unit/dispatch_check.exe" "$out/"
+printf '@echo off\r\nset fails=0\r\n' > "$out/run.cmd"
+for src in "$k"/*.hlsl; do
+    n=$(basename "$src" .hlsl)
+    case "$n" in *_ref) continue;; esac
+    ref="$src"; [ -f "$k/${n}_ref.hlsl" ] && ref="$k/${n}_ref.hlsl"
+    flags="-enable-16bit-types"
+    wine "$xdxc" -nologo -T cs_6_5 -E main $flags -I "Z:$k" "Z:$src" -Fo "Z:$out/$n.cso" > "$out/$n.xdxc.log" 2>&1 || { echo "$n: console compile failed"; continue; }
+    "$root/build-native/xsl-gpucode" translate "$out/$n.cso" > "$out/$n.hlsl" 2> "$out/$n.err" || { echo "$n: not translated: $(cat "$out/$n.err")"; continue; }
+    p=$(head -1 "$out/$n.hlsl" | awk '{print $3}' | tr -d ,)
+    wine "$pdxc" -nologo -T "$p" -E main "Z:$out/$n.hlsl" -Fo "Z:$out/$n.dxil" > "$out/$n.dxc.log" 2>&1 || { echo "$n: translation does not compile"; continue; }
+    wine "$pdxc" -nologo -T cs_6_2 -E main $flags -I "Z:$k" "Z:$ref" -Fo "Z:$out/$n.ref.dxil" > "$out/$n.ref.log" 2>&1 || { echo "$n: reference does not compile"; continue; }
+    printf 'echo == %s\r\ndispatch_check.exe %s.dxil %s.cso %s.hlsl -g 4 1 --ref %s.ref.dxil || set /a fails+=1\r\n' "$n" "$n" "$n" "$n" "$n" >> "$out/run.cmd"
+    echo "$n: built"
+done
+printf 'echo failures: %%fails%%\r\nexit /b %%fails%%\r\n' >> "$out/run.cmd"

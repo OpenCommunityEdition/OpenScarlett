@@ -814,7 +814,12 @@ struct Translator {
                      W == 64 ? (" " + S(r + 1) + " = b_.y;").c_str() : ""));
         }
     }
+    std::string lane_pred;   // extra per-lane write condition of the current instruction (DPP)
     void write_v(unsigned r, const std::string& v, bool pred = true) {
+        if (pred && !lane_pred.empty()) {
+            line("{ uint x_ = " + v + "; if (kexec && (" + lane_pred + ")) " + V(r) + " = x_; }");
+            return;
+        }
         // Cross-lane reads are evaluated by every lane (outside the EXEC predicate), so the lanes
         // they read from are active on the PC as well.
         if (pred && (v.find("xlane") != std::string::npos || v.find("WaveReadLaneAt") != std::string::npos || v.find("quadperm") != std::string::npos))
@@ -867,6 +872,7 @@ struct Translator {
         return ok;
     }
     bool emit1(const Instr& in, size_t idx) {
+        lane_pred.clear();
         if (opt.comments && cp <= 0) out << "  // " << fmt("%04x", in.offset) << ": " << disasm(in) << "\n";
         switch (in.fmt) {
         case Fmt::SOP1: case Fmt::SOP2: case Fmt::SOPC: case Fmt::SOPK: case Fmt::SOPP: return emit_salu(in, idx);
@@ -1261,6 +1267,13 @@ bool Translator::emit_valu(const Instr& in, size_t idx) {
                 else if (c >= 0x160 && c <= 0x16f) srcl = fmt("((L & ~15u) | ((L & 15u) ^ %uu))", c - 0x160);  // row_xmask
                 else { fail(fmt("%s at 0x%x: DPP control 0x%x not supported", in.name, in.offset, c)); return "0u"; }
                 v = fmt("xlane_bc(%s, %s, %s)", v.c_str(), srcl.c_str(), d.bound_ctrl ? "true" : "false");
+                // Lanes DPP disables keep their destination: a source outside the row without
+                // bound_ctrl, and lanes outside row_mask / bank_mask.
+                std::string p;
+                if (!d.bound_ctrl) p = fmt("(%s) != 0xffffffffu", srcl.c_str());
+                if ((d.row_mask & 15) != 15) p += fmt("%s((%uu >> ((L >> 4) & 3u)) & 1u) != 0u", p.empty() ? "" : " && ", d.row_mask & 15u);
+                if ((d.bank_mask & 15) != 15) p += fmt("%s((%uu >> ((L >> 2) & 3u)) & 1u) != 0u", p.empty() ? "" : " && ", d.bank_mask & 15u);
+                lane_pred = p;
                 uses_wave = true;
             }
         }
@@ -1320,7 +1333,7 @@ bool Translator::emit_valu(const Instr& in, size_t idx) {
         }
         switch (t) {
         case 'f': return "asuint(float(" + v + "))";
-        case 'h': return "f32tof16(float(" + v + "))";
+        case 'h': return "f16r(float(" + v + "))";
         case 'i': return "uint(" + v + ")";
         default: return "uint(" + v + ")";
         }
@@ -1424,6 +1437,18 @@ bool Translator::emit_valu(const Instr& in, size_t idx) {
     if (n == "v_writelane_b32") { line(fmt("if (L == (%s & %uu)) %s = %s;", rd(se[1], in).c_str(), W - 1, V(dst).c_str(), rd(se[0], in).c_str())); return true; }
     // Lane index within the console wave (LG: compute and mesh shaders derive it from the thread
     // index, so thread numbering stays right when the PC wave is narrower).
+    if (n == "v_pack_b32_f16") {
+        // Bit move: op_sel picks each source's half; neg flips and abs clears the f16 sign bit.
+        auto h = [&](int k) {
+            std::string b = src_bits(k, 'u');
+            std::string v = ((in.opsel >> k) & 1) ? "(" + b + " >> 16)" : "(" + b + " & 0xffffu)";
+            if ((in.abs >> k) & 1) v = "(" + v + " & 0x7fffu)";
+            if ((in.neg >> k) & 1) v = "(" + v + " ^ 0x8000u)";
+            return v;
+        };
+        wv(fmt("(%s | (%s << 16))", h(0).c_str(), h(1).c_str()));
+        return true;
+    }
     if (n == "v_mbcnt_lo_u32_b32") { wv(fmt("%s + countbits(%s & (LG < 32u ? ((1u << LG) - 1u) : 0xffffffffu))", rd(se[1], in).c_str(), rd(se[0], in).c_str())); return true; }
     if (n == "v_mbcnt_hi_u32_b32") { wv(fmt("%s + countbits(%s & (LG < 32u ? 0u : ((1u << (LG - 32u)) - 1u)))", rd(se[1], in).c_str(), rd(se[0], in).c_str())); return true; }
     if (n == "v_permlane16_b32" || n == "v_permlanex16_b32") {
@@ -1664,17 +1689,21 @@ bool Translator::emit_valu(const Instr& in, size_t idx) {
             std::string e = fmt("mad(%s, %s, %s)", ms(0).c_str(), ms(1).c_str(), ms(2).c_str());
             if (in.clamp) e = "saturate(" + e + ")";
             if (n == "v_fma_mix_f32") write_v(dst, "asuint(float(" + e + "))");
-            else if (n == "v_fma_mixlo_f16") write_v(dst, fmt("(f32tof16(%s) & 0xffffu) | (%s & 0xffff0000u)", e.c_str(), V(dst).c_str()));
-            else write_v(dst, fmt("(f32tof16(%s) << 16) | (%s & 0xffffu)", e.c_str(), V(dst).c_str()));
+            else if (n == "v_fma_mixlo_f16") write_v(dst, fmt("(f16r(%s) & 0xffffu) | (%s & 0xffff0000u)", e.c_str(), V(dst).c_str()));
+            else write_v(dst, fmt("(f16r(%s) << 16) | (%s & 0xffffu)", e.c_str(), V(dst).c_str()));
             return true;
         }
-        struct PO { const char* name; bool f; const char* e; };
-        static const PO po[] = {{"v_pk_add_f16", true, "a + b"}, {"v_pk_mul_f16", true, "a * b"}, {"v_pk_fma_f16", true, "mad(a, b, c)"},
-                                {"v_pk_min_f16", true, "min(a, b)"}, {"v_pk_max_f16", true, "max(a, b)"},
-                                {"v_pk_add_u16", false, "a + b"}, {"v_pk_sub_u16", false, "a - b"}, {"v_pk_mul_lo_u16", false, "a * b"},
-                                {"v_pk_add_i16", false, "a + b"}, {"v_pk_sub_i16", false, "a - b"}, {"v_pk_mad_u16", false, "a * b + c"},
-                                {"v_pk_lshlrev_b16", false, "b << (a & 15u)"}, {"v_pk_lshrrev_b16", false, "b >> (a & 15u)"},
-                                {"v_pk_min_u16", false, "min(a, b)"}, {"v_pk_max_u16", false, "max(a, b)"}};
+        // Kind: 'f' f16, 'u' unsigned 16-bit, 's' signed 16-bit (halves sign-extended).
+        struct PO { const char* name; char f; const char* e; };
+        static const PO po[] = {{"v_pk_add_f16", 'f', "a + b"}, {"v_pk_mul_f16", 'f', "a * b"}, {"v_pk_fma_f16", 'f', "mad(a, b, c)"},
+                                {"v_pk_min_f16", 'f', "min(a, b)"}, {"v_pk_max_f16", 'f', "max(a, b)"},
+                                {"v_pk_add_u16", 'u', "a + b"}, {"v_pk_sub_u16", 'u', "a - b"}, {"v_pk_mul_lo_u16", 'u', "a * b"},
+                                {"v_pk_add_i16", 'u', "a + b"}, {"v_pk_sub_i16", 'u', "a - b"}, {"v_pk_mad_u16", 'u', "a * b + c"},
+                                {"v_pk_lshlrev_b16", 'u', "b << (a & 15u)"}, {"v_pk_lshrrev_b16", 'u', "b >> (a & 15u)"},
+                                {"v_pk_ashrrev_i16", 's', "b >> (a & 15)"},
+                                {"v_pk_min_u16", 'u', "min(a, b)"}, {"v_pk_max_u16", 'u', "max(a, b)"},
+                                {"v_pk_min_i16", 's', "min(a, b)"}, {"v_pk_max_i16", 's', "max(a, b)"},
+                                {"v_pk_mad_i16", 's', "a * b + c"}};
         for (auto& p : po) {
             if (n != p.name) continue;
             std::string lohi[2];
@@ -1683,10 +1712,11 @@ bool Translator::emit_valu(const Instr& in, size_t idx) {
                 for (size_t i = 0; i < e.size(); i++) {
                     char ch = e[i];
                     bool word = (i > 0 && isalnum(uint8_t(e[i - 1]))) || (i + 1 < e.size() && isalnum(uint8_t(e[i + 1])));
-                    if (!word && ch >= 'a' && ch <= 'c') r += "(" + (p.f ? fh(ch - 'a', h) : ih(ch - 'a', h)) + ")";
+                    if (!word && ch >= 'a' && ch <= 'c')
+                        r += "(" + (p.f == 'f' ? fh(ch - 'a', h) : p.f == 's' ? "(int(" + ih(ch - 'a', h) + " << 16) >> 16)" : ih(ch - 'a', h)) + ")";
                     else r += ch;
                 }
-                lohi[h] = p.f ? (in.clamp ? "f32tof16(saturate(" + r + "))" : "f32tof16(" + r + ")") : "(uint(" + r + ") & 0xffffu)";
+                lohi[h] = p.f == 'f' ? (in.clamp ? "f16r(saturate(" + r + "))" : "f16r(" + r + ")") : "(uint(" + r + ") & 0xffffu)";
             }
             write_v(dst, fmt("(%s & 0xffffu) | (%s << 16)", lohi[0].c_str(), lohi[1].c_str()));
             return true;
@@ -1707,7 +1737,9 @@ bool Translator::emit_mubuf(const Instr& in, size_t idx) {
     std::string voff = in.offen ? V(in.idxen ? va + 1 : va) : "0u";
     std::string so = rd(in.soffset, in);
     uint32_t stride = R.kind == ResKind::StructBuf ? R.stride : ((R.root_hi_or >> 16) & 0x3fff);
-    if (R.kind == ResKind::CBuffer && in.idxen) stride = (R.root_hi_or >> 16) & 0x3fff;
+    // Constant buffers indexed per lane: root CBVs get the stride from the bits the shader ORs into
+    // the descriptor; table CBV descriptors index 16-byte rows (the compiler relies on that).
+    if (R.kind == ResKind::CBuffer && in.idxen) stride = R.root_hi_or ? (R.root_hi_or >> 16) & 0x3fff : 16;
     std::string addr = fmt("(%s + %s + %uu)", voff.c_str(), so.c_str(), uint32_t(in.offset_imm) + R.addr_off);
     if (in.idxen && R.kind != ResKind::TypedBuf) addr = fmt("(%s + %s * %uu)", addr.c_str(), vidx.c_str(), stride);
     bool store = has(n, "_store_");
@@ -1877,8 +1909,8 @@ bool Translator::emit_mimg(const Instr& in, size_t idx) {
     if (R.dim < 0) R.dim = in.dim;
     else if (R.dim != in.dim && !(R.dim == 3 && in.dim == 5) && !(R.dim == 5 && in.dim == 3))
         return fail(fmt("%s at 0x%x: image used with two dimensions", in.name, in.offset));
-    if (in.a16 || in.d16) return fail(n + ": 16-bit addresses or data not supported yet");
-    // Address registers.
+    // Address registers. With A16, coordinates (with LOD and clamp) and each derivative group are
+    // 16-bit values packed two per register; offsets, bias and depth reference keep a register each.
     std::vector<std::string> ad;
     auto areg = [&](unsigned k) -> std::string {
         if (in.nsa) return V(k == 0 ? in.vaddr : in.addr_extra[k - 1]);
@@ -1901,10 +1933,33 @@ bool Translator::emit_mimg(const Instr& in, size_t idx) {
             for (unsigned i = 0; i < nderiv[dim]; i++) ddy.push_back(areg(k++));
         }
     }
-    for (unsigned i = 0; i < nc; i++) crd.push_back(areg(k++));
-    if (samp && (has(n, "_l") && !has(n, "_lz"))) lod = areg(k++);
-    if (samp && has(n, "_cl")) clampv = areg(k++);
-    if (n == "image_load_mip" || n == "image_store_mip") lod = areg(k++);
+    if (!in.a16) {
+        for (unsigned i = 0; i < nc; i++) crd.push_back(areg(k++));
+        if (samp && (has(n, "_l") && !has(n, "_lz"))) lod = areg(k++);
+        if (samp && has(n, "_cl")) clampv = areg(k++);
+        if (n == "image_load_mip" || n == "image_store_mip") lod = areg(k++);
+    } else {
+        bool flt = samp;   // sampling takes f16 coordinates; loads and stores take 16-bit integers
+        auto half = [&](unsigned reg, unsigned h) {
+            std::string r = areg(reg);
+            std::string e = h ? "(" + r + " >> 16)" : "(" + r + " & 0xffffu)";
+            return flt ? "asuint(f16tof32(" + e + "))" : e;
+        };
+        if (!bias.empty()) bias = fmt("asuint(f16tof32(%s & 0xffffu))", bias.c_str());
+        if (!ddx.empty()) {   // re-read the derivatives as packed halves
+            k -= 2 * nderiv[dim];
+            unsigned per = (nderiv[dim] + 1) / 2;
+            for (unsigned i = 0; i < nderiv[dim]; i++) ddx[i] = half(k + i / 2, i % 2);
+            for (unsigned i = 0; i < nderiv[dim]; i++) ddy[i] = half(k + per + i / 2, i % 2);
+            k += 2 * per;
+        }
+        unsigned h = 0;
+        for (unsigned i = 0; i < nc; i++, h++) crd.push_back(half(k + h / 2, h % 2));
+        if (samp && (has(n, "_l") && !has(n, "_lz"))) { lod = half(k + h / 2, h % 2); h++; }
+        if (samp && has(n, "_cl")) { clampv = half(k + h / 2, h % 2); h++; }
+        if (n == "image_load_mip" || n == "image_store_mip") { lod = half(k + h / 2, h % 2); h++; }
+        k += (h + 1) / 2;
+    }
 
     const char* sw = "xyzw";
     auto fcoord = [&](unsigned cnt) {
@@ -1919,7 +1974,20 @@ bool Translator::emit_mimg(const Instr& in, size_t idx) {
         if (!extra.empty()) s += ", " + extra;
         return s + ")";
     };
+    // D16: components are 16-bit, packed two per register (floats as f16).
+    auto pack16 = [&](const std::string& c) { return R.is_uint ? "(" + c + " & 0xffffu)" : "f16r(" + c + ")"; };
     auto write_result = [&](const std::string& vec4) {
+        if (in.d16) {
+            line(fmt("if (kexec) { %s t_ = %s;", R.is_uint || R.scalar ? "uint4" : "float4", R.scalar ? ("uint4(" + vec4 + ", 0u, 0u, 1u)").c_str() : vec4.c_str()));
+            std::vector<std::string> c;
+            for (int b = 0; b < 4; b++)
+                if ((in.dmask >> b) & 1) c.push_back(pack16(fmt("t_.%c", sw[b])));
+            for (size_t i = 0; i < c.size(); i += 2)
+                line(fmt("  %s = %s%s;", V(in.vdata + unsigned(i / 2)).c_str(), c[i].c_str(), i + 1 < c.size() ? (" | (" + c[i + 1] + " << 16)").c_str() : ""));
+            if (in.tfe) line(fmt("  %s = 0u;", V(in.vdata + unsigned((c.size() + 1) / 2)).c_str()));
+            line("}");
+            return;
+        }
         if (R.scalar) line(fmt("if (kexec) { uint4 t_ = uint4(%s, 0u, 0u, 1u);", vec4.c_str()));
         else line(fmt("if (kexec) { %s t_ = %s;", R.is_uint ? "uint4" : "float4", vec4.c_str()));
         unsigned o = 0;
@@ -1958,7 +2026,11 @@ bool Translator::emit_mimg(const Instr& in, size_t idx) {
             else call = fmt("%s.Gather%s(%s, %s)", T.c_str(), ch, SS.c_str(), tc.c_str());
             // Gather returns 4 values regardless of dmask.
             line(fmt("if (kexec) { %s t_ = %s;", R.is_uint ? "uint4" : "float4", call.c_str()));
-            for (int b = 0; b < 4; b++) line(fmt("  %s = %s(t_.%c);", V(in.vdata + b).c_str(), R.is_uint ? "uint" : "asuint", sw[b]));
+            if (in.d16)
+                for (int b = 0; b < 4; b += 2)
+                    line(fmt("  %s = %s | (%s << 16);", V(in.vdata + b / 2).c_str(), pack16(fmt("t_.%c", sw[b])).c_str(), pack16(fmt("t_.%c", sw[b + 1])).c_str()));
+            else
+                for (int b = 0; b < 4; b++) line(fmt("  %s = %s(t_.%c);", V(in.vdata + b).c_str(), R.is_uint ? "uint" : "asuint", sw[b]));
             line("}");
             return true;
         }
@@ -1994,10 +2066,18 @@ bool Translator::emit_mimg(const Instr& in, size_t idx) {
         std::string v;
         unsigned o = 0;
         for (int b = 0; b < 4; b++) {
-            std::string e = ((in.dmask >> b) & 1) ? V(in.vdata + o++) : std::string("0u");
+            std::string e = "0u";
+            if ((in.dmask >> b) & 1) {
+                if (in.d16) {
+                    std::string r = V(in.vdata + o / 2);
+                    e = o % 2 ? "(" + r + " >> 16)" : "(" + r + " & 0xffffu)";
+                    if (!R.is_uint) e = "asuint(f16tof32(" + e + "))";
+                    o++;
+                } else e = V(in.vdata + o++);
+            }
             v += (b ? ", " : "") + (R.is_uint ? e : "asfloat(" + e + ")");
         }
-        if (R.scalar) line(fmt("if (kexec) %s[%s] = %s;", RN.c_str(), icoord(nc, "").c_str(), V(in.vdata).c_str()));
+        if (R.scalar) line(fmt("if (kexec) %s[%s] = %s;", RN.c_str(), icoord(nc, "").c_str(), in.d16 ? ("(" + V(in.vdata) + " & 0xffffu)").c_str() : V(in.vdata).c_str()));
         else line(fmt("if (kexec) %s[%s] = %s4(%s);", RN.c_str(), icoord(nc, "").c_str(), R.is_uint ? "uint" : "float", v.c_str()));
         return true;
     }
@@ -2409,7 +2489,30 @@ uint64_t bfe_u64(uint64_t x, uint o, uint w) { if (w == 0u) return 0; uint64_t v
 float med3f(float a, float b, float c) { return max(min(a, b), min(max(a, b), c)); }
 float frexp_mant(float a) { float e; return frexp(a, e); }
 int frexp_exp(float a) { float e; frexp(a, e); return int(e); }
-uint pkrtz(float a, float b) { return (f32tof16(a) & 0xffffu) | (f32tof16(b) << 16); }
+// f32 -> f16 with round-to-nearest-even (f16r) and round-toward-zero (f16z), whatever rounding the
+// PC's own conversion uses: its result is corrected by one f16 step when the neighbour is closer.
+uint f16r(float x) {
+  uint h = f32tof16(x) & 0xffffu;
+  if (isnan(x)) return h;
+  float a = abs(x);
+  uint s = asuint(x) >> 31 << 15;
+  if (a >= 65520.0) return s | 0x7c00u;
+  uint m = h & 0x7fffu;
+  float v = f16tof32(m);
+  if (v == a) return s | m;
+  uint n = v < a ? m + 1u : m - 1u;
+  float dv = abs(v - a), dn = abs(f16tof32(n) - a);
+  return s | ((dn < dv || (dn == dv && (n & 1u) == 0u)) ? n : m);
+}
+uint f16z(float x) {
+  uint h = f16r(x);
+  if (isnan(x) || isinf(x)) return h;
+  uint m = h & 0x7fffu;
+  if (m != 0u && f16tof32(m) > abs(x)) m -= 1u;
+  if (m == 0x7c00u) m = 0x7bffu;   // finite values do not round toward zero to infinity
+  return (h & 0x8000u) | m;
+}
+uint pkrtz(float a, float b) { return f16z(a) | (f16z(b) << 16); }
 uint pknorm_u16(float a, float b) { return uint(round(saturate(a) * 65535.0)) | (uint(round(saturate(b) * 65535.0)) << 16); }
 uint pknorm_i16(float a, float b) { return (uint(int(round(clamp(a, -1.0, 1.0) * 32767.0))) & 0xffffu) | (uint(int(round(clamp(b, -1.0, 1.0) * 32767.0))) << 16); }
 uint pk_u8(float a, uint sel, uint c) { uint s = (sel & 3u) * 8u; return (c & ~(0xffu << s)) | ((cvt_u32(round(a)) & 0xffu) << s); }
