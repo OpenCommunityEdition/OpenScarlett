@@ -1,0 +1,4 @@
+LIBRARY GameInput.dll
+EXPORTS
+    ; The GDK import library binds GameInputCreate by ordinal 1.
+    GameInputCreate @1

@@ -1,0 +1,10 @@
+LIBRARY XFrontPanelDisplay.dll
+EXPORTS
+    XFrontPanelIsSupported=xsl_zero
+    XFrontPanelGetButtonStates=xsl_no_device
+    XFrontPanelGetLightStates=xsl_no_device
+    XFrontPanelGetScreenDimensions=xsl_no_device
+    XFrontPanelGetScreenPixelFormat=xsl_no_device
+    XFrontPanelPresentBuffer=xsl_no_device
+    XFrontPanelSetDisplayName=xsl_no_device
+    XFrontPanelSetLightStates=xsl_no_device

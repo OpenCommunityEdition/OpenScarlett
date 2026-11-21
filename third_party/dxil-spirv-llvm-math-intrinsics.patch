@@ -1,0 +1,121 @@
+diff --git a/dxil_converter.cpp b/dxil_converter.cpp
+index 90f963e..9bba817 100644
+--- a/dxil_converter.cpp
++++ b/dxil_converter.cpp
+@@ -1,3 +1,4 @@
++#include "GLSL.std.450.h"
+ /* Copyright (c) 2019-2022 Hans-Kristian Arntzen for Valve Corporation
+  *
+  * SPDX-License-Identifier: MIT
+@@ -6391,6 +6392,97 @@ static bool instruction_has_side_effects(const llvm::Instruction &instruction)
+ 	return false;
+ }
+ 
++
++// Translation of LLVM float intrinsics that appear in DXIL produced by the Xbox DXC.
++static bool emit_llvm_math_intrinsic(Converter::Impl &impl, const llvm::CallInst *call)
++{
++	auto &builder = impl.builder();
++	std::string name = call->getCalledFunction()->getName().data();
++	auto starts = [&](const char *p) { return name.compare(0, strlen(p), p) == 0; };
++
++	struct Std450 { const char *prefix; GLSLstd450 op; unsigned args; };
++	static const Std450 table[] = {
++		{ "llvm.fabs.", GLSLstd450FAbs, 1 },     { "llvm.sqrt.", GLSLstd450Sqrt, 1 },
++		{ "llvm.floor.", GLSLstd450Floor, 1 },   { "llvm.ceil.", GLSLstd450Ceil, 1 },
++		{ "llvm.trunc.", GLSLstd450Trunc, 1 },   { "llvm.round.", GLSLstd450Round, 1 },
++		{ "llvm.rint.", GLSLstd450RoundEven, 1 }, { "llvm.nearbyint.", GLSLstd450RoundEven, 1 },
++		{ "llvm.sin.", GLSLstd450Sin, 1 },       { "llvm.cos.", GLSLstd450Cos, 1 },
++		{ "llvm.exp2.", GLSLstd450Exp2, 1 },     { "llvm.log2.", GLSLstd450Log2, 1 },
++		{ "llvm.exp.", GLSLstd450Exp, 1 },       { "llvm.log.", GLSLstd450Log, 1 },
++		{ "llvm.maxnum.", GLSLstd450NMax, 2 },   { "llvm.minnum.", GLSLstd450NMin, 2 },
++		{ "llvm.pow.", GLSLstd450Pow, 2 },       { "llvm.fma.", GLSLstd450Fma, 3 },
++		{ "llvm.fmuladd.", GLSLstd450Fma, 3 },
++	};
++
++	for (auto &e : table)
++	{
++		if (!starts(e.prefix))
++			continue;
++		if (!impl.glsl_std450_ext)
++			impl.glsl_std450_ext = builder.import("GLSL.std.450");
++		Operation *op = impl.allocate(spv::OpExtInst, call);
++		op->add_id(impl.glsl_std450_ext);
++		op->add_literal(e.op);
++		for (unsigned i = 0; i < e.args; i++)
++			op->add_id(impl.get_id_for_value(call->getOperand(i)));
++		impl.add(op);
++		return true;
++	}
++
++	if (starts("llvm.copysign."))
++	{
++		// copysign(a, b) = sign bit of b ? -|a| : |a|
++		if (!impl.glsl_std450_ext)
++			impl.glsl_std450_ext = builder.import("GLSL.std.450");
++		const llvm::Type *type = call->getType();
++		const llvm::Type *scalar = type->getScalarType();
++		unsigned width = scalar->getTypeID() == llvm::Type::TypeID::HalfTyID ? 16 :
++		                 (scalar->getTypeID() == llvm::Type::TypeID::DoubleTyID ? 64 : 32);
++		unsigned count = type->getTypeID() == llvm::Type::TypeID::VectorTyID ? type->getVectorNumElements() : 1;
++		spv::Id ftype = impl.get_type_id(type);
++		spv::Id itype = builder.makeIntType(int(width));
++		spv::Id btype = builder.makeBoolType();
++		spv::Id zero = width == 64 ? builder.makeInt64Constant(0) : (width == 16 ? builder.makeInt16Constant(0) : builder.makeIntConstant(0));
++		if (count > 1)
++		{
++			itype = builder.makeVectorType(itype, int(count));
++			btype = builder.makeVectorType(btype, int(count));
++			dxil_spv::Vector<spv::Id> comps(count, zero);
++			zero = builder.makeCompositeConstant(itype, comps);
++		}
++
++		Operation *abs_op = impl.allocate(spv::OpExtInst, ftype);
++		abs_op->add_id(impl.glsl_std450_ext);
++		abs_op->add_literal(GLSLstd450FAbs);
++		abs_op->add_id(impl.get_id_for_value(call->getOperand(0)));
++		impl.add(abs_op);
++
++		Operation *neg_op = impl.allocate(spv::OpFNegate, ftype);
++		neg_op->add_id(abs_op->id);
++		impl.add(neg_op);
++
++		Operation *bits_op = impl.allocate(spv::OpBitcast, itype);
++		bits_op->add_id(impl.get_id_for_value(call->getOperand(1)));
++		impl.add(bits_op);
++
++		Operation *neg_test = impl.allocate(spv::OpSLessThan, btype);
++		neg_test->add_id(bits_op->id);
++		neg_test->add_id(zero);
++		impl.add(neg_test);
++
++		Operation *sel = impl.allocate(spv::OpSelect, call);
++		sel->add_id(neg_test->id);
++		sel->add_id(neg_op->id);
++		sel->add_id(abs_op->id);
++		impl.add(sel);
++		return true;
++	}
++
++	// llvm.lifetime.*, llvm.dbg.* and other annotations carry no value.
++	return true;
++}
++
++
+ bool Converter::Impl::emit_instruction(CFGNode *block, const llvm::Instruction &instruction)
+ {
+ 	if (instruction.isTerminator())
+@@ -6416,9 +6508,10 @@ bool Converter::Impl::emit_instruction(CFGNode *block, const llvm::Instruction &
+ 		}
+ 		else if (strncmp(called_function->getName().data(), "llvm.", 5) == 0)
+ 		{
+-			// lib_6_6 sometimes emits llvm.lifetime.begin/end for some bizarre reason.
+-			// Just ignore ...
+-			return true;
++			// Xbox (GDKX) DXC emits a few LLVM math intrinsics that the PC compiler lowers to
++			// dx.op calls (e.g. sign() -> llvm.copysign). Translate those; ignore the rest
++			// (lib_6_6 sometimes emits llvm.lifetime.begin/end).
++			return emit_llvm_math_intrinsic(*this, call_inst);
+ 		}
+ 		else
+ 		{

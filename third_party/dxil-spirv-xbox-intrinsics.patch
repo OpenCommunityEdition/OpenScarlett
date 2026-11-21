@@ -1,0 +1,135 @@
+--- a/dxil_converter.cpp
++++ b/dxil_converter.cpp
+@@ -6478,11 +6478,110 @@
+ 		return true;
+ 	}
+ 
+-	// llvm.lifetime.*, llvm.dbg.* and other annotations carry no value.
++	// llvm.lifetime.*, llvm.dbg.* and other annotations carry no value; anything else that produces
++	// one is not translated yet and would leave its result undefined.
++	if (call->getType()->getTypeID() != llvm::Type::TypeID::VoidTyID)
++	{
++		LOGE("Unsupported LLVM intrinsic %s.\n", name.c_str());
++		return false;
++	}
+ 	return true;
+ }
+ 
+ 
++#ifdef _WIN32
++extern "C" __declspec(dllimport) unsigned long __stdcall GetEnvironmentVariableA(const char *, char *, unsigned long);
++#endif
++// Process environment as the host API sees it (the CRT copy misses variables set after start-up).
++static void xsl_env(const char *name, char *out, unsigned long size)
++{
++	out[0] = '\0';
++#ifdef _WIN32
++	unsigned long n = GetEnvironmentVariableA(name, out, size);
++	if (n == 0 || n >= size)
++		out[0] = '\0';
++#else
++	if (const char *v = getenv(name))
++	{
++		strncpy(out, v, size - 1);
++		out[size - 1] = '\0';
++	}
++#endif
++}
++
++// Xbox (GDKX) DXC intrinsics ("xbox.*" functions in DXIL targeting dxil-ms-xb2).
++static bool emit_xbox_intrinsic(Converter::Impl &impl, const llvm::CallInst *call)
++{
++	auto &builder = impl.builder();
++	std::string name = call->getCalledFunction()->getName().data();
++
++	if (name == "xbox.MemTime")
++	{
++		// __XB_MemTime(): 64-bit GPU clock as { lo, hi }. Lowered to OpReadClockKHR, which returns
++		// the same pair as a uvec2 (OpCompositeExtract on it matches extractvalue on the struct).
++		// Subgroup scope: the only scope every VK_KHR_shader_clock device offers.
++		//
++		// The host environment (set by vkd3d-proton / the user) selects:
++		//   XSL_SHADER_CLOCK_SCOPE=device  device-scope clock (comparable across dispatches), else
++		//                                  subgroup scope, the only one every implementation has;
++		//   XSL_MEMTIME_SCALE=num/den      host ticks -> console GPU clocks (titles assume the
++		//                                  console's core clock, e.g. 1565 MHz on Lockhart).
++		builder.addExtension("SPV_KHR_shader_clock");
++		builder.addCapability(spv::CapabilityShaderClockKHR);
++		char scope_env[16] = "", scale_env[64] = "";
++		xsl_env("XSL_SHADER_CLOCK_SCOPE", scope_env, sizeof(scope_env));
++		xsl_env("XSL_MEMTIME_SCALE", scale_env, sizeof(scale_env));
++		spv::Scope scope = strcmp(scope_env, "device") == 0 ? spv::ScopeDevice : spv::ScopeSubgroup;
++		unsigned long long num = 0, den = 1;
++		if (scale_env[0] && sscanf(scale_env, "%llu/%llu", &num, &den) < 1)
++			num = 0;
++		if (!den)
++			den = 1;
++
++		spv::Id uint_type = builder.makeUintType(32);
++		spv::Id uvec2 = builder.makeVectorType(uint_type, 2);
++		Operation *clk = impl.allocate(spv::OpReadClockKHR, uvec2);
++		clk->add_id(builder.makeUintConstant(scope));
++		impl.add(clk);
++		spv::Id value = clk->id;
++
++		if (num && num != den)
++		{
++			// value = uvec2(uint64(clock) * num / den)
++			builder.addCapability(spv::CapabilityInt64);
++			spv::Id u64 = builder.makeUintType(64);
++			Operation *wide = impl.allocate(spv::OpBitcast, u64);
++			wide->add_id(value);
++			impl.add(wide);
++			Operation *mul = impl.allocate(spv::OpIMul, u64);
++			mul->add_id(wide->id);
++			mul->add_id(builder.makeUint64Constant(num));
++			impl.add(mul);
++			Operation *div = impl.allocate(spv::OpUDiv, u64);
++			div->add_id(mul->id);
++			div->add_id(builder.makeUint64Constant(den));
++			impl.add(div);
++			Operation *narrow = impl.allocate(spv::OpBitcast, uvec2);
++			narrow->add_id(div->id);
++			impl.add(narrow);
++			value = narrow->id;
++		}
++
++		auto meta = impl.llvm_composite_meta.find(call);
++		bool scalar = meta != impl.llvm_composite_meta.end() && meta->second.components == 1 && !meta->second.forced_composite;
++		// When only .x is read, extractvalue forwards the call's id: give the call the scalar.
++		Operation *result = impl.allocate(scalar ? spv::OpCompositeExtract : spv::OpCopyObject, call, scalar ? uint_type : uvec2);
++		result->add_id(value);
++		if (scalar)
++			result->add_literal(0);
++		impl.add(result);
++		return true;
++	}
++
++	LOGE("Unsupported Xbox intrinsic %s.\n", name.c_str());
++	return false;
++}
++
+ bool Converter::Impl::emit_instruction(CFGNode *block, const llvm::Instruction &instruction)
+ {
+ 	if (instruction.isTerminator())
+@@ -6513,6 +6612,10 @@
+ 			// (lib_6_6 sometimes emits llvm.lifetime.begin/end).
+ 			return emit_llvm_math_intrinsic(*this, call_inst);
+ 		}
++		else if (strncmp(called_function->getName().data(), "xbox.", 5) == 0)
++		{
++			return emit_xbox_intrinsic(*this, call_inst);
++		}
+ 		else
+ 		{
+ 			return emit_call_instruction(*this, *call_inst);
+@@ -8483,7 +8586,8 @@
+ 			{
+ 				auto *fn = call_inst->getCalledFunction();
+ 				if (strncmp(fn->getName().data(), "dx.op", 5) != 0 &&
+-				    strncmp(fn->getName().data(), "llvm.", 5) != 0)
++				    strncmp(fn->getName().data(), "llvm.", 5) != 0 &&
++				    strncmp(fn->getName().data(), "xbox.", 5) != 0)
+ 				{
+ 					gather_function_dependencies(fn, funcs);
+ 				}

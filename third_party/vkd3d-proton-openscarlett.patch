@@ -1,0 +1,75 @@
+diff --git a/libs/vkd3d-shader/vkd3d_shader_main.c b/libs/vkd3d-shader/vkd3d_shader_main.c
+index a4c19d1..d64c67d 100644
+--- a/libs/vkd3d-shader/vkd3d_shader_main.c
++++ b/libs/vkd3d-shader/vkd3d_shader_main.c
+@@ -485,7 +485,9 @@ vkd3d_shader_quirks_t vkd3d_shader_compile_arguments_select_quirks(
+         const struct vkd3d_shader_compile_arguments *compile_args,
+         vkd3d_shader_hash_t shader_hash, const char *entry)
+ {
+-    vkd3d_shader_quirks_t quirks = 0;
++    /* OpenScarlett: every shader here comes from the Xbox DXC. Console GPUs clamp rsqrt (fast-math
++     * lowering), so normalize(0) gives 0, not NaN; titles and samples rely on it. */
++    vkd3d_shader_quirks_t quirks = VKD3D_SHADER_QUIRK_FIXUP_RSQRT_INF_NAN;
+     unsigned int i;
+ 
+     pthread_once(&vkd3d_shader_quirk_once, vkd3d_shader_init_quirk_table);
+diff --git a/libs/vkd3d/device.c b/libs/vkd3d/device.c
+index 14ed4f8..3e96182 100644
+--- a/libs/vkd3d/device.c
++++ b/libs/vkd3d/device.c
+@@ -87,6 +87,8 @@ static const struct vkd3d_optional_extension_info optional_device_extensions[] =
+     VK_EXTENSION(KHR_MAINTENANCE_11, KHR_maintenance11),
+     VK_EXTENSION(KHR_SHADER_MAXIMAL_RECONVERGENCE, KHR_shader_maximal_reconvergence),
+     VK_EXTENSION(KHR_SHADER_QUAD_CONTROL, KHR_shader_quad_control),
++    /* OpenScarlett: Xbox __XB_MemTime() is lowered to OpReadClockKHR by dxil-spirv. */
++    VK_EXTENSION(KHR_SHADER_CLOCK, KHR_shader_clock),
+     VK_EXTENSION(KHR_COMPUTE_SHADER_DERIVATIVES, KHR_compute_shader_derivatives),
+     VK_EXTENSION(KHR_CALIBRATED_TIMESTAMPS, KHR_calibrated_timestamps),
+     VK_EXTENSION(KHR_COOPERATIVE_MATRIX, KHR_cooperative_matrix),
+@@ -1530,6 +1532,12 @@ static void vkd3d_physical_device_info_init(struct vkd3d_physical_device_info *i
+         vk_prepend_struct(&info->features2, &info->shader_maximal_reconvergence_features);
+     }
+ 
++    if (vulkan_info->KHR_shader_clock)
++    {
++        info->shader_clock_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_CLOCK_FEATURES_KHR;
++        vk_prepend_struct(&info->features2, &info->shader_clock_features);
++    }
++
+     if (vulkan_info->KHR_shader_quad_control)
+     {
+         info->shader_quad_control_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_QUAD_CONTROL_FEATURES_KHR;
+@@ -10259,6 +10267,13 @@ static void vkd3d_init_shader_extensions(struct d3d12_device *device)
+                 VKD3D_SHADER_TARGET_EXTENSION_QUAD_CONTROL_RECONVERGENCE;
+     }
+ 
++#ifdef _WIN32
++    /* OpenScarlett: tell dxil-spirv which OpReadClockKHR scope can stand in for the Xbox
++     * __XB_MemTime() clock. Device scope is comparable across dispatches; subgroup scope may not be. */
++    if (device->device_info.shader_clock_features.shaderDeviceClock)
++        SetEnvironmentVariableA("XSL_SHADER_CLOCK_SCOPE", "device");
++#endif
++
+     if (device->device_info.raw_access_chains_nv.shaderRawAccessChains)
+     {
+         device->vk_info.shader_extensions[device->vk_info.shader_extension_count++] =
+diff --git a/libs/vkd3d/vkd3d_private.h b/libs/vkd3d/vkd3d_private.h
+index 8024485..c949aac 100644
+--- a/libs/vkd3d/vkd3d_private.h
++++ b/libs/vkd3d/vkd3d_private.h
+@@ -150,6 +150,7 @@ struct vkd3d_vulkan_info
+     bool KHR_maintenance11;
+     bool KHR_shader_maximal_reconvergence;
+     bool KHR_shader_quad_control;
++    bool KHR_shader_clock;
+     bool KHR_compute_shader_derivatives;
+     bool KHR_calibrated_timestamps;
+     bool KHR_cooperative_matrix;
+@@ -5383,6 +5384,7 @@ struct vkd3d_physical_device_info
+     VkPhysicalDeviceSwapchainMaintenance1FeaturesKHR swapchain_maintenance1_features;
+     VkPhysicalDeviceShaderMaximalReconvergenceFeaturesKHR shader_maximal_reconvergence_features;
+     VkPhysicalDeviceShaderQuadControlFeaturesKHR shader_quad_control_features;
++    VkPhysicalDeviceShaderClockFeaturesKHR shader_clock_features;
+     VkPhysicalDeviceRawAccessChainsFeaturesNV raw_access_chains_nv;
+     VkPhysicalDeviceAddressBindingReportFeaturesEXT address_binding_report_features;
+     VkPhysicalDeviceImageAlignmentControlFeaturesMESA image_alignment_control_features;

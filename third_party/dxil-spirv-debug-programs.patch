@@ -1,0 +1,36 @@
+diff --git a/bc/module.cpp b/bc/module.cpp
+index 0f5d52c..4670b78 100644
+--- a/bc/module.cpp
++++ b/bc/module.cpp
+@@ -23,6 +23,7 @@
+  */
+ 
+ #include "module.hpp"
++#include <cstring>
+ #include "cast.hpp"
+ #include "context.hpp"
+ #include "function.hpp"
+@@ -1361,6 +1362,11 @@ bool ModuleParseContext::parse_record(const BlockOrRecord &entry)
+ 		if (!callee)
+ 			return false;
+ 
++		// llvm.dbg.* calls (programs from the ILDB debug part) take metadata operands and carry no
++		// semantics; being void they also take no value number, so they can be dropped here.
++		if (strncmp(callee->getName().data(), "llvm.dbg.", 9) == 0)
++			break;
++
+ 		if (!function_type)
+ 			function_type = callee->getFunctionType();
+ 
+@@ -1819,6 +1825,11 @@ bool ModuleParseContext::parse_record(const BlockOrRecord &entry)
+ 		break;
+ 	}
+ 
++	case FunctionRecord::DEBUG_LOC:
++	case FunctionRecord::DEBUG_LOC_AGAIN:
++		// Source locations (programs taken from the ILDB debug part): no semantics.
++		break;
++
+ 	default:
+ 		LOGE("Unhandled instruction!\n");
+ 		return false;

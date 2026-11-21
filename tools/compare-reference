@@ -1,0 +1,91 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
+"""Compare console samples on the layer with their desktop reference builds.
+
+For each pair "<console sample>=<desktop build>" (default: the XSL_REFERENCES pairs that were built):
+  1. run build/samples/<console> on the layer and capture frame N (XSL_CAPTURE);
+  2. run build/desktop/<desktop> on PC Direct3D 12 (vkd3d-proton) and grab its window (X11);
+  3. scale both to 1280x720 and compute PSNR; write <outdir>/<console>_compare.png side by side.
+A pair passes at PSNR >= --min-psnr (default 30 dB).
+
+Usage: tools/compare-reference [--out DIR] [--seconds S] [--min-psnr DB] [pair ...]
+Needs: DISPLAY (X11/Xwayland), xdotool, ImageMagick.
+"""
+import argparse
+import os
+import re
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parent.parent
+
+
+def run_layer(console, out, seconds):
+    bmp = out / f"{console}_layer.bmp"
+    bmp.unlink(missing_ok=True)
+    env = dict(os.environ, XSL_CAPTURE=f"Z:{bmp}@120", DXVK_LOG_LEVEL="none", VKD3D_DEBUG="err")
+    subprocess.run([str(REPO / "tools/xsl-run"), "--timeout", str(seconds), str(REPO / "build/samples" / console)],
+                   env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    return bmp if bmp.exists() else None
+
+
+def run_desktop(desktop, out, seconds):
+    png = out / f"{desktop}_reference.png"
+    png.unlink(missing_ok=True)
+    env = dict(os.environ, DXVK_LOG_LEVEL="none", VKD3D_DEBUG="err")
+    p = subprocess.Popen([str(REPO / "tools/xsl-run"), "--timeout", str(seconds), str(REPO / "build/desktop" / desktop)],
+                         env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    win = None
+    deadline = time.time() + seconds - 2
+    while time.time() < deadline and not win:
+        time.sleep(1)
+        r = subprocess.run(["xdotool", "search", "--name", desktop], capture_output=True, text=True)
+        win = r.stdout.split()[0] if r.stdout.split() else None
+    if win:
+        time.sleep(min(6, max(1, deadline - time.time())))  # let it render a while
+        subprocess.run(["import", "-window", win, str(png)], stderr=subprocess.DEVNULL)
+    p.wait()
+    return png if png.exists() else None
+
+
+def psnr(a, b, out):
+    tmp = [out / "_a.png", out / "_b.png"]
+    for src, dst in zip((a, b), tmp):
+        subprocess.run(["magick", str(src), "-alpha", "off", "-resize", "1280x720!", str(dst)], check=True)
+    r = subprocess.run(["magick", "compare", "-metric", "PSNR", str(tmp[0]), str(tmp[1]), "null:"],
+                       capture_output=True, text=True)
+    m = re.search(r"([0-9.]+|inf)", r.stderr)
+    value = float("inf") if m and m.group(1) == "inf" else (float(m.group(1)) if m else 0.0)
+    return value, tmp
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--out", default=str(REPO / "run/compare"))
+    ap.add_argument("--seconds", type=float, default=20)
+    ap.add_argument("--min-psnr", type=float, default=30)
+    ap.add_argument("pairs", nargs="*", default=["SimpleTriangle=SimpleTriangleDesktop"])
+    a = ap.parse_args()
+    out = Path(a.out)
+    out.mkdir(parents=True, exist_ok=True)
+    failures = 0
+    for pair in a.pairs:
+        console, desktop = pair.split("=")
+        layer = run_layer(console, out, a.seconds)
+        ref = run_desktop(desktop, out, a.seconds)
+        if not layer or not ref:
+            print(f"FAIL {console}: {'no layer frame' if not layer else 'no reference frame'}")
+            failures += 1
+            continue
+        value, tmp = psnr(layer, ref, out)
+        subprocess.run(["magick", str(tmp[0]), str(tmp[1]), "+append", str(out / f"{console}_compare.png")])
+        ok = value >= a.min_psnr
+        failures += not ok
+        print(f"{'PASS' if ok else 'FAIL'} {console} vs {desktop}: PSNR {value:.2f} dB (side by side: {out / (console + '_compare.png')})")
+    return 1 if failures else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

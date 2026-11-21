@@ -1,0 +1,26 @@
+# Licensed Microsoft SDK (GDKX) — never commit (hygiene rules 2 and 3).
+/sdk
+/sdk/
+# Anything generated from the SDK or built against it.
+/build/
+/build-*/
+/out/
+# Wine prefix and run directories.
+/.prefix/
+/run/
+# Microsoft binaries, symbols and images must never enter the tree.
+*.pdb
+*.xvd
+*.Xvd
+*.cso
+/run/
+
+# Recordings and captures
+*.mp4
+*.bmp
+
+# User patch files belong to users, never to the repository (docs/patches.md).
+*.patches.txt
+patches.txt
+__pycache__/
+*.pyc

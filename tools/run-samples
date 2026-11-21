@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: MIT
+# Run every built track-A sample on the layer, capture one frame, and summarise problems.
+# Usage: tools/run-samples [outdir] [seconds]   (frames land in <outdir>/<sample>.bmp)
+set -u
+here=$(cd "$(dirname "$0")/.." && pwd)
+out=${1:-$here/build/sample-results}
+secs=${2:-15}
+mkdir -p "$out"
+for exe in "$here"/build/samples/*/*.exe; do
+  name=$(basename "$exe" .exe)
+  rm -f "$out/$name.bmp"
+  XSL_CAPTURE="Z:$out/$name.bmp@120" "$here/tools/xsl-run" --timeout "$secs" "$exe" > "$out/$name.log" 2>&1
+  stubs=$(grep -c "unimplemented" "$out/$name.log")
+  errs=$(grep ":err:" "$out/$name.log" | grep -vc "pending command lists")
+  frame=$([ -f "$out/$name.bmp" ] && echo captured || echo NO-FRAME)
+  printf '%-26s %-9s errors=%-3s unimplemented=%s\n' "$name" "$frame" "$errs" "$stubs"
+done

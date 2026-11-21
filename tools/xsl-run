@@ -1,0 +1,187 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: AGPL-3.0-or-later
+"""Run a Series X|S title (a directory or an .exe) on the layer under Wine.
+
+The title's files are never modified. A run directory is built from symlinks to
+the title tree plus the layer's DLLs, so same-named replacements such as
+d3d12_xs.dll and xgameruntime.dll resolve from the application directory.
+
+    xsl-run [--device anaconda|lockhart|pc] [--build DIR] [--log LEVEL] TITLE [ARGS...]
+"""
+import argparse
+import os
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parent.parent
+LAYER_DLLS = ["src/gfx/d3d12_xs.dll", "src/runtime/xgameruntime.dll", "src/input/GameInput.dll", "src/xmem/xmem.dll",
+              "src/storage/XCRDAPI.dll", "src/audio/AcpHal.dll", "src/audio/xapu.dll", "src/audio/chad.dll",
+              "src/audio/PIXEvt.dll", "src/audio/XFrontPanelDisplay.dll"]
+# The title-side xgameruntime.lib loads its DLL with LOAD_LIBRARY_SEARCH_SYSTEM32 (0x800) unless
+# "local services" mode is set, so the runtime must live in System32, as the Game OS provides it.
+# GameInput.dll too: desktop builds (reference images) load it with LOAD_LIBRARY_SEARCH_SYSTEM32.
+SYSTEM32_DLLS = ["src/runtime/xgameruntime.dll", "src/input/GameInput.dll"]
+# XSystemGetDeviceType reads HKLM\Software\Microsoft\Windows NT\CurrentVersion\OEM\ConsoleMode
+# (decoded from xgameruntime.lib): 0x64 -> XboxScarlettAnaconda, 0x60 -> XboxScarlettLockhart.
+CONSOLE_MODE = {"anaconda": 0x64, "lockhart": 0x60, "pc": None}
+
+
+# Linux D3D12 back ends. "vkd3d-proton" (a pinned build, with DXVK's DXGI) is placed in the
+# run directory; "wine" uses Wine's builtin d3d12/dxgi (upstream vkd3d).
+BACKENDS = {
+    "vkd3d-proton": ["deps/vkd3d-proton/vkd3d-proton-3.1/x64/d3d12.dll",
+                     "deps/vkd3d-proton/vkd3d-proton-3.1/x64/d3d12core.dll",
+                     "deps/dxvk/dxvk-3.1.1/x64/dxgi.dll"],
+    # vkd3d-proton 3.1 rebuilt with the layer's dxil-spirv patch (tools/build-vkd3d-proton.sh).
+    "vkd3d-proton-xsl": ["deps/vkd3d-proton-xsl/x64/d3d12.dll",
+                         "deps/vkd3d-proton-xsl/x64/d3d12core.dll",
+                         "deps/dxvk/dxvk-3.1.1/x64/dxgi.dll"],
+    "wine": [],
+}
+# Null graphics: the default back end's DLLs, but no shader translation and no GPU work
+# (XSL_NULL_GRAPHICS=1): for running a title's frame loop with graphics discarded.
+BACKENDS["null"] = BACKENDS["vkd3d-proton-xsl"]
+
+
+def wine_env(prefix, extra):
+    env = dict(os.environ)
+    env["WINEPREFIX"] = str(prefix)
+    env.setdefault("WINEDEBUG", "-all")
+    env["WINEDLLOVERRIDES"] = "d3d12_xs,xgameruntime,gameinput,xmem,xcrdapi,acphal,xapu,chad,pixevt,xfrontpaneldisplay=n;" + env.get("WINEDLLOVERRIDES", "")
+    backend = extra.pop("_backend", "wine")
+    if backend.startswith("vkd3d-proton") or backend == "null":
+        env["WINEDLLOVERRIDES"] = "d3d12,d3d12core,dxgi=n;" + env["WINEDLLOVERRIDES"]
+    if backend == "null":
+        env["XSL_NULL_GRAPHICS"] = "1"
+    env.update(extra)
+    return env
+
+
+def ensure_prefix(prefix, device):
+    env = wine_env(prefix, {})
+    if not (prefix / "system.reg").exists():
+        print(f"[xsl-run] creating Wine prefix {prefix}", file=sys.stderr)
+        subprocess.run(["wineboot", "-i"], env=env, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    # The GDK Game OS runs titles with UTF-8 as the ANSI code page ("UTF-8 everywhere").
+    subprocess.run(["wine", "reg", "add", r"HKLM\System\CurrentControlSet\Control\Nls\CodePage", "/v", "ACP",
+                    "/t", "REG_SZ", "/d", "65001", "/f"], env=env, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    # No crash dialog: a crash prints winedbg's backtrace and the process exits on its own
+    # (the dialog waits for a click, which stalls unattended and timed runs).
+    subprocess.run(["wine", "reg", "add", r"HKCU\Software\Wine\WineDbg", "/v", "ShowCrashDialog", "/t", "REG_DWORD",
+                    "/d", "0", "/f"], env=env, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    # Gamepads through SDL, so XInput (and GameInput) sees them: Wine's hidraw backend claims
+    # Sony pads (DualSense, DualShock 4) but cannot open /dev/hidraw* without root, hiding them.
+    subprocess.run(["wine", "reg", "add", r"HKLM\System\CurrentControlSet\Services\WineBus", "/v", "DisableHidraw",
+                    "/t", "REG_DWORD", "/d", "1", "/f"], env=env, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    key = r"HKLM\Software\Microsoft\Windows NT\CurrentVersion\OEM"
+    mode = CONSOLE_MODE[device]
+    if mode is None:
+        subprocess.run(["wine", "reg", "delete", key, "/v", "ConsoleMode", "/f"], env=env,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    else:
+        subprocess.run(["wine", "reg", "add", key, "/v", "ConsoleMode", "/t", "REG_DWORD", "/d", str(mode), "/f"],
+                       env=env, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+# Optional DLLs taken from the user's own GDKX install (never shipped, docs/hygiene.md).
+# SDK DLLs the layer uses at run time, copied from the user's SDK (never shipped): xg_xs.dll for the
+# title, BCPack.dll (host build) for DirectStorage BCPack requests.
+SDK_DLLS = {"xg_xs.dll": "xbox/bin/gen9/xg_xs.dll", "BCPack.dll": "xbox/bin/devpctools/gen9/BCPack.dll"}
+# The shader compiler and the back ends it loads, for expanding slim shader PDBs (development builds).
+for _dll in ("dxcompiler_xs.dll", "newbe_xs.dll", "xbsc_xs.dll", "PhSO_pc_xs.dll", "xgs12_pc_xs.dll", "XBTC.dll"):
+    SDK_DLLS[_dll] = "xbox/bin/gen9/" + _dll
+
+
+def map_drives(prefix, run_dir, title):
+    """Console drive letters: G: = title (read-only on console), T: = temporary, D: = scratch."""
+    dd = prefix / "dosdevices"
+    data = REPO / "run" / "_drives" / title
+    for letter, target in (("g:", run_dir), ("t:", data / "T"), ("d:", data / "D")):
+        Path(target).mkdir(parents=True, exist_ok=True)
+        link = dd / letter
+        if link.is_symlink() or link.exists():
+            link.unlink()
+        link.symlink_to(Path(target).resolve())
+
+
+def build_run_dir(title_dir, build_dir, run_dir, backend):
+    if run_dir.exists():
+        shutil.rmtree(run_dir)
+    run_dir.mkdir(parents=True)
+    for entry in title_dir.iterdir():
+        (run_dir / entry.name).symlink_to(entry.resolve())
+    for rel in LAYER_DLLS:
+        src = build_dir / rel
+        if not src.exists():
+            sys.exit(f"[xsl-run] missing layer DLL {src}; build first")
+        dst = run_dir / src.name
+        if dst.exists() or dst.is_symlink():
+            dst.unlink()  # the layer replaces any same-named DLL shipped with the title
+        shutil.copy2(src, dst)
+    sdk = REPO / "sdk"
+    for name, rel in SDK_DLLS.items():
+        if (sdk / rel).exists() and not (run_dir / name).exists():
+            shutil.copy2(sdk / rel, run_dir / name)
+    for rel in BACKENDS[backend]:
+        src = build_dir / rel
+        if not src.exists():
+            sys.exit(f"[xsl-run] backend {backend}: missing {src} (see docs/backends.md)")
+        dst = run_dir / src.name
+        if dst.exists() or dst.is_symlink():
+            dst.unlink()
+        shutil.copy2(src, dst)
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--device", choices=CONSOLE_MODE, default="lockhart",
+                    help="console the title should see (default lockhart: 1440p targets suit laptop GPUs)")
+    ap.add_argument("--build", default=str(REPO / "build"))
+    ap.add_argument("--prefix", default=os.environ.get("XSL_PREFIX", str(REPO / ".prefix")))
+    ap.add_argument("--log", default=os.environ.get("XSL_LOG", "info"))
+    ap.add_argument("--backend", choices=BACKENDS, default=os.environ.get("XSL_BACKEND", "vkd3d-proton-xsl"))
+    ap.add_argument("--timeout", type=float, default=0, help="stop the title after N seconds (0 = never)")
+    ap.add_argument("--renderdoc", metavar="SUBMITS", default=None,
+                    help="RenderDoc capture of the translated (Vulkan) stream at these queue submissions, e.g. 300 or 300-302; "
+                         "captures land in run/rdc/ (needs renderdoccmd)")
+    ap.add_argument("title")
+    ap.add_argument("args", nargs=argparse.REMAINDER)
+    a = ap.parse_args()
+
+    title = Path(a.title).resolve()
+    exe = title if title.is_file() else None
+    title_dir = title.parent if exe else title
+    if exe is None:
+        exes = sorted(title_dir.glob("*.exe"))
+        if len(exes) != 1:
+            sys.exit(f"[xsl-run] pick an executable in {title_dir}: {[e.name for e in exes]}")
+        exe = exes[0]
+    prefix = Path(a.prefix)
+    run_dir = REPO / "run" / exe.stem
+    ensure_prefix(prefix, a.device)
+    sys32 = prefix / "drive_c" / "windows" / "system32"
+    for rel in SYSTEM32_DLLS:
+        shutil.copy2(Path(a.build) / rel, sys32 / Path(rel).name)
+    build_run_dir(title_dir, Path(a.build), run_dir, a.backend)
+    map_drives(prefix, run_dir, exe.stem)
+    env = wine_env(prefix, {"XSL_LOG": a.log, "_backend": a.backend})
+    cmd = ["wine", exe.name] + a.args
+    if a.renderdoc:
+        rdc = REPO / "run" / "rdc"
+        rdc.mkdir(parents=True, exist_ok=True)
+        env["VKD3D_AUTO_CAPTURE_COUNTS"] = a.renderdoc
+        cmd = ["renderdoccmd", "capture", "-w", "--opt-hook-children", "-d", str(run_dir), "-c", str(rdc / exe.stem)] + cmd
+    print(f"[xsl-run] {exe.name} as {a.device} on {a.backend} in {run_dir}", file=sys.stderr)
+    try:
+        p = subprocess.run(cmd, cwd=run_dir, env=env, timeout=a.timeout or None)
+        sys.exit(p.returncode)
+    except subprocess.TimeoutExpired:
+        subprocess.run(["wineserver", "-k"], env=env)
+        print("[xsl-run] stopped after timeout", file=sys.stderr)
+        sys.exit(0)
+
+
+if __name__ == "__main__":
+    main()

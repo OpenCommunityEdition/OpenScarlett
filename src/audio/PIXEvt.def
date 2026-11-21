@@ -1,0 +1,16 @@
+LIBRARY PIXEvt.dll
+EXPORTS
+    ConfigureL3PMCs=xsl_no_device
+    ConfigureNBPMCs=xsl_no_device
+    ConfigurePMCs=xsl_no_device
+    PIXBeginCapture1=xsl_no_device
+    PIXBeginCapture2=xsl_no_device
+    PIXEndCapture=xsl_no_device
+    PIXEventsReplaceBlock=xsl_zero
+    PIXGetCaptureState=xsl_zero
+    PIXGetPowerMetrics=xsl_no_device
+    PIXRecordMemoryAllocationEvent=xsl_zero
+    PIXRecordMemoryFreeEvent=xsl_zero
+    PIXReportCounter=xsl_zero
+    PIXSetLinkWorkerThreadAffinityMask=xsl_ok
+    PIXSetPerformanceContext=xsl_zero

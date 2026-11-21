@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: MIT
+# Run every synthetic Series X|S title on the layer; each exits 0 on success.
+set -u
+here=$(cd "$(dirname "$0")/.." && pwd)
+fail=0
+for exe in "$here"/build/synthetic/*/*.exe; do
+  name=$(basename "$exe" .exe)
+  out=$("$here/tools/xsl-run" --timeout 60 "$exe" 2>&1); rc=$?
+  if [ $rc -eq 0 ]; then echo "PASS $name"; else echo "FAIL $name (exit $rc)"; echo "$out" | grep -E "^FAIL" ; fail=1; fi
+done
+exit $fail

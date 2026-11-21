@@ -1,0 +1,9 @@
+LIBRARY chad.dll
+EXPORTS
+    XDspActivate=xsl_no_device
+    XDspConnect=xsl_no_device
+    XDspConnectWithMaximumStreamLimit=xsl_no_device
+    XDspDeactivate=xsl_ok
+    XDspDisconnect=xsl_ok
+    XDspSubmitCommand=xsl_no_device
+    XDspSubmitCommandWithEnvelope=xsl_no_device
