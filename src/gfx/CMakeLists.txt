@@ -9,7 +9,7 @@ target_link_libraries(xsl_gfx_pc PUBLIC xsl_common d3d12 dxgi xsl_gpucode)
 target_include_directories(xsl_gfx_pc PRIVATE "${GXDK_ROOT}/xbox/include/devpctools/gen9")
 
 # Xbox half: GDKX headers only (never in the same translation unit as d3d12.h).
-add_library(d3d12_xs SHARED xs_objects.cpp xs_pagemap.cpp xs_descriptors.cpp xs_device.cpp xs_cbv.cpp xs_unified.cpp xs_exports.cpp xs_abi.cpp d3d12_xs.def)
+add_library(d3d12_xs SHARED fixed_time.cpp xs_objects.cpp xs_pagemap.cpp xs_descriptors.cpp xs_device.cpp xs_cbv.cpp xs_unified.cpp xs_exports.cpp xs_abi.cpp d3d12_xs.def)
 target_compile_definitions(d3d12_xs PRIVATE XSL_PINNED_GXDK_EDITION=${XSL_PINNED_GXDK_EDITION})
 add_dependencies(d3d12_xs xsl_gen)
 target_include_directories(d3d12_xs PRIVATE ${XSL_GEN_DIR} "${GXDK_ROOT}/xbox/include/gen9" "${GXDK_ROOT}/xbox/include")

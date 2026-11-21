@@ -101,6 +101,26 @@ struct Translator {
 
     // ---- setup ------------------------------------------------------------------------------
     std::vector<PsvResource> psv;
+    std::vector<SigElem> isg, osg;
+    // Pixel shaders: barycentric VGPR -> interpolation mode; console attribute -> mode used.
+    std::map<unsigned, std::string> bary_mode;
+    std::map<unsigned, std::string> attr_mode;
+    std::map<unsigned, unsigned> attr_reg;          // console attribute N -> input signature register
+    std::vector<std::pair<unsigned, std::string>> ps_sysv;   // VGPR initialisations
+    std::set<unsigned> ps_targets;
+    bool ps_depth = false, ps_stencil = false, ps_mask = false, ps_discard = false;
+    // Vertex shaders.
+    bool vs_fetch = false;
+    std::map<unsigned, unsigned> vs_input_vgpr;    // input signature register -> first VGPR
+    std::set<unsigned> vs_params;
+    bool vs_pos = false;
+    bool uses_codedata = false;
+    unsigned user_end() const {   // first SGPR after the user arguments (PS: primitive mask)
+        unsigned e = c.kind == ProgramKind::CS ? 4 : 8;
+        for (auto& a : meta.args)
+            if (a.loc < 32) e = std::max(e, a.loc + std::max(1u, a.size));
+        return e;
+    }
     const PsvResource* psv_find(bool sampler, bool cbv, bool uav, uint32_t reg, uint32_t space) const {
         for (auto& p : psv) {
             bool cls = sampler ? p.type == 1 : cbv ? p.type == 2 : uav ? (p.type >= 6 && p.type <= 9) : (p.type >= 3 && p.type <= 5);
@@ -121,11 +141,36 @@ struct Translator {
     bool load() {
         std::string e;
         if (auto* pp = c.part("PSV0")) psv = parse_psv0(*pp);
+        if (auto* pp = c.part("ISG1")) isg = parse_signature(*pp);
+        if (auto* pp = c.part("OSG1")) osg = parse_signature(*pp);
         if (!parse_meta(c, meta, &e)) return fail("metadata: " + e);
+        if (c.kind == ProgramKind::PS) {
+            // Initial VGPRs in SPI_PS_INPUT_ENA order (AMD's public register layout).
+            static const struct { int bit, n; const char* what; } lay[] = {
+                {0, 2, "sample"}, {1, 2, "center"}, {2, 2, "centroid"}, {3, 3, "pull"}, {4, 2, "nsample"}, {5, 2, "ncenter"},
+                {6, 2, "ncentroid"}, {7, 1, "stipple"}, {8, 1, "posx"}, {9, 1, "posy"}, {10, 1, "posz"}, {11, 1, "posw"},
+                {12, 1, "face"}, {13, 1, "ancillary"}, {14, 1, "coverage"}, {15, 1, "fixed"}};
+            unsigned v = 0;
+            for (auto& l : lay) {
+                if (!((meta.ps_input_ena >> l.bit) & 1)) continue;
+                for (int k = 0; k < l.n; k++) bary_mode[v + k] = l.what;
+                std::string w = l.what, init;
+                if (w == "posx") init = "asuint(I.pos_.x)";
+                else if (w == "posy") init = "asuint(I.pos_.y)";
+                else if (w == "posz") init = "asuint(I.pos_.z)";
+                else if (w == "posw") init = "asuint(I.pos_.w)";
+                else if (w == "face") init = "(I.face_ ? 0x3f800000u : 0xbf800000u)";
+                else if (w == "ancillary") init = "((I.sid_ & 15u) << 8)";
+                else if (w == "coverage") init = "I.cov_";
+                if (!init.empty()) ps_sysv.push_back({v, init});
+                v += l.n;
+            }
+            for (size_t k = 0; k < meta.ps_inputs.size(); k++) attr_reg[unsigned(k)] = meta.ps_inputs[k].reg;
+        }
         code = c.code();
         ins = decode_all(code.data(), code.size());
         for (auto& in : ins) {
-            if (!in.name) return fail(fmt("unknown %s opcode %u at 0x%x", fmt_name(in.fmt), in.op, in.offset));
+            if (!in.name) continue;   // data after the code decodes as junk; reported only if reached
             std::string n = in.name;
             if ((n == "s_mov_b32" || starts(n, "s_and_b32") || starts(n, "s_or_b32")) && (in.dst == 126))
                 W = 32;
@@ -134,6 +179,7 @@ struct Translator {
                 W = 32;
         }
         for (auto& in : ins) {
+            if (!in.name) continue;
             std::string n = in.name;
             if (ends(n, "_b64") && (in.dst == 126 || in.src0 == 126 || in.src1 == 126) && in.fmt != Fmt::VOP3) W = 64;
             if (has(n, "saveexec_b64") || has(n, "wrexec_b64")) W = 64;
@@ -145,7 +191,7 @@ struct Translator {
         std::set<uint32_t> leaders{0};
         for (size_t i = 0; i < ins.size(); i++) {
             auto& in = ins[i];
-            if (in.fmt != Fmt::SOPP) continue;
+            if (in.fmt != Fmt::SOPP || !in.name) continue;
             std::string n = in.name;
             if (starts(n, "s_branch") || starts(n, "s_cbranch")) {
                 leaders.insert(uint32_t(int32_t(in.offset) + 4 + in.simm16 * 4));
@@ -198,6 +244,7 @@ struct Translator {
         return res[r].name + "[" + (it == samp_index.end() ? std::string("0") : it->second) + "]";
     }
     void step(SState& st, const Instr& in) {
+        if (!in.name) return;
         std::string n = in.name;
         auto lit = [&](uint16_t e) -> AV { return e == src::kLiteral ? AV::cst(in.literal) : sval_of(st, e); };
         auto setd = [&](uint16_t d, AV v) { if (d < kNumS) st[d] = v; };
@@ -529,6 +576,7 @@ struct Translator {
     }
     void resolve(size_t i, const SState& st) {
         const Instr& in = ins[i];
+        if (!in.name) return;
         std::string n = in.name;
         if (in.fmt == Fmt::MUBUF || in.fmt == Fmt::MTBUF) {
             int r = resource(st, in.srsrc, 4, in, false);
@@ -666,7 +714,12 @@ struct Translator {
     bool emit_mubuf(const Instr& in, size_t idx);
     bool emit_mimg(const Instr& in, size_t idx);
     bool emit_ds(const Instr& in, size_t idx);
+    bool emit_vintrp(const Instr& in, size_t idx);
+    bool emit_exp(const Instr& in, size_t idx);
+    bool emit_global(const Instr& in, size_t idx);
+    std::string attr_value(unsigned attr, unsigned chan, const std::string& mode);
     bool emit(const Instr& in, size_t idx) {
+        if (!in.name) return fail(fmt("unknown %s opcode %u at 0x%x", fmt_name(in.fmt), in.op, in.offset));
         if (opt.comments) out << "  // " << fmt("%04x", in.offset) << ": " << disasm(in) << "\n";
         switch (in.fmt) {
         case Fmt::SOP1: case Fmt::SOP2: case Fmt::SOPC: case Fmt::SOPK: case Fmt::SOPP: return emit_salu(in, idx);
@@ -675,6 +728,9 @@ struct Translator {
         case Fmt::MUBUF: case Fmt::MTBUF: return emit_mubuf(in, idx);
         case Fmt::MIMG: return emit_mimg(in, idx);
         case Fmt::DS: return emit_ds(in, idx);
+        case Fmt::VINTRP: return emit_vintrp(in, idx);
+        case Fmt::EXP: return emit_exp(in, idx);
+        case Fmt::GLOBAL: return emit_global(in, idx);
         default: return fail(fmt("%s at 0x%x: format %s not supported", in.name, in.offset, fmt_name(in.fmt)));
         }
     }
@@ -847,6 +903,10 @@ bool Translator::emit_salu(const Instr& in, size_t idx) {
                 line(fmt("{ uint ol_ = s126; uint lo_ = %s; bool k_ = %s; s126 = lo_; kexec = k_; scc = lo_ != 0u; %s = %s; }", il.c_str(), ib.c_str(),
                          S(d).c_str(), wr ? "lo_" : "ol_"));
             if (d == 106) sync_mask_from_int(106);
+            return true;
+        }
+        if (n == "s_swappc_b64" && c.kind == ProgramKind::VS && idx <= 1 && in.src0 == 4) {
+            vs_fetch = true;   // call of the driver's fetch shader: the input assembler does it on PC
             return true;
         }
         if (n == "s_setpc_b64" || n == "s_swappc_b64") return fail(n + " (indirect branch/call) not supported");
@@ -1868,6 +1928,175 @@ bool Translator::emit_ds(const Instr& in, size_t idx) {
     return fail(fmt("%s at 0x%x not supported", in.name, in.offset));
 }
 
+
+// ---- pixel inputs (interpolation) ----------------------------------------------------------
+// Console attribute N is the shader's Nth interpolated input (header records); its value is
+// declared as an HLSL input with the original semantic, so the PC rasteriser interpolates it.
+std::string Translator::attr_value(unsigned attr, unsigned chan, const std::string& mode) {
+    auto it = attr_reg.find(attr);
+    if (it == attr_reg.end()) { fail(fmt("pixel shader reads attribute %u that has no input record", attr)); return "0u"; }
+    unsigned reg = it->second;
+    const SigElem* el = nullptr;
+    for (auto& e : isg)
+        if (e.reg == reg && ((e.mask >> chan) & 1) && e.sysval == 0) el = &e;
+    if (!el) { fail(fmt("pixel input register %u component %u not in the input signature", reg, chan)); return "0u"; }
+    unsigned first = unsigned(__builtin_ctz(el->mask));
+    std::string md = el->is_float() ? mode : "nointerpolation";
+    auto m = attr_mode.find(el->reg * 4 + first);
+    if (m == attr_mode.end()) attr_mode[el->reg * 4 + first] = md;
+    else if (m->second != md) { fail(fmt("pixel input %s interpolated in two modes", el->name.c_str())); return "0u"; }
+    unsigned comp = chan - first;
+    unsigned w = unsigned(__builtin_popcount(el->mask));
+    std::string f = w > 1 ? fmt("I.a%u_%u.%c", el->reg, first, "xyzw"[comp]) : fmt("I.a%u_%u", el->reg, first);
+    return el->is_float() ? "asuint(" + f + ")" : "uint(" + f + ")";
+}
+
+bool Translator::emit_vintrp(const Instr& in, size_t idx) {
+    std::string n = in.name;
+    unsigned vsrc = in.src0 - src::kVgpr0;
+    std::string mode;
+    if (n == "v_interp_mov_f32") mode = "nointerpolation";
+    else {
+        auto b = bary_mode.find(vsrc);
+        std::string w = b == bary_mode.end() ? "center" : b->second;
+        mode = w == "center" ? "linear" : w == "centroid" ? "centroid" : w == "sample" ? "sample" : w == "ncenter" ? "noperspective"
+             : w == "ncentroid" ? "noperspective centroid" : w == "nsample" ? "noperspective sample" : "linear";
+    }
+    // p1 produces an intermediate that only p2 consumes; both write the interpolated value.
+    write_v(in.dst, attr_value(in.attr, in.attr_chan, mode));
+    return true;
+}
+
+// ---- exports --------------------------------------------------------------------------------
+// VGPRs an instruction writes (for the packed-export peephole); conservative.
+static bool writes_vgpr(const Instr& in, unsigned v) {
+    switch (in.fmt) {
+    case Fmt::VOP1: case Fmt::VOP2: case Fmt::VOP3: case Fmt::VOP3P: case Fmt::VINTRP:
+        if (in.fmt == Fmt::VOP3 && in.op < 256) return false;
+        if (in.name && (!strcmp(in.name, "v_readfirstlane_b32") || !strcmp(in.name, "v_readlane_b32"))) return false;
+        return in.dst == v || in.dst + 1 == v;   // 64-bit results may write two
+    case Fmt::MIMG: case Fmt::MUBUF: case Fmt::MTBUF: case Fmt::GLOBAL: case Fmt::FLAT: case Fmt::SCRATCH:
+        return v >= in.vdata && v < in.vdata + 5u;
+    case Fmt::DS: return v >= in.dst && v < in.dst + 4u;
+    default: return false;
+    }
+}
+
+bool Translator::emit_exp(const Instr& in, size_t idx) {
+    const unsigned t = in.exp_target;
+    // Packed fp16 exports come from v_cvt_pkrtz_f16_f32: export its f32 sources instead (the
+    // console driver patches the export for the render-target format; PC converts on write).
+    auto unpacked = [&](unsigned reg, std::string& lo, std::string& hi) -> bool {
+        size_t b = idx;
+        while (b > 0) {
+            b--;
+            const Instr& w = ins[b];
+            if (w.fmt == Fmt::SOPP && w.name && (starts(w.name, "s_branch") || starts(w.name, "s_cbranch") || !strcmp(w.name, "s_endpgm"))) break;
+            if (!writes_vgpr(w, reg)) continue;
+            if (!w.name || strcmp(w.name, "v_cvt_pkrtz_f16_f32") || w.sdwa || w.dpp || (w.fmt == Fmt::VOP3 && (w.abs || w.neg))) return false;
+            for (size_t k = b + 1; k < idx; k++) {
+                if (w.src0 >= src::kVgpr0 && writes_vgpr(ins[k], w.src0 - src::kVgpr0)) return false;
+                if (w.src1 >= src::kVgpr0 && writes_vgpr(ins[k], w.src1 - src::kVgpr0)) return false;
+            }
+            lo = "asfloat(" + rd(w.src0, w, 'f') + ")";
+            hi = "asfloat(" + rd(w.src1, w, 'f') + ")";
+            return true;
+        }
+        return false;
+    };
+    std::string comp[4];
+    if (in.exp_compr) {
+        for (int k = 0; k < 2; k++) {
+            std::string lo, hi;
+            unsigned reg = in.exp_src[k];
+            if (!unpacked(reg, lo, hi)) {
+                lo = "f16tof32(" + V(reg) + ")";
+                hi = "f16tof32(" + V(reg) + " >> 16)";
+            }
+            comp[2 * k] = lo;
+            comp[2 * k + 1] = hi;
+        }
+    } else {
+        for (int k = 0; k < 4; k++) comp[k] = "asfloat(" + V(in.exp_src[k]) + ")";
+    }
+    auto en = [&](int k) { return in.exp_compr ? ((in.exp_en >> (k / 2 * 2)) & 1) : ((in.exp_en >> k) & 1); };
+    if (c.kind == ProgramKind::PS) {
+        if (t <= 7) {
+            ps_targets.insert(t);
+            bool isint = false;
+            for (auto& e : osg)
+                if (e.sysval == 64 && e.index == t && !e.is_float()) isint = true;
+            line("if (kexec) {");
+            for (int k = 0; k < 4; k++)
+                if (en(k)) line(fmt("  O.t%u.%c = %s;", t, "xyzw"[k], isint ? ("asuint(" + comp[k] + ")").c_str() : comp[k].c_str()));
+            line("}");
+        } else if (t == 8) {
+            line("if (kexec) {");
+            if (in.exp_en & 1) { ps_depth = true; line("  O.depth_ = " + comp[0] + ";"); }
+            if (in.exp_en & 2) { ps_stencil = true; line("  O.stencil_ = asuint(" + comp[1] + ");"); }
+            if (in.exp_en & 4) { ps_mask = true; line("  O.mask_ = asuint(" + comp[2] + ");"); }
+            line("}");
+        } else if (t != 9) {
+            return fail(fmt("pixel export target %u not supported", t));
+        }
+        if (in.exp_done) { ps_discard = true; line("if (!kexec) discard;"); }
+        return true;
+    }
+    if (c.kind == ProgramKind::VS) {
+        if (t == 12) {
+            vs_pos = true;
+            line("if (kexec) {");
+            for (int k = 0; k < 4; k++)
+                if (en(k)) line(fmt("  O.pos_.%c = %s;", "xyzw"[k], comp[k].c_str()));
+            line("}");
+            return true;
+        }
+        if (t >= 13 && t <= 15) {
+            if (!in.exp_en) return true;
+            return fail(fmt("vertex export pos%u (clip/cull distances, point size) not supported yet", t - 12));
+        }
+        if (t >= 32 && t < 64) {
+            unsigned p = t - 32;
+            vs_params.insert(p);
+            // Param N is the Nth output register (non-system elements, register order).
+            std::vector<unsigned> regs;
+            for (auto& e : osg)
+                if (e.sysval == 0 && std::find(regs.begin(), regs.end(), e.reg) == regs.end()) regs.push_back(e.reg);
+            std::sort(regs.begin(), regs.end());
+            if (p >= regs.size()) return true;   // exported but not consumed by the signature
+            unsigned reg = regs[p];
+            line("if (kexec) {");
+            for (auto& e : osg) {
+                if (e.sysval != 0 || e.reg != reg) continue;
+                unsigned first = unsigned(__builtin_ctz(e.mask));
+                for (int k = 0; k < 4; k++) {
+                    if (!((e.mask >> k) & 1) || !en(k)) continue;
+                    std::string v = e.is_float() ? comp[k] : "asuint(" + comp[k] + ")";
+                    line(fmt("  O.o%u_%u.%c = %s;", e.reg, first, "xyzw"[k - first], v.c_str()));
+                }
+            }
+            line("}");
+            return true;
+        }
+        return fail(fmt("vertex export target %u not supported", t));
+    }
+    return fail("exports in this stage not supported");
+}
+
+// ---- global loads: constant tables addressed relative to the program counter ----------------
+bool Translator::emit_global(const Instr& in, size_t idx) {
+    std::string n = in.name;
+    if (!starts(n, "global_load_dword")) return fail(fmt("%s at 0x%x not supported", in.name, in.offset));
+    unsigned cnt = has(n, "x4") ? 4 : has(n, "x3") ? 3 : has(n, "x2") ? 2 : 1;
+    uses_codedata = true;
+    std::string a = in.saddr != src::kNull ? fmt("(%s + %s + %du)", S(in.saddr).c_str(), V(in.vaddr).c_str(), in.offset_imm)
+                                           : fmt("(%s + %du)", V(in.vaddr).c_str(), in.offset_imm);
+    line(fmt("if (kexec) { uint a_ = %s >> 2;", a.c_str()));
+    for (unsigned k = 0; k < cnt; k++) line(fmt("  %s = a_ + %uu < CODEDATA_N ? codedata[a_ + %uu] : 0u;", V(in.dst + k).c_str(), k, k));
+    line("}");
+    return true;
+}
+
 // ---- declarations and program ------------------------------------------------------------
 std::string Translator::res_decl(const Res& r) const {
     std::string reg;
@@ -1991,8 +2220,30 @@ std::string Translator::generate() {
     const size_t nb = block_start.size();
     if (!loops) line(fmt("bool reach[%zu]; [unroll] for (uint i_ = 0u; i_ < %zuu; i_++) reach[i_] = false; reach[0] = true;", nb + 1, nb + 1));
     else line("uint pc = 0u;\n  [loop] for (;;) {\n  [forcecase] switch (pc) {");
+    // Blocks not reachable from the entry (data after the last instruction) are not emitted.
+    std::vector<bool> live(nb, false);
+    {
+        std::vector<size_t> work{0};
+        live[0] = true;
+        while (!work.empty()) {
+            size_t b = work.back();
+            work.pop_back();
+            const Instr& last = ins[block_end(b) - 1];
+            std::string ln = last.name ? last.name : "";
+            std::vector<size_t> succ;
+            bool br = last.fmt == Fmt::SOPP && (starts(ln, "s_branch") || starts(ln, "s_cbranch"));
+            if (br) {
+                auto it = block_of.find(uint32_t(int32_t(last.offset) + 4 + last.simm16 * 4));
+                if (it != block_of.end()) succ.push_back(it->second);
+            }
+            if (!(last.fmt == Fmt::SOPP && (ln == "s_endpgm" || starts(ln, "s_branch"))) && b + 1 < nb) succ.push_back(b + 1);
+            for (size_t x : succ)
+                if (!live[x]) { live[x] = true; work.push_back(x); }
+        }
+    }
     for (size_t b = 0; b < nb; b++) {
         size_t e = block_end(b);
+        if (!live[b]) continue;
         if (!loops) line(fmt("if (reach[%zu]) {", b));
         else line(fmt("case %zuu: {", b));
         for (size_t i = block_start[b]; i < e; i++)
@@ -2001,7 +2252,7 @@ std::string Translator::generate() {
         const Instr& last = ins[e - 1];
         std::string ln = last.name;
         size_t next = b + 1;
-        if (last.fmt == Fmt::SOPP && ln == "s_endpgm") line(loops ? "return;" : "return;");
+        if (last.fmt == Fmt::SOPP && ln == "s_endpgm") line("RETURN;");
         else if (last.fmt == Fmt::SOPP && (starts(ln, "s_branch") || starts(ln, "s_cbranch"))) {
             size_t t = block_of.count(uint32_t(int32_t(last.offset) + 4 + last.simm16 * 4)) ? block_of[uint32_t(int32_t(last.offset) + 4 + last.simm16 * 4)] : nb;
             if (starts(ln, "s_branch")) line(loops ? fmt("pc = %zuu; break;", t) : fmt("reach[%zu] = true;", t));
@@ -2015,7 +2266,8 @@ std::string Translator::generate() {
         }
         line("}");
     }
-    if (loops) line(fmt("default: return;\n  }\n  }"));
+    if (loops) line(fmt("default: RETURN;\n  }\n  }"));
+    else line("RETURN;");
     std::swap(out, body);
     if (!err.empty()) return "";
 
@@ -2038,12 +2290,119 @@ std::string Translator::generate() {
     }
     h << kPrelude;
     if (uses_quad) h << kQuadPrelude;
-    h << "\n[numthreads(" << meta.numthreads[0] << ", " << meta.numthreads[1] << ", " << meta.numthreads[2] << ")]\n";
-    h << "void main(uint3 gid_ : SV_GroupID, uint3 tid_ : SV_GroupThreadID, uint gi_ : SV_GroupIndex) {\n";
+    if (uses_codedata) {
+        size_t n = (c.precompiled.size() - c.body_begin) / 4;
+        h << "static const uint codedata[" << n << "] = {";
+        for (size_t i = 0; i < n; i++) {
+            uint32_t v;
+            memcpy(&v, c.precompiled.data() + c.body_begin + 4 * i, 4);
+            h << (i ? "," : "") << fmt("0x%xu", v);
+        }
+        h << "};\n#define CODEDATA_N " << n << "u\n";
+    }
+    auto type_of = [](const SigElem& e) {
+        unsigned w = unsigned(__builtin_popcount(e.mask));
+        const char* b = e.comptype == 1 ? "uint" : e.comptype == 2 ? "int" : "float";
+        return w > 1 ? fmt("%s%u", b, w) : std::string(b);
+    };
+    auto sem = [](const SigElem& e) { return e.index ? fmt("%s%u", e.name.c_str(), e.index) : e.name; };
+    auto sorted = [](std::vector<SigElem> v) {
+        std::sort(v.begin(), v.end(), [](const SigElem& a, const SigElem& b) { return a.reg != b.reg ? a.reg < b.reg : (a.mask & -a.mask) < (b.mask & -b.mask); });
+        return v;
+    };
+    std::string init;   // stage-specific initialisation of registers
+    if (c.kind == ProgramKind::CS) {
+        h << "#define RETURN return\n";
+        h << "\n[numthreads(" << meta.numthreads[0] << ", " << meta.numthreads[1] << ", " << meta.numthreads[2] << ")]\n";
+        h << "void main(uint3 gid_ : SV_GroupID, uint3 tid_ : SV_GroupThreadID, uint gi_ : SV_GroupIndex) {\n";
+        unsigned s = meta.user_sgprs();
+        for (int k = 0; k < 3; k++)
+            if (meta.tgid_en(k)) init += fmt("  s%u = gid_.%c;\n", s++, "xyz"[k]);
+        if (meta.tg_size_en()) init += fmt("  s%u = (gi_ / WAVE) << 6;   // wave id in group (TG_SIZE)\n", s++);
+        for (unsigned k = 0; k < meta.tid_comps(); k++) init += fmt("  v%u = tid_.%c;\n", k, "xyz"[k]);
+    } else if (c.kind == ProgramKind::PS) {
+        h << "struct PSIn {\n";
+        bool has_pos = false, has_face = false, has_sid = false, has_cov = false;
+        for (auto& e : sorted(isg)) {
+            if (e.sysval == 1) { h << "  float4 pos_ : SV_Position;\n"; has_pos = true; continue; }
+            if (e.sysval == 9) { h << "  bool face_ : SV_IsFrontFace;\n"; has_face = true; continue; }
+            if (e.sysval == 10) { h << "  uint sid_ : SV_SampleIndex;\n"; has_sid = true; continue; }
+            if (e.sysval != 0) { h << "  " << type_of(e) << " sv" << e.reg << "_ : " << sem(e) << ";\n"; continue; }
+            unsigned first = unsigned(__builtin_ctz(e.mask));
+            auto m = attr_mode.find(e.reg * 4 + first);
+            std::string md = m != attr_mode.end() ? m->second : (e.is_float() ? "linear" : "nointerpolation");
+            if (md == "linear") md = "";
+            h << "  " << md << (md.empty() ? "" : " ") << type_of(e) << " a" << e.reg << "_" << first << " : " << sem(e) << ";\n";
+        }
+        for (auto& pr : ps_sysv) {
+            const std::string& ini = pr.second;
+            if (has(ini, "pos_") && !has_pos) { h << "  float4 pos_ : SV_Position;\n"; has_pos = true; }
+            if (has(ini, "face_") && !has_face) { h << "  bool face_ : SV_IsFrontFace;\n"; has_face = true; }
+            if (has(ini, "sid_") && !has_sid) { h << "  uint sid_ : SV_SampleIndex;\n"; has_sid = true; }
+            if (has(ini, "cov_") && !has_cov) { h << "  uint cov_ : SV_Coverage;\n"; has_cov = true; }
+        }
+        h << "};\nstruct PSOut {\n";
+        for (unsigned t : ps_targets) {
+            bool isint = false, sgn = false;
+            for (auto& e : osg)
+                if (e.sysval == 64 && e.index == t) { isint = !e.is_float(); sgn = e.is_sint(); }
+            h << "  " << (isint ? (sgn ? "int4" : "uint4") : "float4") << " t" << t << " : SV_Target" << t << ";\n";
+        }
+        if (ps_depth) {
+            std::string dn = "SV_Depth";
+            for (auto& e : osg)
+                if (starts(e.name, "SV_Depth")) dn = e.name;
+            h << "  float depth_ : " << dn << ";\n";
+        }
+        if (ps_stencil) h << "  uint stencil_ : SV_StencilRef;\n";
+        if (ps_mask) h << "  uint mask_ : SV_Coverage;\n";
+        if (ps_targets.empty() && !ps_depth && !ps_stencil && !ps_mask) h << "  float4 t0 : SV_Target0;\n";
+        h << "};\n#define RETURN return O\n";
+        h << "\nPSOut main(PSIn I) {\n  PSOut O = (PSOut)0;\n";
+        for (auto& pr : ps_sysv) init += fmt("  v%u = %s;\n", pr.first, pr.second.c_str());
+    } else if (c.kind == ProgramKind::VS) {
+        h << "struct VSIn {\n";
+        unsigned vg = 4;
+        bool vid = false, iid = false;
+        for (auto& e : sorted(isg)) {
+            if (e.sysval == 6) { h << "  uint vid_ : SV_VertexID;\n"; vid = true; continue; }
+            if (e.sysval == 8) { h << "  uint iid_ : SV_InstanceID;\n"; iid = true; continue; }
+            if (e.sysval != 0) continue;
+            h << "  " << type_of(e) << " i" << e.reg << " : " << sem(e) << ";\n";
+            unsigned w = unsigned(__builtin_popcount(e.mask));
+            if (vs_fetch) {
+                // The fetch shader leaves each attribute in 4 VGPRs from v4, filling missing
+                // components with (0, 0, 0, 1).
+                for (unsigned k = 0; k < 4; k++) {
+                    std::string f = k >= w ? (k == 3 ? (e.is_float() ? "1.0f" : "1") : "0") : w > 1 ? fmt("I.i%u.%c", e.reg, "xyzw"[k]) : fmt("I.i%u", e.reg);
+                    init += fmt("  v%u = %s;\n", vg + k, e.is_float() ? ("asuint(" + f + ")").c_str() : ("uint(" + f + ")").c_str());
+                }
+                max_v = std::max(max_v, vg + 4);
+                vg += 4;
+            }
+        }
+        if (!vid) h << "  uint vid_ : SV_VertexID;\n";
+        if (!iid) h << "  uint iid_ : SV_InstanceID;\n";
+        h << "};\nstruct VSOut {\n";
+        bool pos_in_sig = false;
+        for (auto& e : sorted(osg)) {
+            if (e.sysval == 1) { h << "  float4 pos_ : SV_Position;\n"; pos_in_sig = true; continue; }
+            if (e.sysval != 0) continue;
+            unsigned w = unsigned(__builtin_popcount(e.mask));
+            const char* b = e.comptype == 1 ? "uint" : e.comptype == 2 ? "int" : "float";
+            h << "  " << (w > 1 ? fmt("%s%u", b, w) : std::string(b)) << " o" << e.reg << "_" << __builtin_ctz(e.mask) << " : " << sem(e) << ";\n";
+        }
+        if (!pos_in_sig) h << "  float4 pos_ : SV_Position;\n";
+        h << "};\n#define RETURN return O\n";
+        h << "\nVSOut main(VSIn I) {\n  VSOut O = (VSOut)0;\n";
+        init += "  v0 = I.vid_;\n";
+        if (!vs_fetch) init += "  v3 = I.iid_;\n";
+    }
     h << "  L = WaveGetLaneIndex();\n";
     h << "  uint snull = 0u;\n";
     for (unsigned i = 0; i < kNumS; i++) h << (i % 16 == 0 ? "  uint " : ", ") << "s" << i << " = 0u" << (i % 16 == 15 ? ";\n" : "");
-    for (unsigned i = 0; i < std::max(max_v, 3u); i++) h << (i % 16 == 0 ? "  uint " : ", ") << "v" << i << " = 0u" << (i % 16 == 15 || i + 1 == std::max(max_v, 3u) ? ";\n" : "");
+    const unsigned nv = std::max(max_v, 4u);
+    for (unsigned i = 0; i < nv; i++) h << (i % 16 == 0 ? "  uint " : ", ") << "v" << i << " = 0u" << (i % 16 == 15 || i + 1 == nv ? ";\n" : "");
     h << "  bool scc = false, kexec = true, kvcc = false;\n";
     for (size_t d : dyn_loads) h << "  uint dyn" << d << " = 0u;\n";
     for (auto& a : meta.args) {
@@ -2051,12 +2410,7 @@ std::string Translator::generate() {
         for (unsigned k = 0; k < a.size; k++) h << fmt("  s%u = RC%u_d[%u][%u];\n", a.loc + k, a.param, k / 4, k % 4);
     }
     h << "  { uint2 b_ = ballot2(true); s126 = b_.x; s127 = " << (W == 64 ? "b_.y" : "0u") << "; }\n";
-    // System values after the user SGPRs.
-    unsigned s = meta.user_sgprs();
-    for (int k = 0; k < 3; k++)
-        if (meta.tgid_en(k)) h << "  s" << s++ << " = gid_." << "xyz"[k] << ";\n";
-    if (meta.tg_size_en()) h << "  s" << s++ << " = (gi_ / WAVE) << 6;   // wave id in group (TG_SIZE)\n";
-    for (unsigned k = 0; k < meta.tid_comps(); k++) h << "  v" << k << " = tid_." << "xyz"[k] << ";\n";
+    h << init;
     h << body.str();
     h << "}\n";
     return h.str();
@@ -2067,7 +2421,7 @@ std::string Translator::generate() {
 TranslateResult translate(const Container& c, const RootSig& rs, const TranslateOptions& opt) {
     TranslateResult r;
     Translator t(c, rs, opt);
-    if (c.kind != ProgramKind::CS) {
+    if (c.kind != ProgramKind::CS && c.kind != ProgramKind::PS && c.kind != ProgramKind::VS) {
         r.error = std::string("stage ") + kind_name(c.kind) + " not supported yet";
         return r;
     }
@@ -2090,7 +2444,9 @@ TranslateResult translate(const Container& c, const RootSig& rs, const Translate
         return r;
     }
     r.ok = true;
-    r.profile = t.uses_quad ? "cs_6_6" : "cs_6_0";
+    if (c.kind == ProgramKind::CS) r.profile = t.uses_quad ? "cs_6_6" : "cs_6_0";
+    else if (c.kind == ProgramKind::PS) r.profile = "ps_6_0";
+    else r.profile = "vs_6_0";
     return r;
 }
 

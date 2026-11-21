@@ -7,6 +7,7 @@
 // (A/B testing against the DXIL path); default: only shaders without DXIL.
 // XSL_SHADER_CACHE=<dir> overrides the cache directory (%LOCALAPPDATA%\OpenScarlett\shadercache).
 // XSL_DUMP_SHADERS=<dir> writes each translated container and its HLSL.
+// XSL_NATIVE_STAGES=VS,PS,... limits translation to those stages (testing).
 #include <windows.h>
 
 #include <cstdio>
@@ -198,6 +199,7 @@ bool native_translate(const void* in, size_t n, void** out, size_t* outSize) {
     gpucode::Container c;
     if (!gpucode::read_container(in, n, c) || !c.has_native) return false;
     if (c.has_bitcode && mode() != 1) return false;
+    if (const char* st = getenv("XSL_NATIVE_STAGES"); st && *st && !strstr(st, gpucode::kind_name(c.kind))) return false;
     uint64_t key = fnv(kVersion, strlen(kVersion), fnv(in, n));
     {
         std::lock_guard<std::mutex> g(g_lock);

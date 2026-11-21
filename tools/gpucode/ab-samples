@@ -10,14 +10,18 @@ out=${1:-$here/build/ab-results}
 frame=${2:-60}
 pat=${3:-.}
 mkdir -p "$out"
+export XSL_FIXED_FPS=${XSL_FIXED_FPS:-60}   # deterministic animation time per frame
 for exe in "$here"/build/samples/*/*.exe; do
   name=$(basename "$exe" .exe)
   [[ "$name" =~ $pat ]] || continue
   rm -f "$out/$name".{ref,nat}.bmp
   XSL_CAPTURE="Z:$out/$name.ref.bmp@$frame" "$here/tools/xsl-run" --timeout 15 "$exe" > "$out/$name.ref.log" 2>&1
   rm -rf "$out/cache-$name"
+  # First run fills the shader cache (translation and compilation would stall early frames and
+  # shift the sample's clock); the second run is captured.
+  XSL_NATIVE_SHADERS=1 XSL_SHADER_CACHE="Z:$out/cache-$name" "$here/tools/xsl-run" --timeout 15 "$exe" > "$out/$name.nat.log" 2>&1
   XSL_NATIVE_SHADERS=1 XSL_SHADER_CACHE="Z:$out/cache-$name" XSL_CAPTURE="Z:$out/$name.nat.bmp@$frame" \
-    "$here/tools/xsl-run" --timeout 15 "$exe" > "$out/$name.nat.log" 2>&1
+    "$here/tools/xsl-run" --timeout 15 "$exe" > "$out/$name.nat2.log" 2>&1
   ok=$(grep -c "gfx.native:info.*translated" "$out/$name.nat.log")
   no=$(grep -c "not translated\|does not compile" "$out/$name.nat.log")
   cmp=$(python3 "$here/tools/gpucode/bmpdiff.py" "$out/$name.ref.bmp" "$out/$name.nat.bmp" 2>&1)

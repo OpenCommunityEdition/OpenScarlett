@@ -5,6 +5,8 @@
 #include <vector>
 
 #include "xs_object.h"
+
+void xsl_fixed_time_frame();   // fixed_time.cpp (global namespace)
 #include "xs_cbv.h"
 #include "xs_unified.h"
 
@@ -808,6 +810,7 @@ HRESULT D3DAPI Q_GetTimestampFrequency(ID3D12CommandQueue* q, UINT64* f) { retur
 HRESULT D3DAPI Q_GetClockCalibration(ID3D12CommandQueue* q, UINT64* g, UINT64* c) { return pc::queue_clock_calibration(pc_of(q), g, c); }
 HRESULT D3DAPI Q_PresentX(ID3D12CommandQueue* q, UINT planes, const D3D12XBOX_PRESENT_PLANE_PARAMETERS* p, const D3D12XBOX_PRESENT_PARAMETERS*) {
     if (planes == 0 || !p || !p->ResourceCount || !p->ppResources) return S_OK;  // "present blank": nothing to show yet
+    xsl_fixed_time_frame();
     LARGE_INTEGER callQpc;
     QueryPerformanceCounter(&callQpc);
     Device* dev = hdr(q)->device;

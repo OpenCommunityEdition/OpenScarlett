@@ -8,6 +8,8 @@
 
 #include "xs_object.h"
 
+void xsl_fixed_time_install();   // fixed_time.cpp (global namespace)
+
 namespace xs {
 namespace {
 Device* g_device = nullptr;
@@ -781,6 +783,7 @@ HRESULT create_dxgi_device(Device* dev, void** out) {
 // DLL exports
 // ============================================================================================
 extern "C" HRESULT D3DAPI D3D12XboxCreateDevice(IGraphicsUnknown*, const D3D12XBOX_CREATE_DEVICE_PARAMETERS* p, REFIID riid, void** out) {
+    xsl_fixed_time_install();
     return xs::create_device(p, riid, out);
 }
 extern "C" void D3DAPI D3D12XboxUnloadDriverModule() {}
