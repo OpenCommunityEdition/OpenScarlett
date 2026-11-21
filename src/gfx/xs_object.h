@@ -13,6 +13,7 @@
 // The pointer handed to the title is the interface struct; the header sits
 // immediately before it.
 #pragma once
+#include <vector>
 #define INITGUID
 #include <windows.h>
 #include <initguid.h>
@@ -197,4 +198,8 @@ HRESULT D3DAPI Q_ClearPageMappingsX(ID3D12CommandQueue* q, D3D12_GPU_VIRTUAL_ADD
 
 HWND find_title_window();
 
+// Ray-tracing build inputs in PC form: console-only flags cleared, pointer-array geometry layouts
+// turned into arrays (kept in `geo`), addresses translated when `dev` is given.
+void rt_pc_inputs(Device* dev, const D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS* in,
+                  D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS* out, std::vector<D3D12_RAYTRACING_GEOMETRY_DESC>* geo);
 }  // namespace xs

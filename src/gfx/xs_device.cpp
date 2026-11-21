@@ -381,7 +381,15 @@ void D3DAPI D_CreateCBV(ID3D12Device* d, const D3D12_CONSTANT_BUFFER_VIEW_DESC* 
 void D3DAPI D_CreateSampler(ID3D12Device* d, const D3D12_SAMPLER_DESC* v, D3D12_CPU_DESCRIPTOR_HANDLE h) { pc::create_sampler(DPC(d), v, h.ptr); }
 void D3DAPI D_CopyDescriptorsSimple(ID3D12Device* d, UINT n, D3D12_CPU_DESCRIPTOR_HANDLE dst, D3D12_CPU_DESCRIPTOR_HANDLE src, D3D12_DESCRIPTOR_HEAP_TYPE t) {
     if (!n || desc_copy(n, dst.ptr, src.ptr, t)) return;  // console-layout slots
-    pc::copy_descriptors_simple(DPC(d), n, dst.ptr, src.ptr, t);
+    // One side in console-layout slots and the other in a PC heap: translate each descriptor
+    // (the title steps both handles by its increment).
+    uint64_t pd = desc_pc_cpu(dst.ptr, t), ps = desc_pc_cpu(src.ptr, t);
+    if (pd == dst.ptr && ps == src.ptr) { pc::copy_descriptors_simple(DPC(d), n, dst.ptr, src.ptr, t); return; }
+    const uint64_t inc = D_GetDescriptorHandleIncrementSize(d, t);
+    for (UINT k = 0; k < n; k++) {
+        uint64_t a = desc_pc_cpu(dst.ptr + k * inc, t), b = desc_pc_cpu(src.ptr + k * inc, t);
+        if (a && b) pc::copy_descriptors_simple(DPC(d), 1, a, b, t);
+    }
 }
 // The general form, expressed as simple copies: each destination/source range pair is walked in step.
 void D3DAPI D_CopyDescriptors(ID3D12Device* d, UINT nDst, const D3D12_CPU_DESCRIPTOR_HANDLE* dst, const UINT* dstSizes, UINT nSrc,
@@ -619,17 +627,27 @@ HRESULT make_inert_state_object(Device* dev, REFIID riid, void** out) {
 
 // Acceleration-structure sizes for the inert ray-tracing path: modest fixed sizes, so titles
 // allocate buffers they will never fill (builds are no-ops until ray tracing is translated).
-void D3DAPI D_GetRaytracingAccelerationStructurePrebuildInfo(ID3D12Device5*, const D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS*,
+// Sizes come from the PC driver (it builds the structures); a console structure is never smaller.
+void D3DAPI D_GetRaytracingAccelerationStructurePrebuildInfo(ID3D12Device5* d, const D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS* in,
                                                              D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO* info) {
     if (!info) return;
-    info->ResultDataMaxSizeInBytes = 64 * 1024;
-    info->ScratchDataSizeInBytes = 64 * 1024;
-    info->UpdateScratchDataSizeInBytes = 64 * 1024;
+    *info = {};
+    if (in && d && !null_graphics()) {
+        D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS x;
+        std::vector<D3D12_RAYTRACING_GEOMETRY_DESC> geo;
+        rt_pc_inputs(nullptr, in, &x, &geo);
+        pc::rt_prebuild_info(DPC((ID3D12Device*)d), &x, info);
+    }
+    if (!info->ResultDataMaxSizeInBytes) {   // no PC answer: generous fixed sizes
+        info->ResultDataMaxSizeInBytes = 64 * 1024;
+        info->ScratchDataSizeInBytes = 64 * 1024;
+        info->UpdateScratchDataSizeInBytes = 64 * 1024;
+    }
 }
 
-void D3DAPI D_GetRaytracingAccelerationStructurePrebuildInfoX(ID3D12Device8*, const D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS* in,
+void D3DAPI D_GetRaytracingAccelerationStructurePrebuildInfoX(ID3D12Device8* d, const D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS* in,
                                                               const D3D12XBOX_XDXR_STREAM_DESC*, D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO* info) {
-    D_GetRaytracingAccelerationStructurePrebuildInfo(nullptr, in, info);
+    D_GetRaytracingAccelerationStructurePrebuildInfo((ID3D12Device5*)d, in, info);
 }
 
 // DXR libraries compiled to DXIL become console code only when the pipeline is created; until

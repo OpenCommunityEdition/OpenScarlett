@@ -793,6 +793,132 @@ void D3DAPI L_ClearUAVFloat(ID3D12GraphicsCommandList* l, D3D12_GPU_DESCRIPTOR_H
     pc::list_clear_uav_float(LPC(l), desc_pc_gpu(g.ptr), desc_pc_cpu(c.ptr, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV), P(r), v, n, rects);
 }
 void D3DAPI L_DiscardResource(ID3D12GraphicsCommandList* l, ID3D12Resource* r, const D3D12_DISCARD_REGION*) { pc::list_discard(LPC(l), P(r)); }
+// ---- ray-tracing acceleration structures (built by the PC driver; same structure layouts) ----
+void rt_inputs_impl(Device* dev, const D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS* in,
+                    D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS* out, std::vector<D3D12_RAYTRACING_GEOMETRY_DESC>* geo) {
+    *out = *in;
+    out->Flags = (D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAGS)(in->Flags & 0x3f);   // console flags (DEHYDRATE) dropped
+    auto va = [&](uint64_t a) { return dev && a ? gpu_va(dev, a) : a; };
+    if (in->Type == D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL) {
+        out->InstanceDescs = va(in->InstanceDescs);   // instance contents (BLAS addresses) are GPU data, used as written
+        return;
+    }
+    geo->resize(in->NumDescs);
+    for (UINT i = 0; i < in->NumDescs; i++) {
+        D3D12_RAYTRACING_GEOMETRY_DESC g = in->DescsLayout == D3D12_ELEMENTS_LAYOUT_ARRAY ? in->pGeometryDescs[i] : *in->ppGeometryDescs[i];
+        if (g.Type == D3D12_RAYTRACING_GEOMETRY_TYPE_TRIANGLES) {
+            g.Triangles.Transform3x4 = va(g.Triangles.Transform3x4);
+            g.Triangles.IndexBuffer = va(g.Triangles.IndexBuffer);
+            g.Triangles.VertexBuffer.StartAddress = va(g.Triangles.VertexBuffer.StartAddress);
+        } else {
+            g.AABBs.AABBs.StartAddress = va(g.AABBs.AABBs.StartAddress);
+        }
+        (*geo)[i] = g;
+    }
+    out->DescsLayout = D3D12_ELEMENTS_LAYOUT_ARRAY;
+    out->pGeometryDescs = geo->data();
+}
+namespace {
+// Postbuild queries the PC knows (the console's offline statistics have no PC equivalent).
+bool pc_postbuild(Device* dev, const D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_DESC& d, D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_DESC* out) {
+    if ((int)d.InfoType > 3) {
+        static volatile long n = 0;
+        if (InterlockedIncrement(&n) <= 2) XSL_WARN(CH, "acceleration structure postbuild info type %#x is console-only; skipped", (unsigned)d.InfoType);
+        return false;
+    }
+    *out = d;
+    out->DestBuffer = gpu_va(dev, d.DestBuffer);
+    return true;
+}
+}  // namespace
+// Acceleration structures stay inert by default: titles ship serialized console structures (copied
+// in with DESERIALIZE) that a PC driver cannot read, and the TLAS references them. Builds and
+// copies then do nothing and postbuild queries report plausible sizes, until ray tracing is
+// translated. XSL_RT_BUILD=1 forwards builds to the PC driver.
+bool rt_build_on() {
+    static bool on = [] { char b[4]; return GetEnvironmentVariableA("XSL_RT_BUILD", b, 4) && b[0] == '1'; }();
+    return on;
+}
+void rt_fake_postbuild(ID3D12GraphicsCommandList* l, Device* dev, const D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_DESC& d, UINT n) {
+    // Every info type starts with UINT64 sizes (serialization: size, then BLAS pointer count).
+    uint32_t stride = d.InfoType == D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_SERIALIZATION ? 16 : 8;
+    if ((int)d.InfoType > 3) return;
+    std::vector<uint64_t> a;
+    std::vector<uint32_t> v;
+    uint64_t base = gpu_va(dev, d.DestBuffer);
+    for (UINT i = 0; i < n; i++) {
+        uint64_t e = base + (uint64_t)i * stride;
+        a.push_back(e); v.push_back(64 * 1024);   // size: 64 KB
+        a.push_back(e + 4); v.push_back(0);
+        if (stride == 16) { a.push_back(e + 8); v.push_back(0); a.push_back(e + 12); v.push_back(0); }
+    }
+    pc::list_write_immediate(LPC(l), (uint32_t)a.size(), a.data(), v.data());
+}
+void D3DAPI L_BuildRtAs(ID3D12GraphicsCommandList4* l4, const D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC* d, UINT np,
+                        const D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_DESC* post) {
+    auto* l = (ID3D12GraphicsCommandList*)l4;
+    if (null_graphics() || !d) return;
+    if (!rt_build_on()) {
+        for (UINT i = 0; i < np; i++) rt_fake_postbuild(l, hdr(l)->device, post[i], 1);
+        return;
+    }
+    Device* dev = hdr(l)->device;
+    {
+        static volatile long n = 0;
+        if (InterlockedIncrement(&n) <= 20)
+            XSL_INFO(CH, "BuildRaytracingAccelerationStructure type %d flags %#x, %u descs, %u postbuild", (int)d->Inputs.Type, (unsigned)d->Inputs.Flags,
+                     d->Inputs.NumDescs, np);
+    }
+    D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC x = *d;
+    std::vector<D3D12_RAYTRACING_GEOMETRY_DESC> geo;
+    rt_inputs_impl(dev, &d->Inputs, &x.Inputs, &geo);
+    x.DestAccelerationStructureData = gpu_va(dev, d->DestAccelerationStructureData);
+    x.SourceAccelerationStructureData = d->SourceAccelerationStructureData ? gpu_va(dev, d->SourceAccelerationStructureData) : 0;
+    x.ScratchAccelerationStructureData = gpu_va(dev, d->ScratchAccelerationStructureData);
+    std::vector<D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_DESC> p;
+    for (UINT i = 0; i < np; i++) {
+        D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_DESC t;
+        if (pc_postbuild(dev, post[i], &t)) p.push_back(t);
+    }
+    pc::list_rt_build(LPC(l), &x, (uint32_t)p.size(), p.empty() ? nullptr : p.data());
+}
+void D3DAPI L_BuildRtAsBatched2X(ID3D12GraphicsCommandList6* l6, UINT n, const D3D12XBOX_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_BATCHED_DESC2* d) {
+    for (UINT i = 0; d && i < n; i++)   // the console stream options (ExtraOptions) have no PC meaning
+        L_BuildRtAs((ID3D12GraphicsCommandList4*)l6, &d[i].Desc, d[i].NumPostbuildInfoDescs, d[i].pPostbuildInfoDescs);
+}
+void D3DAPI L_EmitRtAsPostbuild(ID3D12GraphicsCommandList4* l4, const D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_DESC* d, UINT n,
+                                const D3D12_GPU_VIRTUAL_ADDRESS* src) {
+    auto* l = (ID3D12GraphicsCommandList*)l4;
+    if (null_graphics() || !d || !n) return;
+    Device* dev = hdr(l)->device;
+    if (!rt_build_on()) { rt_fake_postbuild(l, dev, *d, n); return; }
+    D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_DESC t;
+    if (!pc_postbuild(dev, *d, &t)) return;
+    std::vector<uint64_t> s(n);
+    for (UINT i = 0; i < n; i++) s[i] = gpu_va(dev, src[i]);
+    pc::list_rt_postbuild(LPC(l), &t, n, s.data());
+}
+void D3DAPI L_CopyRtAs(ID3D12GraphicsCommandList4* l4, D3D12_GPU_VIRTUAL_ADDRESS dst, D3D12_GPU_VIRTUAL_ADDRESS src,
+                       D3D12_RAYTRACING_ACCELERATION_STRUCTURE_COPY_MODE mode) {
+    auto* l = (ID3D12GraphicsCommandList*)l4;
+    if (null_graphics() || !rt_build_on()) return;
+    uint32_t m = (uint32_t)mode;
+    {
+        static volatile long n = 0;
+        if (InterlockedIncrement(&n) <= 20) XSL_INFO(CH, "CopyRaytracingAccelerationStructure mode %#x", m);
+    }
+    // Serialized structures are driver data: a console blob cannot be deserialized on PC, and the
+    // console's compressed serialization has no PC form. Those copies are skipped.
+    if (m == D3D12_RAYTRACING_ACCELERATION_STRUCTURE_COPY_MODE_DESERIALIZE || m > 4) {
+        static volatile long n = 0;
+        if (InterlockedIncrement(&n) <= 3) XSL_WARN(CH, "acceleration structure copy mode %#x (serialized console data) skipped", m);
+        return;
+    }
+    Device* dev = hdr(l)->device;
+    pc::list_rt_copy(LPC(l), gpu_va(dev, dst), gpu_va(dev, src), m);
+}
+void D3DAPI L_DepthBoundsX(ID3D12GraphicsCommandList* l, FLOAT lo, FLOAT hi) { pc::list_depth_bounds(LPC(l), lo, hi); }
+void D3DAPI L_DepthBounds(ID3D12GraphicsCommandList1* l, FLOAT lo, FLOAT hi) { pc::list_depth_bounds(LPC((ID3D12GraphicsCommandList*)l), lo, hi); }
 void D3DAPI L_DispatchMesh(ID3D12GraphicsCommandList6* l, UINT x, UINT y, UINT z) {
     if (!null_graphics() && !lx((ID3D12GraphicsCommandList*)l)->placeholderPso) pc::list_dispatch_mesh(pc_of(l), x, y, z);
 }
@@ -871,6 +997,15 @@ HRESULT make_list(Device* dev, PcObj pcl, D3D12_COMMAND_LIST_TYPE t, REFIID riid
         g->ClearUnorderedAccessViewFloat = L_ClearUAVFloat;
         g->DiscardResource = L_DiscardResource;
         ((D3D12GraphicsCommandList6_Function_Table*)&g_list_tbl)->DispatchMesh = L_DispatchMesh;
+        {
+            auto* t4 = (D3D12GraphicsCommandList4_Function_Table*)&g_list_tbl;
+            t4->BuildRaytracingAccelerationStructure = L_BuildRtAs;
+            t4->EmitRaytracingAccelerationStructurePostbuildInfo = L_EmitRtAsPostbuild;
+            t4->CopyRaytracingAccelerationStructure = L_CopyRtAs;
+            ((D3D12GraphicsCommandList6_Function_Table*)&g_list_tbl)->BuildRaytracingAccelerationStructureBatched2X = L_BuildRtAsBatched2X;
+            ((D3D12GraphicsCommandList1_Function_Table*)&g_list_tbl)->OMSetDepthBounds = L_DepthBounds;
+        }
+        g->OMSetDepthBoundsX = L_DepthBoundsX;
         g->ResolveSubresource = L_ResolveSubresource;
         g->CopyResourceX = L_CopyResourceX;
         g->OMSetBlendFactor = L_OMSetBlendFactor;
@@ -1032,5 +1167,12 @@ void report_foreign(void* obj, void* caller, const char* fn) {
     module_of(caller, cm, sizeof cm, &coff);
     XSL_ERR(CH, "foreign object %p (vtable %p = %s+%#llx) passed to %s from %s+%#llx", obj, vtbl, vm,
             (unsigned long long)voff, fn, cm, (unsigned long long)coff);
+}
+}  // namespace xs
+
+namespace xs {
+void rt_pc_inputs(Device* dev, const D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS* in,
+                  D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS* out, std::vector<D3D12_RAYTRACING_GEOMETRY_DESC>* geo) {
+    rt_inputs_impl(dev, in, out, geo);
 }
 }  // namespace xs

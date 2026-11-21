@@ -118,6 +118,14 @@ void list_execute_indirect(PcObj l, PcObj sig, uint32_t max, PcObj args, uint64_
 // XSL_D3D12_DRED: copies the first argument bytes (and the count) of an ExecuteIndirect to memory the
 // device-removed report prints; the buffers must be in a state that allows copying from them.
 bool dred_on();
+// Ray-tracing acceleration structures. Descriptions are PC layouts with PC addresses (the
+// geometry array layout, never pointers).
+void rt_prebuild_info(PcObj dev, const void* inputs, void* info);
+void list_rt_build(PcObj l, const void* desc, uint32_t npost, const void* post);
+void list_rt_postbuild(PcObj l, const void* desc, uint32_t n, const uint64_t* src);
+void list_rt_copy(PcObj l, uint64_t dst, uint64_t src, uint32_t mode);
+void list_depth_bounds(PcObj l, float lo, float hi);
+void list_write_immediate(PcObj l, uint32_t n, const uint64_t* addrs, const uint32_t* values);
 void list_record_indirect(PcObj l, PcObj args, uint64_t argOff, PcObj count, uint64_t countOff);
 void list_clear_uav_uint(PcObj l, uint64_t gpu, uint64_t cpu, PcObj res, const uint32_t* v, uint32_t n, const void* rects);
 void list_clear_uav_float(PcObj l, uint64_t gpu, uint64_t cpu, PcObj res, const float* v, uint32_t n, const void* rects);

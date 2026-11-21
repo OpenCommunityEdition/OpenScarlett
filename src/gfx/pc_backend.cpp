@@ -180,7 +180,39 @@ HRESULT_T device_removed_reason(PcObj dev) {
     return hr;
 }
 
+// Diagnostics: unusual exceptions (codes outside the usual debugger/C++ ones) with the module and
+// offset of each stack frame, logged when DRED or the debug layer is on.
+static LONG CALLBACK note_exception(EXCEPTION_POINTERS* e) {
+    DWORD c = e->ExceptionRecord->ExceptionCode;
+    if (c == 0x406D1388 || c == 0x40010006 || c == 0x4001000A || c == 0xE06D7363 || c == 0x80000003 || c == 0xC0000005 || c == 0x80000004 ||
+        c == 0xE0434352 || c == 0x40080201 || c == 0x4000001F)
+        return EXCEPTION_CONTINUE_SEARCH;
+    static volatile long n = 0;
+    if (InterlockedIncrement(&n) > 4) return EXCEPTION_CONTINUE_SEARCH;
+    void* frames[24];
+    USHORT k = RtlCaptureStackBackTrace(0, 24, frames, nullptr);
+    std::string t;
+    for (USHORT i = 0; i < k; i++) {
+        HMODULE m = nullptr;
+        char name[MAX_PATH] = "?";
+        if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCSTR)frames[i], &m)) {
+            GetModuleFileNameA(m, name, MAX_PATH);
+            const char* b = strrchr(name, '\\');
+            char buf[MAX_PATH + 32];
+            snprintf(buf, sizeof buf, " %s+%llx", b ? b + 1 : name, (unsigned long long)((uint8_t*)frames[i] - (uint8_t*)m));
+            t += buf;
+        } else t += " ?";
+    }
+    XSL_ERR(CH, "exception %08lx (%lu parameters%s%llx):%s", c, e->ExceptionRecord->NumberParameters,
+            e->ExceptionRecord->NumberParameters ? ", first " : "", e->ExceptionRecord->NumberParameters ? (unsigned long long)e->ExceptionRecord->ExceptionInformation[0] : 0ull, t.c_str());
+    if (c == 0x87d) dump_debug_messages();   // the debug layer's break: show the message behind it
+    return EXCEPTION_CONTINUE_SEARCH;
+}
 HRESULT_T create_device(PcObj* out) {
+    if (env_on("XSL_D3D12_DRED") || env_on("XSL_D3D12_DEBUG")) {
+        static bool once = false;
+        if (!once) { once = true; AddVectoredExceptionHandler(1, note_exception); }
+    }
     HRESULT hr;
     if (env_on("XSL_D3D12_DRED")) {
         ID3D12DeviceRemovedExtendedDataSettings* ds = nullptr;
@@ -242,6 +274,11 @@ HRESULT_T create_device(PcObj* out) {
              (unsigned)sm.HighestShaderModel, g_caps.waveMin, g_caps.waveMax, g_caps.meshShaders ? "yes" : "NO", g_caps.raytracing ? "yes" : "NO", g_caps.vrs ? "yes" : "NO", g_caps.samplerFeedback ? "yes" : "NO");
     if (env_on("XSL_D3D12_DEBUG") && SUCCEEDED(dev->QueryInterface(IID_PPV_ARGS(&g_info)))) {
         g_info->SetMessageCountLimit(4096);
+        // The debug layer breaks (raises exception 0x87d) on corruption messages by default; titles
+        // treat that as a fatal error. Messages are logged instead.
+        g_info->SetBreakOnSeverity(D3D12_MESSAGE_SEVERITY_CORRUPTION, FALSE);
+        g_info->SetBreakOnSeverity(D3D12_MESSAGE_SEVERITY_ERROR, FALSE);
+        g_info->SetBreakOnSeverity(D3D12_MESSAGE_SEVERITY_WARNING, FALSE);
         // The layer probes whether resources can be mapped (unified-memory emulation); the
         // refusals on default heaps are expected, so they are not stored.
         D3D12_MESSAGE_ID deny[] = {(D3D12_MESSAGE_ID)822};
@@ -1053,6 +1090,43 @@ void list_record_indirect(PcObj l, PcObj args, uint64_t ao, PcObj cnt, uint64_t 
     uint64_t n = std::min<uint64_t>(32, a->GetDesc().Width - std::min(ao, a->GetDesc().Width));
     if (n) L->CopyBufferRegion(g_ei_rb, (uint64_t)slot * kEiBytes, a, ao, n);
     if (cnt) L->CopyBufferRegion(g_ei_rb, (uint64_t)slot * kEiBytes + 32, as<ID3D12Resource>(cnt), co, 4);
+}
+void rt_prebuild_info(PcObj dev, const void* inputs, void* info) {
+    ID3D12Device5* d5 = nullptr;
+    if (FAILED(as<ID3D12Device>(dev)->QueryInterface(IID_PPV_ARGS(&d5)))) return;
+    d5->GetRaytracingAccelerationStructurePrebuildInfo(static_cast<const D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS*>(inputs),
+                                                       static_cast<D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO*>(info));
+    d5->Release();
+}
+static ID3D12GraphicsCommandList4* list4(PcObj l) {
+    ID3D12GraphicsCommandList4* l4 = nullptr;
+    if (FAILED(L->QueryInterface(IID_PPV_ARGS(&l4)))) return nullptr;
+    l4->Release();   // the list keeps itself alive
+    return l4;
+}
+void list_rt_build(PcObj l, const void* desc, uint32_t npost, const void* post) {
+    if (auto* l4 = list4(l))
+        l4->BuildRaytracingAccelerationStructure(static_cast<const D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC*>(desc), npost,
+                                                 static_cast<const D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_DESC*>(post));
+}
+void list_rt_postbuild(PcObj l, const void* desc, uint32_t n, const uint64_t* src) {
+    if (auto* l4 = list4(l))
+        l4->EmitRaytracingAccelerationStructurePostbuildInfo(static_cast<const D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_DESC*>(desc), n, src);
+}
+void list_write_immediate(PcObj l, uint32_t n, const uint64_t* addrs, const uint32_t* values) {
+    ID3D12GraphicsCommandList2* l2 = nullptr;
+    if (FAILED(L->QueryInterface(IID_PPV_ARGS(&l2)))) return;
+    std::vector<D3D12_WRITEBUFFERIMMEDIATE_PARAMETER> p(n);
+    for (uint32_t i = 0; i < n; i++) p[i] = {addrs[i], values[i]};
+    l2->WriteBufferImmediate(n, p.data(), nullptr);
+    l2->Release();
+}
+void list_depth_bounds(PcObj l, float lo, float hi) {
+    ID3D12GraphicsCommandList1* l1 = nullptr;
+    if (SUCCEEDED(L->QueryInterface(IID_PPV_ARGS(&l1)))) { l1->OMSetDepthBounds(lo, hi); l1->Release(); }
+}
+void list_rt_copy(PcObj l, uint64_t dst, uint64_t src, uint32_t mode) {
+    if (auto* l4 = list4(l)) l4->CopyRaytracingAccelerationStructure(dst, src, (D3D12_RAYTRACING_ACCELERATION_STRUCTURE_COPY_MODE)mode);
 }
 void list_execute_indirect(PcObj l, PcObj sig, uint32_t max, PcObj args, uint64_t ao, PcObj cnt, uint64_t co) {
     L->ExecuteIndirect(as<ID3D12CommandSignature>(sig), max, as<ID3D12Resource>(args), ao, as<ID3D12Resource>(cnt), co);
