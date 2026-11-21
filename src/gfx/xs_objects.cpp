@@ -892,6 +892,7 @@ namespace {
 struct QueueExtra { D3D12_COMMAND_QUEUE_DESC desc; };
 void D3DAPI Q_Execute(ID3D12CommandQueue* q, UINT n, ID3D12CommandList* const* lists) {
     desc_sync();  // descriptors the title wrote inline since the last submission
+    cbv_refresh();   // constant buffer view copies: the title has written the constants by now
     std::vector<PcObj> v(n);
     for (UINT i = 0; i < n; i++) { v[i] = P(lists[i]); XSL_TRACE("gfx.cmd", "Execute list %p", (void*)lists[i]); }
     pc::queue_execute(pc_of(q), n, v.data());

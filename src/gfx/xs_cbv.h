@@ -11,4 +11,6 @@ uint64_t cbv_fix_root(Device* dev, uint64_t va);
 // `gpu` its PC GPU address. Returns a 256-aligned PC address holding a copy of `size` bytes, or `gpu`
 // when the source is not CPU-visible.
 uint64_t cbv_fix_view(Device* dev, uint64_t title_va, uint64_t gpu, uint64_t size);
+// Re-copies the constant buffer views made since the last submission (called before each submission).
+void cbv_refresh();
 }

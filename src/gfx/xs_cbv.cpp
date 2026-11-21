@@ -50,6 +50,10 @@ struct Ring {
     uint64_t frame = UINT64_MAX;
     std::map<uint64_t, uint64_t> seen;  // source VA -> ring GPU VA, this frame
 } g_ring;
+// Views made since the last submission: their copies are refreshed when it happens, so constants
+// the title writes after creating the view (but before submitting) are seen.
+struct Pending { uint8_t* dst; const uint8_t* src; uint64_t n; };
+std::vector<Pending> g_pending;
 
 bool add_chunk(Device* dev, Segment& sg) {
     DeviceExtra* de = dev_extra(dev);
@@ -120,6 +124,7 @@ uint64_t cbv_fix_root(Device* dev, uint64_t va) {
         uint64_t n = avail < kCopyBytes ? avail : kCopyBytes;
         uint64_t off = sg.head;
         memcpy(c.cpu + off, it->second.cpu + (va - it->first), n);
+        g_pending.push_back({c.cpu + off, it->second.cpu + (va - it->first), n});
         g_ring.seen[va] = c.gpu + off;
         const float* f = (const float*)(it->second.cpu + (va - it->first));
         if (log_enabled("gfx.cbv", Level::Trace)) {
@@ -136,6 +141,7 @@ untracked:
     return va;
 }
 
+
 // Copies `n` bytes from `src` into this frame's ring segment; 0 if the ring is full.
 static uint64_t ring_copy(Device* dev, const uint8_t* src, uint64_t n) {
     DeviceExtra* de = dev_extra(dev);
@@ -147,8 +153,15 @@ static uint64_t ring_copy(Device* dev, const uint8_t* src, uint64_t n) {
     Chunk& c = sg.chunks[sg.cur];
     uint64_t off = sg.head;
     memcpy(c.cpu + off, src, n);
+    g_pending.push_back({c.cpu + off, src, n});
     sg.head += (n + 255) & ~255ull;
     return c.gpu + off;
+}
+
+void cbv_refresh() {
+    std::lock_guard<std::mutex> g(g_mu);
+    for (auto& p : g_pending) memcpy(p.dst, p.src, p.n);
+    g_pending.clear();
 }
 
 uint64_t cbv_fix_view(Device* dev, uint64_t title_va, uint64_t gpu, uint64_t size) {
