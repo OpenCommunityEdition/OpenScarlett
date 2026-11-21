@@ -408,7 +408,10 @@ void D3DAPI D_CopyDescriptorsSimple(ID3D12Device* d, UINT n, D3D12_CPU_DESCRIPTO
     const uint64_t inc = D_GetDescriptorHandleIncrementSize(d, t);
     for (UINT k = 0; k < n; k++) {
         uint64_t a = desc_pc_cpu(dst.ptr + k * inc, t), b = desc_pc_cpu(src.ptr + k * inc, t);
-        if (a && b) pc::copy_descriptors_simple(DPC(d), 1, a, b, t);
+        if (a && b) {
+            pc::copy_descriptors_simple(DPC(d), 1, a, b, t);
+            if (t == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV && a != dst.ptr + k * inc) desc_publish(dst.ptr + k * inc);
+        }
     }
 }
 // The general form, expressed as simple copies: each destination/source range pair is walked in step.

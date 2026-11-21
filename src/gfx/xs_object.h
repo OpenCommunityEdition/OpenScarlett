@@ -179,6 +179,7 @@ uint64_t desc_begin_write(uint64_t h, D3D12_DESCRIPTOR_HEAP_TYPE type, DescTag* 
 void desc_commit(uint64_t h, D3D12_DESCRIPTOR_HEAP_TYPE type, const DescTag& tag);
 bool desc_copy(uint32_t n, uint64_t dst, uint64_t src, D3D12_DESCRIPTOR_HEAP_TYPE type);
 uint64_t desc_pc_cpu(uint64_t h, D3D12_DESCRIPTOR_HEAP_TYPE type);
+void desc_publish(uint64_t h);   // after writing a PC descriptor to desc_pc_cpu(h) of a view slot
 uint64_t desc_pc_gpu(uint64_t h);
 void desc_sync();
 HRESULT make_rtv_dsv_shadow_heap(Device* dev, PcObj pch, const D3D12_DESCRIPTOR_HEAP_DESC* d, uint64_t shadow, REFIID riid, void** out);

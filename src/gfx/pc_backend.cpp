@@ -602,10 +602,17 @@ bool translate_indirect_args(const D3D12_COMMAND_SIGNATURE_DESC* in, std::vector
 
 std::mutex g_rays_mu;
 std::set<PcObj> g_rays_sigs;   // command signatures that dispatch rays (skipped while ray tracing is inert)
+// Command signatures whose single argument is a console 1-D dispatch (DISPATCH_SINGLE: X only, Y and
+// Z unused) or a DISPATCH_MESH_X (X, then reserved/payload words): PC dispatches read three group
+// counts, so ExecuteIndirect runs from a copy of the arguments with Y = Z = 1.
+std::map<PcObj, uint32_t> g_fix_sigs;   // signature -> byte stride
 HRESULT_T create_command_signature(PcObj dev, const void* desc, PcObj rs, PcObj* out) {
     auto* d = static_cast<const D3D12_COMMAND_SIGNATURE_DESC*>(desc);
     bool rays = false;
     for (UINT i = 0; d && d->pArgumentDescs && i < d->NumArgumentDescs; i++) rays |= d->pArgumentDescs[i].Type == D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_RAYS;
+    bool fix_args = d && d->pArgumentDescs && d->NumArgumentDescs == 1 &&
+                    ((int)d->pArgumentDescs[0].Type == kXboxArgDispatchL2 || (int)d->pArgumentDescs[0].Type == kXboxArgDispatchMeshX);
+    uint32_t fix_stride = d ? d->ByteStride : 0;
     std::vector<D3D12_INDIRECT_ARGUMENT_DESC> args;
     D3D12_COMMAND_SIGNATURE_DESC pcDesc;
     if (d && d->pArgumentDescs && translate_indirect_args(d, &args)) {
@@ -628,6 +635,7 @@ HRESULT_T create_command_signature(PcObj dev, const void* desc, PcObj rs, PcObj*
     HRESULT hr = as<ID3D12Device>(dev)->CreateCommandSignature(d, as<ID3D12RootSignature>(rs),
                                                                IID_PPV_ARGS(reinterpret_cast<ID3D12CommandSignature**>(out)));
     if (SUCCEEDED(hr) && rays) { std::lock_guard<std::mutex> g(g_rays_mu); g_rays_sigs.insert(*out); }
+    if (SUCCEEDED(hr) && fix_args) { std::lock_guard<std::mutex> g(g_rays_mu); g_fix_sigs[*out] = fix_stride; }
     if (FAILED(hr) && d) {
         std::string args;
         for (UINT i = 0; i < d->NumArgumentDescs && i < 16; i++) {
@@ -1204,6 +1212,59 @@ void list_depth_bounds(PcObj l, float lo, float hi) {
 void list_rt_copy(PcObj l, uint64_t dst, uint64_t src, uint32_t mode) {
     if (auto* l4 = list4(l)) l4->CopyRaytracingAccelerationStructure(dst, src, (D3D12_RAYTRACING_ACCELERATION_STRUCTURE_COPY_MODE)mode);
 }
+// Scratch ring for rewritten indirect arguments (default heap, COPY_DEST between uses).
+struct ArgRing { ID3D12Resource* res = nullptr; uint64_t head = 0; std::mutex mu; } g_arg_ring;
+constexpr uint64_t kArgRing = 16ull << 20;
+static bool fixed_indirect(PcObj l, PcObj sig, uint32_t max, PcObj args, uint64_t ao, PcObj cnt, uint64_t co, uint32_t stride) {
+    if (!max || !stride || max > 4096 || !g_main_device) return false;
+    uint64_t bytes = ((uint64_t)max * stride + 255) & ~255ull, off;
+    {
+        std::lock_guard<std::mutex> g(g_arg_ring.mu);
+        if (!g_arg_ring.res) {
+            D3D12_HEAP_PROPERTIES hp{D3D12_HEAP_TYPE_DEFAULT};
+            D3D12_RESOURCE_DESC rd{};
+            rd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+            rd.Width = kArgRing;
+            rd.Height = rd.DepthOrArraySize = rd.MipLevels = 1;
+            rd.SampleDesc.Count = 1;
+            rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+            if (FAILED(g_main_device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                                              IID_PPV_ARGS(&g_arg_ring.res))))
+                return false;
+            XSL_INFO(CH, "console 1-D and mesh-X indirect dispatches run from rewritten arguments (Y = Z = 1)");
+        }
+        if (g_arg_ring.head + bytes > kArgRing) g_arg_ring.head = 0;
+        off = g_arg_ring.head;
+        g_arg_ring.head += bytes;
+    }
+    ID3D12Resource* a = as<ID3D12Resource>(args);
+    if (ao + (uint64_t)max * stride > a->GetDesc().Width) return false;
+    auto barrier = [&](ID3D12Resource* r, D3D12_RESOURCE_STATES x, D3D12_RESOURCE_STATES y) {
+        D3D12_RESOURCE_BARRIER b{};
+        b.Transition.pResource = r;
+        b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        b.Transition.StateBefore = x;
+        b.Transition.StateAfter = y;
+        L->ResourceBarrier(1, &b);
+    };
+    // The arguments are in INDIRECT_ARGUMENT, where the title leaves them for ExecuteIndirect.
+    const auto ind = D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT;
+    barrier(a, ind, (D3D12_RESOURCE_STATES)(ind | D3D12_RESOURCE_STATE_COPY_SOURCE));
+    L->CopyBufferRegion(g_arg_ring.res, off, a, ao, (uint64_t)max * stride);
+    barrier(a, (D3D12_RESOURCE_STATES)(ind | D3D12_RESOURCE_STATE_COPY_SOURCE), ind);
+    std::vector<uint64_t> wa;
+    std::vector<uint32_t> wv;
+    uint64_t base = g_arg_ring.res->GetGPUVirtualAddress() + off;
+    for (uint32_t i = 0; i < max; i++) {
+        wa.push_back(base + (uint64_t)i * stride + 4); wv.push_back(1);
+        wa.push_back(base + (uint64_t)i * stride + 8); wv.push_back(1);
+    }
+    list_write_immediate(l, (uint32_t)wa.size(), wa.data(), wv.data());
+    barrier(g_arg_ring.res, D3D12_RESOURCE_STATE_COPY_DEST, ind);
+    L->ExecuteIndirect(as<ID3D12CommandSignature>(sig), max, g_arg_ring.res, off, as<ID3D12Resource>(cnt), co);
+    barrier(g_arg_ring.res, ind, D3D12_RESOURCE_STATE_COPY_DEST);
+    return true;
+}
 void list_execute_indirect(PcObj l, PcObj sig, uint32_t max, PcObj args, uint64_t ao, PcObj cnt, uint64_t co) {
     {   // ray dispatches need a ray-tracing pipeline, which is not translated yet (inert state objects)
         std::lock_guard<std::mutex> g(g_rays_mu);
@@ -1213,6 +1274,13 @@ void list_execute_indirect(PcObj l, PcObj sig, uint32_t max, PcObj args, uint64_
             return;
         }
     }
+    uint32_t fix_stride = 0;
+    {
+        std::lock_guard<std::mutex> g(g_rays_mu);
+        auto it = g_fix_sigs.find(sig);
+        if (it != g_fix_sigs.end()) fix_stride = it->second;
+    }
+    if (fix_stride && fixed_indirect(l, sig, max, args, ao, cnt, co, fix_stride)) return;
     if (g_info) check_rs(l, "ExecuteIndirect");
     L->ExecuteIndirect(as<ID3D12CommandSignature>(sig), max, as<ID3D12Resource>(args), ao, as<ID3D12Resource>(cnt), co);
 }

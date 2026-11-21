@@ -83,6 +83,11 @@ std::vector<uint8_t> g_snapshot;
 uint32_t g_viewCount = 0;
 uint64_t g_pcCpu = 0, g_pcGpu = 0;
 uint32_t g_pcInc = 0;
+// CPU-only mirror of the global view heap: slot i's current PC descriptor, the source for
+// descriptor copies and clears (shader-visible heaps cannot be copied from), independent of the
+// record ring (records of long-lived views are recycled while their slots are still copied).
+PcObj g_mirror = nullptr;
+uint64_t g_mirrorCpu = 0;
 std::vector<ShadowHeap> g_rtvDsv;  // per RTV/DSV heap shadow arrays
 
 bool enabled() {
@@ -106,6 +111,9 @@ bool ensure(Device* dev) {
     g_view = (uint8_t*)VirtualAlloc(nullptr, bytes, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE);
     if (!g_view) { XSL_ERR(CH, "descriptor shadow: VirtualAlloc(MEM_WRITE_WATCH) failed (%lu)", GetLastError()); return false; }
     g_snapshot.assign(bytes, 0);
+    D3D12_DESCRIPTOR_HEAP_DESC md{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, g_viewCount, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
+    if (FAILED(pc::create_descriptor_heap(pcdev, &md, &g_mirror))) { XSL_ERR(CH, "descriptor mirror heap (%u) failed", g_viewCount); return false; }
+    g_mirrorCpu = pc::heap_cpu_start(g_mirror);
     if (!g_rec[D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV].init(pcdev, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 1u << 18) ||
         !g_rec[D3D12_DESCRIPTOR_HEAP_TYPE_RTV].init(pcdev, D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1u << 14) ||
         !g_rec[D3D12_DESCRIPTOR_HEAP_TYPE_DSV].init(pcdev, D3D12_DESCRIPTOR_HEAP_TYPE_DSV, 1u << 12))
@@ -116,6 +124,15 @@ bool ensure(Device* dev) {
 }
 
 uint64_t pc_view_cpu(uint32_t i) { return g_pcCpu + (uint64_t)i * g_pcInc; }
+uint64_t mirror_cpu(uint32_t i) { return g_mirrorCpu + (uint64_t)i * g_pcInc; }
+// Slot i's PC descriptor is in the mirror: publish it to the shader-visible heap.
+void publish(uint32_t i) {
+    pc::copy_descriptors_simple(dev_extra(g_dev)->pcDevice, 1, pc_view_cpu(i), mirror_cpu(i), D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+}
+void set_slot(uint32_t i, uint64_t src) {   // src: a CPU-only PC descriptor
+    pc::copy_descriptors_simple(dev_extra(g_dev)->pcDevice, 1, mirror_cpu(i), src, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    publish(i);
+}
 bool view_slot(uint64_t h, uint32_t* i) {
     if (!g_view || h < (uint64_t)g_view || h >= (uint64_t)g_view + (uint64_t)g_viewCount * kViewSlot) return false;
     *i = (uint32_t)((h - (uint64_t)g_view) / kViewSlot);
@@ -134,7 +151,8 @@ bool materialize_xbox_cbv(uint32_t i, const uint64_t* q) {
     uint64_t size = (q[1] & 0xFFFFFFFFull) << 4;
     PcObj pcdev = dev_extra(g_dev)->pcDevice;
     if (!addr) {
-        pc::create_cbv(pcdev, nullptr, pc_view_cpu(i));
+        pc::create_cbv(pcdev, nullptr, mirror_cpu(i));
+        publish(i);
         return true;
     }
     uint64_t gpu = gpu_va(g_dev, addr);
@@ -146,7 +164,8 @@ bool materialize_xbox_cbv(uint32_t i, const uint64_t* q) {
     }
     D3D12_CONSTANT_BUFFER_VIEW_DESC d{gpu, (UINT)((size + 255) & ~255ull)};
     if (d.SizeInBytes > 65536) d.SizeInBytes = 65536;
-    pc::create_cbv(pcdev, &d, pc_view_cpu(i));
+    pc::create_cbv(pcdev, &d, mirror_cpu(i));
+    publish(i);
     return true;
 }
 
@@ -158,7 +177,7 @@ void materialize(uint32_t i) {
     uint64_t rec;
     if (t.magic == kMagic) {
         if (g_rec[D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV].resolve(t, &rec)) {
-            pc::copy_descriptors_simple(dev_extra(g_dev)->pcDevice, 1, pc_view_cpu(i), rec, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+            set_slot(i, rec);
         } else {
             static volatile long n = 0;
             if (InterlockedIncrement(&n) <= 3) XSL_WARN(CH, "descriptor slot %u names a recycled record (raise the record ring)", i);
@@ -233,8 +252,7 @@ void desc_commit(uint64_t h, D3D12_DESCRIPTOR_HEAP_TYPE type, const Tag& tag) {
         memset(s, 0, kViewSlot);
         memcpy(s, &tag, sizeof tag);
         uint64_t rec;
-        if (g_rec[type].resolve(tag, &rec))
-            pc::copy_descriptors_simple(dev_extra(g_dev)->pcDevice, 1, pc_view_cpu(i), rec, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+        if (g_rec[type].resolve(tag, &rec)) set_slot(i, rec);
         memcpy(&g_snapshot[(size_t)i * kViewSlot], s, kViewSlot);
     } else if (const ShadowHeap* sh = rtv_dsv_heap(h)) {
         memset((void*)h, 0, sh->slot);
@@ -251,7 +269,14 @@ bool desc_copy(uint32_t n, uint64_t dst, uint64_t src, D3D12_DESCRIPTOR_HEAP_TYP
         uint32_t di, si;
         if (!view_slot(dst, &di) || !view_slot(src, &si)) return false;
         memmove((void*)dst, (const void*)src, (size_t)n * kViewSlot);
-        for (uint32_t k = 0; k < n; k++) materialize(di + k);
+        // PC descriptors follow from the source slots' mirror entries (in an order that is safe
+        // for overlapping ranges); the copied bytes become the destinations' snapshots.
+        for (uint32_t q = 0; q < n; q++) {
+            uint32_t k = di > si ? n - 1 - q : q;
+            if (di + k == si + k) continue;
+            set_slot(di + k, mirror_cpu(si + k));
+            memcpy(&g_snapshot[(size_t)(di + k) * kViewSlot], g_view + (size_t)(di + k) * kViewSlot, kViewSlot);
+        }
         return true;
     }
     const ShadowHeap* d = rtv_dsv_heap(dst);
@@ -270,9 +295,16 @@ uint64_t desc_pc_cpu(uint64_t h, D3D12_DESCRIPTOR_HEAP_TYPE type) {
     Tag t;
     memcpy(&t, (const void*)h, sizeof t);
     uint64_t rec;
+    if (type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) return mirror_cpu(i);   // the slot's current PC descriptor
     if (g_rec[type].resolve(t, &rec)) return rec;
-    if (type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) return pc_view_cpu(i);  // e.g. an inline CBV
     return 0;
+}
+// After a PC descriptor was written to desc_pc_cpu(h) of a console-layout view slot.
+void desc_publish(uint64_t h) {
+    if (!g_ready) return;
+    std::lock_guard<std::mutex> g(g_mu);
+    uint32_t i;
+    if (view_slot(h, &i)) publish(i);
 }
 uint64_t desc_pc_gpu(uint64_t h) {
     if (!g_ready || h < g_pcGpu || h >= g_pcGpu + (uint64_t)g_viewCount * kViewSlot) return h;
