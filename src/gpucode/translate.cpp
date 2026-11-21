@@ -44,6 +44,7 @@ struct AV {
     static AV cst(uint32_t v) { return AV{Const, v}; }
 };
 constexpr unsigned kNumS = 128;
+constexpr uint32_t kMemBlock = 0x100;   // AV::Arg location of the memory-based argument block pointer
 using SState = std::array<AV, kNumS>;
 AV merge(const AV& x, const AV& y) {
     if (x.k == AV::Undef) return y;
@@ -115,6 +116,8 @@ struct Translator {
     std::set<unsigned> vs_params;
     bool vs_pos = false;
     bool uses_codedata = false;
+    unsigned ms_max_verts = 256, ms_max_prims = 256, ms_lds = 0;
+    bool merged_vs = false;   // vertex shader compiled as a merged (ES/GS or primitive) stage
     unsigned user_end() const {   // first SGPR after the user arguments (PS: primitive mask)
         unsigned e = c.kind == ProgramKind::CS ? 4 : 8;
         for (auto& a : meta.args)
@@ -144,6 +147,18 @@ struct Translator {
         if (auto* pp = c.part("ISG1")) isg = parse_signature(*pp);
         if (auto* pp = c.part("OSG1")) osg = parse_signature(*pp);
         if (!parse_meta(c, meta, &e)) return fail("metadata: " + e);
+        if (c.kind == ProgramKind::MS) {
+            // Mesh shaders run as merged (primitive) shaders: argument locations are 8 SGPRs higher.
+            for (auto& a : meta.args) if (a.loc < 32) a.loc += 8;
+            for (auto& r : meta.resources) if (r.loc < 32) r.loc += 8;
+            if (auto* pp = c.part("PSV0"); pp && pp->size() >= 4 + 48) {
+                auto rd = [&](size_t o) { uint32_t v; memcpy(&v, pp->data() + 4 + o, 4); return v; };
+                ms_lds = rd(0);
+                ms_max_verts = rd(12) & 0xffff;
+                ms_max_prims = rd(12) >> 16;
+                for (int k = 0; k < 3; k++) meta.numthreads[k] = rd(36 + 4 * k);
+            }
+        }
         if (c.kind == ProgramKind::PS) {
             // Initial VGPRs in SPI_PS_INPUT_ENA order (AMD's public register layout).
             static const struct { int bit, n; const char* what; } lay[] = {
@@ -328,7 +343,12 @@ struct Translator {
             bool soc = so.k == AV::Const;
             for (unsigned i = 0; i < cnt; i++) {
                 AV v = AV::top();
-                if (starts(n, "s_load_dword") && base.k == AV::Arg) {
+                if (starts(n, "s_load_dword") && base.k == AV::Arg && base.a == kMemBlock && soc) {
+                    uint32_t dw = (uint32_t(off) + so.a + base.b) / 4 + i;
+                    for (auto& a : meta.args)
+                        if (a.loc >= 32 && dw >= a.loc - 32 && dw < a.loc - 32 + std::max(1u, a.size) && a.kind != 0)
+                            v = AV{AV::Arg, a.loc + (dw - (a.loc - 32))};
+                } else if (starts(n, "s_load_dword") && base.k == AV::Arg) {
                     // Table pointers are 0 in the generated code, so a run-time offset is the SGPR's value.
                     uint32_t at = uint32_t(off) + (soc ? so.a : 0) + 4 * i;
                     const UserArg* a = arg_at(base.a);
@@ -372,6 +392,15 @@ struct Translator {
                 for (unsigned k = 0; k < std::max(1u, a.size); k++) init[a.loc + k] = AV{AV::Arg, a.loc + k};
         for (unsigned i = 0; i < meta.user_sgprs() && i < 32; i++)
             if (init[i].k == AV::Top) init[i] = AV{AV::Arg, i};
+        // Memory-based argument ABI (argument locations from 32): the block pointer arrives in
+        // s[0:1] (s[8:9] for merged stages).
+        bool memabi = false;
+        for (auto& a : meta.args) memabi |= a.loc >= 32;
+        if (memabi) {
+            unsigned b = (c.kind == ProgramKind::MS || merged_vs) ? 8 : 0;
+            init[b] = AV{AV::Arg, kMemBlock};
+            init[b + 1] = AV{AV::Arg, kMemBlock + 1};
+        }
         block_in[0] = init;
         std::vector<bool> seen(block_start.size(), false);
         seen[0] = true;
@@ -608,6 +637,18 @@ struct Translator {
                 AV so = in.soffset == src::kNull ? AV::cst(0) : sval_of(st, in.soffset);
                 for (unsigned k = 0; k < cnt; k++) v[k] = fmt("0x%xu", code_dword(base.b + in.offset_imm + so.a + 4 * k));
             }
+            if (base.k == AV::Arg && base.a == kMemBlock) {
+                // Root constants in the memory-based argument block come from their constant buffer.
+                AV so = in.soffset == src::kNull ? AV::cst(0) : sval_of(st, in.soffset);
+                for (unsigned k = 0; k < cnt; k++) {
+                    uint32_t dw = (uint32_t(in.offset_imm) + so.a + base.b) / 4 + k;
+                    for (auto& a : meta.args)
+                        if (a.kind == 0 && a.loc >= 32 && dw >= a.loc - 32 && dw < a.loc - 32 + a.size && a.param < rs.params.size()) {
+                            uint32_t j = dw - (a.loc - 32);
+                            v[k] = fmt("RC%u_d[%u][%u]", a.param, j / 4, j % 4);
+                        }
+                }
+            }
             sval[i] = v;
         }
     }
@@ -795,6 +836,10 @@ bool Translator::emit_salu(const Instr& in, size_t idx) {
         if (n == "s_sendmsg" || n == "s_sendmsghalt") {
             // MSG_DEALLOC_VGPRS and similar hints; stage-specific messages are handled by the stage.
             if ((in.simm16 & 0xf) == 3) return true;   // MSG_GS_DONE: nothing to do for compute
+            if ((in.simm16 & 0xf) == 9 && c.kind == ProgramKind::MS) {   // MSG_GS_ALLOC_REQ: m0 = primitives << 12 | vertices
+                line("ms_counts_ = s124;");
+                return true;
+            }
             return fail(fmt("s_sendmsg %d at 0x%x not supported in this stage", in.simm16, in.offset));
         }
         return fail(fmt("%s at 0x%x not supported", in.name, in.offset));
@@ -1225,8 +1270,10 @@ bool Translator::emit_valu(const Instr& in, size_t idx) {
     if (n == "v_readfirstlane_b32") { write_s(dst, fmt("WaveReadLaneAt(%s, first_lane(kexec))", src_bits(0, 'u').c_str())); uses_wave = true; return true; }
     if (n == "v_readlane_b32") { write_s(dst, fmt("WaveReadLaneAt(%s, %s & %uu)", src_bits(0, 'u').c_str(), rd(se[1], in).c_str(), W - 1)); uses_wave = true; return true; }
     if (n == "v_writelane_b32") { line(fmt("if (L == (%s & %uu)) %s = %s;", rd(se[1], in).c_str(), W - 1, V(dst).c_str(), rd(se[0], in).c_str())); return true; }
-    if (n == "v_mbcnt_lo_u32_b32") { wv(fmt("%s + countbits(%s & (L < 32u ? ((1u << L) - 1u) : 0xffffffffu))", rd(se[1], in).c_str(), rd(se[0], in).c_str())); return true; }
-    if (n == "v_mbcnt_hi_u32_b32") { wv(fmt("%s + countbits(%s & (L < 32u ? 0u : ((1u << (L - 32u)) - 1u)))", rd(se[1], in).c_str(), rd(se[0], in).c_str())); return true; }
+    // Lane index within the console wave (LG: compute and mesh shaders derive it from the thread
+    // index, so thread numbering stays right when the PC wave is narrower).
+    if (n == "v_mbcnt_lo_u32_b32") { wv(fmt("%s + countbits(%s & (LG < 32u ? ((1u << LG) - 1u) : 0xffffffffu))", rd(se[1], in).c_str(), rd(se[0], in).c_str())); return true; }
+    if (n == "v_mbcnt_hi_u32_b32") { wv(fmt("%s + countbits(%s & (LG < 32u ? 0u : ((1u << (LG - 32u)) - 1u)))", rd(se[1], in).c_str(), rd(se[0], in).c_str())); return true; }
     if (n == "v_permlane16_b32" || n == "v_permlanex16_b32") {
         bool xx = n == "v_permlanex16_b32";
         std::string sel = fmt("(((L & 15u) < 8u ? (%s >> ((L & 7u) * 4u)) : (%s >> ((L & 7u) * 4u))) & 15u)", rd(se[1], in).c_str(), rd(se[2], in).c_str());
@@ -2041,7 +2088,14 @@ bool Translator::emit_exp(const Instr& in, size_t idx) {
         if (in.exp_done) { ps_discard = true; line("if (!kexec) discard;"); }
         return true;
     }
-    if (c.kind == ProgramKind::VS) {
+    if (c.kind == ProgramKind::VS || c.kind == ProgramKind::MS) {
+        const bool ms = c.kind == ProgramKind::MS;
+        if (ms && t == 20) {   // primitive: three 10-bit vertex indices, bit 31 = null primitive
+            line(fmt("if (kexec) { prim_ = %s; hasp_ = true; }", V(in.exp_src[0]).c_str()));
+            return true;
+        }
+        if (ms && (t == 12 || t >= 32) && in.exp_en) line("if (kexec) hasv_ = true;");
+        if (t == 12 && !in.exp_en) return true;
         if (t == 12) {
             vs_pos = true;
             line("if (kexec) {");
@@ -2122,7 +2176,7 @@ std::string Translator::res_decl(const Res& r) const {
 }
 
 const char* kPrelude = R"(
-static uint L;
+static uint L, LG;
 static uint64_t memtime_ = 0;
 // 32x32 -> high 32 bits without 64-bit integer multiplies (some PC drivers reject those).
 uint mulhi_u(uint a, uint b) {
@@ -2291,8 +2345,9 @@ std::string Translator::generate() {
         h << fmt("cbuffer RC%u : register(b%u, space%u) { uint4 RC%u_d[%u]; };\n", a.param, p.reg, p.space, a.param, (p.num32 + 3) / 4);
     }
     if (uses_lds) {
-        unsigned bytes = meta.lds_bytes() ? meta.lds_bytes() : 32768;
-        if (bytes > 32768) return fail(fmt("LDS size %u exceeds the PC group-shared limit", bytes)), "";
+        unsigned limit = c.kind == ProgramKind::MS ? 28672 : 32768;   // PC group-shared limits
+        unsigned bytes = meta.lds_bytes() ? meta.lds_bytes() : c.kind == ProgramKind::MS && ms_lds ? std::min(limit, (ms_lds + 1023) & ~1023u) : limit;
+        if (bytes > limit) return fail(fmt("LDS size %u exceeds the PC group-shared limit", bytes)), "";
         h << "groupshared uint lds[" << bytes / 4 << "];\n";
     }
     h << kPrelude;
@@ -2405,7 +2460,29 @@ std::string Translator::generate() {
         init += "  v0 = I.vid_;\n";
         if (!vs_fetch) init += "  v3 = I.iid_;\n";
     }
+    if (c.kind == ProgramKind::MS) {
+        // The program runs as prog(); each thread captures the vertex and primitive it exports
+        // (thread i owns output slot i) and the counts sent with MSG_GS_ALLOC_REQ; main() then sets
+        // the output counts in uniform control flow and writes the captured outputs.
+        h << "struct MSV {\n";
+        bool pos_in_sig = false;
+        for (auto& e : sorted(osg)) {
+            if (e.sysval == 1) { h << "  float4 pos_ : SV_Position;\n"; pos_in_sig = true; continue; }
+            if (e.sysval != 0) continue;
+            unsigned w = unsigned(__builtin_popcount(e.mask));
+            const char* b = e.comptype == 1 ? "uint" : e.comptype == 2 ? "int" : "float";
+            h << "  " << (w > 1 ? fmt("%s%u", b, w) : std::string(b)) << " o" << e.reg << "_" << __builtin_ctz(e.mask) << " : " << sem(e) << ";\n";
+        }
+        if (!pos_in_sig) h << "  float4 pos_ : SV_Position;\n";
+        h << "};\n";
+        h << "groupshared uint ms_counts_;\nstatic MSV O;\nstatic uint prim_;\nstatic bool hasv_, hasp_;\n#define RETURN return\n";
+        h << "\nvoid prog(uint3 gid_, uint gi_) {\n";
+        unsigned nt = meta.numthreads[0] * meta.numthreads[1] * meta.numthreads[2];
+        init += fmt("  s3 = ((gi_ / WAVE) << 24) | min(WAVE, %uu - (gi_ / WAVE) * WAVE);   // wave id, threads in wave\n", nt);
+        init += fmt("  v5 = gid_.x * %uu + gi_;   // flat thread id in the dispatch\n", nt);
+    }
     h << "  L = WaveGetLaneIndex();\n";
+    h << (c.kind == ProgramKind::CS || c.kind == ProgramKind::MS ? "  LG = gi_ % WAVE;\n" : "  LG = L;\n");
     h << "  uint snull = 0u;\n";
     for (unsigned i = 0; i < kNumS; i++) h << (i % 16 == 0 ? "  uint " : ", ") << "s" << i << " = 0u" << (i % 16 == 15 ? ";\n" : "");
     const unsigned nv = std::max(max_v, 4u);
@@ -2420,6 +2497,18 @@ std::string Translator::generate() {
     h << init;
     h << body.str();
     h << "}\n";
+    if (c.kind == ProgramKind::MS) {
+        h << "\n[outputtopology(\"triangle\")]\n[numthreads(" << meta.numthreads[0] << ", " << meta.numthreads[1] << ", " << meta.numthreads[2] << ")]\n";
+        h << "void main(uint gi_ : SV_GroupIndex, uint3 gid_ : SV_GroupID, out vertices MSV verts[" << ms_max_verts << "], out indices uint3 tris[" << ms_max_prims << "]) {\n";
+        h << "  if (gi_ == 0u) ms_counts_ = 0u;\n  GroupMemoryBarrierWithGroupSync();\n";
+        h << "  O = (MSV)0; prim_ = 0u; hasv_ = false; hasp_ = false;\n";
+        h << "  prog(gid_, gi_);\n  GroupMemoryBarrierWithGroupSync();\n";
+        h << "  uint nv = min(ms_counts_ & 0xfffu, " << ms_max_verts << "u), np = min(ms_counts_ >> 12, " << ms_max_prims << "u);\n";
+        h << "  SetMeshOutputCounts(nv, np);\n";
+        h << "  if (gi_ < nv) verts[gi_] = O;   // unexported slots stay zero\n";
+        h << "  if (gi_ < np) tris[gi_] = (hasp_ && (prim_ >> 31) == 0u) ? uint3(prim_ & 0x3ffu, (prim_ >> 10) & 0x3ffu, (prim_ >> 20) & 0x3ffu) : uint3(0u, 0u, 0u);\n";
+        h << "}\n";
+    }
     return h.str();
 }
 
@@ -2428,7 +2517,7 @@ std::string Translator::generate() {
 TranslateResult translate(const Container& c, const RootSig& rs, const TranslateOptions& opt) {
     TranslateResult r;
     Translator t(c, rs, opt);
-    if (c.kind != ProgramKind::CS && c.kind != ProgramKind::PS && c.kind != ProgramKind::VS) {
+    if (c.kind != ProgramKind::CS && c.kind != ProgramKind::PS && c.kind != ProgramKind::VS && c.kind != ProgramKind::MS) {
         r.error = std::string("stage ") + kind_name(c.kind) + " not supported yet";
         return r;
     }
@@ -2453,6 +2542,7 @@ TranslateResult translate(const Container& c, const RootSig& rs, const Translate
     r.ok = true;
     if (c.kind == ProgramKind::CS) r.profile = t.uses_quad ? "cs_6_6" : "cs_6_0";
     else if (c.kind == ProgramKind::PS) r.profile = "ps_6_0";
+    else if (c.kind == ProgramKind::MS) r.profile = "ms_6_5";
     else r.profile = "vs_6_0";
     return r;
 }
