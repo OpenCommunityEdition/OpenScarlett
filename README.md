@@ -71,6 +71,22 @@ User patches: a `patches.txt` (or `<exe>.patches.txt`) next to a title executabl
 start-up, verified against the original bytes; see [docs/patches.md](docs/patches.md). The project
 ships no patches; they are user data.
 
+## Windows
+
+The same DLLs run natively on Windows 10/11 with the system's Direct3D 12 (no Wine, no vkd3d).
+Copy `build/` (the layer DLLs), `tools/xsl-run` and the SDK runtime DLLs it lists to the PC, then:
+
+```
+python tools\xsl-run path\to\Title
+```
+
+The launcher builds a run directory (symlinks, or copies on filesystems without them, refreshed
+on later runs). System32 and the registry are never modified: the layer redirects the title's
+loads of `xgameruntime.dll` to its own copy and answers the console-type registry read from
+`XSL_CONSOLE_MODE`. On GPUs without the GPU upload heap (the Windows 10 runtime), buffers titles
+map live in system memory. `XSL_D3D12_DEBUG=1` enables the debug layer and logs its messages
+after failing calls.
+
 ## Hygiene
 
 No Microsoft files enter this repository: the SDK is reached through the gitignored `sdk/`

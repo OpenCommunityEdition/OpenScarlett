@@ -11,4 +11,7 @@ void install_windowing(HMODULE exe);
 // Apply the user's patches.txt next to the executable (docs/patches.md). Called once, before
 // the title's entry point.
 void apply_user_patches();
+// Redirect title loads of xgameruntime.dll to the layer's copy and answer the ConsoleMode registry
+// read from XSL_CONSOLE_MODE (host_windows.cpp).
+void install_host_redirects();
 }

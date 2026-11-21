@@ -44,6 +44,7 @@ void install_into_title() {
     };
     for (auto& e : table) patch_import(exe, "api-ms-win-core-psm-appnotify", e.fn, e.p);
     install_windowing(exe);
+    install_host_redirects();
     apply_user_patches();
 }
 }  // namespace xsl::platform

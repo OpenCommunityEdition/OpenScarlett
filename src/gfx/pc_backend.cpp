@@ -22,8 +22,29 @@ namespace pc {
 namespace {
 DXGI_FORMAT stand_in(DXGI_FORMAT f);
 template <class T> T* as(PcObj o) { return static_cast<T*>(o); }
+// With XSL_D3D12_DEBUG=1: the debug layer's info queue, whose stored messages are copied into
+// the log whenever a call fails (works without ID3D12InfoQueue1 callbacks, e.g. on Windows 10).
+ID3D12InfoQueue* g_info = nullptr;
+void dump_debug_messages() {
+    if (!g_info) return;
+    static std::mutex m;
+    std::lock_guard<std::mutex> l(m);
+    UINT64 n = g_info->GetNumStoredMessages();
+    for (UINT64 i = 0; i < n && i < 64; i++) {
+        SIZE_T len = 0;
+        if (FAILED(g_info->GetMessage(i, nullptr, &len)) || !len) continue;
+        std::vector<char> buf(len);
+        auto* msg = (D3D12_MESSAGE*)buf.data();
+        if (SUCCEEDED(g_info->GetMessage(i, msg, &len)))
+            XSL_ERR("d3d12.debug", "[%d] %.*s", (int)msg->ID, (int)msg->DescriptionByteLength, msg->pDescription);
+    }
+    g_info->ClearStoredMessages();
+}
 HRESULT logged(HRESULT hr, const char* what) {
-    if (FAILED(hr)) XSL_ERR(CH, "%s failed %08lx", what, hr);
+    if (FAILED(hr)) {
+        XSL_ERR(CH, "%s failed %08lx", what, hr);
+        dump_debug_messages();
+    }
     return hr;
 }
 D3D12_CPU_DESCRIPTOR_HANDLE cpu(uint64_t h) { return D3D12_CPU_DESCRIPTOR_HANDLE{(SIZE_T)h}; }
@@ -86,6 +107,17 @@ HRESULT_T create_device(PcObj* out) {
     g_caps.featureLevel = fl.MaxSupportedFeatureLevel;
     XSL_INFO(CH, "host caps: feature level %x, mesh shaders %s, ray tracing %s, VRS %s, sampler feedback %s", g_caps.featureLevel,
              g_caps.meshShaders ? "yes" : "NO", g_caps.raytracing ? "yes" : "NO", g_caps.vrs ? "yes" : "NO", g_caps.samplerFeedback ? "yes" : "NO");
+    if (env_on("XSL_D3D12_DEBUG") && SUCCEEDED(dev->QueryInterface(IID_PPV_ARGS(&g_info)))) {
+        g_info->SetMessageCountLimit(4096);
+        // The layer probes whether resources can be mapped (unified-memory emulation); the
+        // refusals on default heaps are expected, so they are not stored.
+        D3D12_MESSAGE_ID deny[] = {(D3D12_MESSAGE_ID)822};
+        D3D12_INFO_QUEUE_FILTER f{};
+        f.DenyList.NumIDs = 1;
+        f.DenyList.pIDList = deny;
+        g_info->AddStorageFilterEntries(&f);
+        XSL_INFO(CH, "D3D12 debug layer on: its messages are logged after failing calls (channel d3d12.debug)");
+    }
     *out = dev;
     return S_OK;
 }
@@ -332,9 +364,11 @@ D3D12_HEAP_FLAGS clean_heap_flags(uint32_t f) {
 
 // Console memory is unified: titles Map DEFAULT-heap buffers (FramePacing reads its query buffer that
 // way). Such buffers get CPU-visible memory chosen once per device: the GPU-upload heap (resizable BAR)
-// where supported, else write-back system memory on UMA GPUs; otherwise they stay unmappable.
+// where supported, else write-back system memory on UMA GPUs, else (discrete GPUs on runtimes
+// without the GPU upload heap, e.g. Windows 10's) write-back system memory the GPU reads over
+// the bus: slower for GPU-heavy buffers, but titles' CPU writes then reach the GPU.
 // XSL_MAPPABLE_DEFAULT=0 disables this.
-enum class MappableDefault { None, GpuUpload, UmaCustom };
+enum class MappableDefault { None, GpuUpload, UmaCustom, SystemCustom };
 MappableDefault mappable_default(ID3D12Device* dev) {
     static MappableDefault m = [dev] {
         char b[4];
@@ -349,8 +383,8 @@ MappableDefault mappable_default(ID3D12Device* dev) {
             XSL_INFO(CH, "DEFAULT-heap buffers are CPU-mappable (UMA, write-back system memory)");
             return MappableDefault::UmaCustom;
         }
-        XSL_WARN(CH, "no CPU-visible GPU memory: titles cannot Map DEFAULT-heap buffers");
-        return MappableDefault::None;
+        XSL_WARN(CH, "no GPU upload heap on this runtime: DEFAULT-heap buffers live in system memory (CPU-mappable, slower GPU access)");
+        return MappableDefault::SystemCustom;
     }();
     return m;
 }
@@ -364,6 +398,7 @@ HRESULT_T create_committed_resource(PcObj dev, const void* heapProps, uint32_t h
         switch (mappable_default(as<ID3D12Device>(dev))) {
             case MappableDefault::GpuUpload: hp.Type = D3D12_HEAP_TYPE_GPU_UPLOAD; break;
             case MappableDefault::UmaCustom:
+            case MappableDefault::SystemCustom:
                 hp.Type = D3D12_HEAP_TYPE_CUSTOM;
                 hp.CPUPageProperty = D3D12_CPU_PAGE_PROPERTY_WRITE_BACK;
                 hp.MemoryPoolPreference = D3D12_MEMORY_POOL_L0;
@@ -679,7 +714,26 @@ void list_copy_texture_region(PcObj l, const void* dst, uint32_t x, uint32_t y, 
 }
 void list_copy_resource(PcObj l, PcObj dst, PcObj src) { L->CopyResource(as<ID3D12Resource>(dst), as<ID3D12Resource>(src)); }
 void list_resolve_subresource(PcObj l, PcObj dst, uint32_t ds, PcObj src, uint32_t ss, int fmt) {
-    L->ResolveSubresource(as<ID3D12Resource>(dst), ds, as<ID3D12Resource>(src), ss, (DXGI_FORMAT)fmt);
+    // The console resolves between resources whose sizes may differ (a 1080p target into a plane
+    // sized from the window's client area); PC D3D12 requires identical sizes and puts the list in
+    // an error state otherwise, so differing sizes resolve their overlap.
+    auto* d = as<ID3D12Resource>(dst);
+    auto* s = as<ID3D12Resource>(src);
+    D3D12_RESOURCE_DESC dd = d->GetDesc(), sd = s->GetDesc();
+    if (dd.Width != sd.Width || dd.Height != sd.Height) {
+        ID3D12GraphicsCommandList1* l1 = nullptr;
+        if (SUCCEEDED(L->QueryInterface(IID_PPV_ARGS(&l1)))) {
+            D3D12_RECT r{0, 0, (LONG)std::min<UINT64>(dd.Width, sd.Width), (LONG)std::min<UINT>(dd.Height, sd.Height)};
+            l1->ResolveSubresourceRegion(d, ds, 0, 0, s, ss, &r, (DXGI_FORMAT)fmt, D3D12_RESOLVE_MODE_AVERAGE);
+            l1->Release();
+            static volatile long n = 0;
+            if (InterlockedIncrement(&n) <= 2)
+                XSL_INFO(CH, "resolve between %llux%u and %llux%u: resolving the overlap", (unsigned long long)sd.Width, sd.Height,
+                         (unsigned long long)dd.Width, dd.Height);
+            return;
+        }
+    }
+    L->ResolveSubresource(d, ds, s, ss, (DXGI_FORMAT)fmt);
 }
 void list_blend_factor(PcObj l, const float* f) { L->OMSetBlendFactor(f); }
 void list_stencil_ref(PcObj l, uint32_t r) { L->OMSetStencilRef(r); }

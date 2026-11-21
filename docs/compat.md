@@ -50,7 +50,7 @@ zlib, BCPack, zlib+BCPack; error records; cancellation; fence signals) — all p
 
 | Title | GDK edition | Status | Notes |
 |---|---|---|---|
-| Minecraft Preview 1.18.3064.0 (Series X\|S, unmodified executable) | GXDK 220300 (March 2022) | **Main menu renders correctly** (loading screen, panorama, skin preview), silent | Needs the 220300 edition files (docs/sdk-editions.md). Input: DualSense/XInput pads, keyboard and mouse through GameInput (mouse captured while focused). Known gaps: no audio (silent ACP); speech synthesis and game streaming unimplemented; CPU writes to mapped GPU-only textures stay on a CPU shadow (only render targets seen so far). Fixed on the way: constants bound at 16-byte offsets in default-heap buffers were not re-aligned (skin preview and loading-screen logo invisible). |
+| Minecraft Preview 1.18.3064.0 (Series X\|S, unmodified executable) | GXDK 220300 (March 2022) | **Main menu renders correctly** (loading screen, panorama, skin preview), silent; also natively on Windows 10 (RTX 5090, ~60 FPS, no D3D12 errors) | Needs the 220300 edition files (docs/sdk-editions.md). Input: DualSense/XInput pads, keyboard and mouse through GameInput (mouse captured while focused). Known gaps: no audio (silent ACP); speech synthesis and game streaming unimplemented; CPU writes to mapped GPU-only textures stay on a CPU shadow (only render targets seen so far). Fixed on the way: constants bound at 16-byte offsets in default-heap buffers were not re-aligned (skin preview and loading-screen logo invisible). |
 
 ## Back-end findings
 

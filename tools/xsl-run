@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: AGPL-3.0-or-later
-"""Run a Series X|S title (a directory or an .exe) on the layer under Wine.
+"""Run a Series X|S title (a directory or an .exe) on the layer: under Wine on Linux, natively on
+Windows (the system's Direct3D 12; System32 and the registry are left alone).
 
 The title's files are never modified. A run directory is built from symlinks to
 the title tree plus the layer's DLLs, so same-named replacements such as
@@ -40,6 +41,9 @@ BACKENDS = {
                          "deps/dxvk/dxvk-3.1.1/x64/dxgi.dll"],
     "wine": [],
 }
+# Windows: the system's own Direct3D 12 and DXGI.
+BACKENDS["native"] = []
+WINDOWS = os.name == "nt"
 # Null graphics: the default back end's DLLs, but no shader translation and no GPU work
 # (XSL_NULL_GRAPHICS=1): for running a title's frame loop with graphics discarded.
 BACKENDS["null"] = BACKENDS["vkd3d-proton-xsl"]
@@ -106,12 +110,44 @@ def map_drives(prefix, run_dir, title):
         link.symlink_to(Path(target).resolve())
 
 
+def copy_sync(src, dst):
+    """Copy src to dst, skipping files whose size and modification time already match."""
+    if src.is_dir():
+        dst.mkdir(parents=True, exist_ok=True)
+        for child in src.iterdir():
+            copy_sync(child, dst / child.name)
+        return
+    if dst.is_symlink():
+        dst.unlink()
+    if dst.exists():
+        a, b = src.stat(), dst.stat()
+        if a.st_size == b.st_size and int(a.st_mtime) == int(b.st_mtime):
+            return
+    shutil.copy2(src, dst)
+
+
+def place(src, dst):
+    """Link src into the run directory, or copy it where links are unavailable (Windows without
+    administrator rights or Developer Mode, filesystems such as exFAT)."""
+    if dst.is_symlink():
+        dst.unlink()
+    if not dst.exists():
+        try:
+            dst.symlink_to(src.resolve(), target_is_directory=src.is_dir())
+            return
+        except OSError:
+            pass
+    copy_sync(src, dst)
+
+
 def build_run_dir(title_dir, build_dir, run_dir, backend):
-    if run_dir.exists():
+    # On Windows the run directory is kept between runs: copies (where links are unavailable)
+    # are then only refreshed.
+    if run_dir.exists() and not WINDOWS:
         shutil.rmtree(run_dir)
-    run_dir.mkdir(parents=True)
+    run_dir.mkdir(parents=True, exist_ok=True)
     for entry in title_dir.iterdir():
-        (run_dir / entry.name).symlink_to(entry.resolve())
+        place(entry, run_dir / entry.name)
     for rel in LAYER_DLLS:
         src = build_dir / rel
         if not src.exists():
@@ -141,7 +177,8 @@ def main():
     ap.add_argument("--build", default=str(REPO / "build"))
     ap.add_argument("--prefix", default=os.environ.get("XSL_PREFIX", str(REPO / ".prefix")))
     ap.add_argument("--log", default=os.environ.get("XSL_LOG", "info"))
-    ap.add_argument("--backend", choices=BACKENDS, default=os.environ.get("XSL_BACKEND", "vkd3d-proton-xsl"))
+    ap.add_argument("--backend", choices=BACKENDS,
+                    default=os.environ.get("XSL_BACKEND", "native" if WINDOWS else "vkd3d-proton-xsl"))
     ap.add_argument("--timeout", type=float, default=0, help="stop the title after N seconds (0 = never)")
     ap.add_argument("--renderdoc", metavar="SUBMITS", default=None,
                     help="RenderDoc capture of the translated (Vulkan) stream at these queue submissions, e.g. 300 or 300-302; "
@@ -158,8 +195,11 @@ def main():
         if len(exes) != 1:
             sys.exit(f"[xsl-run] pick an executable in {title_dir}: {[e.name for e in exes]}")
         exe = exes[0]
-    prefix = Path(a.prefix)
     run_dir = REPO / "run" / exe.stem
+    if WINDOWS:
+        run_windows(a, exe, title_dir, run_dir)
+        return
+    prefix = Path(a.prefix)
     ensure_prefix(prefix, a.device)
     sys32 = prefix / "drive_c" / "windows" / "system32"
     for rel in SYSTEM32_DLLS:
@@ -179,6 +219,28 @@ def main():
         sys.exit(p.returncode)
     except subprocess.TimeoutExpired:
         subprocess.run(["wineserver", "-k"], env=env)
+        print("[xsl-run] stopped after timeout", file=sys.stderr)
+        sys.exit(0)
+
+
+def run_windows(a, exe, title_dir, run_dir):
+    """Native Windows: no prefix, no drive letters, the system's D3D12 (or null graphics). The
+    console type reaches the title through XSL_CONSOLE_MODE (the layer answers the registry read);
+    xgameruntime.dll loads are redirected by the layer to its copy in the run directory."""
+    backend = a.backend if a.backend in ("native", "null") else "native"
+    build_run_dir(title_dir, Path(a.build), run_dir, "native")
+    env = dict(os.environ)
+    env["XSL_LOG"] = a.log
+    mode = CONSOLE_MODE[a.device]
+    if mode is not None:
+        env["XSL_CONSOLE_MODE"] = f"{mode:x}"
+    if backend == "null":
+        env["XSL_NULL_GRAPHICS"] = "1"
+    print(f"[xsl-run] {exe.name} as {a.device} on {backend} Direct3D 12 in {run_dir}", file=sys.stderr)
+    try:
+        p = subprocess.run([str(run_dir / exe.name)] + a.args, cwd=run_dir, env=env, timeout=a.timeout or None)
+        sys.exit(p.returncode)
+    except subprocess.TimeoutExpired:
         print("[xsl-run] stopped after timeout", file=sys.stderr)
         sys.exit(0)
 
