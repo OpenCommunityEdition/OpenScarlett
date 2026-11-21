@@ -95,10 +95,20 @@ HRESULT D3DAPI D_CheckFeatureSupport(ID3D12Device* d, D3D12_FEATURE f, void* dat
 HRESULT D3DAPI D_CreateDescriptorHeap(ID3D12Device* d, const D3D12_DESCRIPTOR_HEAP_DESC* desc, REFIID riid, void** out) {
     XSL_TRACE("gfx.cmd", "CreateDescriptorHeap type %d n %u", (int)desc->Type, desc->NumDescriptors);
     static bool unified = [] { char b[4]; return !(GetEnvironmentVariableA("XSL_UNIFIED_DESCRIPTORS", b, 4) && b[0] == '0'); }();
-    if (unified && desc->Type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) {
+    // Shader-visible heaps share the global PC heap. CPU-only (staging) heaps get PC heaps of their
+    // own: titles fill shader-visible heaps up to the PC maximum, and copies out of staging heaps
+    // translate each descriptor (D_CopyDescriptorsSimple).
+    if (unified && desc->Type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV && (desc->Flags & D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE)) {
         uint32_t off;
         uint64_t cpu, gpu;
-        if (pc::global_view_alloc(DPC(d), desc->NumDescriptors, &off, &cpu, &gpu)) {
+        // XSL_VIEW_HEAP_CAP=<n> (experiment): heaps after the first get at most n global slots.
+        static uint32_t cap = [] { char b[16]; return GetEnvironmentVariableA("XSL_VIEW_HEAP_CAP", b, sizeof b) ? (uint32_t)atoi(b) : 0u; }();
+        static bool first = true;
+        uint32_t want = desc->NumDescriptors;
+        if (cap && !first && want > cap) want = cap;
+        first = false;
+        if (pc::global_view_alloc(DPC(d), want, &off, &cpu, &gpu)) {
+            XSL_INFO(CH, "shader-visible view heap: %u entries (%u backed) at %u", desc->NumDescriptors, want, off);
             // Console layout: CPU handles in the layer's descriptor memory (see xs_descriptors.cpp).
             if (uint64_t shadow = desc_view_cpu_start(DEV(d), off)) { cpu = shadow; gpu = desc_view_gpu_start(off); }
             return make_descriptor_heap_range(DEV(d), desc, off, cpu, gpu, riid, out);

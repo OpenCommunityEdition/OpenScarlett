@@ -126,7 +126,9 @@ bool ensure(Device* dev) {
 uint64_t pc_view_cpu(uint32_t i) { return g_pcCpu + (uint64_t)i * g_pcInc; }
 uint64_t mirror_cpu(uint32_t i) { return g_mirrorCpu + (uint64_t)i * g_pcInc; }
 // Slot i's PC descriptor is in the mirror: publish it to the shader-visible heap.
+uint32_t g_hi[8] = {};   // highest slot published per 125k-slot band (usage diagnostics)
 void publish(uint32_t i) {
+    if (i / 125000 < 8 && i > g_hi[i / 125000]) g_hi[i / 125000] = i;
     pc::copy_descriptors_simple(dev_extra(g_dev)->pcDevice, 1, pc_view_cpu(i), mirror_cpu(i), D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
 }
 void set_slot(uint32_t i, uint64_t src) {   // src: a CPU-only PC descriptor
@@ -315,6 +317,9 @@ uint64_t desc_pc_gpu(uint64_t h) {
 void desc_sync() {
     if (!g_ready) return;
     std::lock_guard<std::mutex> g(g_mu);
+    static uint64_t syncs = 0;
+    if (++syncs % 2000 == 0)
+        XSL_INFO(CH, "view slots written, highest per 125k band: %u %u %u %u %u %u %u %u", g_hi[0], g_hi[1], g_hi[2], g_hi[3], g_hi[4], g_hi[5], g_hi[6], g_hi[7]);
     size_t bytes = (size_t)g_viewCount * kViewSlot;
     static std::vector<void*> pages;
     pages.resize(bytes / 4096 + 1);

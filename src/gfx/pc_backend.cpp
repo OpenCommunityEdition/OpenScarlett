@@ -348,11 +348,16 @@ PcObj global_view_heap(PcObj dev) {
     if (g_gv || g_gv_failed) return g_gv;
     char b[16];
     g_gv_size = GetEnvironmentVariableA("XSL_DESCRIPTOR_HEAP_SIZE", b, sizeof b) ? (uint32_t)atoi(b) : 0;
-    if (g_gv_size < 4096) g_gv_size = 1000000;  // the D3D12 tier-2/3 maximum; titles allocate several 73k-entry heaps
-    if (g_gv_size > 1000000) g_gv_size = 1000000;
+    // 1,000,000 is the binding tier 1/2 maximum; tier-3 GPUs may allow larger heaps, which titles
+    // with several large heaps need (XSL_DESCRIPTOR_HEAP_SIZE; falls back to 1,000,000).
+    if (g_gv_size < 4096) g_gv_size = 1000000;
     D3D12_DESCRIPTOR_HEAP_DESC d{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, g_gv_size, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
     g_gv_inc = as<ID3D12Device>(dev)->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
-    if (FAILED(logged(as<ID3D12Device>(dev)->CreateDescriptorHeap(&d, IID_PPV_ARGS(&g_gv)), "CreateDescriptorHeap(global)"))) {
+    if (FAILED(as<ID3D12Device>(dev)->CreateDescriptorHeap(&d, IID_PPV_ARGS(&g_gv))) && g_gv_size > 1000000) {
+        XSL_WARN(CH, "a %u-entry shader-visible descriptor heap is not supported; using 1000000", g_gv_size);
+        g_gv_size = d.NumDescriptors = 1000000;
+    }
+    if (!g_gv && FAILED(logged(as<ID3D12Device>(dev)->CreateDescriptorHeap(&d, IID_PPV_ARGS(&g_gv)), "CreateDescriptorHeap(global)"))) {
         g_gv_failed = true;
         return nullptr;
     }
@@ -735,6 +740,7 @@ bool cached_upload(D3D12_HEAP_PROPERTIES* hp) {
     return true;
 }
 
+static void note_texture(PcObj r);
 HRESULT_T create_committed_resource(PcObj dev, const void* heapProps, uint32_t heapFlags, const void* desc,
                                     uint32_t state, const void* clear, PcObj* out) {
     D3D12_RESOURCE_DESC d = clean_desc(desc);
@@ -771,6 +777,7 @@ HRESULT_T create_committed_resource(PcObj dev, const void* heapProps, uint32_t h
     else if (hp.Type == D3D12_HEAP_TYPE_READBACK) st = D3D12_RESOURCE_STATE_COPY_DEST;
     HRESULT hr = as<ID3D12Device>(dev)->CreateCommittedResource(&hp, clean_heap_flags(heapFlags), &d, st, cv,
                                                                 IID_PPV_ARGS(reinterpret_cast<ID3D12Resource**>(out)));
+    if (SUCCEEDED(hr)) note_texture(*out);
     if (SUCCEEDED(hr) && remap) {
         std::lock_guard<std::mutex> g(g_remap_mu);
         g_remapped.insert(*reinterpret_cast<ID3D12Resource**>(out));
@@ -879,8 +886,10 @@ HRESULT_T create_placed_resource(PcObj dev, PcObj heap, uint64_t offset, const v
     D3D12_RESOURCE_DESC d = clean_desc(desc);
     const D3D12_CLEAR_VALUE* cv = static_cast<const D3D12_CLEAR_VALUE*>(clear);
     if (!(d.Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL))) cv = nullptr;
-    return logged(as<ID3D12Device>(dev)->CreatePlacedResource(as<ID3D12Heap>(heap), offset, &d, pc_state(state), cv,
-                                                       IID_PPV_ARGS(reinterpret_cast<ID3D12Resource**>(out))), "CreatePlacedResource");
+    HRESULT hr = logged(as<ID3D12Device>(dev)->CreatePlacedResource(as<ID3D12Heap>(heap), offset, &d, pc_state(state), cv,
+                                                             IID_PPV_ARGS(reinterpret_cast<ID3D12Resource**>(out))), "CreatePlacedResource");
+    if (SUCCEEDED(hr)) note_texture(*out);
+    return hr;
 }
 
 // XSL_TRACE_WRITERS=1: which pipeline last drew into each render target (the presented image's
@@ -892,6 +901,20 @@ std::map<PcObj, PcObj> g_wr_rt0, g_wr_pso;        // list -> render target 0, pi
 std::map<PcObj, std::pair<PcObj, uint64_t>> g_wr_last;   // resource -> (pipeline, draws)
 std::map<PcObj, uint64_t> g_wr_frame;                     // resource -> present count of its last draw
 std::atomic<uint64_t> g_wr_present{0};   // presents so far (writer tracing)
+std::vector<PcObj> g_big_textures;        // 2D textures of 1080p and more (writer tracing)
+std::map<PcObj, uint32_t> g_last_state;   // last whole-resource transition target (writer tracing)
+std::map<uint64_t, PcObj> g_uav_res;      // CPU descriptor handle -> resource of the UAV there (writer tracing)
+std::map<PcObj, std::map<uint32_t, uint64_t>> g_cs_tables;   // list -> compute root table GPU handles
+std::map<PcObj, std::pair<PcObj, uint64_t>> g_cs_writer;      // big texture -> (compute pipeline, present)
+static void note_dispatch(PcObj l);
+static uint64_t rt_stats_at() { static uint64_t v = [] { char b[16]; return GetEnvironmentVariableA("XSL_RT_STATS", b, sizeof b) ? _strtoui64(b, nullptr, 10) : 0ull; }(); return v; }
+static void note_texture(PcObj r) {
+    if (!trace_writers() || !r) return;
+    D3D12_RESOURCE_DESC d = as<ID3D12Resource>(r)->GetDesc();
+    if (d.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || d.Width < 1920 || d.Height < 1080 || d.SampleDesc.Count > 1) return;
+    std::lock_guard<std::mutex> g(g_wr_mu);
+    g_big_textures.push_back(r);
+}
 static void note_draw(PcObj l) {
     if (!trace_writers()) return;
     std::lock_guard<std::mutex> g(g_wr_mu);
@@ -915,6 +938,7 @@ void create_srv(PcObj dev, PcObj res, const void* desc, uint64_t h) {
     as<ID3D12Device>(dev)->CreateShaderResourceView(as<ID3D12Resource>(res), view_fix(res, desc, t), cpu(h));
 }
 void create_uav(PcObj dev, PcObj res, PcObj counter, const void* desc, uint64_t h) {
+    if (trace_writers()) { std::lock_guard<std::mutex> g(g_wr_mu); g_uav_res[h] = res; }
     if (res && !(as<ID3D12Resource>(res)->GetDesc().Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)) {
         // e.g. a depth-stencil resource whose UAV flag was dropped: null view of the requested dimension
         D3D12_UNORDERED_ACCESS_VIEW_DESC nd{};
@@ -956,6 +980,15 @@ void create_sampler(PcObj dev, const void* desc, uint64_t h) {
 }
 void copy_descriptors_simple(PcObj dev, uint32_t n, uint64_t dst, uint64_t src, int type) {
     if (type > 3) type = D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER;
+    if (trace_writers() && type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) {
+        std::lock_guard<std::mutex> g(g_wr_mu);
+        uint32_t inc = g_gv_inc ? g_gv_inc : 32;
+        for (uint32_t k = 0; k < n; k++) {
+            auto it = g_uav_res.find(src + (uint64_t)k * inc);
+            if (it != g_uav_res.end()) g_uav_res[dst + (uint64_t)k * inc] = it->second;
+            else g_uav_res.erase(dst + (uint64_t)k * inc);
+        }
+    }
     as<ID3D12Device>(dev)->CopyDescriptorsSimple(n, cpu(dst), cpu(src), (D3D12_DESCRIPTOR_HEAP_TYPE)type);
 }
 void get_copyable_footprints(PcObj dev, const void* desc, uint32_t first, uint32_t num, uint64_t base, void* layouts,
@@ -1096,6 +1129,11 @@ void list_barriers(PcObj l, uint32_t n, const void* b) {
         if (tmp[k].Type == D3D12_RESOURCE_BARRIER_TYPE_TRANSITION) {
             tmp[k].Transition.StateBefore = pc_state(tmp[k].Transition.StateBefore);
             tmp[k].Transition.StateAfter = pc_state(tmp[k].Transition.StateAfter);
+            if (trace_writers() && tmp[k].Transition.Subresource == D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES &&
+                !(tmp[k].Flags & D3D12_RESOURCE_BARRIER_FLAG_BEGIN_ONLY)) {
+                std::lock_guard<std::mutex> g(g_wr_mu);
+                g_last_state[tmp[k].Transition.pResource] = tmp[k].Transition.StateAfter;
+            }
             if (tmp[k].Transition.StateBefore == tmp[k].Transition.StateAfter) continue;  // e.g. PRESENT <-> COMMON
         }
         k++;
@@ -1170,7 +1208,36 @@ void list_ia_vbs(PcObj l, uint32_t s, uint32_t n, const void* v) { L->IASetVerte
 void list_ia_ib(PcObj l, const void* v) { L->IASetIndexBuffer(static_cast<const D3D12_INDEX_BUFFER_VIEW*>(v)); }
 void list_draw(PcObj l, uint32_t a, uint32_t b, uint32_t c, uint32_t d) { note_draw(l); L->DrawInstanced(a, b, c, d); }
 void list_draw_indexed(PcObj l, uint32_t a, uint32_t b, uint32_t c, int32_t d, uint32_t e) { note_draw(l); L->DrawIndexedInstanced(a, b, c, d, e); }
-void list_dispatch(PcObj l, uint32_t x, uint32_t y, uint32_t z) { L->Dispatch(x, y, z); }
+void list_dispatch(PcObj l, uint32_t x, uint32_t y, uint32_t z) { note_dispatch(l); L->Dispatch(x, y, z); }
+// A dispatch writes the big textures whose UAVs are in the first slots of its compute tables.
+static void note_dispatch(PcObj l) {
+    if (!trace_writers() || !g_gv) return;
+    std::lock_guard<std::mutex> g(g_wr_mu);
+    auto t = g_cs_tables.find(l);
+    if (t == g_cs_tables.end()) return;
+    uint64_t gpu0 = g_gv->GetGPUDescriptorHandleForHeapStart().ptr, cpu0 = g_gv->GetCPUDescriptorHandleForHeapStart().ptr;
+    for (auto& [idx, h] : t->second) {
+        if (h < gpu0 || h >= gpu0 + (uint64_t)g_gv_size * g_gv_inc) continue;
+        uint64_t c = cpu0 + (h - gpu0);
+        for (uint32_t k = 0; k < 64; k++) {
+            auto it = g_uav_res.find(c + (uint64_t)k * g_gv_inc);
+            if (it == g_uav_res.end()) continue;
+            for (PcObj b : g_big_textures)
+                if (b == it->second) {
+                    PcObj pso = g_wr_pso.count(l) ? g_wr_pso[l] : nullptr;
+                    g_cs_writer[b] = {pso, g_wr_present.load()};
+                    static uint64_t logged_at = 0;
+                    if (g_wr_present.load() + 1 == rt_stats_at() && pso) {   // the frame being examined: every writer
+                        wchar_t wn[128] = L"?";
+                        UINT sz = sizeof wn;
+                        as<ID3D12PipelineState>(pso)->GetPrivateData(WKPDID_D3DDebugObjectNameW, &sz, wn);
+                        XSL_INFO(CH, "frame writer of texture %p: %ls (table %u slot %u)", b, wn, idx, k);
+                    }
+                    (void)logged_at;
+                }
+        }
+    }
+}
 void list_dispatch_mesh(PcObj l, uint32_t x, uint32_t y, uint32_t z) {
     if (!g_caps.meshShaders) return;
     ID3D12GraphicsCommandList6* l6 = nullptr;
@@ -1309,6 +1376,7 @@ static bool fixed_indirect(PcObj l, PcObj sig, uint32_t max, PcObj args, uint64_
     return true;
 }
 void list_execute_indirect(PcObj l, PcObj sig, uint32_t max, PcObj args, uint64_t ao, PcObj cnt, uint64_t co) {
+    note_dispatch(l);
     {   // ray dispatches need a ray-tracing pipeline, which is not translated yet (inert state objects)
         std::lock_guard<std::mutex> g(g_rays_mu);
         if (g_rays_sigs.count(sig)) {
@@ -1344,7 +1412,10 @@ void list_write_immediate(PcObj l, uint64_t va, uint32_t value, bool bottom) {
 void list_discard(PcObj l, PcObj r) { L->DiscardResource(as<ID3D12Resource>(r), nullptr); }
 void list_set_heaps(PcObj l, uint32_t n, PcObj* h) { L->SetDescriptorHeaps(n, reinterpret_cast<ID3D12DescriptorHeap* const*>(h)); }
 void list_gfx_root_table(PcObj l, uint32_t i, uint64_t h) { L->SetGraphicsRootDescriptorTable(i, gpu(h)); }
-void list_compute_root_table(PcObj l, uint32_t i, uint64_t h) { L->SetComputeRootDescriptorTable(i, gpu(h)); }
+void list_compute_root_table(PcObj l, uint32_t i, uint64_t h) {
+    if (trace_writers()) { std::lock_guard<std::mutex> g(g_wr_mu); g_cs_tables[l][i] = h; }
+    L->SetComputeRootDescriptorTable(i, gpu(h));
+}
 void list_gfx_root_cbv(PcObj l, uint32_t i, uint64_t va) { L->SetGraphicsRootConstantBufferView(i, va); }
 void list_compute_root_cbv(PcObj l, uint32_t i, uint64_t va) { L->SetComputeRootConstantBufferView(i, va); }
 void list_gfx_root_srv(PcObj l, uint32_t i, uint64_t va) { L->SetGraphicsRootShaderResourceView(i, va); }
@@ -1616,7 +1687,10 @@ void capture_plane(ID3D12Device* dev, ID3D12CommandQueue* q, ID3D12Resource* res
     ID3D12CommandAllocator* a = nullptr;
     ID3D12GraphicsCommandList* l = nullptr;
     ID3D12Fence* f = nullptr;
-    if (FAILED(dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&rb)))) return;
+    if (HRESULT hrr = dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&rb)); FAILED(hrr)) {
+        XSL_WARN(CH, "capture: readback buffer (%llu bytes) failed %08lx", (unsigned long long)total, hrr);
+        return;
+    }
     dev->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&a));
     dev->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, a, nullptr, IID_PPV_ARGS(&l));
     dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&f));
@@ -1636,11 +1710,18 @@ void capture_plane(ID3D12Device* dev, ID3D12CommandQueue* q, ID3D12Resource* res
     HANDLE e = CreateEventW(nullptr, FALSE, FALSE, nullptr);
     q->Signal(f, 1);
     f->SetEventOnCompletion(1, e);
-    WaitForSingleObject(e, INFINITE);
+    DWORD waited = WaitForSingleObject(e, 2000);
     CloseHandle(e);
+    if (waited != WAIT_OBJECT_0) {
+        XSL_WARN(CH, "capture: copy did not finish (device %08lx)", dev->GetDeviceRemovedReason());
+        f->Release(); l->Release(); a->Release(); rb->Release();
+        return;
+    }
     void* p = nullptr;
     D3D12_RANGE r{0, (SIZE_T)total};
-    if (SUCCEEDED(rb->Map(0, &r, &p)) && !path) {   // statistics only: share of non-zero texels
+    HRESULT mapHr = rb->Map(0, &r, &p);
+    if (FAILED(mapHr)) XSL_WARN(CH, "capture: map failed %08lx (device %08lx)", mapHr, dev->GetDeviceRemovedReason());
+    if (SUCCEEDED(mapHr) && !path) {   // statistics only: share of non-zero texels
         UINT w = fp.Footprint.Width, h = fp.Footprint.Height;
         size_t bpt = fp.Footprint.RowPitch / (w ? w : 1) >= 8 ? 8 : 4, nz = 0, n = 0;
         uint32_t mx = 0;
@@ -1654,7 +1735,7 @@ void capture_plane(ID3D12Device* dev, ID3D12CommandQueue* q, ID3D12Resource* res
         XSL_INFO(CH, "%s stats (present %llu, %llux%u format %d): %.1f%% non-zero, max byte %u", state == D3D12_RESOURCE_STATE_PRESENT ? "plane" : "target",
                  (unsigned long long)g_present_count, (unsigned long long)rd.Width, rd.Height, rd.Format, n ? 100.0 * nz / n : 0.0, mx);
         rb->Unmap(0, nullptr);
-    } else if (p) {
+    } else if (SUCCEEDED(mapHr)) {
         UINT w = fp.Footprint.Width, h = fp.Footprint.Height;
         bool rgba = rd.Format == DXGI_FORMAT_R8G8B8A8_UNORM || rd.Format == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB || rd.Format == DXGI_FORMAT_R8G8B8A8_TYPELESS;
         FILE* out = fopen(path, "wb");
@@ -2027,6 +2108,29 @@ HRESULT_T present(PcObj devObj, PcObj queueObj, PcObj resObj, void* hwndPtr, uin
                 for (auto& [r, f] : g_wr_frame)
                     if (f + 1 >= g_present_count) targets.push_back({r, g_wr_last[r].first});
             }
+            std::vector<PcObj> big;
+            { std::lock_guard<std::mutex> g(g_wr_mu); big = g_big_textures; }
+            for (PcObj r : big) {   // 1080p textures (written by compute passes too), in their last transitioned state
+                if (as<ID3D12Resource>(r) == res) continue;
+                uint32_t st;
+                { std::lock_guard<std::mutex> g(g_wr_mu); auto it = g_last_state.find(r); if (it == g_last_state.end()) continue; st = it->second; }
+                if (st == D3D12_RESOURCE_STATE_COPY_SOURCE) continue;
+                switch (as<ID3D12Resource>(r)->GetDesc().Format) {   // colour targets only
+                    case DXGI_FORMAT_R16G16B16A16_FLOAT: case DXGI_FORMAT_R11G11B10_FLOAT: case DXGI_FORMAT_R10G10B10A2_UNORM:
+                    case DXGI_FORMAT_R8G8B8A8_UNORM: case DXGI_FORMAT_B8G8R8A8_UNORM: case DXGI_FORMAT_R32G32B32A32_FLOAT:
+                    case DXGI_FORMAT_R16G16_FLOAT: case DXGI_FORMAT_R32_FLOAT: case DXGI_FORMAT_R16_FLOAT: break;
+                    default: continue;
+                }
+                wchar_t wn[128] = L"(no compute writer seen)";
+                {
+                    std::lock_guard<std::mutex> g(g_wr_mu);
+                    auto w = g_cs_writer.find(r);
+                    UINT sz = sizeof wn;
+                    if (w != g_cs_writer.end() && w->second.first) as<ID3D12PipelineState>(w->second.first)->GetPrivateData(WKPDID_D3DDebugObjectNameW, &sz, wn);
+                }
+                XSL_INFO(CH, "texture %p (format %d, state %#x), last compute writer %ls:", r, (int)as<ID3D12Resource>(r)->GetDesc().Format, st, wn);
+                capture_plane(dev, q, as<ID3D12Resource>(r), nullptr, (D3D12_RESOURCE_STATES)st);
+            }
             for (auto& [r, pso] : targets) {
                 auto* tr = as<ID3D12Resource>(r);
                 if (tr == res || tr->GetDesc().Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || tr->GetDesc().SampleDesc.Count > 1) continue;
@@ -2035,6 +2139,20 @@ HRESULT_T present(PcObj devObj, PcObj queueObj, PcObj resObj, void* hwndPtr, uin
                 if (pso) as<ID3D12PipelineState>(pso)->GetPrivateData(WKPDID_D3DDebugObjectNameW, &sz, name);
                 XSL_INFO(CH, "render target %p last drawn by %ls:", r, name);
                 capture_plane(dev, q, tr, nullptr, D3D12_RESOURCE_STATE_RENDER_TARGET);
+                // XSL_RT_DUMP=<dir>: also write the larger 4-byte targets as BMPs (raw bytes).
+                static char dumpDir[MAX_PATH] = "";
+                static bool dumpInit = (GetEnvironmentVariableA("XSL_RT_DUMP", dumpDir, sizeof dumpDir), true);
+                (void)dumpInit;
+                D3D12_RESOURCE_DESC td = tr->GetDesc();
+                DXGI_FORMAT f = td.Format;
+                bool four = f == DXGI_FORMAT_R11G11B10_FLOAT || f == DXGI_FORMAT_R10G10B10A2_UNORM || f == DXGI_FORMAT_R8G8B8A8_UNORM ||
+                            f == DXGI_FORMAT_B8G8R8A8_UNORM || f == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB || f == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB ||
+                            f == DXGI_FORMAT_R8G8B8A8_TYPELESS || f == DXGI_FORMAT_B8G8R8A8_TYPELESS || f == DXGI_FORMAT_R10G10B10A2_TYPELESS;
+                if (dumpDir[0] && four && td.Width >= 512) {
+                    char path[MAX_PATH];
+                    snprintf(path, sizeof path, "%s\\rt_%p_f%d.bmp", dumpDir, r, (int)f);
+                    capture_plane(dev, q, tr, path, D3D12_RESOURCE_STATE_RENDER_TARGET);
+                }
             }
         }
         if (cap[0] && g_present_count >= capFrame && g_present_count < capFrame + capCount) {
