@@ -46,6 +46,7 @@ void install_into_title() {
     install_windowing(exe);
     install_host_redirects();
     install_net_trace(exe);
+    install_console_drives();
     apply_user_patches();
 }
 }  // namespace xsl::platform

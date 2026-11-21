@@ -50,7 +50,7 @@ zlib, BCPack, zlib+BCPack; error records; cancellation; fence signals) — all p
 
 | Title | GDK edition | Status | Notes |
 |---|---|---|---|
-| Minecraft Preview 1.18.3064.0 (Series X\|S, unmodified executable) | GXDK 220300 (March 2022) | **Playable**: worlds are created, saved and played (Linux and natively on Windows 10, RTX 5090, ~60 FPS in-world, no D3D12 errors), silent | Needs the 220300 edition files (docs/sdk-editions.md). Input: DualSense/XInput pads, keyboard and mouse through GameInput (mouse captured while focused). Known gaps: no audio (silent ACP); speech synthesis and game streaming unimplemented; CPU writes to mapped GPU-only textures stay on a CPU shadow (only render targets seen so far). Fixed on the way: constants bound at 16-byte offsets in default-heap buffers were not re-aligned (skin preview and loading-screen logo invisible); texture copies with 256-byte-aligned buffer footprints removed the device on Windows when a world loaded; CPU reads of write-combined upload memory held the world at ~3 FPS. |
+| Minecraft Preview 1.18.3064.0 (Series X\|S, unmodified executable) | GXDK 220300 (March 2022) | **Playable**: worlds are created, saved and played (Linux and natively on Windows 10, RTX 5090, ~60 FPS in-world, no D3D12 errors), silent | Needs the 220300 edition files (docs/sdk-editions.md). Input: DualSense/XInput pads, keyboard and mouse through GameInput (mouse captured while focused). Known gaps: no audio (silent ACP); speech synthesis and game streaming unimplemented; CPU writes to mapped GPU-only textures stay on a CPU shadow (only render targets seen so far). Fixed on the way: constants bound at 16-byte offsets in default-heap buffers were not re-aligned (skin preview and loading-screen logo invisible); texture copies with 256-byte-aligned buffer footprints removed the device on Windows when a world loaded; CPU reads of write-combined upload memory held the world at ~3 FPS; world creation failed for standard (non-elevated) users on Windows because the title's console `C:` storage was the real system drive. |
 
 ## Back-end findings
 
@@ -64,6 +64,11 @@ zlib, BCPack, zlib+BCPack; error records; cancellation; fence signals) — all p
 - **Upload memory**: console memory is CPU-cached; a PC UPLOAD heap is write-combined (or device-local
   BAR memory under vkd3d-proton), where CPU reads are uncached. The CBV re-alignment reads title buffers
   at bind time, so UPLOAD heaps are created as write-back system memory (`XSL_UPLOAD_CACHED=0` disables).
+- **Console drives**: titles address storage by drive letter (Minecraft: `C:/Users/<xuid>/games/com.mojang`,
+  `C:/` as its storage root, `t:/` for temporary data). Under Wine C: is the prefix's private drive; on Windows
+  it is the system drive (standard users cannot create folders under `C:\Users`) and T: does not exist. The
+  title modules' file calls (Win32, CRT, free-space queries, handle renames) map `C:` (Windows only) and `T:` to
+  `C:\users\Public\OpenScarlett\<title>\Drives\C|T`; paths in the title, layer and temp folders pass through.
 - **Display size**: titles size display planes from their window's client area, which on a console is the
   output resolution. A PC window's client area is smaller (title bar, taskbar), and planes of that size
   next to 1080p targets meant mismatched resolves and copies; the title's `GetClientRect` reports the

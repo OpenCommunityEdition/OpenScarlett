@@ -64,9 +64,10 @@ Useful environment variables: `XSL_LOG=info|trace|gfx=trace,…`, `XSL_LOG_FILE=
 `XSL_CAPTURE='Z:\path\frame.bmp@120[+count]'` (dump displayed frames; `XSL_CAPTURE_SOURCE=plane`
 for the raw plane), `XSL_D3D12_DEBUG=1`, `XSL_FPS_TITLE=0`, `XSL_BACKEND=vkd3d-proton-xsl|vkd3d-proton|wine|null`,
 `XSL_MEMTIME_SCALE=num/den`, `XSL_SDR_WHITE_NITS=200`, `XSL_GAMERTAG=…`, `XSL_SAVE_DIR=…`,
-`XSL_DISPLAY_SIZE=1920x1080` (the client area titles see; `0` for the real window), `XSL_CLOSE_EXITS=0`.
+`XSL_DISPLAY_SIZE=1920x1080` (the client area titles see; `0` for the real window), `XSL_CLOSE_EXITS=0`,
+`XSL_CONSOLE_DRIVES=0` (titles' `C:`/`T:` paths unmapped).
 Diagnostics: `XSL_CBV_REALIGN=0`, `XSL_UNIFIED_DESCRIPTORS=0`, `XSL_BARRIER_FIX=0`, `XSL_PLACED_COMMITTED=1`,
-`XSL_UPLOAD_CACHED=0`, `XSL_NET_TRACE=1` (log the title's socket calls).
+`XSL_UPLOAD_CACHED=0`, `XSL_NET_TRACE=1` (log the title's socket calls), `XSL_FILE_TRACE=1` (log mapped console-drive paths).
 Input: `XSL_MOUSE_CAPTURE=0`, `XSL_INPUT_TRACE=1`; on-demand frames: `XSL_CAPTURE_TRIGGER='Z:\path\trigger'`.
 
 User patches: a `patches.txt` (or `<exe>.patches.txt`) next to a title executable is applied at

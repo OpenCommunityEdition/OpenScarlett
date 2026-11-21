@@ -16,4 +16,6 @@ void apply_user_patches();
 void install_host_redirects();
 // XSL_NET_TRACE=1: log the module's socket calls (net_trace.cpp).
 void install_net_trace(HMODULE module);
+// Map the title's console drives (C: on Windows, T:) to per-title folders (console_drives.cpp).
+void install_console_drives();
 }

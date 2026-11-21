@@ -131,3 +131,4 @@ void install_net_trace(HMODULE m) {
     for (auto& e : t) patch_import(m, "ws2_32", e.fn, e.p);
 }
 }  // namespace xsl::platform
+
