@@ -600,8 +600,12 @@ bool translate_indirect_args(const D3D12_COMMAND_SIGNATURE_DESC* in, std::vector
     return changed;
 }
 
+std::mutex g_rays_mu;
+std::set<PcObj> g_rays_sigs;   // command signatures that dispatch rays (skipped while ray tracing is inert)
 HRESULT_T create_command_signature(PcObj dev, const void* desc, PcObj rs, PcObj* out) {
     auto* d = static_cast<const D3D12_COMMAND_SIGNATURE_DESC*>(desc);
+    bool rays = false;
+    for (UINT i = 0; d && d->pArgumentDescs && i < d->NumArgumentDescs; i++) rays |= d->pArgumentDescs[i].Type == D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_RAYS;
     std::vector<D3D12_INDIRECT_ARGUMENT_DESC> args;
     D3D12_COMMAND_SIGNATURE_DESC pcDesc;
     if (d && d->pArgumentDescs && translate_indirect_args(d, &args)) {
@@ -623,6 +627,7 @@ HRESULT_T create_command_signature(PcObj dev, const void* desc, PcObj rs, PcObj*
     if (!rootArgs) rs = nullptr;
     HRESULT hr = as<ID3D12Device>(dev)->CreateCommandSignature(d, as<ID3D12RootSignature>(rs),
                                                                IID_PPV_ARGS(reinterpret_cast<ID3D12CommandSignature**>(out)));
+    if (SUCCEEDED(hr) && rays) { std::lock_guard<std::mutex> g(g_rays_mu); g_rays_sigs.insert(*out); }
     if (FAILED(hr) && d) {
         std::string args;
         for (UINT i = 0; i < d->NumArgumentDescs && i < 16; i++) {
@@ -1200,6 +1205,14 @@ void list_rt_copy(PcObj l, uint64_t dst, uint64_t src, uint32_t mode) {
     if (auto* l4 = list4(l)) l4->CopyRaytracingAccelerationStructure(dst, src, (D3D12_RAYTRACING_ACCELERATION_STRUCTURE_COPY_MODE)mode);
 }
 void list_execute_indirect(PcObj l, PcObj sig, uint32_t max, PcObj args, uint64_t ao, PcObj cnt, uint64_t co) {
+    {   // ray dispatches need a ray-tracing pipeline, which is not translated yet (inert state objects)
+        std::lock_guard<std::mutex> g(g_rays_mu);
+        if (g_rays_sigs.count(sig)) {
+            static volatile long n = 0;
+            if (InterlockedIncrement(&n) <= 2) XSL_WARN(CH, "indirect ray dispatch skipped (ray tracing is not translated yet)");
+            return;
+        }
+    }
     if (g_info) check_rs(l, "ExecuteIndirect");
     L->ExecuteIndirect(as<ID3D12CommandSignature>(sig), max, as<ID3D12Resource>(args), ao, as<ID3D12Resource>(cnt), co);
 }

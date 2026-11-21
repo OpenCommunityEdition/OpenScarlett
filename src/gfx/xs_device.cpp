@@ -70,6 +70,14 @@ HRESULT D3DAPI D_CheckFeatureSupport(ID3D12Device* d, D3D12_FEATURE f, void* dat
         }
     }
     if (FAILED(hr)) XSL_WARN(CH, "CheckFeatureSupport(feature %d, %u bytes) failed %08lx", (int)f, size, hr);
+    // XSL_NO_RAYTRACING=1: report no ray tracing, so titles that check take their other paths
+    // (ray-tracing pipelines and ray queries are not translated yet).
+    static bool no_rt = [] { char b[4]; return GetEnvironmentVariableA("XSL_NO_RAYTRACING", b, 4) && b[0] == '1'; }();
+    if (no_rt && SUCCEEDED(hr) && f == D3D12_FEATURE_D3D12_OPTIONS5 && data && size >= sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS5)) {
+        ((D3D12_FEATURE_DATA_D3D12_OPTIONS5*)data)->RaytracingTier = D3D12_RAYTRACING_TIER_NOT_SUPPORTED;
+        static volatile long n = 0;
+        if (InterlockedIncrement(&n) == 1) XSL_INFO(CH, "ray tracing reported as unsupported (XSL_NO_RAYTRACING)");
+    }
     if (f == D3D12_FEATURE_FEATURE_LEVELS && data && size >= sizeof(D3D12_FEATURE_DATA_FEATURE_LEVELS)) {
         auto* fl = (D3D12_FEATURE_DATA_FEATURE_LEVELS*)data;
         std::string req;

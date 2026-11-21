@@ -2685,8 +2685,14 @@ std::string Translator::generate() {
     // The guard bounds the block transitions so a mistranslated loop ends the shader instead of
     // hanging the GPU (which removes the PC device).
     else {
+        // A wave stopped by the guard leaves the group: only barriers it could still reach (at or
+        // after a loop head) need the large limit.
+        uint32_t first_head = UINT32_MAX;
+        for (auto& i : ins)
+            if (i.name && (starts(i.name, "s_cbranch") || !strcmp(i.name, "s_branch")) && i.simm16 < 0)
+                first_head = std::min(first_head, uint32_t(int32_t(i.offset) + 4 + i.simm16 * 4));
         bool barriers = false;
-        for (auto& i : ins) barriers |= i.name && !strcmp(i.name, "s_barrier");
+        for (auto& i : ins) barriers |= i.name && !strcmp(i.name, "s_barrier") && i.offset >= first_head;
         line(fmt("uint pc = 0u, guard_ = 0u;\n  [loop] for (;;) {\n  if (++guard_ > %uu) RETURN;\n  [forcecase] switch (pc) {",
                  barriers ? opt.loop_guard_barrier : opt.loop_guard));
     }
