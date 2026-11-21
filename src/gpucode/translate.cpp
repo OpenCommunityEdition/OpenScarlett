@@ -40,12 +40,19 @@ struct AV {
     uint32_t c = 0;   // RootHi: bits ORed in; Desc: 1 if modified
     uint32_t d = 0;   // Arg: 1 if a run-time offset was added; Desc: 1 + index of the load that used a run-time offset
     bool operator==(const AV& o) const { return k == o.k && a == o.a && b == o.b && c == o.c && d == o.d; }
+    bool operator!=(const AV& o) const { return !(*this == o); }
     static AV top() { return AV{Top}; }
     static AV cst(uint32_t v) { return AV{Const, v}; }
 };
 constexpr unsigned kNumS = 128;
 constexpr uint32_t kMemBlock = 0x100;   // AV::Arg location of the memory-based argument block pointer
-using SState = std::array<AV, kNumS>;
+// SGPR values plus scalar values spilled to VGPR lanes (v_writelane/v_readlane with constant lanes).
+struct SState {
+    std::array<AV, kNumS> s{};
+    std::map<uint32_t, AV> spill;   // key: VGPR << 8 | lane
+    AV& operator[](size_t i) { return s[i]; }
+    const AV& operator[](size_t i) const { return s[i]; }
+};
 AV merge(const AV& x, const AV& y) {
     if (x.k == AV::Undef) return y;
     if (y.k == AV::Undef) return x;
@@ -366,7 +373,24 @@ struct Translator {
             break;
         }
         case Fmt::VOP1: case Fmt::VOP2: case Fmt::VOP3: case Fmt::VOPC: case Fmt::VOP3P: {
-            if (n == "v_readfirstlane_b32" || n == "v_readlane_b32") setd(in.dst, AV::top());
+            if (n == "v_writelane_b32" || n == "v_readlane_b32") {
+                AV lane = in.src1 == src::kLiteral ? AV::cst(in.literal) : sval_of(st, in.src1);
+                if (n == "v_writelane_b32") {
+                    if (lane.k == AV::Const) st.spill[uint32_t(in.dst) << 8 | (lane.a & 63)] = lit(in.src0);
+                    else for (auto it = st.spill.begin(); it != st.spill.end();) it = (it->first >> 8) == in.dst ? st.spill.erase(it) : std::next(it);
+                } else {
+                    AV v = AV::top();
+                    if (lane.k == AV::Const && in.src0 >= src::kVgpr0) {
+                        auto it = st.spill.find(uint32_t(in.src0 - src::kVgpr0) << 8 | (lane.a & 63));
+                        if (it != st.spill.end()) v = it->second;
+                    }
+                    setd(in.dst, v);
+                }
+            } else if (n == "v_readfirstlane_b32") setd(in.dst, AV::top());
+            // Any other write to a VGPR invalidates scalar values spilled to it.
+            if ((in.fmt == Fmt::VOP1 || in.fmt == Fmt::VOP2 || (in.fmt == Fmt::VOP3 && in.op >= 256) || in.fmt == Fmt::VOP3P) &&
+                n != "v_writelane_b32" && n != "v_readlane_b32" && n != "v_readfirstlane_b32" && !st.spill.empty())
+                for (auto it = st.spill.begin(); it != st.spill.end();) it = (it->first >> 8) == in.dst ? st.spill.erase(it) : std::next(it);
             if (in.fmt == Fmt::VOP3 && in.op < 256) {            // compare: mask in the vdst field
                 setd(in.dst, AV::top());
                 setd(in.dst + 1, AV::top());
@@ -431,6 +455,16 @@ struct Translator {
                         if (!(v == m[k])) {
                             m[k] = v;
                             ch = true;
+                        }
+                    }
+                    if (!seen[s]) {
+                        if (m.spill != st.spill) { m.spill = st.spill; ch = true; }
+                    } else {
+                        for (auto it = m.spill.begin(); it != m.spill.end();) {
+                            auto o = st.spill.find(it->first);
+                            AV v = o == st.spill.end() ? AV::top() : merge(it->second, o->second);
+                            if (!(v == it->second)) { ch = true; if (v.k == AV::Top) { it = m.spill.erase(it); continue; } it->second = v; }
+                            ++it;
                         }
                     }
                     seen[s] = true;

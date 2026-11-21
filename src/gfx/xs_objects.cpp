@@ -709,7 +709,7 @@ void D3DAPI L_FlushPipelineX(ID3D12GraphicsCommandList* l, D3D12XBOX_FLUSH, D3D1
 }
 void D3DAPI L_ExecuteIndirect(ID3D12GraphicsCommandList* l, ID3D12CommandSignature* sig, UINT max, ID3D12Resource* args, UINT64 ao,
                               ID3D12Resource* cnt, UINT64 co) {
-    if (null_graphics()) return;
+    if (null_graphics() || lx(l)->placeholderPso) return;   // placeholder PSO: its work is skipped
     pc::list_execute_indirect(LPC(l), P(sig), max, P(args), ao, P(cnt), co);
 }
 void D3DAPI L_ClearUAVUint(ID3D12GraphicsCommandList* l, D3D12_GPU_DESCRIPTOR_HANDLE g, D3D12_CPU_DESCRIPTOR_HANDLE c, ID3D12Resource* r,
@@ -722,7 +722,7 @@ void D3DAPI L_ClearUAVFloat(ID3D12GraphicsCommandList* l, D3D12_GPU_DESCRIPTOR_H
 }
 void D3DAPI L_DiscardResource(ID3D12GraphicsCommandList* l, ID3D12Resource* r, const D3D12_DISCARD_REGION*) { pc::list_discard(LPC(l), P(r)); }
 void D3DAPI L_DispatchMesh(ID3D12GraphicsCommandList6* l, UINT x, UINT y, UINT z) {
-    if (!null_graphics()) pc::list_dispatch_mesh(pc_of(l), x, y, z);
+    if (!null_graphics() && !lx((ID3D12GraphicsCommandList*)l)->placeholderPso) pc::list_dispatch_mesh(pc_of(l), x, y, z);
 }
 
 // Console copy variants: the flags select copy engines and cache behaviour, which have no PC meaning.

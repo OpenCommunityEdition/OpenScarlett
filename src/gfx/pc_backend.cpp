@@ -1156,8 +1156,23 @@ void list_stencil_ref(PcObj l, uint32_t r) { L->OMSetStencilRef(r); }
 void queue_execute(PcObj q, uint32_t n, PcObj* lists) {
     as<ID3D12CommandQueue>(q)->ExecuteCommandLists(n, reinterpret_cast<ID3D12CommandList* const*>(lists));
 }
-HRESULT_T queue_signal(PcObj q, PcObj f, uint64_t v) { return as<ID3D12CommandQueue>(q)->Signal(as<ID3D12Fence>(f), v); }
-HRESULT_T queue_wait(PcObj q, PcObj f, uint64_t v) { return as<ID3D12CommandQueue>(q)->Wait(as<ID3D12Fence>(f), v); }
+HRESULT_T queue_signal(PcObj q, PcObj f, uint64_t v) {
+    if (g_dred) {
+        static volatile long n = 0;
+        if (InterlockedIncrement(&n) <= 400) XSL_INFO(CH, "queue %p signals fence %p = %llu", q, f, (unsigned long long)v);
+    }
+    return as<ID3D12CommandQueue>(q)->Signal(as<ID3D12Fence>(f), v);
+}
+HRESULT_T queue_wait(PcObj q, PcObj f, uint64_t v) {
+    if (g_dred && f) {   // diagnostics: GPU waits that are not satisfied yet when submitted
+        uint64_t done = as<ID3D12Fence>(f)->GetCompletedValue();
+        if (done < v) {
+            static volatile long n = 0;
+            if (InterlockedIncrement(&n) <= 400) XSL_INFO(CH, "queue %p waits for fence %p >= %llu (completed %llu)", q, f, (unsigned long long)v, (unsigned long long)done);
+        }
+    }
+    return as<ID3D12CommandQueue>(q)->Wait(as<ID3D12Fence>(f), v);
+}
 
 // Root signatures: console-only flags (0x01000000 and up: memory-based ABI, compute spill area)
 // have no PC meaning and are masked off before the PC serializer sees them.

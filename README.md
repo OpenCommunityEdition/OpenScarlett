@@ -34,7 +34,7 @@ hardware platform the project targets.
 | GameInput (`src/input`) | Gamepads (XInput, incl. DualSense via SDL), keyboard and mouse devices, device callbacks, readings |
 | DirectStorage (`src/storage`) | `XCRDAPI.dll`: queues, files, status arrays, fences, events, cancellation, zlib (vendored), BCPack (SDK DLL at run time) |
 | Audio hardware (`src/audio`) | APU memory and a silent software audio processor (`AcpHal`), stubs for `xapu`, `chad`, `PIXEvt`, `XFrontPanelDisplay` |
-| Shaders | Xbox DXIL containers rewritten to plain DXIL (checksum verified against DXC); vkd3d-proton/dxil-spirv patches for Xbox LLVM and `xbox.*` intrinsics |
+| Shaders | Xbox DXIL containers rewritten to plain DXIL (checksum verified against DXC); vkd3d-proton/dxil-spirv patches for Xbox LLVM and `xbox.*` intrinsics. Shaders shipped as console GPU machine code only (no DXIL) are translated to HLSL and compiled with the PC shader compiler (`src/gpucode`, `docs/gpucode.md`): compute, pixel, vertex and mesh shaders |
 
 **22 of 25** of Microsoft's samples, built as genuine Scarlett executables, present frames
 on an Intel Iris Xe laptop, all with their intended image. The other three need mesh shaders (no DX12
