@@ -72,6 +72,13 @@ void fatal(const char* channel, const char* fmt, ...) {
 }
 }  // namespace xsl
 
+long xsl_stub_hresult() {
+    static long hr = [] {
+        char b[8];
+        return (GetEnvironmentVariableA("XSL_STUB_HRESULT", b, sizeof b) && !strcmp(b, "ok")) ? 0L : (long)0x80004001L;
+    }();
+    return hr;
+}
 XSL_STUB_RET xsl_stub_hit(int id, const char* name, void* self) {
     static volatile long counts[4096];
     long n = id < 4096 ? InterlockedIncrement(&counts[id]) : 1;

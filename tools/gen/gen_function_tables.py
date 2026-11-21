@@ -63,7 +63,13 @@ def parse(text):
                 continue
             mf = re.search(r"\(\s*\w*\s*\*\s*(\w+)\s*\)\s*\(", s)
             if mf:
-                out.append(("fn", mf.group(1)))
+                ret = s[:mf.start()].split()[-1] if s[:mf.start()].split() else ""
+                params = [p.strip() for p in s[mf.end():s.rfind(")")].split(",") if p.strip()]
+                # HRESULT entries: the parameter that receives a created object (a trailing T**).
+                out_index = -1
+                if ret == "HRESULT" and params and "**" in params[-1].replace(" ", ""):
+                    out_index = len(params) - 1
+                out.append(("fn", mf.group(1), ret, out_index))
                 continue
             out.append(("unknown", s))
         tables[name] = out
@@ -94,7 +100,10 @@ def main():
                 sid = stub_id
                 stub_id += 1
                 stubs.append((sid, f"{prefix}::{e[1]}"))
-                body.append(f"    t->{path}{e[1]} = reinterpret_cast<decltype(t->{path}{e[1]})>(&xsl_stub<{sid}>);")
+                if e[2] == "HRESULT" and e[3] < 10:
+                    body.append(f"    t->{path}{e[1]} = reinterpret_cast<decltype(t->{path}{e[1]})>(&xsl_stub_hr<{sid}, {e[3]}>);")
+                else:
+                    body.append(f"    t->{path}{e[1]} = reinterpret_cast<decltype(t->{path}{e[1]})>(&xsl_stub<{sid}>);")
             else:
                 body.append(f"    // unparsed: {e[1]}")
 
@@ -111,6 +120,18 @@ def main():
     lines.append("};")
     lines.append("}")
     lines.append("template <int N> XSL_STUB_RET xsl_stub(void* self) { return xsl_stub_hit(N, xsl_gen::kStubNames[N], self); }")
+    # HRESULT entries fail with E_NOTIMPL and clear the created-object pointer (argument OUTARG); x64
+    # passes argument k in the same position whatever the other arguments' types.
+    lines.append("template <int N, int OUTARG> long xsl_stub_hr(uintptr_t a0, uintptr_t a1, uintptr_t a2, uintptr_t a3, uintptr_t a4,")
+    lines.append("                                           uintptr_t a5, uintptr_t a6, uintptr_t a7, uintptr_t a8, uintptr_t a9) {")
+    lines.append("    xsl_stub_hit(N, xsl_gen::kStubNames[N], (void*)a0);")
+    lines.append("    const long hr_ = xsl_stub_hresult();")
+    lines.append("    if constexpr (OUTARG > 0) {")
+    lines.append("        const uintptr_t args_[10] = {a0, a1, a2, a3, a4, a5, a6, a7, a8, a9};")
+    lines.append("        if (hr_ < 0 && args_[OUTARG]) *(void**)args_[OUTARG] = nullptr;")
+    lines.append("    }")
+    lines.append("    return hr_;")
+    lines.append("}")
     lines.append("")
     for t, body in fills:
         lines.append(f"inline void xsl_fill_default({t}* t) {{")

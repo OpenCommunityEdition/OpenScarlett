@@ -350,6 +350,18 @@ HRESULT D3DAPI D_CreateCommittedResource(ID3D12Device* d, const D3D12_HEAP_PROPE
     if (!out) { pc::release(r); return S_FALSE; }
     return make_resource(DEV(d), r, riid, out, hp->Type == D3D12_HEAP_TYPE_UPLOAD);
 }
+// The console resource description is the PC one plus DCC options (no PC meaning).
+HRESULT D3DAPI D_CreateCommittedResourceX(ID3D12Device* d, const D3D12_HEAP_PROPERTIES* hp, D3D12_HEAP_FLAGS hf, const D3D12XBOX_RESOURCE_DESC* xd,
+                                          D3D12_RESOURCE_STATES st, const D3D12_CLEAR_VALUE* cv, REFIID riid, void** out) {
+    if (out) *out = nullptr;
+    if (!xd) return E_INVALIDARG;
+    D3D12_RESOURCE_DESC rd{};
+    // Same fields up to Flags; DccOptions sits where the PC struct has tail padding.
+    static_assert(offsetof(D3D12XBOX_RESOURCE_DESC, DccOptions) == offsetof(D3D12_RESOURCE_DESC, Flags) + sizeof(D3D12_RESOURCE_FLAGS),
+                  "console desc extends the PC one");
+    memcpy(&rd, xd, offsetof(D3D12XBOX_RESOURCE_DESC, DccOptions));
+    return D_CreateCommittedResource(d, hp, hf, &rd, st, cv, riid, out);
+}
 HRESULT D3DAPI D_CreateHeap(ID3D12Device* d, const D3D12_HEAP_DESC* desc, REFIID riid, void** out) {
     PcObj h = nullptr;
     HRESULT hr = pc::create_heap(DPC(d), desc, &h);
@@ -747,6 +759,7 @@ void init_device_table() {
         t->DeserializeComputePipelineStateX = D_DeserializeComputePipelineStateX;
         t->CopyDescriptors = D_CopyDescriptors;
         t->CreatePlacedResourceX = D_CreatePlacedResourceX;
+        t->CreateCommittedResourceX = D_CreateCommittedResourceX;
         t->RegisterPagePoolX = D_RegisterPagePoolX;
         t->UnregisterPagePoolX = D_UnregisterPagePoolX;
         t->CreateCommandQueueX = D_CreateCommandQueueX;

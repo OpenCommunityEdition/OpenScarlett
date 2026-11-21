@@ -209,11 +209,14 @@ HRESULT_T device_removed_reason(PcObj dev) {
 // offset of each stack frame, logged when DRED or the debug layer is on.
 static LONG CALLBACK note_exception(EXCEPTION_POINTERS* e) {
     DWORD c = e->ExceptionRecord->ExceptionCode;
-    if (c == 0x406D1388 || c == 0x40010006 || c == 0x4001000A || c == 0xE06D7363 || c == 0x80000003 || c == 0xC0000005 || c == 0x80000004 ||
+    if (c == 0xC00000FD) return EXCEPTION_CONTINUE_SEARCH;   // stack overflow: no stack left to log with
+    static bool log_av = env_on("XSL_LOG_AV");   // access violations too (titles probe memory; noisy)
+    if (c == 0xC0000005 && !log_av) return EXCEPTION_CONTINUE_SEARCH;
+    if (c == 0x406D1388 || c == 0x40010006 || c == 0x4001000A || c == 0xE06D7363 || c == 0x80000003 || c == 0x80000004 ||
         c == 0xE0434352 || c == 0x40080201 || c == 0x4000001F)
         return EXCEPTION_CONTINUE_SEARCH;
     static volatile long n = 0;
-    if (InterlockedIncrement(&n) > 4) return EXCEPTION_CONTINUE_SEARCH;
+    if (InterlockedIncrement(&n) > 12) return EXCEPTION_CONTINUE_SEARCH;
     void* frames[24];
     USHORT k = RtlCaptureStackBackTrace(0, 24, frames, nullptr);
     std::string t;
@@ -1205,6 +1208,20 @@ void list_write_immediate(PcObj l, uint32_t n, const uint64_t* addrs, const uint
     l2->WriteBufferImmediate(n, p.data(), nullptr);
     l2->Release();
 }
+HRESULT_T create_rs_deserializer(const void* data, size_t size, bool versioned, PcObj* out) {
+    *out = nullptr;
+    if (versioned)
+        return D3D12CreateVersionedRootSignatureDeserializer(data, size, IID_PPV_ARGS(reinterpret_cast<ID3D12VersionedRootSignatureDeserializer**>(out)));
+    return D3D12CreateRootSignatureDeserializer(data, size, IID_PPV_ARGS(reinterpret_cast<ID3D12RootSignatureDeserializer**>(out)));
+}
+const void* rs_deserializer_desc(PcObj d) { return as<ID3D12RootSignatureDeserializer>(d)->GetRootSignatureDesc(); }
+HRESULT_T rs_vdeserializer_desc(PcObj d, int version, const void** out) {
+    const D3D12_VERSIONED_ROOT_SIGNATURE_DESC* p = nullptr;
+    HRESULT hr = as<ID3D12VersionedRootSignatureDeserializer>(d)->GetRootSignatureDescAtVersion((D3D_ROOT_SIGNATURE_VERSION)version, &p);
+    *out = p;
+    return hr;
+}
+const void* rs_vdeserializer_unconverted(PcObj d) { return as<ID3D12VersionedRootSignatureDeserializer>(d)->GetUnconvertedRootSignatureDesc(); }
 void list_depth_bounds(PcObj l, float lo, float hi) {
     ID3D12GraphicsCommandList1* l1 = nullptr;
     if (SUCCEEDED(L->QueryInterface(IID_PPV_ARGS(&l1)))) { l1->OMSetDepthBounds(lo, hi); l1->Release(); }

@@ -128,6 +128,11 @@ void list_rt_build(PcObj l, const void* desc, uint32_t npost, const void* post);
 void list_rt_postbuild(PcObj l, const void* desc, uint32_t n, const uint64_t* src);
 void list_rt_copy(PcObj l, uint64_t dst, uint64_t src, uint32_t mode);
 void list_depth_bounds(PcObj l, float lo, float hi);
+// Root signature deserializers (PC objects; descriptions have the PC layout).
+HRESULT_T create_rs_deserializer(const void* data, size_t size, bool versioned, PcObj* out);
+const void* rs_deserializer_desc(PcObj d);
+HRESULT_T rs_vdeserializer_desc(PcObj d, int version, const void** out);
+const void* rs_vdeserializer_unconverted(PcObj d);
 void list_write_immediate(PcObj l, uint32_t n, const uint64_t* addrs, const uint32_t* values);
 void list_record_indirect(PcObj l, PcObj args, uint64_t argOff, PcObj count, uint64_t countOff);
 void list_clear_uav_uint(PcObj l, uint64_t gpu, uint64_t cpu, PcObj res, const uint32_t* v, uint32_t n, const void* rects);

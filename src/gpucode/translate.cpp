@@ -1745,9 +1745,10 @@ bool Translator::emit_valu(const Instr& in, size_t idx) {
         else if (dt == 'U') wv64(r);
         else if (dt == 'h') wv16(fin('h', r));
         else if (dt == 'W' || dt == 'S') wv16("uint(" + r + ") & 0xffffu");
-        else if (dt == 'f' && !has(o.e, "mad(")) {
+        else if (dt == 'f' && !has(o.e, "mad(") && getenv("XSL_PRECISE_OPS")) {
             // The console does not contract separate multiplies and adds: keep the PC compiler
             // from fusing this result into a later operation (real FMAs use mad and may fuse).
+            // Opt-in (XSL_PRECISE_OPS): DXC 1.9 crashes on large shaders with thousands of these.
             std::string f = fin('f', r);   // asuint(float(...))
             line(fmt("{ precise float pf_ = asfloat(%s);", f.c_str()));
             wv("asuint(pf_)");
