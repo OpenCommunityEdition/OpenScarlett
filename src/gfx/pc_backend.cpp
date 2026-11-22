@@ -1047,6 +1047,15 @@ void create_rtv(PcObj dev, PcObj res, const void* desc, uint64_t h) {
     const D3D12_RENDER_TARGET_VIEW_DESC* vd = view_fix(res, desc, t);
     if (trace_writers() && res) {
         D3D12_RESOURCE_DESC rd = as<ID3D12Resource>(res)->GetDesc();
+        if (rd.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D) {
+            static volatile long n3 = 0;
+            const D3D12_RENDER_TARGET_VIEW_DESC* td = static_cast<const D3D12_RENDER_TARGET_VIEW_DESC*>(desc);
+            if (InterlockedIncrement(&n3) <= 20)
+                XSL_INFO(CH, "RTV %llx on 3D %p (%llux%ux%u fmt %d): title %s dim %d fmt %d mip %u w %u+%u -> PC %s dim %d fmt %d mip %u w %u+%u", (unsigned long long)h,
+                         (void*)res, (unsigned long long)rd.Width, rd.Height, rd.DepthOrArraySize, (int)rd.Format, td ? "desc" : "default", td ? (int)td->ViewDimension : -1,
+                         td ? (int)td->Format : -1, td ? td->Texture3D.MipSlice : 0, td ? td->Texture3D.FirstWSlice : 0, td ? td->Texture3D.WSize : 0, vd ? "desc" : "default",
+                         vd ? (int)vd->ViewDimension : -1, vd ? (int)vd->Format : -1, vd ? vd->Texture3D.MipSlice : 0, vd ? vd->Texture3D.FirstWSlice : 0, vd ? vd->Texture3D.WSize : 0);
+        }
         if (rd.Width == 1920 && rd.Height == 1080 && rd.Format == DXGI_FORMAT_R10G10B10A2_UNORM) {
             static volatile long n = 0;
             if (InterlockedIncrement(&n) <= 40)
@@ -1062,7 +1071,19 @@ void create_dsv(PcObj dev, PcObj res, const void* desc, uint64_t h) {
 void create_srv(PcObj dev, PcObj res, const void* desc, uint64_t h) {
     if (trace_writers()) { std::lock_guard<std::mutex> g(g_wr_mu); g_srv_res[h] = res; g_uav_res.erase(h); }
     D3D12_SHADER_RESOURCE_VIEW_DESC t;
-    as<ID3D12Device>(dev)->CreateShaderResourceView(as<ID3D12Resource>(res), view_fix(res, desc, t), cpu(h));
+    const D3D12_SHADER_RESOURCE_VIEW_DESC* vd = view_fix(res, desc, t);
+    if (trace_writers() && res) {
+        D3D12_RESOURCE_DESC rd = as<ID3D12Resource>(res)->GetDesc();
+        if (rd.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && rd.Width == 1920 && rd.Height == 1080 && rd.Format == DXGI_FORMAT_R11G11B10_FLOAT) {
+            static volatile long n = 0;
+            if (InterlockedIncrement(&n) <= 40)
+                XSL_INFO(CH, "SRV %p (%llux%u fmt %d mips %u): %s dim %d fmt %d mips %u..%u swizzle %#x (title desc fmt %d)", (void*)res, (unsigned long long)rd.Width,
+                         rd.Height, (int)rd.Format, rd.MipLevels, vd ? "desc" : "default", vd ? (int)vd->ViewDimension : -1, vd ? (int)vd->Format : -1,
+                         vd ? vd->Texture2D.MostDetailedMip : 0, vd ? vd->Texture2D.MipLevels : 0, vd ? vd->Shader4ComponentMapping : 0,
+                         desc ? (int)static_cast<const D3D12_SHADER_RESOURCE_VIEW_DESC*>(desc)->Format : -1);
+        }
+    }
+    as<ID3D12Device>(dev)->CreateShaderResourceView(as<ID3D12Resource>(res), vd, cpu(h));
 }
 void create_uav(PcObj dev, PcObj res, PcObj counter, const void* desc, uint64_t h) {
     if (trace_writers()) { std::lock_guard<std::mutex> g(g_wr_mu); g_uav_res[h] = res; g_srv_res.erase(h); }
@@ -2168,6 +2189,14 @@ void capture_plane(ID3D12Device* dev, ID3D12CommandQueue* q, ID3D12Resource* res
             for (UINT y = 0; y < h; y++) {
                 auto* row = (uint8_t*)p + fp.Offset + (size_t)y * fp.Footprint.RowPitch;
                 if (rgba) for (UINT x = 0; x < w; x++) std::swap(row[x * 4], row[x * 4 + 2]);
+                if (rd.Format == DXGI_FORMAT_R10G10B10A2_UNORM || rd.Format == DXGI_FORMAT_R10G10B10A2_TYPELESS)
+                    for (UINT x = 0; x < w; x++) {   // 10-bit channels to 8-bit BGR
+                        uint32_t v;
+                        memcpy(&v, row + x * 4, 4);
+                        row[x * 4 + 0] = uint8_t(((v >> 20) & 0x3ff) >> 2);
+                        row[x * 4 + 1] = uint8_t(((v >> 10) & 0x3ff) >> 2);
+                        row[x * 4 + 2] = uint8_t((v & 0x3ff) >> 2);
+                    }
                 // Scan-out ignores alpha; titles may leave it 0, which viewers would show as transparent.
                 for (UINT x = 0; x < w; x++) row[x * 4 + 3] = 0xFF;
                 fwrite(row, 4, w, out);

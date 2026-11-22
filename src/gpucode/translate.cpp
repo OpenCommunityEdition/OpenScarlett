@@ -193,7 +193,11 @@ struct Translator {
                 else if (w == "posz") init = "asuint(I.pos_.z)";
                 else if (w == "posw") init = "asuint(I.pos_.w)";
                 else if (w == "face") init = "(I.face_ ? 0x3f800000u : 0xbf800000u)";
-                else if (w == "ancillary") init = "((I.sid_ & 15u) << 8)";
+                else if (w == "ancillary") {   // [11:8] sample index, [28:16] render-target array index
+                    init = "((I.sid_ & 15u) << 8)";
+                    for (auto& e : isg)
+                        if (e.sysval == 4) init = fmt("(((I.sid_ & 15u) << 8) | ((I.sv%u_ & 0x1fffu) << 16))", e.reg);
+                }
                 else if (w == "coverage") init = "I.cov_";
                 if (!init.empty()) ps_sysv.push_back({v, init});
                 v += l.n;
@@ -2925,7 +2929,7 @@ std::string Translator::generate() {
         else h << "#define RETURN return O\n";
         h << "\nVSOut main(VSIn I) {\n  VSOut O = (VSOut)0;\n";
         init += "  v0 = I.vid_;\n";
-        if (!vs_fetch) init += "  v3 = I.iid_;\n";
+        init += "  v3 = I.iid_;\n";   // with or without a fetch-shader call (it fills v4 up and keeps v0..v3)
     }
     if (c.kind == ProgramKind::MS) {
         // The program runs as prog(); each thread captures the vertex and primitive it exports
