@@ -71,3 +71,36 @@ Shaders that cannot be translated yet make their pipeline a placeholder (its wor
   a fixed frame and compares the images.
 - `src/gpucode` builds natively (`cmake -S src/gpucode -B build-native`); `xsl-gpucode` disassembles
   containers, prints metadata and translates.
+
+## Ray tracing, step R1: design
+
+Console ray tracing is shader code: traversal walks a 4-wide BVH with raw global loads and
+`image_bvh*_intersect_ray`, and a DXR pipeline is one compute program (scheduler, state
+functions, per-ray stacks). R1 translates that code as it is. It needs, in order:
+
+1. **Global memory.** Translated shaders read arbitrary title GPU addresses. Host facts measured on
+   the test PC (Windows 10 21H2, RTX 5090): shader model 6.5 at most (no `ResourceDescriptorHeap`
+   without the Agility SDK) and shader-visible heaps of at most 1,000,000 entries, all of them
+   assigned to title heaps. The title writes only the start of its later heaps (highest slots
+   written per 125k band: full, full, full, full, 505,288, none, 750,023, none), so the layer can
+   reserve a range at the end of the global heap and stop with an error if the title ever writes
+   into it.
+   - Every buffer the title can address gets a raw SRV in that range: committed buffers (title
+     address = PC address) and imported unified memory (title address = CPU address).
+   - A sorted table {start, size, view index} lives in the range's first slot.
+   - Root signatures get one appended descriptor table (SRVs in reserved register spaces); the
+     layer binds it before draws and dispatches of pipelines whose shaders use global memory. Title
+     root parameter indices are unchanged.
+   - Global loads become a binary search in the table plus `ByteAddressBuffer.Load`; misses
+     return 0.
+2. **`image_bvh*_intersect_ray` in HLSL** over that memory (node id = address >> 3 | type;
+   box16/box32 children sorted by entry distance, misses 0xFFFFFFFF; triangle results t/|det|,
+   sign(det), v/|det|, w/|det|; descriptor base address bits 39:0 in 256-byte units), checked with
+   hand-assembled ISA tests.
+3. **Acceleration structures in the console format:** title builds (the console runtime's
+   builder is part of D3D12.X, so the layer must provide one) and deserialized offline structures
+   (`xg_xs.dll`'s BVH computer: DeserializeBVH / DecompressBVH).
+4. **Ray-tracing pipelines:** `DeserializeStateObjectX` blobs carry the compiled program; translate it
+   as a compute shader and run `DispatchRays` as a dispatch with the shader tables in global memory.
+
+Until then ray queries are translated as misses and ray dispatches are skipped (step R0).
