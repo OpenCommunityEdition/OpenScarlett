@@ -286,6 +286,9 @@ struct Translator {
     // Descriptor loads from one table at different constant offsets that meet at a join (a shader
     // picking one of several descriptors by branch): the loads of a group write their offset into
     // the representative's dyn variable, and the use indexes the table range with it.
+    std::set<size_t> gm_sloads;            // s_load from run-time pointers: read through global memory
+    std::set<size_t> dyn_mubuf;            // raw buffer dword accesses whose descriptor is known only at run time
+    bool soft_trace = false;
     std::map<size_t, size_t> dyn_alias;    // load -> representative load
     std::set<size_t> merged_reps;
     std::map<size_t, std::pair<uint32_t, uint32_t>> merged_span;   // representative -> lowest, highest slot byte offset
@@ -809,6 +812,7 @@ struct Translator {
                 return add_res(r);
             }
         }
+        if (soft_trace) return -1;   // the caller has a run-time path (descriptor words read from SGPRs)
         fail(fmt("%s at 0x%x: cannot trace descriptor s[%u:%u] (kinds %d %d)", in.name, in.offset, s, s + n - 1, int(w0.k), int(w1.k)));
         return -1;
     }
@@ -821,7 +825,13 @@ struct Translator {
             for (int r = 0; r < 24; r++) fprintf(stderr, "s%d: k%d a%u b%u c%u d%u\n", r, int(st[r].k), st[r].a, st[r].b, st[r].c, st[r].d);
         std::string n = in.name;
         if (in.fmt == Fmt::MUBUF || in.fmt == Fmt::MTBUF) {
+            // Raw dword loads/stores may take a descriptor that only exists at run time (loaded from
+            // memory): with global memory they address memory from the descriptor words directly.
+            bool rawDw = in.fmt == Fmt::MUBUF && (starts(n, "buffer_load_dword") || starts(n, "buffer_store_dword")) && !in.lds;
+            soft_trace = rawDw && (opt.global_memory || opt.global_memory_test);
             int r = resource(st, in.srsrc, 4, in, false);
+            soft_trace = false;
+            if (r < 0 && rawDw && (opt.global_memory || opt.global_memory_test)) dyn_mubuf.insert(i);
             res_of[i] = r;
             if (r >= 0 && has(n, "_atomic_") && res[r].kind == ResKind::TypedBuf) { res[r].scalar = true; res[r].is_uint = true; }
         }
@@ -846,6 +856,9 @@ struct Translator {
             AV base = st[in.sbase];
             std::vector<std::string> v;
             for (unsigned k = 0; k < cnt; k++) v.push_back("0u");
+            // A pointer computed at run time (not a table, root argument or code address): the
+            // dwords come from memory through the layer's address table.
+            if ((base.k == AV::Top || base.k == AV::Undef) && (opt.global_memory || opt.global_memory_test)) gm_sloads.insert(i);
             if (cnt == 8) {   // an image descriptor: its size fields come from the bound texture
                 SState t = st;
                 step(t, in);
@@ -1402,6 +1415,15 @@ bool Translator::emit_smem(const Instr& in, size_t idx) {
         if (dyn_loads.count(dk)) {
             std::string so = in.soffset == src::kNull ? std::string("0u") : rd(in.soffset, in);
             line(fmt("dyn%zu = %s + %uu + %s;", dk, S(in.sbase).c_str(), uint32_t(in.offset_imm), so.c_str()));
+        }
+        if (gm_sloads.count(idx)) {
+            uses_gm = true;
+            std::string so = in.soffset == src::kNull ? std::string("0u") : rd(in.soffset, in);
+            line(fmt("{ uint lo_ = (%s & ~3u) + %uu + %s, hi_ = %s + (lo_ < %s ? 1u : 0u);", S(in.sbase).c_str(), uint32_t(in.offset_imm), so.c_str(),
+                     S(in.sbase + 1).c_str(), S(in.sbase).c_str()));
+            for (unsigned k = 0; k < cnt; k++) line(fmt("  %s = gm_load(lo_ + %uu, hi_ + (lo_ + %uu < lo_ ? 1u : 0u));", S(in.sdata + k).c_str(), 4 * k, 4 * k));
+            line("}");
+            return true;
         }
         auto it = sval.find(idx);
         for (unsigned k = 0; k < cnt; k++) write_s(in.sdata + k, it != sval.end() ? it->second[k] : std::string("0u"));
@@ -2057,6 +2079,26 @@ bool Translator::emit_tbuffer_raw(const Instr& in, const Res& R, const std::stri
 bool Translator::emit_mubuf(const Instr& in, size_t idx) {
     std::string n = in.name;
     int r = res_of.count(idx) ? res_of[idx] : -1;
+    if (r < 0 && dyn_mubuf.count(idx)) {
+        // Descriptor words in SGPRs: base [47:0], stride [61:48]; global memory at that address.
+        uses_gm = true;
+        unsigned cnt = ends(n, "x4") ? 4 : ends(n, "x3") ? 3 : ends(n, "x2") ? 2 : 1;
+        unsigned va = in.vaddr;
+        std::string vidx = in.idxen ? V(va) : "0u";
+        std::string voff = in.offen ? V(in.idxen ? va + 1 : va) : "0u";
+        std::string so = rd(in.soffset, in);
+        const std::string d0 = S(in.srsrc), d1 = S(in.srsrc + 1);
+        line(fmt("if (kexec) { uint off_ = %s + %s + %uu + %s * ((%s >> 16) & 0x3fffu);", voff.c_str(), so.c_str(), uint32_t(in.offset_imm), vidx.c_str(), d1.c_str()));
+        line(fmt("  uint lo_ = %s + off_, hi_ = (%s & 0xffffu) + (lo_ < %s ? 1u : 0u);", d0.c_str(), d1.c_str(), d0.c_str()));
+        bool store = has(n, "_store_");
+        for (unsigned k = 0; k < cnt; k++) {
+            std::string a = fmt("lo_ + %uu, hi_ + (lo_ + %uu < lo_ ? 1u : 0u)", 4 * k, 4 * k);
+            if (store) line(fmt("  gm_store(%s, %s);", a.c_str(), V(in.vdata + k).c_str()));
+            else line(fmt("  %s = gm_load(%s);", V(in.vdata + k).c_str(), a.c_str()));
+        }
+        line("}");
+        return true;
+    }
     if (r < 0) return false;
     Res& R = res[r];
     const std::string RN = rn(idx, r);
