@@ -907,6 +907,9 @@ std::map<uint64_t, PcObj> g_uav_res;      // CPU descriptor handle -> resource o
 std::map<PcObj, std::map<uint32_t, uint64_t>> g_cs_tables;   // list -> compute root table GPU handles
 std::map<PcObj, std::map<uint32_t, uint64_t>> g_gfx_tables;  // list -> graphics root table GPU handles
 std::map<uint64_t, PcObj> g_srv_res;                          // CPU descriptor handle -> resource of the SRV there
+std::map<uint64_t, uint64_t> g_cbv_va;                        // CPU descriptor handle -> CBV address
+std::map<uint64_t, std::pair<uint64_t, uint8_t*>> g_mapped;   // buffer GPU VA -> (size, CPU pointer)
+std::vector<uint64_t> g_traced_cbvs;                          // CBVs of the traced pipeline (dumped again at present)
 static void note_reads(PcObj l, bool compute);
 std::map<PcObj, std::pair<PcObj, uint64_t>> g_cs_writer;      // big texture -> (compute pipeline, present)
 static void note_dispatch(PcObj l);
@@ -956,6 +959,12 @@ void create_uav(PcObj dev, PcObj res, PcObj counter, const void* desc, uint64_t 
     as<ID3D12Device>(dev)->CreateUnorderedAccessView(as<ID3D12Resource>(res), as<ID3D12Resource>(counter), view_fix(res, desc, t), cpu(h));
 }
 void create_cbv(PcObj dev, const void* desc, uint64_t h) {
+    if (trace_writers() && desc) {
+        std::lock_guard<std::mutex> g(g_wr_mu);
+        g_cbv_va[h] = static_cast<const D3D12_CONSTANT_BUFFER_VIEW_DESC*>(desc)->BufferLocation;
+        g_srv_res.erase(h);
+        g_uav_res.erase(h);
+    }
     // Console constant-buffer views come in 16-byte steps (D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_
     // ALIGNMENT is 16 there); PC D3D12 requires sizes in multiples of 256, so the size is rounded
     // up (a larger window onto the same constants). Addresses must also be 256-aligned on PC;
@@ -991,6 +1000,9 @@ void copy_descriptors_simple(PcObj dev, uint32_t n, uint64_t dst, uint64_t src, 
             auto it = g_uav_res.find(src + (uint64_t)k * inc);
             if (it != g_uav_res.end()) g_uav_res[dst + (uint64_t)k * inc] = it->second;
             else g_uav_res.erase(dst + (uint64_t)k * inc);
+            auto ct = g_cbv_va.find(src + (uint64_t)k * inc);
+            if (ct != g_cbv_va.end()) g_cbv_va[dst + (uint64_t)k * inc] = ct->second;
+            else g_cbv_va.erase(dst + (uint64_t)k * inc);
             auto jt = g_srv_res.find(src + (uint64_t)k * inc);
             if (jt != g_srv_res.end()) g_srv_res[dst + (uint64_t)k * inc] = jt->second;
             else g_srv_res.erase(dst + (uint64_t)k * inc);
@@ -1049,6 +1061,10 @@ void drop_map_shadow(PcObj o) {
 HRESULT_T res_map(PcObj r, uint32_t sub, const void* range, void** out) {
     auto* res = as<ID3D12Resource>(r);
     HRESULT hr = res->Map(sub, static_cast<const D3D12_RANGE*>(range), out);
+    if (SUCCEEDED(hr) && out && *out && trace_writers() && res->GetDesc().Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
+        std::lock_guard<std::mutex> g(g_wr_mu);
+        g_mapped[res->GetGPUVirtualAddress()] = {res->GetDesc().Width, (uint8_t*)*out};
+    }
     if (SUCCEEDED(hr) || !out) return hr;
     D3D12_RESOURCE_DESC d = res->GetDesc();
     if (d.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) return logged(hr, "Map");
@@ -1456,6 +1472,17 @@ static void note_reads(PcObj l, bool compute) {
                     if (h < gpu0 || h >= gpu0 + (uint64_t)g_gv_size * g_gv_inc) continue;
                     uint64_t c = cpu0 + (h - gpu0);
                     for (uint32_t k = 0; k < 16; k++) {
+                        if (auto cb = g_cbv_va.find(c + (uint64_t)k * g_gv_inc); cb != g_cbv_va.end()) {
+                            const float* f = nullptr;
+                            auto m = g_mapped.upper_bound(cb->second);
+                            if (m != g_mapped.begin() && (--m, cb->second < m->first + m->second.first)) f = (const float*)(m->second.second + (cb->second - m->first));
+                            g_traced_cbvs.push_back(cb->second);
+                            if (f)
+                                XSL_INFO(CH, "pso %s table %u slot %u: CBV %llx: %g %g %g %g | %g %g %g %g | %g %g %g %g | %g %g %g %g", nm, idx, k,
+                                         (unsigned long long)cb->second, f[0], f[1], f[2], f[3], f[4], f[5], f[6], f[7], f[8], f[9], f[10], f[11], f[12], f[13], f[14], f[15]);
+                            else XSL_INFO(CH, "pso %s table %u slot %u: CBV %llx (memory not mapped)", nm, idx, k, (unsigned long long)cb->second);
+                            continue;
+                        }
                         auto it = g_srv_res.find(c + (uint64_t)k * g_gv_inc);
                         auto ju = g_uav_res.find(c + (uint64_t)k * g_gv_inc);
                         PcObj r = it != g_srv_res.end() ? it->second : ju != g_uav_res.end() ? ju->second : nullptr;
@@ -2176,6 +2203,16 @@ HRESULT_T present(PcObj devObj, PcObj queueObj, PcObj resObj, void* hwndPtr, uin
                 std::lock_guard<std::mutex> g(g_wr_mu);
                 for (auto& [r, f] : g_wr_frame)
                     if (f + 1 >= g_present_count) targets.push_back({r, g_wr_last[r].first});
+            }
+            {   // the traced pipeline's constants, after the submissions that refresh constant copies
+                std::lock_guard<std::mutex> g(g_wr_mu);
+                for (uint64_t va : g_traced_cbvs) {
+                    auto m = g_mapped.upper_bound(va);
+                    if (m == g_mapped.begin() || (--m, va >= m->first + m->second.first)) continue;
+                    const float* f = (const float*)(m->second.second + (va - m->first));
+                    XSL_INFO(CH, "at present: CBV %llx: %g %g %g %g | %g %g %g %g | %g %g %g %g | %g %g %g %g", (unsigned long long)va, f[0], f[1], f[2],
+                             f[3], f[4], f[5], f[6], f[7], f[8], f[9], f[10], f[11], f[12], f[13], f[14], f[15]);
+                }
             }
             std::vector<PcObj> big;
             { std::lock_guard<std::mutex> g(g_wr_mu); big = g_big_textures; }
