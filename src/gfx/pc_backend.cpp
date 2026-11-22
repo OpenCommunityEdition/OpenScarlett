@@ -985,11 +985,12 @@ static void print_dumps() {
     }
 }
 // presents (table rebuilds are limited to one per frame)
-// XSL_PROBE=<present> (diagnostics for hand-edited shaders): a 64 KiB CPU-readable buffer whose raw
-// UAV is in the last global-memory slot (HLSL: RWByteAddressBuffer GMU[8192] : register(u0, space900);
-// GMU[8191]). It is cleared two presents before that present and its first 256 dwords are logged
-// eight presents after.
+// XSL_PROBE=<present> (diagnostics for hand-edited shaders): a 64 KiB CPU-readable buffer registered
+// in the global-memory table at address 0x7F0000000000 (find it like gm_store does: binary search of
+// GMT, then GMU[index]). It is cleared two presents before that present (dword 15 = 0x5a5a5a5a as a
+// CPU-side marker) and its first 256 dwords are logged eight presents after.
 struct Probe { ID3D12Resource* res = nullptr; uint32_t* cpu = nullptr; bool placed = false; } g_probe;
+bool g_probe_register = false;   // registered in the address table at the next opportunity (outside g_gm_mu)
 static uint64_t probe_at() { static uint64_t v = [] { char b[16]; return GetEnvironmentVariableA("XSL_PROBE", b, sizeof b) ? _strtoui64(b, nullptr, 10) : 0ull; }(); return v; }
 static void probe_place(ID3D12Device* dev, D3D12_CPU_DESCRIPTOR_HANDLE h) {
     if (!probe_at() || g_probe.placed) return;
@@ -1014,12 +1015,13 @@ static void probe_place(ID3D12Device* dev, D3D12_CPU_DESCRIPTOR_HANDLE h) {
     uv.Buffer.NumElements = (64 << 10) / 4;
     uv.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
     dev->CreateUnorderedAccessView(g_probe.res, nullptr, &uv, h);
-    XSL_INFO(CH, "probe buffer in global-memory UAV slot 8191");
+    XSL_INFO(CH, "probe buffer in global-memory UAV slot 8191 and at global address 0x7F0000000000");
+    g_probe_register = true;
 }
 static void probe_present(uint64_t present) {
     uint64_t at = probe_at();
     if (!at || !g_probe.cpu) return;
-    if (present + 2 == at) memset(g_probe.cpu, 0, 64 << 10);
+    if (present + 2 == at) { memset(g_probe.cpu, 0, 64 << 10); g_probe.cpu[15] = 0x5a5a5a5au; }   // dword 15: CPU-side marker
     if (present == at + 8) {
         for (int r = 0; r < 32; r++) {
             const uint32_t* w = g_probe.cpu + r * 8;
@@ -1032,6 +1034,7 @@ void gm_flush(PcObj devObj) {
     {
         const uint32_t pb = gm_reserved_start();
         probe_place(as<ID3D12Device>(devObj), D3D12_CPU_DESCRIPTOR_HANDLE{g_gv->GetCPUDescriptorHandleForHeapStart().ptr + (uint64_t)(pb + kGmSlots - 1) * g_gv_inc});
+        if (g_probe_register) { g_probe_register = false; gm_register((PcObj)g_probe.res, 0x7F0000000000ull, 64 << 10, 0); }
     }
     std::lock_guard<std::mutex> g(g_gm_mu);
     if (!g_gm_dirty) return;
@@ -1190,8 +1193,13 @@ HRESULT_T create_root_signature(PcObj dev, const void* blob, size_t size, PcObj*
     if (owned) free_container(clean);
     if (FAILED(hr)) XSL_ERR(CH, "CreateRootSignature failed %08lx (blob %zu bytes)", hr, size);
     if (SUCCEEDED(hr) && extended) { std::lock_guard<std::mutex> g(g_gm_mu); g_rs_gm[*out] = gmIndex; }
+    if (SUCCEEDED(hr) && !extended && gm_enabled() && !noRs) {
+        static volatile long n = 0;
+        if (InterlockedIncrement(&n) <= 10) XSL_WARN(CH, "root signature (%zu bytes) without the global-memory table (no room, or the extended one was rejected)", size);
+    }
     return hr;
 }
+std::atomic<uint64_t> g_gm_bind_stats[4];   // bound, root signature without table, global heap not set, no heap yet
 static void gm_bind(PcObj l, PcObj rs, bool compute) {
     if (!gm_enabled() || !g_gv || !rs) return;
     uint32_t idx;
@@ -1200,11 +1208,12 @@ static void gm_bind(PcObj l, PcObj rs, bool compute) {
         auto& cur = g_list_gm_rs[l];
         (compute ? cur.second : cur.first) = rs;
         auto it = g_rs_gm.find(rs);
-        if (it == g_rs_gm.end()) return;
+        if (it == g_rs_gm.end()) { g_gm_bind_stats[1]++; return; }
         auto h = g_list_global_heap.find(l);
-        if (h == g_list_global_heap.end() || !h->second) return;   // bound once the global heap is set
+        if (h == g_list_global_heap.end() || !h->second) { g_gm_bind_stats[h == g_list_global_heap.end() ? 3 : 2]++; return; }   // bound once the global heap is set
         idx = it->second;
     }
+    g_gm_bind_stats[0]++;
     D3D12_GPU_DESCRIPTOR_HANDLE gh{g_gv->GetGPUDescriptorHandleForHeapStart().ptr + (uint64_t)gm_reserved_start() * g_gv_inc};
     auto* L2 = as<ID3D12GraphicsCommandList>(l);
     if (compute) L2->SetComputeRootDescriptorTable(idx, gh);
@@ -3841,6 +3850,10 @@ HRESULT_T present(PcObj devObj, PcObj queueObj, PcObj resObj, void* hwndPtr, uin
         }
         ++g_present_count;
         prof_slow_check(g_present_count);
+        if (gm_enabled() && g_present_count % 600 == 0)
+            XSL_INFO(CH, "global memory table: bound %llu, root signature without it %llu, other heap %llu, no heap yet %llu",
+                     (unsigned long long)g_gm_bind_stats[0].load(), (unsigned long long)g_gm_bind_stats[1].load(), (unsigned long long)g_gm_bind_stats[2].load(),
+                     (unsigned long long)g_gm_bind_stats[3].load());
         probe_present(g_present_count);
         prof_report(as<ID3D12CommandQueue>(q));
         ++g_gm_frame;
