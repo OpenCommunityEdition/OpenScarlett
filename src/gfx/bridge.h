@@ -90,6 +90,9 @@ void list_rt_deserialize(PcObj l, uint64_t dst, uint64_t src);   // console stru
 // Top-level build in the console layout (into the destination's shadow); false: not built.
 bool list_rt_build_tlas(PcObj l, uint64_t dst, uint64_t instances, uint32_t count, uint32_t layout, uint64_t scratch);
 uint64_t tlas_console_size(uint32_t instances);
+// A CPU-mapped GPU buffer registered in global memory at 0xF0000000 + offset (below 4 GB, for
+// pointers translated code keeps in 32 bits); returns the mapping or nullptr.
+void* gm_low_buffer(PcObj dev, uint64_t offset, uint64_t bytes, uint64_t* address);
 uint64_t tlas_scratch_size(uint32_t instances);
 // Bottom-level triangle build in the console layout (into the destination's shadow); false: not built.
 struct BlasGeometry { uint64_t vb, ib, transform; uint32_t vbStride, vbFormat, ibFormat, triangles, flags; };

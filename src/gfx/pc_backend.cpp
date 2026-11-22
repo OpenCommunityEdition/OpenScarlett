@@ -533,8 +533,15 @@ bool gm_enabled() { static bool on = [] { char b[4]; return !(GetEnvironmentVari
 }  // namespace
 bool gm_active() { return gm_enabled() && !getenv("XSL_GM_NO_RS"); }
 uint32_t gm_reserved_start() { return gm_enabled() && g_gv_size > kGmSlots ? g_gv_size - kGmSlots : UINT32_MAX; }
+// Layer memory at fixed low addresses (translated ray-tracing code holds some pointers in 32 bits):
+// 0xF0000000 upward. A title buffer registered in that range would be ambiguous: warned.
+constexpr uint64_t kLowBase = 0xF0000000ull, kLowEnd = 0x100000000ull;
 void gm_register(PcObj res, uint64_t titleVa, uint64_t size, uint64_t resOff) {
     if (!gm_enabled() || !res || !size) return;
+    if (titleVa < kLowEnd && titleVa + size > kLowBase && titleVa < kLowBase) {
+        static volatile long w = 0;
+        if (InterlockedIncrement(&w) <= 3) XSL_WARN(CH, "buffer at %llx overlaps the layer's low global-memory range", (unsigned long long)titleVa);
+    }
     D3D12_HEAP_PROPERTIES hp{};
     D3D12_HEAP_FLAGS hf{};
     if (SUCCEEDED(as<ID3D12Resource>(res)->GetHeapProperties(&hp, &hf)) &&
@@ -1276,6 +1283,26 @@ static void print_dumps() {
     }
 }
 // presents (table rebuilds are limited to one per frame)
+// A CPU-mapped GPU buffer of `bytes` registered in global memory at a fixed low address (kLowBase +
+// `offset`): returns the mapping, or nullptr.
+void* gm_low_buffer(PcObj devObj, uint64_t offset, uint64_t bytes, uint64_t* address) {
+    if (!gm_enabled() || kLowBase + offset + bytes > kLowEnd) return nullptr;
+    auto* dev = as<ID3D12Device>(devObj);
+    D3D12_HEAP_PROPERTIES hp{D3D12_HEAP_TYPE_CUSTOM, D3D12_CPU_PAGE_PROPERTY_WRITE_BACK, D3D12_MEMORY_POOL_L0};
+    D3D12_RESOURCE_DESC bd{};
+    bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    bd.Width = bytes;
+    bd.Height = bd.DepthOrArraySize = bd.MipLevels = 1;
+    bd.SampleDesc.Count = 1;
+    bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    ID3D12Resource* r = nullptr;
+    if (FAILED(dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&r)))) return nullptr;
+    void* m = nullptr;
+    if (FAILED(r->Map(0, nullptr, &m))) { r->Release(); return nullptr; }
+    gm_register((PcObj)r, kLowBase + offset, bytes, 0);
+    if (address) *address = kLowBase + offset;
+    return m;
+}
 // XSL_PROBE=<present> (diagnostics for hand-edited shaders): a 64 KiB CPU-readable buffer registered
 // in the global-memory table at address 0x7F0000000000 (find it like gm_store does: binary search of
 // GMT, then GMU[index]). It is cleared two presents before that present (dword 15 = 0x5a5a5a5a as a

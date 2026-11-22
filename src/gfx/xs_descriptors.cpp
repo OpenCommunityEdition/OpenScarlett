@@ -20,6 +20,7 @@
 //   tags by copying their record, Xbox buffer descriptors by decoding them into a PC CBV.
 // - RTV/DSV handles, and the CPU handle of UAV clears, are translated through their tags when used.
 #include <cstring>
+#include <algorithm>
 #include <mutex>
 #include <vector>
 
@@ -95,6 +96,8 @@ bool enabled() {
     return on;
 }
 
+uint8_t* g_viewGpu = nullptr;   // GPU-readable copy of g_view (global memory at g_viewGpuAddr)
+uint64_t g_viewGpuAddr = 0;
 bool ensure(Device* dev) {
     if (g_ready) return true;
     PcObj pcdev = dev_extra(dev)->pcDevice;
@@ -118,6 +121,10 @@ bool ensure(Device* dev) {
         !g_rec[D3D12_DESCRIPTOR_HEAP_TYPE_RTV].init(pcdev, D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1u << 14) ||
         !g_rec[D3D12_DESCRIPTOR_HEAP_TYPE_DSV].init(pcdev, D3D12_DESCRIPTOR_HEAP_TYPE_DSV, 1u << 12))
         return false;
+    // GPU-readable copy of the view slots (translated ray-tracing code reads descriptor memory):
+    // at 0xF0000000 in global memory, refreshed from written pages at each submission.
+    g_viewGpu = (uint8_t*)pc::gm_low_buffer(pcdev, 0, bytes, &g_viewGpuAddr);
+    if (g_viewGpu) memcpy(g_viewGpu, g_view, bytes);
     XSL_INFO(CH, "descriptor memory in console layout (32/112/128-byte slots), synced to PC descriptors at submission");
     g_ready = true;
     return true;
@@ -213,6 +220,11 @@ uint64_t desc_view_cpu_start(Device* dev, uint32_t offset) {
     return (uint64_t)g_view + (uint64_t)offset * kViewSlot;
 }
 uint64_t desc_view_gpu_start(uint32_t offset) { return g_pcGpu + (uint64_t)offset * kViewSlot; }
+// Global-memory address of the descriptor memory at console GPU handle h (0 if none).
+uint64_t desc_memory_address(uint64_t h) {
+    if (!g_viewGpu || h < g_pcGpu || h >= g_pcGpu + (uint64_t)g_viewCount * kViewSlot) return 0;
+    return g_viewGpuAddr + (h - g_pcGpu);
+}
 uint64_t desc_rtv_dsv_heap(Device* dev, D3D12_DESCRIPTOR_HEAP_TYPE type, uint32_t count) {
     std::lock_guard<std::mutex> g(g_mu);
     if (!enabled() || !ensure(dev)) return 0;
@@ -353,6 +365,7 @@ void desc_sync() {
         if (last > g_viewCount) last = g_viewCount;
         for (uint32_t i = first; i < last; i++)
             if (memcmp(g_view + (size_t)i * kViewSlot, &g_snapshot[(size_t)i * kViewSlot], kViewSlot) != 0) materialize(i);
+        if (g_viewGpu) memcpy(g_viewGpu + off, g_view + off, std::min<size_t>(gran, bytes - off));
     }
 }
 

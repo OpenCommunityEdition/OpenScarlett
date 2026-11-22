@@ -200,6 +200,7 @@ void desc_commit(uint64_t h, D3D12_DESCRIPTOR_HEAP_TYPE type, const DescTag& tag
 // format), acceleration structures their address, textures {heap index, kDescTexture | kind}.
 constexpr uint32_t kDescTexture = 0x80000000u;   // payload dword 1 flag: dword 0 is the slot's heap index
 void desc_set_payload(const uint32_t words[4]);
+uint64_t desc_memory_address(uint64_t gpuHandle);   // global-memory address of descriptor memory (0: none)
 bool desc_copy(uint32_t n, uint64_t dst, uint64_t src, D3D12_DESCRIPTOR_HEAP_TYPE type);
 uint64_t desc_pc_cpu(uint64_t h, D3D12_DESCRIPTOR_HEAP_TYPE type);
 void desc_publish(uint64_t h);   // after writing a PC descriptor to desc_pc_cpu(h) of a view slot
