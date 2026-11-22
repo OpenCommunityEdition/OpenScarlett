@@ -792,6 +792,37 @@ void main(uint t : SV_GroupIndex) {
   }
 }
 )";
+// Scratch for the console-layout builders: a layer-owned ring registered in the global-memory table
+// at 0x7E0000000000 (titles' scratch can be transient memory the table does not know yet).
+constexpr uint64_t kRtScratchVa = 0x7E0000000000ull, kRtScratchSize = 64ull << 20;
+struct RtScratch { ID3D12Resource* res = nullptr; uint64_t head = 0; std::mutex mu; } g_rt_scratch;
+static uint64_t rt_scratch(uint64_t bytes) {   // address of a slice of at least `bytes`, 0 when it cannot be had
+    bytes = (bytes + 255) & ~255ull;
+    if (bytes > kRtScratchSize || !g_main_device) return 0;
+    bool fresh = false;
+    uint64_t at;
+    {
+        std::lock_guard<std::mutex> g(g_rt_scratch.mu);
+        if (!g_rt_scratch.res) {
+            D3D12_HEAP_PROPERTIES hp{D3D12_HEAP_TYPE_DEFAULT};
+            D3D12_RESOURCE_DESC bd{};
+            bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+            bd.Width = kRtScratchSize;
+            bd.Height = bd.DepthOrArraySize = bd.MipLevels = 1;
+            bd.SampleDesc.Count = 1;
+            bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+            bd.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+            if (FAILED(g_main_device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&g_rt_scratch.res))))
+                return 0;
+            fresh = true;
+        }
+        if (g_rt_scratch.head + bytes > kRtScratchSize) g_rt_scratch.head = 0;
+        at = g_rt_scratch.head;
+        g_rt_scratch.head += bytes;
+    }
+    if (fresh) gm_register((PcObj)g_rt_scratch.res, kRtScratchVa, kRtScratchSize, 0);
+    return kRtScratchVa + at;
+}
 struct AsDump { ID3D12Resource* rb; uint64_t va; uint64_t frame; };
 std::vector<AsDump> g_as_dumps;   // XSL_AS_DUMP / XSL_TLAS_DUMP readbacks
 bool compile_layer_shader(const std::string& hlsl, const char* profile, std::vector<uint8_t>& out, std::string& log);
@@ -857,11 +888,16 @@ bool list_rt_build_tlas(PcObj l, uint64_t dst, uint64_t inst, uint32_t n, uint32
     PcObj dr, sr; uint64_t doff, davail, soff, savail;
     uint64_t boxes = (tlas_console_size(n) - 64 - (uint64_t)n * 128) / 128;
     uint64_t instOff = 64 + boxes * 128;
+    if (uint64_t own = rt_scratch((uint64_t)n * 32 + boxes * 32)) scratch = own;
+    { std::lock_guard<std::mutex> g(g_gm_mu); if (!gm_in_table(scratch, 32)) { g_gm_force = true; g_gm_dirty = true; } }
     if (!gm_resolve(dst, &dr, &doff, &davail) || davail < tlas_console_size(n) || !gm_resolve(scratch, &sr, &soff, &savail) ||
         savail < (uint64_t)n * 32 + boxes * 32) {
         static volatile long w = 0;
         if (InterlockedIncrement(&w) <= 5)
-            XSL_WARN(CH, "TLAS build (%u instances) at %llx: destination or scratch too small or not addressable", n, (unsigned long long)dst);
+            XSL_WARN(CH, "TLAS build (%u instances) at %llx: destination %s (%llu of %llu bytes), scratch %llx %s (%llu of %llu bytes)", n, (unsigned long long)dst,
+                     gm_resolve(dst, &dr, &doff, &davail) ? "ok" : "NOT addressable", (unsigned long long)davail, (unsigned long long)tlas_console_size(n),
+                     (unsigned long long)scratch, gm_resolve(scratch, &sr, &soff, &savail) ? "ok" : "NOT addressable", (unsigned long long)savail,
+                     (unsigned long long)((uint64_t)n * 32 + boxes * 32));
         return false;
     }
     if (!tlas_init(g_main_device)) return false;
@@ -1104,6 +1140,8 @@ bool list_rt_build_blas(PcObj l, uint64_t dst, uint64_t scratch, uint32_t ngeo, 
     if (total >= (1u << 26)) return false;
     uint64_t boxes = blas_boxes(total);
     uint32_t leafOff = (uint32_t)(64 + boxes * 128);
+    if (uint64_t own = rt_scratch((total + boxes) * 32)) scratch = own;
+    { std::lock_guard<std::mutex> g(g_gm_mu); if (!gm_in_table(scratch, 32)) { g_gm_force = true; g_gm_dirty = true; } }
     PcObj dr, sr; uint64_t doff, davail, soff, savail;
     {   // memory made this frame may not be in the GPU table yet
         std::lock_guard<std::mutex> g(g_gm_mu);
@@ -1115,7 +1153,10 @@ bool list_rt_build_blas(PcObj l, uint64_t dst, uint64_t scratch, uint32_t ngeo, 
         savail < (total + boxes) * 32) {
         static volatile long w = 0;
         if (InterlockedIncrement(&w) <= 5)
-            XSL_WARN(CH, "BLAS build (%llu triangles) at %llx: destination or scratch too small or not addressable", (unsigned long long)total, (unsigned long long)dst);
+            XSL_WARN(CH, "BLAS build (%llu triangles) at %llx: destination %s (%llu of %llu bytes), scratch %llx %s (%llu of %llu bytes)", (unsigned long long)total,
+                     (unsigned long long)dst, gm_resolve(dst, &dr, &doff, &davail) ? "ok" : "NOT addressable", (unsigned long long)davail,
+                     (unsigned long long)blas_console_size(total), (unsigned long long)scratch, gm_resolve(scratch, &sr, &soff, &savail) ? "ok" : "NOT addressable",
+                     (unsigned long long)savail, (unsigned long long)((total + boxes) * 32));
         return false;
     }
     if (!blas_init(g_main_device)) return false;
