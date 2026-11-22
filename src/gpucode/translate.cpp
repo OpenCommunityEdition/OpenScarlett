@@ -69,6 +69,7 @@ struct Res {
     uint32_t root_hi_or = 0;            // root descriptors: bits the shader ORed into word 1
     uint32_t addr_off = 0;              // root descriptors: bytes the shader added to the address
     int dim = -1;                       // images: MIMG dim
+    bool need_desc = false;             // images: descriptor words are read as data (desc_<name>())
     bool cube_array = false;
     bool dyn = false;                   // array indexed at run time
     int alias = -1;                     // static access to an element of resource array `alias`
@@ -192,7 +193,7 @@ struct Translator {
                 if (w == "posx") init = "asuint(I.pos_.x)";
                 else if (w == "posy") init = "asuint(I.pos_.y)";
                 else if (w == "posz") init = "asuint(I.pos_.z)";
-                else if (w == "posw") init = "asuint(I.pos_.w)";
+                else if (w == "posw") init = "asuint(1.0f / I.pos_.w)";   // the hardware supplies 1/w (D3D SV_Position.w is w)
                 else if (w == "face") init = "(I.face_ ? 0x3f800000u : 0xbf800000u)";
                 else if (w == "ancillary") {   // [11:8] sample index, [28:16] render-target array index
                     init = "((I.sid_ & 15u) << 8)";
@@ -779,6 +780,17 @@ struct Translator {
             AV base = st[in.sbase];
             std::vector<std::string> v;
             for (unsigned k = 0; k < cnt; k++) v.push_back("0u");
+            if (cnt == 8) {   // an image descriptor: its size fields come from the bound texture
+                SState t = st;
+                step(t, in);
+                if (t[in.sdata].k == AV::Desc) {
+                    int r = resource(t, in.sdata, 8, in, false);
+                    if (r >= 0 && res[r].kind == ResKind::Image && !res[r].dyn) {
+                        res[r].need_desc = true;
+                        for (unsigned k = 1; k <= 4; k++) v[k] = fmt("desc_%s()[%u]", res[r].name.c_str(), k - 1);
+                    }
+                }
+            }
             if (base.k == AV::Pc) {
                 AV so = in.soffset == src::kNull ? AV::cst(0) : sval_of(st, in.soffset);
                 for (unsigned k = 0; k < cnt; k++) v[k] = fmt("0x%xu", code_dword(base.b + in.offset_imm + so.a + 4 * k));
@@ -1139,6 +1151,8 @@ bool Translator::emit_salu(const Instr& in, size_t idx) {
         if (n == "s_brev_b32") { write_s(d, "reversebits(" + a() + ")"); return true; }
         if (n == "s_bcnt1_i32_b32") { line(fmt("%s = countbits(%s); scc = %s != 0u;", S(d).c_str(), a().c_str(), S(d).c_str())); return true; }
         if (n == "s_bcnt1_i32_b64") { line(fmt("%s = countbits(%s) + countbits(%s); scc = %s != 0u;", S(d).c_str(), a().c_str(), rd_hi(in.src0, in).c_str(), S(d).c_str())); return true; }
+        if (n == "s_bcnt0_i32_b64") { line(fmt("%s = 64u - countbits(%s) - countbits(%s); scc = %s != 0u;", S(d).c_str(), a().c_str(), rd_hi(in.src0, in).c_str(), S(d).c_str())); return true; }
+        if (n == "s_ff0_i32_b64") { write_s(d, fmt("ff1_64(~%s, ~%s)", a().c_str(), rd_hi(in.src0, in).c_str())); return true; }
         if (n == "s_bcnt0_i32_b32") { line(fmt("%s = 32u - countbits(%s); scc = %s != 0u;", S(d).c_str(), a().c_str(), S(d).c_str())); return true; }
         if (n == "s_ff1_i32_b32") { write_s(d, fmt("(%s == 0u ? 0xffffffffu : firstbitlow(%s))", a().c_str(), a().c_str())); return true; }
         if (n == "s_ff1_i32_b64") { write_s(d, fmt("ff1_64(%s, %s)", a().c_str(), rd_hi(in.src0, in).c_str())); return true; }
@@ -2115,6 +2129,27 @@ bool Translator::emit_mimg(const Instr& in, size_t idx) {
     if (R.dim < 0) R.dim = in.dim;
     else if (R.dim != in.dim && !(R.dim == 3 && in.dim == 5) && !(R.dim == 5 && in.dim == 3))
         return fail(fmt("%s at 0x%x: image used with two dimensions", in.name, in.offset));
+    if (n == "image_get_resinfo") {
+        // x = width, y = height (array slices for 1D arrays), z = depth or slices, w = mip levels,
+        // all at the mip level in vaddr; written to consecutive VGPRs for the dmask bits.
+        if (in.dim == 6 || in.dim == 7) return fail(n + " on a multisampled image not supported");
+        std::string mip = V(in.vaddr);
+        line("if (kexec) { uint w_ = 1u, h_ = 1u, d_ = 1u, l_ = 1u;");
+        bool rw = R.uav;
+        switch (in.dim) {
+        case 0: line(rw ? fmt("  %s.GetDimensions(w_);", RN.c_str()) : fmt("  %s.GetDimensions(%s, w_, l_);", RN.c_str(), mip.c_str())); break;
+        case 1: case 3: line(rw ? fmt("  %s.GetDimensions(w_, h_);", RN.c_str()) : fmt("  %s.GetDimensions(%s, w_, h_, l_);", RN.c_str(), mip.c_str())); break;
+        case 2: case 5: line(rw ? fmt("  %s.GetDimensions(w_, h_, d_);", RN.c_str()) : fmt("  %s.GetDimensions(%s, w_, h_, d_, l_);", RN.c_str(), mip.c_str())); break;
+        case 4: line(rw ? fmt("  %s.GetDimensions(w_, h_);", RN.c_str()) : fmt("  %s.GetDimensions(%s, w_, h_, l_);", RN.c_str(), mip.c_str())); break;
+        default: break;
+        }
+        const char* val[4] = {"w_", "h_", "d_", "l_"};
+        unsigned o = 0;
+        for (unsigned c = 0; c < 4; c++)
+            if (in.dmask >> c & 1) line(fmt("  %s = %s;", V(in.vdata + o++).c_str(), val[c]));
+        line("}");
+        return true;
+    }
     // Address registers. With A16, coordinates (with LOD and clamp) and each derivative group are
     // 16-bit values packed two per register; offsets, bias and depth reference keep a register each.
     std::vector<std::string> ad;
@@ -2306,7 +2341,6 @@ bool Translator::emit_mimg(const Instr& in, size_t idx) {
         }
         return fail(n + " not supported");
     }
-    if (n == "image_get_resinfo") return fail("image_get_resinfo not supported yet");
     return fail(fmt("%s at 0x%x not supported", in.name, in.offset));
 }
 
@@ -2880,6 +2914,19 @@ std::string Translator::generate() {
     if (dual) h << "#define XL_N 32u   // wave64 on wave32: cross-lane reads stay within a 32-lane half\n";
     for (auto& r : res)
         if (r.kind != ResKind::Counter && r.alias < 0) h << res_decl(r) << "\n";
+    // Image descriptor words 1..4 (GFX10 T#) rebuilt from the bound texture for code that reads them:
+    // width-1 [1]31:30 + [2]13:0, height-1 [2]29:14, base level [3]15:12, last level [3]19:16,
+    // type [3]31:28, depth or last slice [4]12:0.
+    for (auto& r : res) {
+        if (!r.need_desc || r.alias >= 0) continue;
+        int dim = r.dim < 0 ? 1 : r.dim;
+        static const unsigned type[8] = {8, 9, 10, 11, 12, 13, 14, 15};
+        h << "uint4 desc_" << r.name << "() {\n  uint w = 1u, h = 1u, d = 1u, l = 1u;\n";
+        if (r.uav) h << (dim == 0 ? "  " + r.name + ".GetDimensions(w);\n" : dim == 2 || dim == 5 || dim == 3 ? "  " + r.name + ".GetDimensions(w, h, d);\n" : "  " + r.name + ".GetDimensions(w, h);\n");
+        else h << (dim == 0 ? "  " + r.name + ".GetDimensions(0u, w, l);\n" : dim == 2 || dim == 5 ? "  " + r.name + ".GetDimensions(0u, w, h, d, l);\n" : dim == 3 && r.cube_array ? "  " + r.name + ".GetDimensions(0u, w, h, d, l);\n" : "  " + r.name + ".GetDimensions(0u, w, h, l);\n");
+        if (dim == 4) h << "  d = h; h = 1u;\n";
+        h << fmt("  return uint4(((w - 1u) & 3u) << 30, ((w - 1u) >> 2) | ((h - 1u) << 14), ((l - 1u) << 16) | (%uu << 28), (d - 1u) & 0x1fffu);\n}\n", type[dim]);
+    }
     // Root constants passed in user SGPRs.
     for (auto& a : meta.args) {
         if (a.kind != 0 || a.param >= rs.params.size()) continue;
@@ -2890,6 +2937,18 @@ std::string Translator::generate() {
     if (uses_lds) {
         unsigned limit = c.kind == ProgramKind::MS ? 28672 : 32768;   // PC group-shared limits
         unsigned bytes = meta.lds_bytes() ? meta.lds_bytes() : c.kind == ProgramKind::MS && ms_lds ? std::min(limit, (ms_lds + 1023) & ~1023u) : limit;
+        // Some code uses constant offsets past LDS_SIZE: cover the largest one (rounded to 1 KiB).
+        unsigned need = 0;
+        for (auto& in : ins)
+            if (in.fmt == Fmt::DS && in.name) {
+                std::string nm = in.name;
+                unsigned o0 = uint32_t(in.offset_imm), o1 = uint32_t(in.gds_offset1);
+                unsigned elem = has(nm, "b64") ? 8 : 4;
+                bool two = has(nm, "read2") || has(nm, "write2") || has(nm, "wrxchg2");
+                unsigned top = two ? std::max(o0, o1) * elem * (has(nm, "st64") ? 64 : 1) + elem : (o0 | o1 << 8) + 16;
+                need = std::max(need, top);
+            }
+        if (need > bytes && need <= limit) bytes = std::min(limit, (need + 1023) & ~1023u);
         if (bytes > limit) return fail(fmt("LDS size %u exceeds the PC group-shared limit", bytes)), "";
         h << "groupshared uint lds[" << bytes / 4 << "];\n";
     }
