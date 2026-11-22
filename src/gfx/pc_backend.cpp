@@ -646,8 +646,54 @@ static void print_dumps() {
     }
 }
 // presents (table rebuilds are limited to one per frame)
+// XSL_PROBE=<present> (diagnostics for hand-edited shaders): a 64 KiB CPU-readable buffer whose raw
+// UAV is in the last global-memory slot (HLSL: RWByteAddressBuffer GMU[8192] : register(u0, space900);
+// GMU[8191]). It is cleared two presents before that present and its first 256 dwords are logged
+// eight presents after.
+struct Probe { ID3D12Resource* res = nullptr; uint32_t* cpu = nullptr; bool placed = false; } g_probe;
+static uint64_t probe_at() { static uint64_t v = [] { char b[16]; return GetEnvironmentVariableA("XSL_PROBE", b, sizeof b) ? _strtoui64(b, nullptr, 10) : 0ull; }(); return v; }
+static void probe_place(ID3D12Device* dev, D3D12_CPU_DESCRIPTOR_HANDLE h) {
+    if (!probe_at() || g_probe.placed) return;
+    g_probe.placed = true;
+    D3D12_HEAP_PROPERTIES hp{D3D12_HEAP_TYPE_CUSTOM, D3D12_CPU_PAGE_PROPERTY_WRITE_BACK, D3D12_MEMORY_POOL_L0};
+    D3D12_RESOURCE_DESC bd{};
+    bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    bd.Width = 64 << 10;
+    bd.Height = bd.DepthOrArraySize = bd.MipLevels = 1;
+    bd.SampleDesc.Count = 1;
+    bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    bd.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+    if (FAILED(dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr, IID_PPV_ARGS(&g_probe.res)))) {
+        XSL_ERR(CH, "probe: buffer not created");
+        return;
+    }
+    g_probe.res->Map(0, nullptr, (void**)&g_probe.cpu);
+    if (g_probe.cpu) memset(g_probe.cpu, 0, 64 << 10);
+    D3D12_UNORDERED_ACCESS_VIEW_DESC uv{};
+    uv.Format = DXGI_FORMAT_R32_TYPELESS;
+    uv.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+    uv.Buffer.NumElements = (64 << 10) / 4;
+    uv.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
+    dev->CreateUnorderedAccessView(g_probe.res, nullptr, &uv, h);
+    XSL_INFO(CH, "probe buffer in global-memory UAV slot 8191");
+}
+static void probe_present(uint64_t present) {
+    uint64_t at = probe_at();
+    if (!at || !g_probe.cpu) return;
+    if (present + 2 == at) memset(g_probe.cpu, 0, 64 << 10);
+    if (present == at + 8) {
+        for (int r = 0; r < 32; r++) {
+            const uint32_t* w = g_probe.cpu + r * 8;
+            XSL_INFO(CH, "probe[%3d]: %08x %08x %08x %08x %08x %08x %08x %08x", r * 8, w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7]);
+        }
+    }
+}
 void gm_flush(PcObj devObj) {
     if (!gm_enabled() || !g_gv) return;
+    {
+        const uint32_t pb = gm_reserved_start();
+        probe_place(as<ID3D12Device>(devObj), D3D12_CPU_DESCRIPTOR_HANDLE{g_gv->GetCPUDescriptorHandleForHeapStart().ptr + (uint64_t)(pb + kGmSlots - 1) * g_gv_inc});
+    }
     std::lock_guard<std::mutex> g(g_gm_mu);
     if (!g_gm_dirty) return;
     if (g_gm_built_at == g_gm_frame.load()) return;   // at most one rebuild per frame
@@ -680,7 +726,7 @@ void gm_flush(PcObj devObj) {
                     return next < end ? next++ : 0u;
                 };
                 uint32_t sSlot = srvOk ? take(g_gm_free_srv, g_gm_next_srv, kGmHalf) : 0u;
-                uint32_t uSlot = uavOk ? take(g_gm_free_uav, g_gm_next_uav, kGmSlots) : 0u;
+                uint32_t uSlot = uavOk ? take(g_gm_free_uav, g_gm_next_uav, kGmSlots - 1) : 0u;   // last slot: XSL_PROBE
                 if ((srvOk && !sSlot) || (uavOk && !uSlot)) {
                     if (sSlot) g_gm_free_srv.push_back(sSlot);
                     if (uSlot) g_gm_free_uav.push_back(uSlot);
@@ -3453,6 +3499,7 @@ HRESULT_T present(PcObj devObj, PcObj queueObj, PcObj resObj, void* hwndPtr, uin
         }
         ++g_present_count;
         prof_slow_check(g_present_count);
+        probe_present(g_present_count);
         prof_report(as<ID3D12CommandQueue>(q));
         ++g_gm_frame;
         if (getenv("XSL_AS_DUMP")) print_dumps();

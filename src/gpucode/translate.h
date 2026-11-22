@@ -27,7 +27,7 @@ struct TranslateOptions {
     // Dispatcher iterations before an invocation gives up (runaway loops, e.g. walking a linked list
     // with a cycle in bad data, would otherwise reset the PC's GPU). Shaders with barriers use the
     // larger limit: a wave that stops early would leave the others waiting at the barrier.
-    unsigned loop_guard = 1u << 16;
+    unsigned loop_guard = 1u << 12;   // dispatcher steps (runaway loops: an invocation stops after this many)
     unsigned loop_guard_barrier = 1u << 22;
     bool wave_size_attr = false;
     // Global memory (title GPU addresses) through the layer's address table: t0 space901 = table,

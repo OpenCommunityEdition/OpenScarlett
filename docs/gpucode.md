@@ -48,7 +48,7 @@ Shaders that cannot be translated yet make their pipeline a placeholder (its wor
 | `XSL_SHADER_CACHE=<dir>` | Cache directory (default `%LOCALAPPDATA%\OpenScarlett\shadercache`) |
 | `XSL_DUMP_SHADERS=<dir>` | Save each translated container and its HLSL |
 | `XSL_PLACEHOLDER_PSO=0` | Fail pipelines with untranslated shaders instead of using a placeholder |
-| `XSL_LOOP_GUARD=<n>` | Iterations after which an invocation stops (runaway loops; default 64K, 4M in shaders with barriers) |
+| `XSL_LOOP_GUARD=<n>` | Dispatcher steps after which an invocation stops (runaway loops; default 4096, 4M in shaders with barriers) |
 | `XSL_SKIP_SHADERS=<keys>` | Treat these shaders as untranslatable (placeholder pipelines; for bisecting GPU hangs) |
 | `XSL_FIXED_FPS=<n>` | Deterministic time (QueryPerformanceCounter advances 1/n s per present), for frame comparisons |
 | `XSL_D3D12_DRED=1` | Device-removed breadcrumbs and page faults in the log |

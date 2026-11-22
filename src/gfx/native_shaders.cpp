@@ -10,7 +10,7 @@
 // are translated again even when cached, so they are dumped too).
 // XSL_NATIVE_STAGES=VS,PS,... limits translation to those stages (testing).
 // XSL_SKIP_SHADERS=<key,...> treats those shaders as untranslatable (debugging GPU hangs).
-// XSL_LOOP_GUARD=<n> ends a shader invocation after n loop iterations (default 64K, 4M with barriers; runaway loops).
+// XSL_LOOP_GUARD=<n> ends a shader invocation after n loop iterations (default 4096 steps, 4M with barriers; runaway loops).
 #include <windows.h>
 
 #include <cstdio>
@@ -78,7 +78,7 @@ std::vector<uint8_t> with_root_signature(const std::vector<uint8_t>& dxil, const
     parts.push_back({gpucode::fourcc("RTS0"), *rs});
     return build_container(parts, dxil.data());
 }
-constexpr const char* kVersion = "gpucode-33";
+constexpr const char* kVersion = "gpucode-34";
 
 int mode() {
     static int m = [] {
