@@ -639,7 +639,7 @@ HRESULT_T create_pso_stream(PcObj dev, void* stream, size_t size, PcObj* out) {
         hr = d2->CreatePipelineState(&d, IID_PPV_ARGS(reinterpret_cast<ID3D12PipelineState**>(out)));
         d2->Release();
     }
-    if (FAILED(hr)) { dump_debug_messages(); XSL_ERR(CH, "CreatePipelineState (stream, %zu bytes) failed %08lx", size, hr); note_removed(hr); }
+    if (FAILED(hr)) { dump_debug_messages(); XSL_ERR(CH, "CreatePipelineState (stream, %zu bytes) failed %08lx (translated shaders: %s)", size, hr, translated_keys()); note_removed(hr); }
     if (SUCCEEDED(hr)) name_translated(*out);
     if (hr == DXGI_ERROR_DEVICE_REMOVED) report_device_removed(as<ID3D12Device>(dev));
     return hr;

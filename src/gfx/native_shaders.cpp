@@ -77,7 +77,7 @@ std::vector<uint8_t> with_root_signature(const std::vector<uint8_t>& dxil, const
     parts.push_back({gpucode::fourcc("RTS0"), *rs});
     return build_container(parts, dxil.data());
 }
-constexpr const char* kVersion = "gpucode-27";
+constexpr const char* kVersion = "gpucode-29";
 
 int mode() {
     static int m = [] {

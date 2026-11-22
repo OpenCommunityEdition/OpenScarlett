@@ -31,8 +31,11 @@ translates the machine code to HLSL and compiles it with Microsoft's PC shader c
 | Compute | All sample compute shaders translate; A/B against the DXIL path matches (differences at fused vs unfused multiply-add level); tier-1 kernels match exactly |
 | Pixel, vertex | Samples' pixel and vertex shaders translate; SimpleTexture and SimpleLighting render bit-exact |
 | Mesh | Translate (per-primitive outputs; groups up to 256 threads via the two-lane mapping); SimpleMeshlet renders on an RTX 5090 |
-| Amplification, hull, domain, geometry | Not yet |
-| Ray tracing | Inert (state objects load, dispatches do nothing) |
+| Geometry | Shaders that copy input vertex fields (e.g. render-target slice selection) are translated from a one-lane run with tagged inputs; others not yet |
+| Amplification, hull, domain | Not yet |
+| Ray tracing | Inert: state objects load and indirect ray dispatches are skipped; ray queries (`image_bvh*_intersect_ray`) are translated as misses (every node test returns no children / no hit) |
+
+The Matrix Awakens: all 365 distinct shaders translate.
 
 Shaders that cannot be translated yet make their pipeline a placeholder (its work is skipped).
 
@@ -49,6 +52,9 @@ Shaders that cannot be translated yet make their pipeline a placeholder (its wor
 | `XSL_SKIP_SHADERS=<keys>` | Treat these shaders as untranslatable (placeholder pipelines; for bisecting GPU hangs) |
 | `XSL_FIXED_FPS=<n>` | Deterministic time (QueryPerformanceCounter advances 1/n s per present), for frame comparisons |
 | `XSL_D3D12_DRED=1` | Device-removed breadcrumbs and page faults in the log |
+| `XSL_SHADER_OVERRIDE=<dir>` | Compile `<dir>\<key>.hlsl` instead of the translation (hand-edited probes; never cached) |
+| `XSL_TRACE_WRITERS=1` | Frame diagnostics: with `XSL_RT_STATS=<present>` (target statistics, R11G11B10 decoded), `XSL_TRACE_PSO=<keys>` (views, constants, sizes, pipeline state, indirect arguments), `XSL_PLANE_OPS=<present>` (every write to presented images), `XSL_TRACE_BUFFER=<bytes>`, `XSL_TRACE_TEX=<w>x<h>` (writers) |
+| `XSL_DETILE_RECHECK=0` | Do not re-check uploaded console-tiled textures for later CPU writes |
 
 ## Tests
 
@@ -56,6 +62,9 @@ Shaders that cannot be translated yet make their pipeline a placeholder (its wor
 - `tools/gpucode/tier1 <dir>`: tier-1 kernels (`tests/gpucode/kernels`) compiled with the console
   compiler and translated, against the same kernels compiled for PC; `run.cmd` in the output runs
   them on a Windows PC with `dispatch_check` (exact comparison of everything they write).
+- `tools/gpucode/asmtests <dir>`: hand-assembled ISA tests (`tests/gpucode/asm/*.s`, expected words
+  in their headers) spliced into a template container; `run.cmd` checks them with
+  `dispatch_check --expect`.
 - `tests/gpucode/dispatch_check`: runs one translated compute shader in isolation (timing, hangs,
   comparison with a reference).
 - `tools/gpucode/ab-samples`: renders each sample through the DXIL path and the translated path at

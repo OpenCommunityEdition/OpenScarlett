@@ -123,6 +123,7 @@ struct Translator {
     bool ps_depth = false, ps_stencil = false, ps_mask = false, ps_discard = false;
     // Vertex shaders.
     bool vs_fetch = false;
+    bool uses_inert_bvh = false;   // image_bvh*_intersect_ray translated as misses
     std::map<unsigned, unsigned> vs_input_vgpr;    // input signature register -> first VGPR
     std::set<unsigned> vs_params;
     bool vs_pos = false;
@@ -760,8 +761,8 @@ struct Translator {
             if (r >= 0 && has(n, "_atomic_") && res[r].kind == ResKind::TypedBuf) { res[r].scalar = true; res[r].is_uint = true; }
         }
         else if (in.fmt == Fmt::MIMG) {
-            bool bvh = has(n, "bvh");
-            int r = resource(st, in.srsrc, bvh ? 4 : 8, in, false);
+            bool bvh = has(n, "bvh");   // inert acceleration structures (emit_mimg): no resource
+            int r = bvh ? -2 : resource(st, in.srsrc, 8, in, false);
             res_of[i] = r;
             if (r >= 0 && starts(n, "image_atomic")) { res[r].is_uint = true; res[r].scalar = true; }
             if (starts(n, "image_sample") || starts(n, "image_gather4") || n == "image_get_lod") {
@@ -2121,6 +2122,14 @@ bool Translator::emit_mubuf(const Instr& in, size_t idx) {
 // ---- images ------------------------------------------------------------------------------
 bool Translator::emit_mimg(const Instr& in, size_t idx) {
     std::string n = in.name;
+    if (has(n, "bvh")) {
+        // Acceleration structures are not translated yet (the layer keeps them inert): every node
+        // test misses. Box nodes return no children (~0 in all four slots), triangle nodes no hit, so
+        // traversal ends at the root and ray queries report a miss.
+        for (unsigned k = 0; k < 4; k++) write_v(in.vdata + k, "0xffffffffu");
+        uses_inert_bvh = true;
+        return true;
+    }
     int r = res_of.count(idx) ? res_of[idx] : -1;
     if (r < 0) return false;
     Res& R = res[r];
