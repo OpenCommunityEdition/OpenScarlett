@@ -917,6 +917,256 @@ bool list_rt_build_tlas(PcObj l, uint64_t dst, uint64_t inst, uint32_t n, uint32
     }
     return true;
 }
+// ---- Bottom-level acceleration structures (triangles) in the console layout ---------------------
+//   header (flags 0x80000004: bottom level, version 2008; rootNodePtr at +48; sceneBounds)
+//   box32 nodes (bottom level first, root last), then one 64-byte leaf per triangle:
+//   v0, v1, v2, v2 (the unused 4th vertex), (geometry index << 8) | geometry flags, primitive index,
+//   0xffffffff (no second triangle), barycentric remap 0x09 (identity for TRI0). Leaf pointers have
+//   type TRI0. Leaves keep the index order; inactive triangles (NaN x) are ignored leaves with
+//   empty bounds. Builds and updates are full rebuilds; procedural (AABB) geometry is not built.
+static const char kBlasBuilder[] = R"(
+StructuredBuffer<uint4> GMT : register(t0, space901);
+ByteAddressBuffer GMS[8191] : register(t0, space900);
+globallycoherent RWByteAddressBuffer GMU[8192] : register(u0, space900);
+cbuffer C : register(b0) {
+  uint dstLo, dstHi, scrLo, scrHi, mode, count, base, prev;
+  uint vbLo, vbHi, vbStride, vbFormat, ibLo, ibHi, ibFormat, trLo;
+  uint trHi, geomWord, leafOff, leafBase, total, boxTotal, pad0, pad1;
+};
+uint3 gm_find(uint lo, uint hi) {
+  uint a = 0u, b = GMT[0].x;
+  while (a < b) { uint m = (a + b) >> 1; uint4 e = GMT[1u + m]; if (e.y < hi || (e.y == hi && e.x <= lo)) a = m + 1u; else b = m; }
+  if (a == 0u) return uint3(0u, 0u, 0u);
+  uint4 e = GMT[a];
+  uint off = lo - e.x, ohi = hi - e.y - (lo < e.x ? 1u : 0u);
+  return (ohi == 0u && off < e.z) ? uint3(1u, e.w, off) : uint3(0u, 0u, 0u);
+}
+uint2 at(uint lo, uint hi, uint o) { uint r = lo + o; return uint2(r, hi + (r < lo ? 1u : 0u)); }
+uint ld(uint2 a) {
+  uint3 f = gm_find(a.x, a.y);
+  if (f.x == 0u) return 0u;
+  if (f.y & 0x80000000u) return GMU[NonUniformResourceIndex((f.y >> 14) & 0x3fffu)].Load(f.z & ~3u);
+  if (f.y & 0x40000000u) return GMS[NonUniformResourceIndex(f.y & 0x3fffu)].Load(f.z & ~3u);
+  return 0u;
+}
+void st(uint2 a, uint v) {
+  uint3 f = gm_find(a.x, a.y);
+  if (f.x != 0u && (f.y & 0x80000000u)) GMU[NonUniformResourceIndex((f.y >> 14) & 0x3fffu)].Store(f.z & ~3u, v);
+}
+float ldf(uint2 a) { return asfloat(ld(a)); }
+void stf(uint2 a, float v) { st(a, asuint(v)); }
+uint ld16(uint2 a) { uint w = ld(uint2(a.x & ~3u, a.y)); return (a.x & 2u) ? (w >> 16) : (w & 0xffffu); }
+float snorm16(uint v) { int s = int(v << 16) >> 16; return max(float(s) / 32767.0, -1.0); }
+void box_of(uint2 a, out float3 mn, out float3 mx) {
+  mn = float3(ldf(a), ldf(at(a.x, a.y, 4u)), ldf(at(a.x, a.y, 8u)));
+  mx = float3(ldf(at(a.x, a.y, 12u)), ldf(at(a.x, a.y, 16u)), ldf(at(a.x, a.y, 20u)));
+}
+void put_box(uint2 a, float3 mn, float3 mx) {
+  stf(a, mn.x); stf(at(a.x, a.y, 4u), mn.y); stf(at(a.x, a.y, 8u), mn.z);
+  stf(at(a.x, a.y, 12u), mx.x); stf(at(a.x, a.y, 16u), mx.y); stf(at(a.x, a.y, 20u), mx.z);
+}
+float3 vertex(uint i) {
+  uint2 a = at(vbLo, vbHi, i * vbStride);
+  float3 p;
+  if (vbFormat == 2u || vbFormat == 6u) p = float3(ldf(a), ldf(at(a.x, a.y, 4u)), ldf(at(a.x, a.y, 8u)));
+  else if (vbFormat == 16u) p = float3(ldf(a), ldf(at(a.x, a.y, 4u)), 0.0);
+  else if (vbFormat == 10u) p = float3(f16tof32(ld16(a)), f16tof32(ld16(at(a.x, a.y, 2u))), f16tof32(ld16(at(a.x, a.y, 4u))));
+  else if (vbFormat == 34u) p = float3(f16tof32(ld16(a)), f16tof32(ld16(at(a.x, a.y, 2u))), 0.0);
+  else if (vbFormat == 13u) p = float3(snorm16(ld16(a)), snorm16(ld16(at(a.x, a.y, 2u))), snorm16(ld16(at(a.x, a.y, 4u))));
+  else if (vbFormat == 37u) p = float3(snorm16(ld16(a)), snorm16(ld16(at(a.x, a.y, 2u))), 0.0);
+  else p = asfloat(0x7fc00000u).xxx;   // unknown format: inactive
+  if ((trLo | trHi) != 0u) {
+    float4 r0 = float4(ldf(uint2(trLo, trHi)), ldf(at(trLo, trHi, 4u)), ldf(at(trLo, trHi, 8u)), ldf(at(trLo, trHi, 12u)));
+    float4 r1 = float4(ldf(at(trLo, trHi, 16u)), ldf(at(trLo, trHi, 20u)), ldf(at(trLo, trHi, 24u)), ldf(at(trLo, trHi, 28u)));
+    float4 r2 = float4(ldf(at(trLo, trHi, 32u)), ldf(at(trLo, trHi, 36u)), ldf(at(trLo, trHi, 40u)), ldf(at(trLo, trHi, 44u)));
+    float4 q = float4(p, 1.0);
+    p = float3(dot(r0, q), dot(r1, q), dot(r2, q));
+  }
+  return p;
+}
+uint index_of(uint k) {
+  if (ibFormat == 42u) return ld(at(ibLo, ibHi, k * 4u));       // R32_UINT
+  if (ibFormat == 57u) return ld16(at(ibLo, ibHi, k * 2u));     // R16_UINT
+  return k;                                                     // no index buffer
+}
+[numthreads(64, 1, 1)]
+void main(uint3 tid : SV_DispatchThreadID) {
+  const float BIG = 3.0e38;
+  uint i = tid.x;
+  if (mode == 0u) {   // leaves of one geometry: triangles [0, count) -> leaves [leafBase, leafBase + count)
+    if (i >= count) return;
+    float3 a = vertex(index_of(i * 3u)), b = vertex(index_of(i * 3u + 1u)), c = vertex(index_of(i * 3u + 2u));
+    bool active = !(a.x != a.x || b.x != b.x || c.x != c.x);
+    uint L = leafBase + i;
+    uint2 lf = at(dstLo, dstHi, leafOff + L * 64u);
+    stf(lf, a.x); stf(at(lf.x, lf.y, 4u), a.y); stf(at(lf.x, lf.y, 8u), a.z);
+    stf(at(lf.x, lf.y, 12u), b.x); stf(at(lf.x, lf.y, 16u), b.y); stf(at(lf.x, lf.y, 20u), b.z);
+    stf(at(lf.x, lf.y, 24u), c.x); stf(at(lf.x, lf.y, 28u), c.y); stf(at(lf.x, lf.y, 32u), c.z);
+    stf(at(lf.x, lf.y, 36u), c.x); stf(at(lf.x, lf.y, 40u), c.y); stf(at(lf.x, lf.y, 44u), c.z);
+    st(at(lf.x, lf.y, 48u), geomWord);
+    st(at(lf.x, lf.y, 52u), active ? i : 0xffffffffu);
+    st(at(lf.x, lf.y, 56u), 0xffffffffu);
+    st(at(lf.x, lf.y, 60u), 0x09u);
+    float3 mn = active ? min(a, min(b, c)) : float3(BIG, BIG, BIG);
+    float3 mx = active ? max(a, max(b, c)) : float3(-BIG, -BIG, -BIG);
+    put_box(at(scrLo, scrHi, L * 32u), mn, mx);
+  } else if (mode == 1u) {   // one box level: nodes [base, base + count), children = leaves (prev == ~0) or boxes from prev
+    if (i >= count) return;
+    uint nchild = prev == 0xffffffffu ? total : (base - prev);
+    uint2 nd = at(dstLo, dstHi, 64u + (base + i) * 128u);
+    float3 umn = float3(BIG, BIG, BIG), umx = float3(-BIG, -BIG, -BIG);
+    [unroll] for (uint k = 0u; k < 4u; k++) {
+      uint c2 = i * 4u + k;
+      uint ptr = 0xffffffffu;
+      float3 mn = float3(BIG, BIG, BIG), mx = float3(-BIG, -BIG, -BIG);
+      if (c2 < nchild) {
+        if (prev == 0xffffffffu) { ptr = ((leafOff + c2 * 64u) >> 6) << 3; box_of(at(scrLo, scrHi, c2 * 32u), mn, mx); }
+        else { uint bi = prev + c2; ptr = (((64u + bi * 128u) >> 6) << 3) | 5u; box_of(at(scrLo, scrHi, total * 32u + bi * 32u), mn, mx); }
+        if (mn.x <= mx.x) { umn = min(umn, mn); umx = max(umx, mx); }
+      }
+      st(at(nd.x, nd.y, 4u * k), ptr);
+      put_box(at(nd.x, nd.y, 16u + 24u * k), mn, mx);
+    }
+    st(at(nd.x, nd.y, 112u), 0u); st(at(nd.x, nd.y, 116u), 0u); st(at(nd.x, nd.y, 120u), 0u); st(at(nd.x, nd.y, 124u), 0u);
+    put_box(at(scrLo, scrHi, total * 32u + (base + i) * 32u), umn, umx);
+  } else if (i == 0u) {   // header; base = root box index (or ~0 when empty)
+    uint2 h = uint2(dstLo, dstHi);
+    float3 mn = float3(0, 0, 0), mx = float3(0, 0, 0);
+    uint root = 0xffffffffu;
+    if (base != 0xffffffffu) { root = (((64u + base * 128u) >> 6) << 3) | 5u; box_of(at(scrLo, scrHi, total * 32u + base * 32u), mn, mx); }
+    st(h, 0x80000004u);
+    st(at(h.x, h.y, 4u), (leafOff + total * 64u) / 64u);
+    st(at(h.x, h.y, 8u), 0u);
+    st(at(h.x, h.y, 12u), total);
+    put_box(at(h.x, h.y, 16u), mn, mx);
+    st(at(h.x, h.y, 40u), 64u);
+    st(at(h.x, h.y, 44u), 0u);
+    st(at(h.x, h.y, 48u), root);
+    st(at(h.x, h.y, 52u), leafOff);
+    st(at(h.x, h.y, 56u), 0u);
+    st(at(h.x, h.y, 60u), 0x007F7F7Fu);
+  }
+}
+)";
+struct BlasBuilder { ID3D12RootSignature* rs = nullptr; ID3D12PipelineState* pso = nullptr; bool failed = false; std::mutex mu; } g_blas;
+bool compile_layer_shader(const std::string& hlsl, const char* profile, std::vector<uint8_t>& out, std::string& log);
+static bool blas_init(ID3D12Device* dev) {
+    std::lock_guard<std::mutex> g(g_blas.mu);
+    if (g_blas.pso) return true;
+    if (g_blas.failed) return false;
+    g_blas.failed = true;
+    std::vector<uint8_t> cs;
+    std::string log;
+    if (!compile_layer_shader(std::string(kBlasBuilder, sizeof kBlasBuilder - 1), "cs_6_0", cs, log)) {
+        XSL_ERR(CH, "BLAS builder: compile failed: %s", log.c_str());
+        return false;
+    }
+    static const D3D12_DESCRIPTOR_RANGE ranges[3] = {
+        {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0, 901, 0},
+        {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, kGmHalf - 1, 0, 900, 1},
+        {D3D12_DESCRIPTOR_RANGE_TYPE_UAV, kGmSlots - kGmHalf, 0, 900, kGmHalf}};
+    D3D12_ROOT_PARAMETER params[2] = {};
+    params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    params[0].Constants.Num32BitValues = 24;
+    params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    params[1].DescriptorTable = {3, ranges};
+    D3D12_ROOT_SIGNATURE_DESC rsd{2, params, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_NONE};
+    ID3DBlob *rsb = nullptr, *err = nullptr;
+    if (FAILED(D3D12SerializeRootSignature(&rsd, D3D_ROOT_SIGNATURE_VERSION_1, &rsb, &err)) ||
+        FAILED(dev->CreateRootSignature(0, rsb->GetBufferPointer(), rsb->GetBufferSize(), IID_PPV_ARGS(&g_blas.rs)))) {
+        XSL_ERR(CH, "BLAS builder: root signature failed");
+        return false;
+    }
+    D3D12_COMPUTE_PIPELINE_STATE_DESC pd{};
+    pd.pRootSignature = g_blas.rs;
+    pd.CS = {cs.data(), cs.size()};
+    if (FAILED(dev->CreateComputePipelineState(&pd, IID_PPV_ARGS(&g_blas.pso)))) { XSL_ERR(CH, "BLAS builder: pipeline failed"); return false; }
+    g_blas.failed = false;
+    XSL_INFO(CH, "bottom-level acceleration structures (triangles) are built in the console layout");
+    return true;
+}
+static uint64_t blas_boxes(uint64_t n) {
+    uint64_t boxes = 0;
+    for (uint64_t c = n; c > 0;) { uint64_t lc = (c + 3) / 4; boxes += lc; c = lc == 1 ? 0 : lc; }
+    return boxes;
+}
+uint64_t blas_console_size(uint64_t tris) { return 64 + blas_boxes(tris) * 128 + tris * 64; }
+uint64_t blas_scratch_size(uint64_t tris) { return (tris + blas_boxes(tris)) * 32 + 256; }
+bool list_rt_build_blas(PcObj l, uint64_t dst, uint64_t scratch, uint32_t ngeo, const BlasGeometry* geo) {
+    if (!gm_enabled() || !g_gv || !g_main_device) return false;
+    {
+        std::lock_guard<std::mutex> g(g_gm_mu);
+        auto h = g_list_global_heap.find(l);
+        if (h == g_list_global_heap.end() || !h->second) return false;
+    }
+    uint64_t total = 0;
+    for (uint32_t i = 0; i < ngeo; i++) total += geo[i].triangles;
+    if (total >= (1u << 26)) return false;
+    uint64_t boxes = blas_boxes(total);
+    uint32_t leafOff = (uint32_t)(64 + boxes * 128);
+    PcObj dr, sr; uint64_t doff, davail, soff, savail;
+    {   // memory made this frame may not be in the GPU table yet
+        std::lock_guard<std::mutex> g(g_gm_mu);
+        bool missing = !gm_in_table(dst, 64) || !gm_in_table(scratch, 32);
+        for (uint32_t i = 0; i < ngeo && !missing; i++) missing = !gm_in_table(geo[i].vb, 4) || (geo[i].ib && !gm_in_table(geo[i].ib, 2));
+        if (missing) { g_gm_force = true; g_gm_dirty = true; }
+    }
+    if (!gm_resolve(dst, &dr, &doff, &davail) || davail < blas_console_size(total) || !gm_resolve(scratch, &sr, &soff, &savail) ||
+        savail < (total + boxes) * 32) {
+        static volatile long w = 0;
+        if (InterlockedIncrement(&w) <= 5)
+            XSL_WARN(CH, "BLAS build (%llu triangles) at %llx: destination or scratch too small or not addressable", (unsigned long long)total, (unsigned long long)dst);
+        return false;
+    }
+    if (!blas_init(g_main_device)) return false;
+    auto* L2 = as<ID3D12GraphicsCommandList>(l);
+    D3D12_RESOURCE_BARRIER ub{};
+    ub.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+    L2->ResourceBarrier(1, &ub);
+    L2->SetPipelineState(g_blas.pso);
+    L2->SetComputeRootSignature(g_blas.rs);
+    L2->SetComputeRootDescriptorTable(1, D3D12_GPU_DESCRIPTOR_HANDLE{g_gv->GetGPUDescriptorHandleForHeapStart().ptr + (uint64_t)gm_reserved_start() * g_gv_inc});
+    uint32_t c[24] = {(uint32_t)dst, (uint32_t)(dst >> 32), (uint32_t)scratch, (uint32_t)(scratch >> 32)};
+    c[18] = leafOff;
+    c[20] = (uint32_t)total;
+    c[21] = (uint32_t)boxes;
+    uint64_t leafBase = 0;
+    for (uint32_t gi = 0; gi < ngeo; gi++) {   // leaves
+        const BlasGeometry& gm = geo[gi];
+        if (!gm.triangles) continue;
+        c[4] = 0; c[5] = gm.triangles;
+        c[8] = (uint32_t)gm.vb; c[9] = (uint32_t)(gm.vb >> 32); c[10] = gm.vbStride; c[11] = gm.vbFormat;
+        c[12] = (uint32_t)gm.ib; c[13] = (uint32_t)(gm.ib >> 32); c[14] = gm.ib ? gm.ibFormat : 0;
+        c[15] = (uint32_t)gm.transform; c[16] = (uint32_t)(gm.transform >> 32);
+        c[17] = (gi << 8) | (gm.flags & 0xff);
+        c[19] = (uint32_t)leafBase;
+        L2->SetComputeRoot32BitConstants(0, 24, c, 0);
+        L2->Dispatch((gm.triangles + 63) / 64, 1, 1);
+        leafBase += gm.triangles;
+    }
+    L2->ResourceBarrier(1, &ub);
+    uint32_t base = 0, prev = 0xffffffffu;
+    for (uint64_t cnt = total; cnt > 0;) {   // box levels, bottom up
+        uint32_t lc = (uint32_t)((cnt + 3) / 4);
+        c[4] = 1; c[5] = lc; c[6] = base; c[7] = prev;
+        L2->SetComputeRoot32BitConstants(0, 24, c, 0);
+        L2->Dispatch((lc + 63) / 64, 1, 1);
+        L2->ResourceBarrier(1, &ub);
+        prev = base;
+        base += lc;
+        cnt = lc == 1 ? 0 : lc;
+    }
+    c[4] = 2; c[6] = total ? base - 1 : 0xffffffffu;
+    L2->SetComputeRoot32BitConstants(0, 24, c, 0);
+    L2->Dispatch(1, 1, 1);
+    L2->ResourceBarrier(1, &ub);
+    restore_compute_state(l);
+    static volatile long logged = 0;
+    if (InterlockedIncrement(&logged) <= 3)
+        XSL_INFO(CH, "BLAS build: %u geometries, %llu triangles at %llx (console layout, %llu bytes)", ngeo, (unsigned long long)total, (unsigned long long)dst,
+                 (unsigned long long)blas_console_size(total));
+    return true;
+}
 // DESERIALIZE: the console structure follows the 56-byte serialized header (and its BLAS pointers)
 // at a 64-byte boundary; its node pointers are relative, so it is copied as bytes.
 void list_rt_deserialize(PcObj l, uint64_t dst, uint64_t src) {

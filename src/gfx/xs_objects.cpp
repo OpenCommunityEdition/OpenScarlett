@@ -943,6 +943,28 @@ void D3DAPI L_BuildRtAs(ID3D12GraphicsCommandList4* l4, const D3D12_BUILD_RAYTRA
         if (d->Inputs.Type == D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL)   // translated ray queries read the console layout
             pc::list_rt_build_tlas(LPC(l), d->DestAccelerationStructureData, d->Inputs.InstanceDescs, d->Inputs.NumDescs,
                                    d->Inputs.DescsLayout == D3D12_ELEMENTS_LAYOUT_ARRAY_OF_POINTERS ? 1u : 0u, d->ScratchAccelerationStructureData);
+        else if (d->Inputs.Type == D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL) {
+            std::vector<pc::BlasGeometry> g;
+            Device* dv = hdr(l)->device;
+            for (UINT i = 0; i < d->Inputs.NumDescs; i++) {
+                const D3D12_RAYTRACING_GEOMETRY_DESC* gd =
+                    d->Inputs.DescsLayout == D3D12_ELEMENTS_LAYOUT_ARRAY_OF_POINTERS ? d->Inputs.ppGeometryDescs[i] : &d->Inputs.pGeometryDescs[i];
+                pc::BlasGeometry b{};
+                if (gd && gd->Type == D3D12_RAYTRACING_GEOMETRY_TYPE_TRIANGLES) {
+                    const auto& t = gd->Triangles;
+                    b.vb = gpu_va(dv, t.VertexBuffer.StartAddress);
+                    b.vbStride = (uint32_t)t.VertexBuffer.StrideInBytes;
+                    b.vbFormat = (uint32_t)t.VertexFormat;
+                    b.ib = t.IndexBuffer ? gpu_va(dv, t.IndexBuffer) : 0;
+                    b.ibFormat = (uint32_t)t.IndexFormat;
+                    b.transform = t.Transform3x4 ? gpu_va(dv, t.Transform3x4) : 0;
+                    b.triangles = (t.IndexFormat != DXGI_FORMAT_UNKNOWN && t.IndexBuffer ? t.IndexCount : t.VertexCount) / 3;
+                    b.flags = (uint32_t)gd->Flags;
+                }
+                g.push_back(b);   // procedural geometry: no triangles, keeps the geometry index
+            }
+            pc::list_rt_build_blas(LPC(l), d->DestAccelerationStructureData, d->ScratchAccelerationStructureData, (uint32_t)g.size(), g.data());
+        }
         for (UINT i = 0; i < np; i++) rt_fake_postbuild(l, hdr(l)->device, post[i], 1);
         return;
     }

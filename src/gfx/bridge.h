@@ -91,6 +91,11 @@ void list_rt_deserialize(PcObj l, uint64_t dst, uint64_t src);   // console stru
 bool list_rt_build_tlas(PcObj l, uint64_t dst, uint64_t instances, uint32_t count, uint32_t layout, uint64_t scratch);
 uint64_t tlas_console_size(uint32_t instances);
 uint64_t tlas_scratch_size(uint32_t instances);
+// Bottom-level triangle build in the console layout (into the destination's shadow); false: not built.
+struct BlasGeometry { uint64_t vb, ib, transform; uint32_t vbStride, vbFormat, ibFormat, triangles, flags; };
+bool list_rt_build_blas(PcObj l, uint64_t dst, uint64_t scratch, uint32_t count, const BlasGeometry* geometries);
+uint64_t blas_console_size(uint64_t triangles);
+uint64_t blas_scratch_size(uint64_t triangles);
 void list_dump_memory(PcObj l, uint64_t va, const char* what);   // XSL_AS_DUMP diagnostics              // before each submission: views and address table
 uint32_t gm_reserved_start();
 bool gm_active();                      // translated shaders may use global memory          // first global-heap slot reserved for it (UINT32_MAX: none)   // console D3D12_RESOURCE_STATES -> PC

@@ -696,6 +696,18 @@ void D3DAPI D_GetRaytracingAccelerationStructurePrebuildInfo(ID3D12Device5* d, c
         info->ScratchDataSizeInBytes = 64 * 1024;
         info->UpdateScratchDataSizeInBytes = 64 * 1024;
     }
+    if (in && in->Type == D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL) {   // room for the console layout (pc::list_rt_build_blas)
+        UINT64 tris = 0;
+        for (UINT i = 0; i < in->NumDescs; i++) {
+            const D3D12_RAYTRACING_GEOMETRY_DESC* gd = in->DescsLayout == D3D12_ELEMENTS_LAYOUT_ARRAY_OF_POINTERS ? in->ppGeometryDescs[i] : &in->pGeometryDescs[i];
+            if (gd && gd->Type == D3D12_RAYTRACING_GEOMETRY_TYPE_TRIANGLES)
+                tris += (gd->Triangles.IndexFormat != DXGI_FORMAT_UNKNOWN ? gd->Triangles.IndexCount : gd->Triangles.VertexCount) / 3;
+        }
+        UINT64 need = (pc::blas_console_size(tris) + 255) & ~255ull, scr = (pc::blas_scratch_size(tris) + 255) & ~255ull;
+        if (info->ResultDataMaxSizeInBytes < need) info->ResultDataMaxSizeInBytes = need;
+        if (info->ScratchDataSizeInBytes < scr) info->ScratchDataSizeInBytes = scr;
+        if (info->UpdateScratchDataSizeInBytes < scr) info->UpdateScratchDataSizeInBytes = scr;
+    }
     if (in && in->Type == D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL) {   // room for the console layout (pc::list_rt_build_tlas)
         UINT64 need = (pc::tlas_console_size(in->NumDescs) + 255) & ~255ull, scr = (pc::tlas_scratch_size(in->NumDescs) + 255) & ~255ull;
         if (info->ResultDataMaxSizeInBytes < need) info->ResultDataMaxSizeInBytes = need;
