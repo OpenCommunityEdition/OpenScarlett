@@ -124,6 +124,8 @@ IIDS(ID3D12GraphicsCommandList8, &__uuidof(IGraphicsUnknown), &__uuidof(ID3D12Ob
      &__uuidof(ID3D12GraphicsCommandList), &__uuidof(ID3D12GraphicsCommandList1), &__uuidof(ID3D12GraphicsCommandList2), &__uuidof(ID3D12GraphicsCommandList3),
      &__uuidof(ID3D12GraphicsCommandList4), &__uuidof(ID3D12GraphicsCommandList5), &__uuidof(ID3D12GraphicsCommandList6), &__uuidof(ID3D12GraphicsCommandList7),
      &__uuidof(ID3D12GraphicsCommandList8))
+IIDS(ID3D12XboxDmaCommandList, &__uuidof(IGraphicsUnknown), &__uuidof(ID3D12Object), &__uuidof(ID3D12DeviceChild), &__uuidof(ID3D12CommandList),
+     &__uuidof(ID3D12XboxDmaCommandList))
 IIDS(ID3D12Fence1, &__uuidof(IGraphicsUnknown), &__uuidof(ID3D12Object), &__uuidof(ID3D12DeviceChild), &__uuidof(ID3D12Pageable), &__uuidof(ID3D12Fence), &__uuidof(ID3D12Fence1))
 IIDS(ID3D12Resource2, &__uuidof(IGraphicsUnknown), &__uuidof(ID3D12Object), &__uuidof(ID3D12DeviceChild), &__uuidof(ID3D12Pageable), &__uuidof(ID3D12Resource),
      &__uuidof(ID3D12Resource1), &__uuidof(ID3D12Resource2))
@@ -482,7 +484,7 @@ D3D12XBOX_RESOURCE_BARRIER_ACTIONS D3DAPI L_ResourceBarrier(ID3D12GraphicsComman
             switch (x.Type) {
                 case D3D12_RESOURCE_BARRIER_TYPE_TRANSITION: {
                     void* res = b[base + i].Transition.pResource;
-                    x.Transition.pResource = (ID3D12Resource*)P(res);
+                    x.Transition.pResource = (ID3D12Resource*)P_or_pc((ID3D12Resource*)res);   // PC resources come from Media Foundation
                     // Split barriers keep their begin/end pairing; only whole-resource transitions are tracked.
                     bool whole = x.Transition.Subresource == D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES && x.Flags == D3D12_RESOURCE_BARRIER_FLAG_NONE;
                     if (uint32_t* st = tracked_state(e, res, false); st && !whole) {
@@ -500,11 +502,11 @@ D3D12XBOX_RESOURCE_BARRIER_ACTIONS D3DAPI L_ResourceBarrier(ID3D12GraphicsComman
                     break;
                 }
                 case D3D12_RESOURCE_BARRIER_TYPE_ALIASING:
-                    x.Aliasing.pResourceBefore = (ID3D12Resource*)P(x.Aliasing.pResourceBefore);
-                    x.Aliasing.pResourceAfter = (ID3D12Resource*)P(x.Aliasing.pResourceAfter);
+                    x.Aliasing.pResourceBefore = (ID3D12Resource*)P_or_pc(x.Aliasing.pResourceBefore);
+                    x.Aliasing.pResourceAfter = (ID3D12Resource*)P_or_pc(x.Aliasing.pResourceAfter);
                     break;
                 case D3D12_RESOURCE_BARRIER_TYPE_UAV:
-                    x.UAV.pResource = (ID3D12Resource*)P(x.UAV.pResource);
+                    x.UAV.pResource = (ID3D12Resource*)P_or_pc(x.UAV.pResource);
                     break;
                 default:
                     XSL_WARN(CH, "dropping console-only barrier type %d", (int)x.Type);
@@ -670,11 +672,29 @@ void D3DAPI L_CopyBufferRegion(ID3D12GraphicsCommandList* l, ID3D12Resource* d, 
 void D3DAPI L_CopyTextureRegion(ID3D12GraphicsCommandList* l, const D3D12_TEXTURE_COPY_LOCATION* d, UINT x, UINT y, UINT z,
                                 const D3D12_TEXTURE_COPY_LOCATION* s, const D3D12_BOX* box) {
     D3D12_TEXTURE_COPY_LOCATION dd = *d, ss = *s;
-    dd.pResource = (ID3D12Resource*)P(d->pResource);
-    ss.pResource = (ID3D12Resource*)P(s->pResource);
+    dd.pResource = (ID3D12Resource*)P_or_pc(d->pResource);   // decoded video frames are PC resources
+    ss.pResource = (ID3D12Resource*)P_or_pc(s->pResource);
+    if (!is_ours(s->pResource) || !is_ours(d->pResource) || lx(l)->type == D3D12_COMMAND_LIST_TYPE_COPY) {
+        static volatile long n = 0;
+        if (InterlockedIncrement(&n) <= 8) {
+            D3D12_RESOURCE_DESC sd{}, dsd{};
+            pc::res_desc((PcObj)ss.pResource, &sd);
+            pc::res_desc((PcObj)dd.pResource, &dsd);
+            XSL_INFO(CH, "copy (list type %d): src %s %llux%u x%u fmt %d dim %d (type %d sub %u) -> dst %s %llux%u fmt %d dim %d (type %d sub %u, footprint fmt %d %ux%u pitch %u off %llu) at %u,%u box %d",
+                     (int)lx(l)->type, is_ours(s->pResource) ? "console" : "PC", (unsigned long long)sd.Width, sd.Height, sd.DepthOrArraySize, (int)sd.Format, (int)sd.Dimension, (int)s->Type,
+                     s->Type == D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX ? s->SubresourceIndex : 0, is_ours(d->pResource) ? "console" : "PC", (unsigned long long)dsd.Width,
+                     dsd.Height, (int)dsd.Format, (int)dsd.Dimension, (int)d->Type, d->Type == D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX ? d->SubresourceIndex : 0,
+                     d->Type == D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT ? (int)d->PlacedFootprint.Footprint.Format : -1,
+                     d->Type == D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT ? d->PlacedFootprint.Footprint.Width : 0,
+                     d->Type == D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT ? d->PlacedFootprint.Footprint.Height : 0,
+                     d->Type == D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT ? d->PlacedFootprint.Footprint.RowPitch : 0,
+                     d->Type == D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT ? (unsigned long long)d->PlacedFootprint.Offset : 0ull, x, y, box ? 1 : 0);
+        }
+    }
+    if (!is_ours(s->pResource) && getenv("XSL_SKIP_VIDEO_COPIES")) return;   // experiment: copies out of decoder textures
     pc::list_copy_texture_region(LPC(l), &dd, x, y, z, &ss, box);
 }
-void D3DAPI L_CopyResource(ID3D12GraphicsCommandList* l, ID3D12Resource* d, ID3D12Resource* s) { pc::list_copy_resource(LPC(l), P(d), P(s)); }
+void D3DAPI L_CopyResource(ID3D12GraphicsCommandList* l, ID3D12Resource* d, ID3D12Resource* s) { pc::list_copy_resource(LPC(l), P_or_pc(d), P_or_pc(s)); }
 void D3DAPI L_ResolveSubresource(ID3D12GraphicsCommandList* l, ID3D12Resource* d, UINT ds, ID3D12Resource* s, UINT ss, DXGI_FORMAT f) {
     XSL_TRACE("gfx.cmd", "list %p Resolve dst %p src %p fmt %d", (void*)l, (void*)d, (void*)s, f);
     pc::list_resolve_subresource(LPC(l), P(d), ds, P(s), ss, f);
@@ -868,6 +888,16 @@ void D3DAPI L_BuildRtAs(ID3D12GraphicsCommandList4* l4, const D3D12_BUILD_RAYTRA
                         const D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_DESC* post) {
     auto* l = (ID3D12GraphicsCommandList*)l4;
     if (null_graphics() || !d) return;
+    {
+        static volatile long n = 0;
+        if (InterlockedIncrement(&n) <= 40)
+            XSL_INFO(CH, "AS build: type %d flags %#x, %u descs (geometry type %d), dest %llx, source %llx, scratch %llx", (int)d->Inputs.Type,
+                     (unsigned)d->Inputs.Flags, d->Inputs.NumDescs,
+                     d->Inputs.Type == D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL && d->Inputs.NumDescs &&
+                             d->Inputs.DescsLayout == D3D12_ELEMENTS_LAYOUT_ARRAY ? (int)d->Inputs.pGeometryDescs[0].Type : -1,
+                     (unsigned long long)d->DestAccelerationStructureData, (unsigned long long)d->SourceAccelerationStructureData,
+                     (unsigned long long)d->ScratchAccelerationStructureData);
+    }
     if (!rt_build_on()) {
         for (UINT i = 0; i < np; i++) rt_fake_postbuild(l, hdr(l)->device, post[i], 1);
         return;
@@ -911,8 +941,20 @@ void D3DAPI L_EmitRtAsPostbuild(ID3D12GraphicsCommandList4* l4, const D3D12_RAYT
 void D3DAPI L_CopyRtAs(ID3D12GraphicsCommandList4* l4, D3D12_GPU_VIRTUAL_ADDRESS dst, D3D12_GPU_VIRTUAL_ADDRESS src,
                        D3D12_RAYTRACING_ACCELERATION_STRUCTURE_COPY_MODE mode) {
     auto* l = (ID3D12GraphicsCommandList*)l4;
-    if (null_graphics() || !rt_build_on()) return;
     uint32_t m = (uint32_t)mode;
+    {
+        static volatile long n = 0;
+        MEMORY_BASIC_INFORMATION mbi{};
+        bool cpu = VirtualQuery((const void*)src, &mbi, sizeof mbi) && mbi.State == MEM_COMMIT;
+        if (InterlockedIncrement(&n) <= 40)
+            XSL_INFO(CH, "AS copy: mode %#x, dest %llx, source %llx (%s)", m, (unsigned long long)dst, (unsigned long long)src, cpu ? "CPU-readable" : "GPU only");
+    }
+    if (getenv("XSL_AS_DUMP") && m == D3D12_RAYTRACING_ACCELERATION_STRUCTURE_COPY_MODE_DESERIALIZE) pc::list_dump_memory(LPC(l), src, "deserialize source");
+    if (m == D3D12_RAYTRACING_ACCELERATION_STRUCTURE_COPY_MODE_DESERIALIZE && !null_graphics()) {
+        pc::list_rt_deserialize(LPC(l), dst, src);   // console-format structure for translated traversal
+        if (!rt_build_on()) return;
+    }
+    if (null_graphics() || !rt_build_on()) return;
     {
         static volatile long n = 0;
         if (InterlockedIncrement(&n) <= 20) XSL_INFO(CH, "CopyRaytracingAccelerationStructure mode %#x", m);
@@ -948,6 +990,29 @@ D3D12_COMMAND_LIST_TYPE D3DAPI L_GetType(ID3D12CommandList* l) { return ex<XList
 
 D3D12GraphicsCommandList8_Function_Table g_list_tbl;
 std::once_flag g_list_once;
+D3D12DmaCommandList_Function_Table g_dma_tbl;
+std::once_flag g_dma_once;
+// DMA list memory operations on title addresses (global-memory registry).
+void D3DAPI Dma_CopyMemory(ID3D12XboxDmaCommandList* l, D3D12_GPU_VIRTUAL_ADDRESS dst, D3D12_GPU_VIRTUAL_ADDRESS src, UINT64 n, D3D12XBOX_COPY_FLAGS) {
+    Device* dev = hdr(l)->device;
+    PcObj dr, sr; uint64_t doff, soff;
+    uint64_t d2 = gpu_va(dev, dst), s2 = gpu_va(dev, src);
+    if ((pc::gm_resolve(dst, &dr, &doff, nullptr) || pc::gm_resolve(d2, &dr, &doff, nullptr)) &&
+        (pc::gm_resolve(src, &sr, &soff, nullptr) || pc::gm_resolve(s2, &sr, &soff, nullptr)))
+        pc::list_copy_buffer_region(pc_of((ID3D12GraphicsCommandList*)l), dr, doff, sr, soff, n);
+    else {
+        static volatile long w = 0;
+        if (InterlockedIncrement(&w) <= 3) XSL_WARN(CH, "DMA copy %llx -> %llx (%llu bytes): memory not addressable", (unsigned long long)src, (unsigned long long)dst, (unsigned long long)n);
+    }
+}
+void D3DAPI Dma_Fill32(ID3D12XboxDmaCommandList* l, D3D12_GPU_VIRTUAL_ADDRESS dst, UINT64 n, UINT v, D3D12XBOX_COPY_FLAGS) {
+    Device* dev = hdr(l)->device;
+    uint64_t base = gpu_va(dev, dst);
+    std::vector<uint64_t> a;
+    std::vector<uint32_t> vals;
+    for (uint64_t k = 0; k + 4 <= n && k < (1u << 16); k += 4) { a.push_back(base + k); vals.push_back(v); }   // small fills (larger ones are rare)
+    if (!a.empty()) pc::list_write_immediate(pc_of((ID3D12GraphicsCommandList*)l), (uint32_t)a.size(), a.data(), vals.data());
+}
 }  // namespace
 
 void list_bind_global_heap(void* list, PcObj pcl) {
@@ -1024,6 +1089,34 @@ HRESULT make_list(Device* dev, PcObj pcl, D3D12_COMMAND_LIST_TYPE t, REFIID riid
         g->SetMarker = L_Event;
         g->EndEvent = L_EndEvent;
     });
+    if (IsEqualGUID(riid, __uuidof(ID3D12XboxDmaCommandList))) {
+        // Console copy (DMA) lists are their own interface: same list object, DMA function table.
+        std::call_once(g_dma_once, [] {
+            xsl_fill_default(&g_dma_tbl);
+            install_device_child_base(&g_dma_tbl);
+            auto& t = g_dma_tbl;
+            t.CommandListFunction.GetType = L_GetType;
+            t.Close = reinterpret_cast<decltype(t.Close)>(&L_Close);
+            t.Reset = reinterpret_cast<decltype(t.Reset)>(&L_Reset);
+            t.CopyBufferRegion = reinterpret_cast<decltype(t.CopyBufferRegion)>(&L_CopyBufferRegion);
+            t.CopyTextureRegion = reinterpret_cast<decltype(t.CopyTextureRegion)>(&L_CopyTextureRegion);
+            t.CopyResource = reinterpret_cast<decltype(t.CopyResource)>(&L_CopyResource);
+            t.ResourceBarrier = reinterpret_cast<decltype(t.ResourceBarrier)>(&L_ResourceBarrier);
+            t.BeginQuery = reinterpret_cast<decltype(t.BeginQuery)>(&L_BeginQuery);
+            t.EndQuery = reinterpret_cast<decltype(t.EndQuery)>(&L_EndQuery);
+            t.ResolveQueryData = reinterpret_cast<decltype(t.ResolveQueryData)>(&L_ResolveQueryData);
+            t.SetMarker = reinterpret_cast<decltype(t.SetMarker)>(&L_Event);
+            t.BeginEvent = reinterpret_cast<decltype(t.BeginEvent)>(&L_Event);
+            t.EndEvent = reinterpret_cast<decltype(t.EndEvent)>(&L_EndEvent);
+            t.Write64BitValueBottomOfPipeX = reinterpret_cast<decltype(t.Write64BitValueBottomOfPipeX)>(&L_Write64BOP);
+            t.KickoffX = reinterpret_cast<decltype(t.KickoffX)>(&L_KickoffX);
+            t.CopyMemoryToMemoryX = &Dma_CopyMemory;
+            t.FillMemoryWith32BitValueX = &Dma_Fill32;
+        });
+        auto* o = make<XList, ListExtra>(Kind::List, &g_dma_tbl, pcl, dev, Iids<ID3D12XboxDmaCommandList>::list, nullptr);
+        ex<XList, ListExtra>(o)->type = t;
+        return hand_out(o, riid, out);
+    }
     auto* o = make<XList, ListExtra>(Kind::List, &g_list_tbl, pcl, dev, Iids<XList>::list, nullptr);
     ex<XList, ListExtra>(o)->type = t;
     list_bind_global_heap(o, pcl);
@@ -1044,11 +1137,11 @@ void D3DAPI Q_Execute(ID3D12CommandQueue* q, UINT n, ID3D12CommandList* const* l
     for (UINT i = 0; i < n; i++) { v[i] = P(lists[i]); XSL_TRACE("gfx.cmd", "Execute list %p", (void*)lists[i]); }
     pc::queue_execute(pc_of(q), n, v.data());
 }
-HRESULT D3DAPI Q_Signal(ID3D12CommandQueue* q, ID3D12Fence* f, UINT64 v) { return pc::queue_signal(pc_of(q), P(f), v); }
+HRESULT D3DAPI Q_Signal(ID3D12CommandQueue* q, ID3D12Fence* f, UINT64 v) { return pc::queue_signal(pc_of(q), P_or_pc(f), v); }
 // Signal with console cache-flush flags: a PC queue signal already follows completion of all prior
 // work, caches included.
-HRESULT D3DAPI Q_SignalX(ID3D12CommandQueue* q, ID3D12Fence* f, UINT64 v, D3D12XBOX_FLUSH) { return pc::queue_signal(pc_of(q), P(f), v); }
-HRESULT D3DAPI Q_Wait(ID3D12CommandQueue* q, ID3D12Fence* f, UINT64 v) { return pc::queue_wait(pc_of(q), P(f), v); }
+HRESULT D3DAPI Q_SignalX(ID3D12CommandQueue* q, ID3D12Fence* f, UINT64 v, D3D12XBOX_FLUSH) { return pc::queue_signal(pc_of(q), P_or_pc(f), v); }
+HRESULT D3DAPI Q_Wait(ID3D12CommandQueue* q, ID3D12Fence* f, UINT64 v) { return pc::queue_wait(pc_of(q), P_or_pc(f), v); }
 void D3DAPI Q_GetDesc(ID3D12CommandQueue* q, D3D12_COMMAND_QUEUE_DESC* d) { *d = ex<ID3D12CommandQueue, QueueExtra>(q)->desc; }
 HRESULT D3DAPI Q_SuspendX(ID3D12CommandQueue*, UINT) { return S_OK; }
 HRESULT D3DAPI Q_ResumeX(ID3D12CommandQueue*) { return S_OK; }

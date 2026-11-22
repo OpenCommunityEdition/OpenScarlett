@@ -6,7 +6,7 @@ add_custom_command(
   OUTPUT "${_mf_gen_cpp}" "${_mf_gen_def}"
   COMMAND ${Python3_EXECUTABLE} "${CMAKE_SOURCE_DIR}/tools/gen/gen_forwarder.py"
           "${CMAKE_CURRENT_SOURCE_DIR}/mfplat_exports.txt" "${_mf_gen_cpp}" "${_mf_gen_def}" MFPlat
-          --own MFResetDXGIDeviceManagerX
+          --own MFResetDXGIDeviceManagerX MFCreateDXGIDeviceManager
   DEPENDS "${CMAKE_SOURCE_DIR}/tools/gen/gen_forwarder.py" "${CMAKE_CURRENT_SOURCE_DIR}/mfplat_exports.txt"
   COMMENT "Generating MFPlat.dll forwarders")
 add_library(MFPlat SHARED mfplat.cpp "${_mf_gen_cpp}" "${_mf_gen_def}")

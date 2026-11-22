@@ -84,7 +84,10 @@ uint32_t pc_state_of(uint32_t consoleState);
 // Global memory for translated shaders (docs/gpucode.md): buffers addressable at title addresses.
 void gm_register(PcObj res, uint64_t titleVa, uint64_t size, uint64_t resOffset);
 void gm_forget(PcObj res);             // the resource is being destroyed
-void gm_flush(PcObj dev);              // before each submission: views and address table
+void gm_flush(PcObj dev);
+bool gm_resolve(uint64_t va, PcObj* res, uint64_t* off, uint64_t* avail);
+void list_rt_deserialize(PcObj l, uint64_t dst, uint64_t src);   // console structure bytes into the destination's shadow
+void list_dump_memory(PcObj l, uint64_t va, const char* what);   // XSL_AS_DUMP diagnostics              // before each submission: views and address table
 uint32_t gm_reserved_start();
 bool gm_active();                      // translated shaders may use global memory          // first global-heap slot reserved for it (UINT32_MAX: none)   // console D3D12_RESOURCE_STATES -> PC
 using FillSubresource = bool (*)(void* ctx, uint32_t sub, void* dst, uint32_t rowPitch, uint32_t rows, uint32_t depth);

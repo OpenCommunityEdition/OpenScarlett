@@ -405,8 +405,8 @@ void D3DAPI D_CreateDSV(ID3D12Device* d, ID3D12Resource* r, const D3D12_DEPTH_ST
 }
 void D3DAPI D_CreateSRV(ID3D12Device* d, ID3D12Resource* r, const D3D12_SHADER_RESOURCE_VIEW_DESC* v, D3D12_CPU_DESCRIPTOR_HANDLE h) {
     if (r) { D3D12_RESOURCE_DESC rd; pc::res_desc(P(r), &rd); XSL_TRACE("gfx.desc", "SRV handle %llx fmt %d %llux%u viewdesc %p", (unsigned long long)h.ptr, (int)rd.Format, (unsigned long long)rd.Width, rd.Height, (void*)v); }
-    write_view(h.ptr, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, [&](uint64_t ph) { pc::create_srv(DPC(d), P(r), v, ph); });
-    if (r) detile_view_created(P(r));   // CPU-written console texture: convert before the next submission
+    write_view(h.ptr, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, [&](uint64_t ph) { pc::create_srv(DPC(d), P_or_pc(r), v, ph); });   // video frames: PC resources
+    if (r && is_ours(r)) detile_view_created(P(r));   // CPU-written console texture: convert before the next submission
 }
 void D3DAPI D_CreateUAV(ID3D12Device* d, ID3D12Resource* r, ID3D12Resource* c, const D3D12_UNORDERED_ACCESS_VIEW_DESC* v, D3D12_CPU_DESCRIPTOR_HANDLE h) {
     write_view(h.ptr, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, [&](uint64_t ph) { pc::create_uav(DPC(d), P(r), P(c), v, ph); });

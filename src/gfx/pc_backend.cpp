@@ -405,19 +405,26 @@ void set_name(PcObj o, const wchar_t* name) {
     as<ID3D12Object>(o)->SetName(name);
 }
 
+// Console copy (DMA) queues and lists take barriers with any resource state; PC copy lists accept
+// only copy states (other states remove the device). They run as PC direct queues and lists.
+static int pc_list_type(int t) {
+    static bool keep = [] { char b[4]; return GetEnvironmentVariableA("XSL_COPY_QUEUES", b, 4) && b[0] == '1'; }();
+    return t == D3D12_COMMAND_LIST_TYPE_COPY && !keep ? D3D12_COMMAND_LIST_TYPE_DIRECT : t;
+}
 HRESULT_T create_queue(PcObj dev, const void* desc, PcObj* out) {
     D3D12_COMMAND_QUEUE_DESC d = *static_cast<const D3D12_COMMAND_QUEUE_DESC*>(desc);
+    d.Type = (D3D12_COMMAND_LIST_TYPE)pc_list_type(d.Type);
     d.Flags &= D3D12_COMMAND_QUEUE_FLAG_DISABLE_GPU_TIMEOUT;  // drop Xbox priority bits
     d.Priority = 0;
     return logged(as<ID3D12Device>(dev)->CreateCommandQueue(&d, IID_PPV_ARGS(reinterpret_cast<ID3D12CommandQueue**>(out))), "CreateCommandQueue");
 }
 HRESULT_T create_allocator(PcObj dev, int type, PcObj* out) {
-    return logged(as<ID3D12Device>(dev)->CreateCommandAllocator((D3D12_COMMAND_LIST_TYPE)type, IID_PPV_ARGS(reinterpret_cast<ID3D12CommandAllocator**>(out))), "CreateCommandAllocator");
+    return logged(as<ID3D12Device>(dev)->CreateCommandAllocator((D3D12_COMMAND_LIST_TYPE)pc_list_type(type), IID_PPV_ARGS(reinterpret_cast<ID3D12CommandAllocator**>(out))), "CreateCommandAllocator");
 }
 void name_recording(PcObj l);
 void list_set_pso(PcObj l, PcObj pso);
 HRESULT_T create_list(PcObj dev, int type, PcObj alloc, PcObj pso, PcObj* out) {
-    HRESULT hr = logged(as<ID3D12Device>(dev)->CreateCommandList(0, (D3D12_COMMAND_LIST_TYPE)type, as<ID3D12CommandAllocator>(alloc),
+    HRESULT hr = logged(as<ID3D12Device>(dev)->CreateCommandList(0, (D3D12_COMMAND_LIST_TYPE)pc_list_type(type), as<ID3D12CommandAllocator>(alloc),
                                                            as<ID3D12PipelineState>(pso), IID_PPV_ARGS(reinterpret_cast<ID3D12GraphicsCommandList**>(out))), "CreateCommandList");
     if (SUCCEEDED(hr)) {   // a new list is recording: name it like a Reset
         name_recording(*out);
@@ -500,6 +507,7 @@ std::map<uint64_t, GmBuf> g_gm;                 // title address -> buffer
 bool g_gm_dirty = false;
 uint32_t g_gm_next_srv = 1, g_gm_next_uav = kGmHalf;
 std::vector<ID3D12Resource*> g_gm_tables;       // table buffers (recent ones kept alive)
+std::map<ID3D12Resource*, ID3D12Resource*> g_as_shadow;   // acceleration-structure buffer -> shadow
 std::vector<uint32_t> g_gm_free_srv, g_gm_free_uav;   // view slots of destroyed buffers
 uint64_t g_gm_built_at = UINT64_MAX;            // present count of the last table rebuild
 std::map<PcObj, uint32_t> g_rs_gm;              // root signature -> appended parameter index
@@ -524,6 +532,13 @@ void gm_register(PcObj res, uint64_t titleVa, uint64_t size, uint64_t resOff) {
 }
 void gm_forget(PcObj res) {
     if (!gm_enabled() || !res) return;
+    ID3D12Resource* shadow = nullptr;
+    {
+        std::lock_guard<std::mutex> g(g_gm_mu);
+        auto it = g_as_shadow.find(as<ID3D12Resource>(res));
+        if (it != g_as_shadow.end()) { shadow = it->second; g_as_shadow.erase(it); }
+    }
+    if (shadow) { gm_forget((PcObj)shadow); shadow->Release(); }
     std::lock_guard<std::mutex> g(g_gm_mu);
     for (auto it = g_gm.begin(); it != g_gm.end();) {
         if (it->second.res != as<ID3D12Resource>(res)) { ++it; continue; }
@@ -536,6 +551,93 @@ void gm_forget(PcObj res) {
     }
 }
 std::atomic<uint64_t> g_gm_frame{0};   // presents (table rebuilds are limited to one per frame)
+// Acceleration-structure buffers cannot have raw views: each gets a shadow buffer of the same size,
+// registered at its address, that holds the console-format structure (deserialized or built by the
+// layer) for translated traversal code.
+static void gm_shadow_as(ID3D12Device* dev, ID3D12Resource* as, uint64_t size) {
+    D3D12_HEAP_PROPERTIES hp{D3D12_HEAP_TYPE_DEFAULT};
+    D3D12_RESOURCE_DESC bd{};
+    bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    bd.Width = size;
+    bd.Height = bd.DepthOrArraySize = bd.MipLevels = 1;
+    bd.SampleDesc.Count = 1;
+    bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    bd.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+    ID3D12Resource* sh = nullptr;
+    if (FAILED(dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&sh)))) return;
+    { std::lock_guard<std::mutex> g(g_gm_mu); g_as_shadow[as] = sh; }
+    gm_register((PcObj)sh, as->GetGPUVirtualAddress(), size, 0);
+}
+// DESERIALIZE: the console structure follows the 56-byte serialized header (and its BLAS pointers)
+// at a 64-byte boundary; its node pointers are relative, so it is copied as bytes.
+void list_rt_deserialize(PcObj l, uint64_t dst, uint64_t src) {
+    PcObj sr, dr; uint64_t so, doff, savail, davail;
+    if (!gm_resolve(src, &sr, &so, &savail) || !gm_resolve(dst, &dr, &doff, &davail) || savail <= 64) {
+        static volatile long n = 0;
+        if (InterlockedIncrement(&n) <= 3) XSL_WARN(CH, "acceleration structure deserialize %llx -> %llx: memory not addressable", (unsigned long long)src, (unsigned long long)dst);
+        return;
+    }
+    uint64_t bytes = std::min(savail - 64, davail);
+    auto* L2 = as<ID3D12GraphicsCommandList>(l);
+    L2->CopyBufferRegion(as<ID3D12Resource>(dr), doff, as<ID3D12Resource>(sr), so + 64, bytes);
+    D3D12_RESOURCE_BARRIER b{};
+    b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    b.Transition = {as<ID3D12Resource>(dr), D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON};
+    L2->ResourceBarrier(1, &b);   // promoted by the copy; back to COMMON so later reads promote again
+}
+// PC buffer holding title address va (global-memory registry): resource and byte offset.
+bool gm_resolve(uint64_t va, PcObj* res, uint64_t* off, uint64_t* avail) {
+    std::lock_guard<std::mutex> g(g_gm_mu);
+    auto it = g_gm.upper_bound(va);
+    if (it == g_gm.begin()) return false;
+    --it;
+    if (va >= it->first + it->second.size) return false;
+    *res = (PcObj)it->second.res;
+    *off = it->second.resOff + (va - it->first);
+    if (avail) *avail = it->first + it->second.size - va;
+    return true;
+}
+// XSL_AS_DUMP=1: the first 512 bytes of serialized acceleration structures, logged a few frames later.
+namespace {
+struct AsDump { ID3D12Resource* rb; uint64_t va; uint64_t frame; };
+std::vector<AsDump> g_as_dumps;
+}  // namespace
+void list_dump_memory(PcObj l, uint64_t va, const char* what) {
+    static int n = 0;
+    if (n >= 6 || !g_main_device) return;
+    PcObj r; uint64_t off, avail;
+    if (!gm_resolve(va, &r, &off, &avail) || avail < 512) return;
+    n++;
+    D3D12_HEAP_PROPERTIES hp{D3D12_HEAP_TYPE_READBACK};
+    D3D12_RESOURCE_DESC bd{};
+    bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    bd.Width = 512;
+    bd.Height = bd.DepthOrArraySize = bd.MipLevels = 1;
+    bd.SampleDesc.Count = 1;
+    bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    ID3D12Resource* rb = nullptr;
+    if (FAILED(g_main_device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&rb)))) return;
+    as<ID3D12GraphicsCommandList>(l)->CopyBufferRegion(rb, 0, as<ID3D12Resource>(r), off, 512);
+    std::lock_guard<std::mutex> g(g_gm_mu);
+    g_as_dumps.push_back({rb, va, g_gm_frame.load()});
+    (void)what;
+}
+static void print_dumps() {
+    std::lock_guard<std::mutex> g(g_gm_mu);
+    for (size_t i = 0; i < g_as_dumps.size();) {
+        auto& d = g_as_dumps[i];
+        if (d.frame + 4 > g_gm_frame.load()) { i++; continue; }
+        uint32_t* p = nullptr;
+        if (SUCCEEDED(d.rb->Map(0, nullptr, (void**)&p))) {
+            for (int row = 0; row < 32; row++)
+                XSL_INFO(CH, "AS dump %llx +%03x: %08x %08x %08x %08x", (unsigned long long)d.va, row * 16, p[row * 4], p[row * 4 + 1], p[row * 4 + 2], p[row * 4 + 3]);
+            d.rb->Unmap(0, nullptr);
+        }
+        d.rb->Release();
+        g_as_dumps.erase(g_as_dumps.begin() + i);
+    }
+}
+// presents (table rebuilds are limited to one per frame)
 void gm_flush(PcObj devObj) {
     if (!gm_enabled() || !g_gv) return;
     std::lock_guard<std::mutex> g(g_gm_mu);
@@ -1106,7 +1208,10 @@ HRESULT_T create_committed_resource(PcObj dev, const void* heapProps, uint32_t h
                                                                 IID_PPV_ARGS(reinterpret_cast<ID3D12Resource**>(out)));
     if (SUCCEEDED(hr)) note_buffer_fwd(*out);
     if (SUCCEEDED(hr)) note_texture(*out);
-    if (SUCCEEDED(hr) && d.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER && !(st & D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE)) gm_register(*out, as<ID3D12Resource>(*out)->GetGPUVirtualAddress(), d.Width, 0);
+    if (SUCCEEDED(hr) && d.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
+        if (!(st & D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE)) gm_register(*out, as<ID3D12Resource>(*out)->GetGPUVirtualAddress(), d.Width, 0);
+        else if (gm_enabled()) gm_shadow_as(as<ID3D12Device>(dev), as<ID3D12Resource>(*out), d.Width);
+    }
     if (SUCCEEDED(hr) && remap) {
         std::lock_guard<std::mutex> g(g_remap_mu);
         g_remapped.insert(*reinterpret_cast<ID3D12Resource**>(out));
@@ -1232,7 +1337,10 @@ HRESULT_T create_placed_resource(PcObj dev, PcObj heap, uint64_t offset, const v
                                                              IID_PPV_ARGS(reinterpret_cast<ID3D12Resource**>(out))), "CreatePlacedResource");
     if (SUCCEEDED(hr)) note_texture(*out);
     if (SUCCEEDED(hr)) note_buffer(*out);
-    if (SUCCEEDED(hr) && d.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER && !(pc_state(state) & D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE)) gm_register(*out, as<ID3D12Resource>(*out)->GetGPUVirtualAddress(), d.Width, 0);
+    if (SUCCEEDED(hr) && d.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
+        if (!(pc_state(state) & D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE)) gm_register(*out, as<ID3D12Resource>(*out)->GetGPUVirtualAddress(), d.Width, 0);
+        else if (gm_enabled()) gm_shadow_as(as<ID3D12Device>(dev), as<ID3D12Resource>(*out), d.Width);
+    }
     if (SUCCEEDED(hr) && getenv("XSL_TRACE_WRITERS")) {   // placed resources, for aliasing checks at present
         D3D12_RESOURCE_ALLOCATION_INFO ai = as<ID3D12Device>(dev)->GetResourceAllocationInfo(0, 1, &d);
         std::lock_guard<std::mutex> g(g_placed_mu);
@@ -2949,6 +3057,7 @@ HRESULT_T present(PcObj devObj, PcObj queueObj, PcObj resObj, void* hwndPtr, uin
         }
         ++g_present_count;
         ++g_gm_frame;
+        if (getenv("XSL_AS_DUMP")) print_dumps();
         if (g_info && g_present_count % 30 == 0) dump_debug_messages();   // debug layer: what it reported since the last dump
         if (trace_writers()) { std::lock_guard<std::mutex> g(g_wr_mu); g_planes.insert((PcObj)res); }
         if (trace_writers() && plane_ops_now()) { XSL_INFO(CH, "plane op: present %llu of %p on queue %p", (unsigned long long)g_present_count, (void*)res, (void*)q); report_aliases((PcObj)res); }

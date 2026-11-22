@@ -45,6 +45,15 @@ void resolve() {
 }
 }  // namespace
 
+// GPU (D3D12) video decoding through Media Foundation is off by default: with it, the decoder shares
+// the title's queues and its frames enter console command lists, which can still hang the GPU.
+// Without a device the title's player reports a decoder error and the
+// title runs on without that video. XSL_MF_GPU=1 turns GPU decoding on.
+static bool mf_gpu() {
+    static bool on = [] { char b[4]; return GetEnvironmentVariableA("XSL_MF_GPU", b, 4) && b[0] == '1'; }();
+    return on;
+}
+
 // Console-only: re-binds the DXGI device manager to a device (the console's variant of
 // IMFDXGIDeviceManager::ResetDevice). The title passes its console D3D12 device; PC Media
 // Foundation accepts it only if it is a PC device, so a refusal leaves the manager without a
@@ -65,13 +74,42 @@ static IUnknown* pc_device_of(IUnknown* device) {
 extern "C" HRESULT WINAPI MFResetDXGIDeviceManagerX(IMFDXGIDeviceManager* manager, IUnknown* device, UINT token) {
     if (!manager) return E_POINTER;
     // PC Media Foundation needs the PC device, not the console object fronting it.
-    HRESULT hr = manager->ResetDevice(pc_device_of(device), token);
+    HRESULT hr = mf_gpu() ? manager->ResetDevice(pc_device_of(device), token) : E_NOINTERFACE;
     if (FAILED(hr)) {
         static LONG once;
         if (!InterlockedExchange(&once, 1))
             XSL_WARN("media", "MFResetDXGIDeviceManagerX: PC Media Foundation refused the console device (%08lx); video decodes in software", hr);
     }
     return S_OK;
+}
+
+// Titles also call IMFDXGIDeviceManager::ResetDevice directly with the console device; PC Media
+// Foundation would then create its queues and fences through the console object. The manager's
+// ResetDevice (slot 7, after IUnknown and CloseDeviceHandle, GetVideoService, LockDevice,
+// OpenDeviceHandle) is redirected once so it always receives the PC device.
+using ResetDeviceFn = HRESULT(STDMETHODCALLTYPE*)(IMFDXGIDeviceManager*, IUnknown*, UINT);
+static ResetDeviceFn g_reset = nullptr;
+static HRESULT STDMETHODCALLTYPE reset_device(IMFDXGIDeviceManager* self, IUnknown* device, UINT token) {
+    if (!mf_gpu()) return E_NOINTERFACE;   // see mf_gpu()
+    return g_reset(self, pc_device_of(device), token);
+}
+extern "C" HRESULT WINAPI MFCreateDXGIDeviceManager(UINT* token, IMFDXGIDeviceManager** out) {
+    using Fn = HRESULT(WINAPI*)(UINT*, IMFDXGIDeviceManager**);
+    static Fn sys = g_system ? (Fn)GetProcAddress(g_system, "MFCreateDXGIDeviceManager") : nullptr;
+    if (!sys) return E_NOTIMPL;
+    HRESULT hr = sys(token, out);
+    if (SUCCEEDED(hr) && out && *out) {
+        void** vt = *reinterpret_cast<void***>(*out);
+        if (vt[7] != (void*)&reset_device) {
+            DWORD old;
+            if (VirtualProtect(&vt[7], sizeof(void*), PAGE_READWRITE, &old)) {
+                if (!g_reset) g_reset = (ResetDeviceFn)vt[7];
+                vt[7] = (void*)&reset_device;
+                VirtualProtect(&vt[7], sizeof(void*), old, &old);
+            }
+        }
+    }
+    return hr;
 }
 
 BOOL WINAPI DllMain(HINSTANCE, DWORD reason, LPVOID) {

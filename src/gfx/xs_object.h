@@ -116,6 +116,11 @@ template <class T> PcObj P(T* o, const char* fn = __builtin_FUNCTION()) {
     return hdr(o)->pc;
 }
 
+// Objects PC components may hand the title's queues (e.g. Media Foundation's fences through
+// IMFD3D12SynchronizationObjectCommands): a layer object becomes its PC object, anything else is
+// already a PC object.
+template <class T> PcObj P_or_pc(T* o) { return !o ? nullptr : is_ours(o) ? hdr(o)->pc : (PcObj)o; }
+
 // ---- Device ----------------------------------------------------------------------------
 using XDevice = ID3D12Device11;
 struct DeviceExtra {
