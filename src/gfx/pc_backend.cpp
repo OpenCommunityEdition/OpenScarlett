@@ -1220,6 +1220,76 @@ void copy_descriptors_simple(PcObj dev, uint32_t n, uint64_t dst, uint64_t src, 
     }
     as<ID3D12Device>(dev)->CopyDescriptorsSimple(n, cpu(dst), cpu(src), (D3D12_DESCRIPTOR_HEAP_TYPE)type);
 }
+namespace {
+struct UploadJob { ID3D12Resource* buf; ID3D12CommandAllocator* alloc; ID3D12GraphicsCommandList* list; ID3D12Fence* fence; };
+std::mutex g_up_mu;
+std::vector<UploadJob> g_up_jobs;   // in flight; released once their fence has passed
+void reap_uploads(bool all) {
+    for (size_t i = 0; i < g_up_jobs.size();) {
+        auto& j = g_up_jobs[i];
+        if (!all && j.fence->GetCompletedValue() < 1) { i++; continue; }
+        j.buf->Release(); j.list->Release(); j.alloc->Release(); j.fence->Release();
+        g_up_jobs.erase(g_up_jobs.begin() + i);
+    }
+}
+}  // namespace
+uint32_t pc_state_of(uint32_t consoleState) { return (uint32_t)pc_state(consoleState); }
+HRESULT_T upload_texture(PcObj devObj, PcObj qObj, PcObj dstObj, uint32_t state, FillSubresource fill, void* ctx) {
+    auto* dev = as<ID3D12Device>(devObj);
+    auto* q = as<ID3D12CommandQueue>(qObj);
+    auto* dst = as<ID3D12Resource>(dstObj);
+    D3D12_RESOURCE_DESC rd = dst->GetDesc();
+    UINT subs = rd.MipLevels * (rd.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D ? 1 : rd.DepthOrArraySize);
+    if (!subs || subs > 4096) return E_INVALIDARG;
+    std::vector<D3D12_PLACED_SUBRESOURCE_FOOTPRINT> fp(subs);
+    std::vector<UINT> rows(subs);
+    std::vector<UINT64> rowBytes(subs);
+    UINT64 total = 0;
+    dev->GetCopyableFootprints(&rd, 0, subs, 0, fp.data(), rows.data(), rowBytes.data(), &total);
+    if (!total || total == UINT64_MAX) return E_INVALIDARG;
+    D3D12_HEAP_PROPERTIES hp{D3D12_HEAP_TYPE_UPLOAD};
+    D3D12_RESOURCE_DESC bd{};
+    bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    bd.Width = total;
+    bd.Height = bd.DepthOrArraySize = bd.MipLevels = 1;
+    bd.SampleDesc.Count = 1;
+    bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    UploadJob j{};
+    HRESULT hr = dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&j.buf));
+    if (FAILED(hr)) return hr;
+    uint8_t* p = nullptr;
+    if (FAILED(hr = j.buf->Map(0, nullptr, (void**)&p))) { j.buf->Release(); return hr; }
+    bool ok = true;
+    for (UINT s = 0; s < subs && ok; s++) ok = fill(ctx, s, p + fp[s].Offset, fp[s].Footprint.RowPitch, rows[s], fp[s].Footprint.Depth);
+    j.buf->Unmap(0, nullptr);
+    if (!ok) { j.buf->Release(); return E_FAIL; }
+    dev->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&j.alloc));
+    dev->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, j.alloc, nullptr, IID_PPV_ARGS(&j.list));
+    dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&j.fence));
+    auto st = (D3D12_RESOURCE_STATES)state;
+    // COMMON textures are promoted to COPY_DEST by the copy (and decay back afterwards).
+    bool barrier = st != D3D12_RESOURCE_STATE_COMMON && st != D3D12_RESOURCE_STATE_COPY_DEST;
+    D3D12_RESOURCE_BARRIER b{};
+    b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    b.Transition = {dst, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, st, D3D12_RESOURCE_STATE_COPY_DEST};
+    if (barrier) j.list->ResourceBarrier(1, &b);
+    for (UINT s = 0; s < subs; s++) {
+        D3D12_TEXTURE_COPY_LOCATION d{dst, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, {}};
+        d.SubresourceIndex = s;
+        D3D12_TEXTURE_COPY_LOCATION sr{j.buf, D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, {}};
+        sr.PlacedFootprint = fp[s];
+        j.list->CopyTextureRegion(&d, 0, 0, 0, &sr, nullptr);
+    }
+    if (barrier) { std::swap(b.Transition.StateBefore, b.Transition.StateAfter); j.list->ResourceBarrier(1, &b); }
+    j.list->Close();
+    ID3D12CommandList* ls[] = {j.list};
+    q->ExecuteCommandLists(1, ls);
+    q->Signal(j.fence, 1);
+    std::lock_guard<std::mutex> g(g_up_mu);
+    reap_uploads(false);
+    g_up_jobs.push_back(j);
+    return S_OK;
+}
 void get_copyable_footprints(PcObj dev, const void* desc, uint32_t first, uint32_t num, uint64_t base, void* layouts,
                              uint32_t* rows, uint64_t* rowSizes, uint64_t* total) {
     D3D12_RESOURCE_DESC d = clean_desc(desc);

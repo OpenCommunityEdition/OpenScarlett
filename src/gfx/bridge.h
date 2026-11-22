@@ -77,6 +77,12 @@ void create_uav(PcObj dev, PcObj res, PcObj counter, const void* desc, uint64_t 
 void create_cbv(PcObj dev, const void* desc, uint64_t cpuHandle);
 void create_sampler(PcObj dev, const void* desc, uint64_t cpuHandle);
 void copy_descriptors_simple(PcObj dev, uint32_t n, uint64_t dst, uint64_t src, int heapType);
+// Fills every subresource of `dst` (single-plane texture) from linear data written by `fill`
+// (called per subresource with the destination pointer, row pitch, rows and depth) through an upload
+// buffer, on queue `q` before later submissions. `state` is the resource's current state.
+uint32_t pc_state_of(uint32_t consoleState);   // console D3D12_RESOURCE_STATES -> PC
+using FillSubresource = bool (*)(void* ctx, uint32_t sub, void* dst, uint32_t rowPitch, uint32_t rows, uint32_t depth);
+HRESULT_T upload_texture(PcObj dev, PcObj q, PcObj dst, uint32_t state, FillSubresource fill, void* ctx);
 void get_copyable_footprints(PcObj dev, const void* desc, uint32_t first, uint32_t num, uint64_t base,
                              void* layouts, uint32_t* rows, uint64_t* rowSizes, uint64_t* total);
 void get_resource_allocation_info(PcObj dev, uint32_t mask, uint32_t n, const void* descs, void* out);

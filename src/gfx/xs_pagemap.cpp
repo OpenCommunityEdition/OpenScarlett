@@ -18,6 +18,7 @@
 #include <vector>
 
 #include "xs_object.h"
+#include "xs_detile.h"
 
 namespace xs {
 namespace {
@@ -166,6 +167,7 @@ HRESULT D3DAPI D_CreatePlacedResourceX(ID3D12Device* d, D3D12_GPU_VIRTUAL_ADDRES
         PcObj r = nullptr;
         HRESULT hr = pc::create_committed_resource(de->pcDevice, &hp, 0, desc, st, cv, &r);
         if (FAILED(hr)) return hr;
+        detile_register(r, va, desc, pc::pc_state_of(st));
         return make_resource((Device*)d, r, riid, out);
     }
     PcObj r = nullptr;
