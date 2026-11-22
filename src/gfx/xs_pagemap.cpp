@@ -154,8 +154,23 @@ HRESULT D3DAPI D_CreatePlacedResourceX(ID3D12Device* d, D3D12_GPU_VIRTUAL_ADDRES
     DeviceExtra* de = dev_extra(d);
     MEMORY_BASIC_INFORMATION mbi{};
     VirtualQuery((const void*)va, &mbi, sizeof mbi);
+    if (getenv("XSL_TRACE_VIDEO_PLANES") && desc && (desc->Format == DXGI_FORMAT_R8_UNORM || desc->Format == DXGI_FORMAT_R8G8_UNORM) && desc->Width >= 1024)
+        XSL_INFO(CH, "placed X fmt %d %llux%u at %llx (%s)", (int)desc->Format, (unsigned long long)desc->Width, desc->Height, (unsigned long long)va,
+                 mbi.State == MEM_COMMIT ? "committed" : "reserved");
     // XSL_PLACED_COMMITTED=1 (diagnostics): ignore page mappings, give every placed resource its own memory.
     static bool forceCommitted = [] { char b[4]; return GetEnvironmentVariableA("XSL_PLACED_COMMITTED", b, 4) && b[0] == '1'; }();
+    if (va && va < (1ull << 32) && mbi.State == MEM_FREE && desc && desc->Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D) {
+        D3D12_HEAP_PROPERTIES hp{D3D12_HEAP_TYPE_DEFAULT};
+        PcObj r = nullptr;
+        HRESULT hr = pc::create_committed_resource(de->pcDevice, &hp, 0, desc, st, cv, &r);
+        if (FAILED(hr)) return hr;
+        static volatile long n = 0;
+        if (InterlockedIncrement(&n) <= 2)
+            XSL_INFO(CH, "CreatePlacedResourceX at %llx (no memory there): plane %d of a video frame (format %d %llux%u)", (unsigned long long)va, va ? 1 : 0,
+                     (int)desc->Format, (unsigned long long)desc->Width, desc->Height);
+        note_plane_alias(r, va);
+        return make_resource((Device*)d, r, riid, out);
+    }
     if (mbi.State == MEM_COMMIT || forceCommitted) {
         // Placed on committed title memory: contents the CPU writes there are not shared with the
         // PC resource yet (that needs console-tiling conversion); GPU-produced contents work.

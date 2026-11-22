@@ -385,6 +385,8 @@ HRESULT D3DAPI D_CreateHeap(ID3D12Device* d, const D3D12_HEAP_DESC* desc, REFIID
 }
 HRESULT D3DAPI D_CreatePlacedResource(ID3D12Device* d, ID3D12Heap* heap, UINT64 off, const D3D12_RESOURCE_DESC* rd, D3D12_RESOURCE_STATES st,
                                       const D3D12_CLEAR_VALUE* cv, REFIID riid, void** out) {
+    if (getenv("XSL_TRACE_VIDEO_PLANES") && rd && (rd->Format == DXGI_FORMAT_R8_UNORM || rd->Format == DXGI_FORMAT_R8G8_UNORM) && rd->Width >= 1024)
+        XSL_INFO("gfx", "placed fmt %d %llux%u in heap %p at %llu", (int)rd->Format, (unsigned long long)rd->Width, rd->Height, (void*)heap, (unsigned long long)off);
     PcObj r = nullptr;
     HRESULT hr = pc::create_placed_resource(DPC(d), P(heap), off, rd, st, cv, &r);
     if (FAILED(hr)) return hr;

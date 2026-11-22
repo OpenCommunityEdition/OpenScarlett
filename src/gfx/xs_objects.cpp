@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Console Direct3D 12.X objects implemented over the PC back end.
 #include <cstring>
+#include <map>
 #include <mutex>
+#include <set>
 #include <vector>
 
 #include "xs_object.h"
@@ -66,8 +68,16 @@ ULONG D3DAPI Release(IGraphicsUnknown* self) {
     return n;
 }
 void keep_foreign(void* pcObject);
+std::mutex g_alias_mu;
+std::map<PcObj, uint64_t> g_plane_alias;   // PC resource -> offset in the video frame
+std::map<void*, PcObj> g_list_frame;       // console list -> decoded frame it last copied from
+void note_plane_alias(PcObj r, uint64_t off) {
+    std::lock_guard<std::mutex> g(g_alias_mu);
+    g_plane_alias[r] = off;
+}
 void free_object(IGraphicsUnknown* self) {
     ObjHeader* h = hdr(self);
+    if (h->pc && h->kind == Kind::Resource) { std::lock_guard<std::mutex> g(g_alias_mu); g_plane_alias.erase(h->pc); }
     // Resources: the PC object outlives the console one by a few frames. Titles free resources once
     // their own fences say the GPU is done, but other components given the PC object (Media
     // Foundation's decoder) may still have work referencing it.
@@ -694,6 +704,32 @@ void D3DAPI L_CopyTextureRegion(ID3D12GraphicsCommandList* l, const D3D12_TEXTUR
                      d->Type == D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT ? d->PlacedFootprint.Footprint.Height : 0,
                      d->Type == D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT ? d->PlacedFootprint.Footprint.RowPitch : 0,
                      d->Type == D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT ? (unsigned long long)d->PlacedFootprint.Offset : 0ull, x, y, box ? 1 : 0);
+        }
+    }
+    if (!is_ours(s->pResource)) {   // copies out of decoder frames: each distinct kind once
+        static std::mutex mu;
+        static std::set<uint64_t> seen;
+        D3D12_RESOURCE_DESC dsd{};
+        pc::res_desc((PcObj)dd.pResource, &dsd);
+        uint64_t k = (uint64_t)(s->Type == D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX ? s->SubresourceIndex : 999) << 32 | (uint64_t)dsd.Format << 16 | (uint64_t)d->Type;
+        std::lock_guard<std::mutex> g(mu);
+        if (seen.insert(k).second)
+            XSL_INFO(CH, "decoder copy: src sub %u -> dst fmt %d %llux%u (type %d sub %u) box %s%u,%u-%u,%u", (unsigned)(k >> 32), (int)dsd.Format, (unsigned long long)dsd.Width, dsd.Height,
+                     (int)d->Type, d->Type == D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX ? d->SubresourceIndex : 0, box ? "" : "none ", box ? box->left : 0, box ? box->top : 0,
+                     box ? box->right : 0, box ? box->bottom : 0);
+    }
+    if (!is_ours(s->pResource)) {
+        std::lock_guard<std::mutex> g(g_alias_mu);
+        g_list_frame[l] = (PcObj)ss.pResource;
+    } else {
+        std::lock_guard<std::mutex> g(g_alias_mu);
+        auto a = g_plane_alias.find((PcObj)ss.pResource);
+        if (a != g_plane_alias.end()) {
+            auto f = g_list_frame.find(l);
+            if (f == g_list_frame.end()) return;   // no frame yet: nothing to read
+            ss.pResource = (ID3D12Resource*)f->second;
+            ss.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+            ss.SubresourceIndex = a->second ? 1u : 0u;   // NV12/P010: plane 1 is subresource 1 (one mip, one slice)
         }
     }
     if (!is_ours(s->pResource) && getenv("XSL_SKIP_VIDEO_COPIES")) return;   // experiment: copies out of decoder textures

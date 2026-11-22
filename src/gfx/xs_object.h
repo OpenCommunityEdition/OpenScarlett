@@ -122,6 +122,10 @@ template <class T> PcObj P(T* o, const char* fn = __builtin_FUNCTION()) {
 // A PC object recorded into a list stays alive until the GPU is done with it (keep_foreign holds a
 // reference for a few frames): the component that made it may release it right after recording.
 void keep_foreign(void* pcObject);
+// Plane aliases: titles address plane 1 of a decoded video frame by placing a texture at the frame's
+// GPU address plus the plane offset. PC textures have no GPU address (0), so such resources land at a
+// small unreserved address; copies out of them read that plane of the frame the list last copied from.
+void note_plane_alias(PcObj pcResource, uint64_t offset);
 template <class T> PcObj P_or_pc(T* o) {
     if (!o) return nullptr;
     if (is_ours(o)) return hdr(o)->pc;

@@ -1448,13 +1448,26 @@ void report_aliases(PcObj r) {   // resources placed over r's memory
 
 // XSL_TRACE_WRITERS=1: which pipeline last drew into each render target (the presented image's
 // writer is logged at present).
-static bool trace_writers() { static bool on = env_on("XSL_TRACE_WRITERS"); return on; }
+std::atomic<uint64_t> g_wr_present{0};   // presents so far (writer tracing)
+static uint64_t env_u64(const char* n) { char b[16]; return GetEnvironmentVariableA(n, b, sizeof b) ? _strtoui64(b, nullptr, 10) : 0ull; }
+// Writer tracing: always with XSL_TRACE_WRITERS=1; with only XSL_RT_STATS / XSL_PLANE_OPS, during the
+// 30 presents before the requested one (tracing slows every draw). RTV handles are always recorded.
+static bool trace_rtvs() {
+    static bool on = env_on("XSL_TRACE_WRITERS") || env_u64("XSL_RT_STATS") || env_u64("XSL_PLANE_OPS");
+    return on;
+}
+static bool trace_writers() {
+    static bool all = env_on("XSL_TRACE_WRITERS");
+    static uint64_t at = std::max(env_u64("XSL_RT_STATS"), env_u64("XSL_PLANE_OPS"));
+    if (all) return true;
+    uint64_t now = g_wr_present.load();
+    return at && now + 30 >= at && now <= at;
+}
 std::mutex g_wr_mu;
 std::map<uint64_t, PcObj> g_rtv_res;              // PC RTV handle -> resource
 std::map<PcObj, PcObj> g_wr_rt0, g_wr_pso;        // list -> render target 0, pipeline
 std::map<PcObj, std::pair<PcObj, uint64_t>> g_wr_last;   // resource -> (pipeline, draws)
 std::map<PcObj, uint64_t> g_wr_frame;                     // resource -> present count of its last draw
-std::atomic<uint64_t> g_wr_present{0};   // presents so far (writer tracing)
 std::vector<PcObj> g_big_textures;        // 2D textures of 1080p and more (writer tracing)
 std::map<PcObj, uint32_t> g_last_state;   // last whole-resource transition target (writer tracing)
 std::map<uint64_t, PcObj> g_uav_res;      // CPU descriptor handle -> resource of the UAV there (writer tracing)
@@ -1487,7 +1500,7 @@ static void note_draw(PcObj l) {
     g_wr_frame[rt->second] = g_wr_present.load();
 }
 void create_rtv(PcObj dev, PcObj res, const void* desc, uint64_t h) {
-    if (trace_writers()) { std::lock_guard<std::mutex> g(g_wr_mu); g_rtv_res[h] = res; }
+    if (trace_rtvs()) { std::lock_guard<std::mutex> g(g_wr_mu); g_rtv_res[h] = res; }
     D3D12_RENDER_TARGET_VIEW_DESC t;
     const D3D12_RENDER_TARGET_VIEW_DESC* vd = view_fix(res, desc, t);
     if (trace_writers() && res) {
@@ -1517,6 +1530,14 @@ void create_srv(PcObj dev, PcObj res, const void* desc, uint64_t h) {
     if (trace_writers()) { std::lock_guard<std::mutex> g(g_wr_mu); g_srv_res[h] = res; g_uav_res.erase(h); }
     D3D12_SHADER_RESOURCE_VIEW_DESC t;
     const D3D12_SHADER_RESOURCE_VIEW_DESC* vd = view_fix(res, desc, t);
+    if (res && as<ID3D12Resource>(res)->GetDesc().Format == DXGI_FORMAT_NV12) {   // views of decoded video frames
+        static volatile long n = 0;
+        auto* td = static_cast<const D3D12_SHADER_RESOURCE_VIEW_DESC*>(desc);
+        if (InterlockedIncrement(&n) <= 12)
+            XSL_INFO(CH, "NV12 SRV: title %s dim %d fmt %d plane %u swizzle %#x -> PC %s dim %d fmt %d plane %u", td ? "desc" : "default", td ? (int)td->ViewDimension : -1,
+                     td ? (int)td->Format : -1, td ? td->Texture2D.PlaneSlice : 0, td ? td->Shader4ComponentMapping : 0, vd ? "desc" : "default", vd ? (int)vd->ViewDimension : -1,
+                     vd ? (int)vd->Format : -1, vd ? vd->Texture2D.PlaneSlice : 0);
+    }
     if (trace_writers() && res) {
         D3D12_RESOURCE_DESC rd = as<ID3D12Resource>(res)->GetDesc();
         if (rd.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && rd.Width == 1920 && rd.Height == 1080 && rd.Format == DXGI_FORMAT_R11G11B10_FLOAT) {
