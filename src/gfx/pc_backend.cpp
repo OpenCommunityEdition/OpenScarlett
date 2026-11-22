@@ -344,6 +344,7 @@ ID3D12DescriptorHeap* g_gv = nullptr;
 bool g_gv_failed = false;
 uint32_t g_gv_size = 0, g_gv_inc = 0;
 std::map<uint32_t, uint32_t> g_gv_free;  // free ranges: offset -> count
+constexpr uint32_t kGmSlots = 16384, kGmHalf = 8192;   // global-memory view range (end of the global heap)
 }  // namespace
 PcObj global_view_heap(PcObj dev) {
     std::lock_guard<std::mutex> g(g_gv_mu);
@@ -486,15 +487,230 @@ PcObj create_blob(const void* data, size_t size) {
     return (PcObj)static_cast<ID3DBlob*>(b);
 }
 
+// ---- Global memory (docs/gpucode.md, ray tracing R1) ------------------------------------------
+// Console code reads title GPU addresses directly. Every buffer the title can address gets raw
+// views in a range reserved at the end of the global view heap; slot 0 of the range holds a sorted
+// table {start, size, view indices}. Root signatures get one appended descriptor table over the
+// range (SRV t0 space901 = table, SRVs t0.. space900, UAVs u0.. space900), bound whenever a root
+// signature is set.
+namespace {
+struct GmBuf { uint64_t size; ID3D12Resource* res; uint64_t resOff; std::vector<std::pair<uint32_t, uint32_t>> views; };   // (SRV, UAV) slot per 512 MB chunk
+std::mutex g_gm_mu;
+std::map<uint64_t, GmBuf> g_gm;                 // title address -> buffer
+bool g_gm_dirty = false;
+uint32_t g_gm_next_srv = 1, g_gm_next_uav = kGmHalf;
+std::vector<ID3D12Resource*> g_gm_tables;       // table buffers (recent ones kept alive)
+std::vector<uint32_t> g_gm_free_srv, g_gm_free_uav;   // view slots of destroyed buffers
+uint64_t g_gm_built_at = UINT64_MAX;            // present count of the last table rebuild
+std::map<PcObj, uint32_t> g_rs_gm;              // root signature -> appended parameter index
+std::map<PcObj, bool> g_list_global_heap;       // list -> the global heap is bound
+std::map<PcObj, std::pair<PcObj, PcObj>> g_list_gm_rs;   // list -> current (graphics, compute) root signatures
+bool gm_enabled() { static bool on = [] { char b[4]; return !(GetEnvironmentVariableA("XSL_GLOBAL_MEMORY", b, 4) && b[0] == '0'); }(); return on; }
+}  // namespace
+bool gm_active() { return gm_enabled() && !getenv("XSL_GM_NO_RS"); }
+uint32_t gm_reserved_start() { return gm_enabled() && g_gv_size > kGmSlots ? g_gv_size - kGmSlots : UINT32_MAX; }
+void gm_register(PcObj res, uint64_t titleVa, uint64_t size, uint64_t resOff) {
+    if (!gm_enabled() || !res || !size) return;
+    D3D12_HEAP_PROPERTIES hp{};
+    D3D12_HEAP_FLAGS hf{};
+    if (SUCCEEDED(as<ID3D12Resource>(res)->GetHeapProperties(&hp, &hf)) &&
+        (hp.Type == D3D12_HEAP_TYPE_READBACK || (hp.Type == D3D12_HEAP_TYPE_CUSTOM && hp.CPUPageProperty == D3D12_CPU_PAGE_PROPERTY_WRITE_BACK && hp.MemoryPoolPreference == D3D12_MEMORY_POOL_L0 && false)))
+        return;   // readback buffers only take copies
+    std::lock_guard<std::mutex> g(g_gm_mu);
+    auto& e = g_gm[titleVa];
+    if (e.res == as<ID3D12Resource>(res) && e.size == size) return;
+    e = GmBuf{size, as<ID3D12Resource>(res), resOff};
+    g_gm_dirty = true;
+}
+void gm_forget(PcObj res) {
+    if (!gm_enabled() || !res) return;
+    std::lock_guard<std::mutex> g(g_gm_mu);
+    for (auto it = g_gm.begin(); it != g_gm.end();) {
+        if (it->second.res != as<ID3D12Resource>(res)) { ++it; continue; }
+        for (auto& v : it->second.views) {
+            if (v.first) g_gm_free_srv.push_back(v.first);
+            if (v.second) g_gm_free_uav.push_back(v.second);
+        }
+        it = g_gm.erase(it);
+        g_gm_dirty = true;
+    }
+}
+std::atomic<uint64_t> g_gm_frame{0};   // presents (table rebuilds are limited to one per frame)
+void gm_flush(PcObj devObj) {
+    if (!gm_enabled() || !g_gv) return;
+    std::lock_guard<std::mutex> g(g_gm_mu);
+    if (!g_gm_dirty) return;
+    if (g_gm_built_at == g_gm_frame.load()) return;   // at most one rebuild per frame
+    g_gm_built_at = g_gm_frame.load();
+    g_gm_dirty = false;
+    auto* dev = as<ID3D12Device>(devObj);
+    const uint32_t base = gm_reserved_start();
+    auto cpu_at = [&](uint32_t k) { return D3D12_CPU_DESCRIPTOR_HANDLE{g_gv->GetCPUDescriptorHandleForHeapStart().ptr + (uint64_t)(base + k) * g_gv_inc}; };
+    std::vector<uint32_t> table(4, 0);
+    uint32_t count = 0;
+    static volatile long full = 0;
+    // A buffer view holds at most 2^27 elements (512 MB raw): larger buffers become several chunks,
+    // each with its own views and table entry.
+    constexpr uint64_t kChunk = 512ull << 20;
+    for (auto& [va, e] : g_gm) {
+        D3D12_RESOURCE_DESC rd = e.res->GetDesc();
+        uint64_t bytes = std::min<uint64_t>(e.size, rd.Width - e.resOff) & ~3ull;
+        if (!bytes) continue;
+        uint32_t chunks = (uint32_t)((bytes + kChunk - 1) / kChunk);
+        if (e.views.size() != chunks) e.views.assign(chunks, {0, 0});
+        for (uint32_t c = 0; c < chunks; c++) {
+            uint64_t off = (uint64_t)c * kChunk, len = std::min(kChunk, bytes - off);
+            auto& v = e.views[c];
+            const bool srvOk = !(rd.Flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE);
+            const bool uavOk = (rd.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) != 0;
+            if (!srvOk && !uavOk) continue;
+            if (!v.first && !v.second) {
+                auto take = [](std::vector<uint32_t>& fr, uint32_t& next, uint32_t end) -> uint32_t {
+                    if (!fr.empty()) { uint32_t k = fr.back(); fr.pop_back(); return k; }
+                    return next < end ? next++ : 0u;
+                };
+                uint32_t sSlot = srvOk ? take(g_gm_free_srv, g_gm_next_srv, kGmHalf) : 0u;
+                uint32_t uSlot = uavOk ? take(g_gm_free_uav, g_gm_next_uav, kGmSlots) : 0u;
+                if ((srvOk && !sSlot) || (uavOk && !uSlot)) {
+                    if (sSlot) g_gm_free_srv.push_back(sSlot);
+                    if (uSlot) g_gm_free_uav.push_back(uSlot);
+                    if (InterlockedIncrement(&full) == 1) XSL_WARN(CH, "global memory: view range full");
+                    continue;
+                }
+                D3D12_SHADER_RESOURCE_VIEW_DESC sv{};
+                sv.Format = DXGI_FORMAT_R32_TYPELESS;
+                sv.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+                sv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+                sv.Buffer.FirstElement = (e.resOff + off) / 4;
+                sv.Buffer.NumElements = (UINT)(len / 4);
+                sv.Buffer.Flags = D3D12_BUFFER_SRV_FLAG_RAW;
+                if (srvOk) { v.first = sSlot; dev->CreateShaderResourceView(e.res, &sv, cpu_at(v.first)); }
+                if (uavOk) {
+                    v.second = uSlot;
+                    D3D12_UNORDERED_ACCESS_VIEW_DESC uv{};
+                    uv.Format = DXGI_FORMAT_R32_TYPELESS;
+                    uv.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+                    uv.Buffer.FirstElement = sv.Buffer.FirstElement;
+                    uv.Buffer.NumElements = sv.Buffer.NumElements;
+                    uv.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
+                    dev->CreateUnorderedAccessView(e.res, nullptr, &uv, cpu_at(v.second));
+                }
+            }
+            // {start lo, start hi, size, SRV index [13:0] | UAV index [27:14] | has UAV [31]}
+            uint64_t start = va + off;
+            table.push_back(uint32_t(start));
+            table.push_back(uint32_t(start >> 32));
+            table.push_back((uint32_t)len);
+            // [13:0] SRV index, [27:14] UAV index, [30] has SRV, [31] has UAV
+            table.push_back((v.first ? (v.first - 1) | 0x40000000u : 0u) | (v.second ? ((v.second - kGmHalf) << 14) | 0x80000000u : 0u));
+            count++;
+        }
+    }
+    table[0] = count;
+    D3D12_HEAP_PROPERTIES hp{D3D12_HEAP_TYPE_UPLOAD};
+    D3D12_RESOURCE_DESC bd{};
+    bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    bd.Width = table.size() * 4;
+    bd.Height = bd.DepthOrArraySize = bd.MipLevels = 1;
+    bd.SampleDesc.Count = 1;
+    bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    ID3D12Resource* t = nullptr;
+    if (FAILED(dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&t)))) return;
+    void* m = nullptr;
+    if (SUCCEEDED(t->Map(0, nullptr, &m))) { memcpy(m, table.data(), table.size() * 4); t->Unmap(0, nullptr); }
+    D3D12_SHADER_RESOURCE_VIEW_DESC sv{};
+    sv.Format = DXGI_FORMAT_UNKNOWN;
+    sv.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+    sv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    sv.Buffer.NumElements = (UINT)(table.size() / 4);
+    sv.Buffer.StructureByteStride = 16;
+    dev->CreateShaderResourceView(t, &sv, cpu_at(0));
+    g_gm_tables.push_back(t);
+    while (g_gm_tables.size() > 8) { g_gm_tables.front()->Release(); g_gm_tables.erase(g_gm_tables.begin()); }   // in flight at most a few frames
+    static volatile long logged = 0;
+    if (InterlockedIncrement(&logged) <= 3) XSL_INFO(CH, "global memory: %u buffers addressable by translated shaders", count);
+}
+// Appends the global-memory table to a serialized root signature (false: left unchanged).
+static bool gm_extend_root_signature(const void* blob, size_t size, std::vector<uint8_t>& out, uint32_t* index) {
+    ID3D12VersionedRootSignatureDeserializer* ds = nullptr;
+    if (FAILED(D3D12CreateVersionedRootSignatureDeserializer(blob, size, IID_PPV_ARGS(&ds)))) return false;
+    const D3D12_VERSIONED_ROOT_SIGNATURE_DESC* vd = nullptr;
+    bool ok = false;
+    if (SUCCEEDED(ds->GetRootSignatureDescAtVersion(D3D_ROOT_SIGNATURE_VERSION_1_1, &vd)) && vd) {
+        const auto& d = vd->Desc_1_1;
+        unsigned cost = 0;
+        for (UINT i = 0; i < d.NumParameters; i++) {
+            auto t = d.pParameters[i].ParameterType;
+            cost += t == D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE ? 1 : t == D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS ? d.pParameters[i].Constants.Num32BitValues : 2;
+        }
+        if (cost < 64) {
+            std::vector<D3D12_ROOT_PARAMETER1> params(d.pParameters, d.pParameters + d.NumParameters);
+            static const D3D12_DESCRIPTOR_RANGE_FLAGS vol = D3D12_DESCRIPTOR_RANGE_FLAG_DESCRIPTORS_VOLATILE | D3D12_DESCRIPTOR_RANGE_FLAG_DATA_VOLATILE;
+            static const D3D12_DESCRIPTOR_RANGE1 ranges[3] = {
+                {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0, 901, vol, 0},
+                {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, kGmHalf - 1, 0, 900, vol, 1},
+                {D3D12_DESCRIPTOR_RANGE_TYPE_UAV, kGmSlots - kGmHalf, 0, 900, vol, kGmHalf}};
+            D3D12_ROOT_PARAMETER1 p{};
+            p.ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+            p.DescriptorTable = {3, ranges};
+            p.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+            params.push_back(p);
+            D3D12_VERSIONED_ROOT_SIGNATURE_DESC nd{D3D_ROOT_SIGNATURE_VERSION_1_1};
+            nd.Desc_1_1 = d;
+            nd.Desc_1_1.NumParameters = (UINT)params.size();
+            nd.Desc_1_1.pParameters = params.data();
+            ID3DBlob* b = nullptr;
+            ID3DBlob* err = nullptr;
+            if (SUCCEEDED(D3D12SerializeVersionedRootSignature(&nd, &b, &err))) {
+                out.assign((const uint8_t*)b->GetBufferPointer(), (const uint8_t*)b->GetBufferPointer() + b->GetBufferSize());
+                *index = d.NumParameters;
+                ok = true;
+                b->Release();
+            }
+            if (err) err->Release();
+        }
+    }
+    ds->Release();
+    return ok;
+}
 HRESULT_T create_root_signature(PcObj dev, const void* blob, size_t size, PcObj* out) {
     void* clean = nullptr;
     size_t cleanSize = 0;
     bool owned = sanitize_container(blob, size, &clean, &cleanSize);
-    HRESULT hr = as<ID3D12Device>(dev)->CreateRootSignature(0, owned ? clean : blob, owned ? cleanSize : size,
+    const void* use = owned ? clean : blob;
+    size_t useSize = owned ? cleanSize : size;
+    std::vector<uint8_t> ext;
+    uint32_t gmIndex = 0;
+    static bool noRs = getenv("XSL_GM_NO_RS") != nullptr;   // bisecting: views and table only
+    bool extended = gm_enabled() && !noRs && gm_extend_root_signature(use, useSize, ext, &gmIndex);
+    HRESULT hr = as<ID3D12Device>(dev)->CreateRootSignature(0, extended ? ext.data() : use, extended ? ext.size() : useSize,
                                                             IID_PPV_ARGS(reinterpret_cast<ID3D12RootSignature**>(out)));
+    if (FAILED(hr) && extended) {   // fall back to the title's own layout
+        extended = false;
+        hr = as<ID3D12Device>(dev)->CreateRootSignature(0, use, useSize, IID_PPV_ARGS(reinterpret_cast<ID3D12RootSignature**>(out)));
+    }
     if (owned) free_container(clean);
     if (FAILED(hr)) XSL_ERR(CH, "CreateRootSignature failed %08lx (blob %zu bytes)", hr, size);
+    if (SUCCEEDED(hr) && extended) { std::lock_guard<std::mutex> g(g_gm_mu); g_rs_gm[*out] = gmIndex; }
     return hr;
+}
+static void gm_bind(PcObj l, PcObj rs, bool compute) {
+    if (!gm_enabled() || !g_gv || !rs) return;
+    uint32_t idx;
+    {
+        std::lock_guard<std::mutex> g(g_gm_mu);
+        auto& cur = g_list_gm_rs[l];
+        (compute ? cur.second : cur.first) = rs;
+        auto it = g_rs_gm.find(rs);
+        if (it == g_rs_gm.end()) return;
+        auto h = g_list_global_heap.find(l);
+        if (h == g_list_global_heap.end() || !h->second) return;   // bound once the global heap is set
+        idx = it->second;
+    }
+    D3D12_GPU_DESCRIPTOR_HANDLE gh{g_gv->GetGPUDescriptorHandleForHeapStart().ptr + (uint64_t)gm_reserved_start() * g_gv_inc};
+    auto* L2 = as<ID3D12GraphicsCommandList>(l);
+    if (compute) L2->SetComputeRootDescriptorTable(idx, gh);
+    else L2->SetGraphicsRootDescriptorTable(idx, gh);
 }
 
 namespace {
@@ -890,6 +1106,7 @@ HRESULT_T create_committed_resource(PcObj dev, const void* heapProps, uint32_t h
                                                                 IID_PPV_ARGS(reinterpret_cast<ID3D12Resource**>(out)));
     if (SUCCEEDED(hr)) note_buffer_fwd(*out);
     if (SUCCEEDED(hr)) note_texture(*out);
+    if (SUCCEEDED(hr) && d.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER && !(st & D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE)) gm_register(*out, as<ID3D12Resource>(*out)->GetGPUVirtualAddress(), d.Width, 0);
     if (SUCCEEDED(hr) && remap) {
         std::lock_guard<std::mutex> g(g_remap_mu);
         g_remapped.insert(*reinterpret_cast<ID3D12Resource**>(out));
@@ -1015,6 +1232,7 @@ HRESULT_T create_placed_resource(PcObj dev, PcObj heap, uint64_t offset, const v
                                                              IID_PPV_ARGS(reinterpret_cast<ID3D12Resource**>(out))), "CreatePlacedResource");
     if (SUCCEEDED(hr)) note_texture(*out);
     if (SUCCEEDED(hr)) note_buffer(*out);
+    if (SUCCEEDED(hr) && d.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER && !(pc_state(state) & D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE)) gm_register(*out, as<ID3D12Resource>(*out)->GetGPUVirtualAddress(), d.Width, 0);
     if (SUCCEEDED(hr) && getenv("XSL_TRACE_WRITERS")) {   // placed resources, for aliasing checks at present
         D3D12_RESOURCE_ALLOCATION_INFO ai = as<ID3D12Device>(dev)->GetResourceAllocationInfo(0, 1, &d);
         std::lock_guard<std::mutex> g(g_placed_mu);
@@ -1416,6 +1634,7 @@ void name_recording(PcObj l) {
     }
 }
 HRESULT_T list_reset(PcObj l, PcObj a, PcObj pso) {
+    if (gm_enabled()) { std::lock_guard<std::mutex> g(g_gm_mu); g_list_global_heap.erase(l); g_list_gm_rs.erase(l); }
     name_recording(l);
     if (g_info) { std::lock_guard<std::mutex> g(g_rs_mu); g_list_rs.erase(l); }
     HRESULT hr = logged(L->Reset(as<ID3D12CommandAllocator>(a), as<ID3D12PipelineState>(pso)), "CommandList::Reset");
@@ -1497,10 +1716,12 @@ void note_pso_rs(PcObj pso, PcObj rs, bool compute) {
 void list_set_gfx_root_signature(PcObj l, PcObj rs) {
     if (g_info) { std::lock_guard<std::mutex> g(g_rs_mu); g_list_rs[l].gfx = rs; }
     L->SetGraphicsRootSignature(as<ID3D12RootSignature>(rs));
+    gm_bind(l, rs, false);
 }
 void list_set_compute_root_signature(PcObj l, PcObj rs) {
     if (g_info) { std::lock_guard<std::mutex> g(g_rs_mu); g_list_rs[l].cs = rs; }
     L->SetComputeRootSignature(as<ID3D12RootSignature>(rs));
+    gm_bind(l, rs, true);
 }
 static void check_rs(PcObj l, const char* what) {
     std::lock_guard<std::mutex> g(g_rs_mu);
@@ -1882,7 +2103,22 @@ void list_write_immediate(PcObj l, uint64_t va, uint32_t value, bool bottom) {
     l2->Release();
 }
 void list_discard(PcObj l, PcObj r) { L->DiscardResource(as<ID3D12Resource>(r), nullptr); }
-void list_set_heaps(PcObj l, uint32_t n, PcObj* h) { L->SetDescriptorHeaps(n, reinterpret_cast<ID3D12DescriptorHeap* const*>(h)); }
+void list_set_heaps(PcObj l, uint32_t n, PcObj* h) {
+    if (gm_enabled()) {
+        bool global = false;
+        for (uint32_t i = 0; i < n; i++) global |= as<ID3D12DescriptorHeap>(h[i]) == g_gv;
+        std::pair<PcObj, PcObj> cur{};
+        {
+            std::lock_guard<std::mutex> g(g_gm_mu);
+            g_list_global_heap[l] = global;
+            cur = g_list_gm_rs[l];
+        }
+        L->SetDescriptorHeaps(n, reinterpret_cast<ID3D12DescriptorHeap* const*>(h));
+        if (global) { gm_bind(l, cur.first, false); gm_bind(l, cur.second, true); }   // root signatures set before the heap
+        return;
+    }
+    L->SetDescriptorHeaps(n, reinterpret_cast<ID3D12DescriptorHeap* const*>(h));
+}
 void list_gfx_root_table(PcObj l, uint32_t i, uint64_t h) {
     if (trace_writers()) { std::lock_guard<std::mutex> g(g_wr_mu); g_gfx_tables[l][i] = h; }
     L->SetGraphicsRootDescriptorTable(i, gpu(h));
@@ -2712,6 +2948,7 @@ HRESULT_T present(PcObj devObj, PcObj queueObj, PcObj resObj, void* hwndPtr, uin
             }
         }
         ++g_present_count;
+        ++g_gm_frame;
         if (g_info && g_present_count % 30 == 0) dump_debug_messages();   // debug layer: what it reported since the last dump
         if (trace_writers()) { std::lock_guard<std::mutex> g(g_wr_mu); g_planes.insert((PcObj)res); }
         if (trace_writers() && plane_ops_now()) { XSL_INFO(CH, "plane op: present %llu of %p on queue %p", (unsigned long long)g_present_count, (void*)res, (void*)q); report_aliases((PcObj)res); }

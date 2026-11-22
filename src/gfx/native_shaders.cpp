@@ -77,7 +77,7 @@ std::vector<uint8_t> with_root_signature(const std::vector<uint8_t>& dxil, const
     parts.push_back({gpucode::fourcc("RTS0"), *rs});
     return build_container(parts, dxil.data());
 }
-constexpr const char* kVersion = "gpucode-29";
+constexpr const char* kVersion = "gpucode-30";
 
 int mode() {
     static int m = [] {
@@ -278,6 +278,10 @@ bool native_translate(const void* in, size_t n, void** out, size_t* outSize) {
         o.wave_size_attr = g_host_sm66;
         if (const char* g = getenv("XSL_LOOP_GUARD"); g && *g) o.loop_guard = o.loop_guard_barrier = (unsigned)strtoul(g, nullptr, 0);
         if (getenv("XSL_NO_BARRIER_SYNC")) o.barrier_sync = false;
+        {   // global memory follows the backend's switches (pc::gm_active)
+            const char* g = getenv("XSL_GLOBAL_MEMORY");
+            o.global_memory = !(g && g[0] == '0') && !getenv("XSL_GM_NO_RS");
+        }
         o.wave64_dual = g_host_wave_min <= 32 && (g_host_wave_max <= 32 || g_host_sm66);
         gpucode::TranslateResult r = gpucode::translate(c, rs, o);
         if (r.ok && !ovr.empty()) r.hlsl.assign(ovr.begin(), ovr.end());

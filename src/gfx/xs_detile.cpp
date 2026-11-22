@@ -92,6 +92,11 @@ void detile_register(PcObj pcRes, uint64_t va, const void* consoleDesc, uint32_t
     g_tex[pcRes] = {va, *d, initialState};
 }
 
+void detile_forget(PcObj pcRes) {
+    std::lock_guard<std::mutex> g(g_mu);
+    g_tex.erase(pcRes);
+    for (auto& q : g_queue) if (q == pcRes) q = nullptr;
+}
 void detile_view_created(PcObj pcRes) {
     std::lock_guard<std::mutex> g(g_mu);
     auto it = g_tex.find(pcRes);
@@ -122,6 +127,7 @@ void detile_flush(PcObj pcDevice, PcObj pcQueue) {
         }
         if (g_queue.empty()) return;
         for (PcObj r : g_queue) {
+            if (!r) continue;
             auto it = g_tex.find(r);
             if (it != g_tex.end() && !it->second.done) { it->second.done = true; work.push_back(*it); }
         }

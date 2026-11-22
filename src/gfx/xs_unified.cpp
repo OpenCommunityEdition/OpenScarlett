@@ -35,6 +35,7 @@ bool unified_lookup(Device* dev, uint64_t va, UnifiedRef* out) {
         Imported im{size, nullptr, 0};
         if (FAILED(pc::import_host_memory(dev_extra(dev)->pcDevice, base, size, &im.res, &im.gpu))) return false;
         XSL_INFO(CH, "unified memory: %p (+%zu) visible to the GPU at %llx", base, (size_t)size, (unsigned long long)im.gpu);
+        pc::gm_register(im.res, (uint64_t)(uintptr_t)base, size, 0);   // title addresses of unified memory are CPU addresses
         it = g_imported.insert_or_assign((uintptr_t)base, im).first;
     }
     out->res = it->second.res;

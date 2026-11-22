@@ -128,6 +128,7 @@ struct Translator {
     std::set<unsigned> vs_params;
     bool vs_pos = false;
     bool uses_codedata = false;
+    bool uses_gm = false;   // global loads/stores through the layer's address table
     unsigned ms_max_verts = 256, ms_max_prims = 256, ms_lds = 0;
     bool merged_vs = false;
     bool uses_clipcull = false;
@@ -2676,13 +2677,40 @@ bool Translator::emit_exp(const Instr& in, size_t idx) {
 // ---- global loads: constant tables addressed relative to the program counter ----------------
 bool Translator::emit_global(const Instr& in, size_t idx) {
     std::string n = in.name;
-    if (!starts(n, "global_load_dword")) return fail(fmt("%s at 0x%x not supported", in.name, in.offset));
+    bool load = starts(n, "global_load_"), store = starts(n, "global_store_");
+    if (!load && !store) return fail(fmt("%s at 0x%x not supported", in.name, in.offset));
+    bool dword = has(n, "dword");
     unsigned cnt = has(n, "x4") ? 4 : has(n, "x3") ? 3 : has(n, "x2") ? 2 : 1;
+    if (!dword && (store ? !(ends(n, "byte") || ends(n, "short")) : !(ends(n, "ubyte") || ends(n, "sbyte") || ends(n, "ushort") || ends(n, "sshort"))))
+        return fail(fmt("%s at 0x%x not supported", in.name, in.offset));
+    if (store && !opt.global_memory) return fail(fmt("%s at 0x%x: global stores need the layer's global memory", in.name, in.offset));
     uses_codedata = true;
-    std::string a = in.saddr != src::kNull ? fmt("(%s + %s + %du)", S(in.saddr).c_str(), V(in.vaddr).c_str(), in.offset_imm)
-                                           : fmt("(%s + %du)", V(in.vaddr).c_str(), in.offset_imm);
-    line(fmt("if (kexec) { uint a_ = %s >> 2;", a.c_str()));
-    for (unsigned k = 0; k < cnt; k++) line(fmt("  %s = a_ + %uu < CODEDATA_N ? codedata[a_ + %uu] : 0u;", V(in.dst + k).c_str(), k, k));
+    if (opt.global_memory) uses_gm = true;
+    // 64-bit address: SGPR base pair + 32-bit VGPR offset, or a VGPR pair; plus the signed immediate.
+    std::string lo0 = in.saddr != src::kNull ? fmt("(%s + %s)", S(in.saddr).c_str(), V(in.vaddr).c_str()) : V(in.vaddr);
+    std::string hi0 = in.saddr != src::kNull ? fmt("(%s + (%s + %s < %s ? 1u : 0u))", S(in.saddr + 1).c_str(), S(in.saddr).c_str(), V(in.vaddr).c_str(), S(in.saddr).c_str())
+                                             : V(in.vaddr + 1);
+    line(fmt("if (kexec) { uint lo_ = %s, hi_ = %s; uint im_ = %du; uint al_ = lo_ + im_;", lo0.c_str(), hi0.c_str(), in.offset_imm));
+    line(fmt("  hi_ += %s; lo_ = al_;", in.offset_imm < 0 ? "(al_ > lo_ ? 0xffffffffu : 0u)" : "(al_ < lo_ ? 1u : 0u)"));
+    auto rdw = [&](const std::string& k) {   // dword at lo_ + k
+        std::string cd = fmt("((lo_ + %s) >> 2) < CODEDATA_N ? codedata[(lo_ + %s) >> 2] : 0u", k.c_str(), k.c_str());
+        if (!opt.global_memory) return fmt("(hi_ == 0u ? (%s) : 0u)", cd.c_str());
+        return fmt("(hi_ == 0u && ((lo_ + %s) >> 2) < CODEDATA_N ? codedata[(lo_ + %s) >> 2] : gm_load(lo_ + %s, hi_ + (lo_ + %s < lo_ ? 1u : 0u)))",
+                   k.c_str(), k.c_str(), k.c_str(), k.c_str());
+    };
+    if (load && dword) {
+        for (unsigned k = 0; k < cnt; k++) line(fmt("  %s = %s;", V(in.dst + k).c_str(), rdw(fmt("%uu", 4 * k)).c_str()));
+    } else if (load) {
+        bool sgn = has(n, "sbyte") || has(n, "sshort");
+        unsigned bits = has(n, "byte") ? 8 : 16;
+        line(fmt("  uint w_ = %s; uint v_ = (w_ >> ((lo_ & 3u) * 8u)) & 0x%xu;", rdw("0u").c_str(), (1u << bits) - 1));
+        line(fmt("  %s = %s;", V(in.dst).c_str(), sgn ? fmt("uint(int(v_ << %uu) >> %u)", 32 - bits, 32 - bits).c_str() : "v_"));
+    } else if (dword) {
+        for (unsigned k = 0; k < cnt; k++) line(fmt("  gm_store(lo_ + %uu, hi_ + (lo_ + %uu < lo_ ? 1u : 0u), %s);", 4 * k, 4 * k, V(in.data0 + k).c_str()));
+    } else {
+        unsigned bits = ends(n, "byte") ? 8 : 16;
+        line(fmt("  gm_store_bits(lo_, hi_, %s & 0x%xu, 0x%xu);", V(in.data0).c_str(), (1u << bits) - 1, (1u << bits) - 1));
+    }
     line("}");
     return true;
 }
@@ -2963,6 +2991,38 @@ std::string Translator::generate() {
     }
     h << kPrelude;
     if (uses_quad) h << kQuadPrelude;
+    if (uses_gm) {
+        h << "StructuredBuffer<uint4> GMT : register(t0, space901);\n"
+             "ByteAddressBuffer GMS[8191] : register(t0, space900);\n"
+             "RWByteAddressBuffer GMU[8192] : register(u0, space900);\n"
+             "// Entry of the address table holding (lo, hi): (found, view word, byte offset).\n"
+             "uint3 gm_find(uint lo, uint hi) {\n"
+             "  uint a = 0u, b = GMT[0].x;\n"
+             "  while (a < b) { uint m = (a + b) >> 1; uint4 e = GMT[1u + m]; if (e.y < hi || (e.y == hi && e.x <= lo)) a = m + 1u; else b = m; }\n"
+             "  if (a == 0u) return uint3(0u, 0u, 0u);\n"
+             "  uint4 e = GMT[a];\n"
+             "  uint off = lo - e.x, ohi = hi - e.y - (lo < e.x ? 1u : 0u);\n"
+             "  return (ohi == 0u && off < e.z) ? uint3(1u, e.w, off) : uint3(0u, 0u, 0u);\n"
+             "}\n"
+             "uint gm_load(uint lo, uint hi) {\n"
+             "  uint3 f = gm_find(lo, hi);\n"
+             "  if (f.x == 0u) return 0u;\n"
+             "  if (f.y & 0x40000000u) return GMS[NonUniformResourceIndex(f.y & 0x3fffu)].Load(f.z & ~3u);\n"
+             "  if (f.y & 0x80000000u) return GMU[NonUniformResourceIndex((f.y >> 14) & 0x3fffu)].Load(f.z & ~3u);\n"
+             "  return 0u;\n"
+             "}\n"
+             "void gm_store(uint lo, uint hi, uint v) {\n"
+             "  uint3 f = gm_find(lo, hi);\n"
+             "  if (f.x != 0u && (f.y & 0x80000000u)) GMU[NonUniformResourceIndex((f.y >> 14) & 0x3fffu)].Store(f.z & ~3u, v);\n"
+             "}\n"
+             "void gm_store_bits(uint lo, uint hi, uint v, uint mask) {   // byte/short stores: atomic clear and set\n"
+             "  uint3 f = gm_find(lo, hi);\n"
+             "  if (f.x == 0u || !(f.y & 0x80000000u)) return;\n"
+             "  uint s = (f.z & 3u) * 8u, o;\n"
+             "  GMU[NonUniformResourceIndex((f.y >> 14) & 0x3fffu)].InterlockedAnd(f.z & ~3u, ~(mask << s), o);\n"
+             "  GMU[NonUniformResourceIndex((f.y >> 14) & 0x3fffu)].InterlockedOr(f.z & ~3u, v << s, o);\n"
+             "}\n";
+    }
     if (uses_codedata) {
         size_t n = (c.precompiled.size() - c.body_begin) / 4;
         h << "static const uint codedata[" << n << "] = {";

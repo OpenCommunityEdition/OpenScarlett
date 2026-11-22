@@ -7,5 +7,6 @@ namespace xs {
 // the title's own xg_xs.dll) and uploaded before the next submission after a view is made of them.
 void detile_register(PcObj pcRes, uint64_t va, const void* consoleDesc, uint32_t initialState);
 void detile_view_created(PcObj pcRes);
-void detile_flush(PcObj pcDevice, PcObj pcQueue);   // before each submission
+void detile_flush(PcObj pcDevice, PcObj pcQueue);
+void detile_forget(PcObj pcRes);                     // the resource is being destroyed   // before each submission
 }

@@ -129,6 +129,12 @@ uint64_t mirror_cpu(uint32_t i) { return g_mirrorCpu + (uint64_t)i * g_pcInc; }
 uint32_t g_hi[8] = {};   // highest slot published per 125k-slot band (usage diagnostics)
 void publish(uint32_t i) {
     if (i / 125000 < 8 && i > g_hi[i / 125000]) g_hi[i / 125000] = i;
+    if (i >= pc::gm_reserved_start()) {   // the title writes into the range reserved for global memory
+        static volatile long n = 0;
+        if (InterlockedIncrement(&n) == 1)
+            XSL_ERR(CH, "title view slot %u lies in the global-memory range (from %u): run with XSL_GLOBAL_MEMORY=0", i, pc::gm_reserved_start());
+        return;
+    }
     pc::copy_descriptors_simple(dev_extra(g_dev)->pcDevice, 1, pc_view_cpu(i), mirror_cpu(i), D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
 }
 void set_slot(uint32_t i, uint64_t src) {   // src: a CPU-only PC descriptor

@@ -161,7 +161,7 @@ static bool splice_code(Container& c, const std::vector<uint8_t>& code) {
     c.code_end = end;
     return true;
 }
-static int translate_cmd(const char* path, const char* rspath, const char* codepath, int dual) {
+static int translate_cmd(const char* path, const char* rspath, const char* codepath, int dual, bool gm) {
     Container c;
     if (!load_cso(path, c)) return 1;
     if (codepath && !splice_code(c, read_file(codepath))) return fprintf(stderr, "%s: cannot use code %s\n", path, codepath), 1;
@@ -173,6 +173,7 @@ static int translate_cmd(const char* path, const char* rspath, const char* codep
     if (!parse_root_signature(rsb.data(), rsb.size(), rs, &err)) return fprintf(stderr, "%s: root signature: %s\n", path, err.c_str()), 1;
     TranslateOptions o;
     if (dual >= 0) o.wave64_dual = dual != 0;
+    o.global_memory = gm;
     TranslateResult r = translate(c, rs, o);
     if (!r.ok) return fprintf(stderr, "%s: %s\n", path, r.error.c_str()), 1;
     printf("// profile %s, wave%u\n%s", r.profile.c_str(), r.wave_size, r.hlsl.c_str());
@@ -198,12 +199,14 @@ int main(int argc, char** argv) {
         // translate <cso> [rootsig.bin] [--code <bin>] [--wave64-dual=0|1]
         const char *rs = nullptr, *code = nullptr;
         int dual = -1;
+        bool gm = false;
         for (int i = 3; i < argc; i++) {
             if (!strcmp(argv[i], "--code") && i + 1 < argc) code = argv[++i];
             else if (!strncmp(argv[i], "--wave64-dual=", 14)) dual = atoi(argv[i] + 14);
+            else if (!strcmp(argv[i], "--global-memory")) gm = true;
             else rs = argv[i];
         }
-        return translate_cmd(argv[2], rs, code, dual);
+        return translate_cmd(argv[2], rs, code, dual, gm);
     }
     if (argc >= 3 && !strcmp(argv[1], "meta")) return meta_cmd(argv[2]);
     if (argc >= 4 && !strcmp(argv[1], "cso2elf")) return cso2elf(argv[2], argc - 3, argv + 3);
@@ -212,7 +215,7 @@ int main(int argc, char** argv) {
         return dis(d, 0, d.size() & ~size_t(3), "", false);
     }
     if (argc >= 3 && !strcmp(argv[1], "dis-elf")) return dis_elf(read_file(argv[2]));
-    fprintf(stderr, "usage: xsl-gpucode cso|meta <file.cso> | translate <file.cso> [rootsig.bin] [--code <bin>] [--wave64-dual=0|1]\n"
+    fprintf(stderr, "usage: xsl-gpucode cso|meta <file.cso> | translate <file.cso> [rootsig.bin] [--code <bin>] [--wave64-dual=0|1] [--global-memory]\n"
                     "       | dis <code.bin> | dis-elf <file.elf> | cso2elf <out.elf> <file.cso>...\n");
     return 2;
 }

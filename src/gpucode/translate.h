@@ -30,6 +30,9 @@ struct TranslateOptions {
     unsigned loop_guard = 1u << 16;
     unsigned loop_guard_barrier = 1u << 22;
     bool wave_size_attr = false;
+    // Global memory (title GPU addresses) through the layer's address table: t0 space901 = table,
+    // t0.. / u0.. space900 = raw views (docs/gpucode.md). False: only code-embedded data is readable.
+    bool global_memory = false;
     bool barrier_sync = true;        // false: s_barrier without the group sync (debugging hangs) // the PC runtime takes shader model 6.6 ([WaveSize] on compute)
 };
 

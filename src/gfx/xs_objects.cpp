@@ -250,6 +250,8 @@ void Res_Destroy(IGraphicsUnknown* self) {
     auto* e = ex<ID3D12Resource2, ResExtra>((ID3D12Resource2*)self);
     if (e->trackedVa) cbv_untrack(e->trackedVa);
     if (e->placedVa) pagemap_forget(e->placedVa, hdr(self)->pc);
+    pc::gm_forget(hdr(self)->pc);
+    detile_forget(hdr(self)->pc);
 }
 }  // namespace
 
@@ -1037,6 +1039,7 @@ void D3DAPI Q_Execute(ID3D12CommandQueue* q, UINT n, ID3D12CommandList* const* l
     desc_sync();  // descriptors the title wrote inline since the last submission
     cbv_refresh();   // constant buffer view copies: the title has written the constants by now
     detile_flush(dev_extra(hdr(q)->device)->pcDevice, pc_of(q));   // CPU-written console textures first
+    pc::gm_flush(dev_extra(hdr(q)->device)->pcDevice);             // global-memory views and address table
     std::vector<PcObj> v(n);
     for (UINT i = 0; i < n; i++) { v[i] = P(lists[i]); XSL_TRACE("gfx.cmd", "Execute list %p", (void*)lists[i]); }
     pc::queue_execute(pc_of(q), n, v.data());
