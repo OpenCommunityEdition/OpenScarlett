@@ -1215,6 +1215,262 @@ bool list_rt_build_blas(PcObj l, uint64_t dst, uint64_t scratch, uint32_t ngeo, 
                  (unsigned long long)blas_console_size(total));
     return true;
 }
+// ---- Console ray-tracing pipelines (translated literally: gpucode/rtso.h) -------------------------
+// Root signature of a linked pipeline's program: 8 root constants (runtime table address, group
+// counts, stack bytes per wave), the global-memory table, and the bindless global-heap arrays of
+// image access through descriptor memory (spaces 910..918, SRVs and UAVs, unbounded from slot 0).
+static ID3D12RootSignature* rt_root_signature(ID3D12Device* dev) {
+    static ID3D12RootSignature* rs = nullptr;
+    static std::once_flag once;
+    std::call_once(once, [dev] {
+        const D3D12_DESCRIPTOR_RANGE_FLAGS vol = D3D12_DESCRIPTOR_RANGE_FLAG_DESCRIPTORS_VOLATILE | D3D12_DESCRIPTOR_RANGE_FLAG_DATA_VOLATILE;
+        static D3D12_DESCRIPTOR_RANGE1 gm[3];
+        gm[0] = {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0, 901, vol, 0};
+        gm[1] = {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, kGmHalf - 1, 0, 900, vol, 1};
+        gm[2] = {D3D12_DESCRIPTOR_RANGE_TYPE_UAV, kGmSlots - kGmHalf, 0, 900, vol, kGmHalf};
+        static D3D12_DESCRIPTOR_RANGE1 heap[18];
+        std::vector<D3D12_ROOT_PARAMETER1> params;
+        D3D12_ROOT_PARAMETER1 p{};
+        p.ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+        p.Constants = {0, 0, 8};
+        params.push_back(p);
+        p = {};
+        p.ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        p.DescriptorTable = {3, gm};
+        params.push_back(p);
+        for (uint32_t k = 0; k < 9; k++) {
+            heap[2 * k] = {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, UINT_MAX, 0, 910 + k, vol, 0};
+            heap[2 * k + 1] = {D3D12_DESCRIPTOR_RANGE_TYPE_UAV, UINT_MAX, 0, 910 + k, vol, 0};
+            for (int j = 0; j < 2; j++) {
+                p = {};
+                p.ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+                p.DescriptorTable = {1, &heap[2 * k + j]};
+                params.push_back(p);
+            }
+        }
+        // parameter 20: cube SRVs (space 919); 21: the title's sampler heap (space 920)
+        static D3D12_DESCRIPTOR_RANGE1 cube = {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, UINT_MAX, 0, 919, vol, 0};
+        static D3D12_DESCRIPTOR_RANGE1 smp = {D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER, UINT_MAX, 0, 920, D3D12_DESCRIPTOR_RANGE_FLAG_DESCRIPTORS_VOLATILE, 0};
+        p = {};
+        p.ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        p.DescriptorTable = {1, &cube};
+        params.push_back(p);
+        p.DescriptorTable = {1, &smp};
+        params.push_back(p);
+        D3D12_VERSIONED_ROOT_SIGNATURE_DESC d{D3D_ROOT_SIGNATURE_VERSION_1_1};
+        d.Desc_1_1 = {(UINT)params.size(), params.data(), 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_NONE};
+        ID3DBlob *b = nullptr, *e = nullptr;
+        if (FAILED(D3D12SerializeVersionedRootSignature(&d, &b, &e)) ||
+            FAILED(dev->CreateRootSignature(0, b->GetBufferPointer(), b->GetBufferSize(), IID_PPV_ARGS(&rs)))) {
+            XSL_ERR(CH, "ray-tracing root signature failed: %s", e ? (const char*)e->GetBufferPointer() : "?");
+            rs = nullptr;
+        }
+    });
+    return rs;
+}
+PcObj rt_create_pso(PcObj devObj, const std::vector<uint8_t>& dxil) {
+    auto* dev = as<ID3D12Device>(devObj);
+    ID3D12RootSignature* rs = rt_root_signature(dev);
+    if (!rs) return nullptr;
+    D3D12_COMPUTE_PIPELINE_STATE_DESC pd{};
+    pd.pRootSignature = rs;
+    pd.CS = {dxil.data(), dxil.size()};
+    ID3D12PipelineState* pso = nullptr;
+    HRESULT hr = dev->CreateComputePipelineState(&pd, IID_PPV_ARGS(&pso));
+    if (FAILED(hr)) { XSL_ERR(CH, "ray-tracing pipeline: CreateComputePipelineState failed %08lx", hr); return nullptr; }
+    return (PcObj)pso;
+}
+// Per-wave ray stacks: kRtStackSlots slots of `perWave` bytes in one layer buffer.
+uint64_t rt_stack_buffer(uint64_t bytes) {
+    static ID3D12Resource* buf = nullptr;
+    static uint64_t size = 0;
+    static std::mutex mu;
+    std::lock_guard<std::mutex> g(mu);
+    if (buf && size >= bytes) return buf->GetGPUVirtualAddress();
+    if (!g_main_device) return 0;
+    D3D12_HEAP_PROPERTIES hp{D3D12_HEAP_TYPE_DEFAULT};
+    D3D12_RESOURCE_DESC bd{};
+    bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    bd.Width = bytes;
+    bd.Height = bd.DepthOrArraySize = bd.MipLevels = 1;
+    bd.SampleDesc.Count = 1;
+    bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    bd.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+    ID3D12Resource* r = nullptr;
+    if (FAILED(g_main_device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&r)))) return 0;
+    buf = r;   // an earlier, smaller buffer stays alive (in-flight work may use it)
+    size = bytes;
+    gm_register((PcObj)r, r->GetGPUVirtualAddress(), bytes, 0);
+    XSL_INFO(CH, "ray stacks: %llu MiB", (unsigned long long)(bytes >> 20));
+    return r->GetGPUVirtualAddress();
+}
+// Ray dispatches: a one-thread prep pass writes the scheduler's runtime table (and the group counts)
+// into a slice of a GPU ring registered in global memory below 4 GB, from the dispatch arguments
+// (root constants for DispatchRays, the 104-byte argument record for indirect dispatches); then
+// the translated program runs as an indirect dispatch of those counts.
+static const char kRtPrep[] = R"(
+RWByteAddressBuffer T : register(u0);   // table slice
+ByteAddressBuffer A : register(t0);     // indirect arguments (D3D12_DISPATCH_RAYS_DESC)
+cbuffer C : register(b0) {
+  uint indirect, srv, cbv, smp, uav, stackLo, stackHi, perLane;
+  uint trav0, trav1, trav2, tableLo, tableHi, w, h, d;
+  uint rgLo, rgHi, missLo, missHi, missStride, hitLo, hitHi, hitStride;
+  uint callLo, callHi, pad0, pad1;
+};
+[numthreads(1, 1, 1)] void main() {
+  uint W = w, H = h, D = d, RG0 = rgLo, RG1 = rgHi, M0 = missLo, M1 = missHi, MS = missStride, H0 = hitLo, H1 = hitHi, HS = hitStride, C0 = callLo, C1 = callHi;
+  if (indirect != 0u) {
+    RG0 = A.Load(0); RG1 = A.Load(4); M0 = A.Load(16); M1 = A.Load(20); MS = A.Load(32);
+    H0 = A.Load(40); H1 = A.Load(44); HS = A.Load(56); C0 = A.Load(64); C1 = A.Load(68);
+    W = A.Load(88); H = A.Load(92); D = A.Load(96);
+  }
+  T.Store4(0, uint4(srv, cbv, smp, uav));
+  uint trav = tableLo + 0xC0u;
+  T.Store2(0x18, uint2(trav, tableHi + (trav < tableLo ? 1u : 0u)));
+  T.Store3(0x20, uint3(W, H, D));
+  T.Store(0x2C, ((HS / 32u) & 0xffu) << 21 | ((MS / 32u) & 0xffu) << 5);
+  T.Store(0x30, 0u);
+  T.Store4(0x34, uint4((M0 >> 6) | (M1 << 26), (H0 >> 6) | (H1 << 26), (RG0 >> 6) | (RG1 << 26), (C0 >> 6) | (C1 << 26)));
+  T.Store(0x44, 0u);
+  T.Store4(0x48, uint4(perLane, 0u, 0u, 0u));
+  T.Store4(0x90, uint4(stackLo, stackHi & 0xffffu, 0xffffffffu, 20u << 12));
+  for (uint k = 0u; k < 32u; k++) T.Store(0xC0u + 4u * k, k == 0u ? trav0 : k == 1u ? trav1 : trav2);
+  uint gx, gy, gz = max(D, 1u);
+  if (H < 2u) { gx = (W + 31u) / 32u; gy = max(H, 1u); } else { gx = (W + 7u) / 8u; gy = (H + 3u) / 4u; }
+  if (W == 0u) gx = 0u;
+  T.Store3(0x1C0, uint3(gx, gy, gz));
+}
+)";
+struct RtRuntime {
+    ID3D12RootSignature* prepRs = nullptr;
+    ID3D12PipelineState* prep = nullptr;
+    ID3D12CommandSignature* dispatchSig = nullptr;
+    ID3D12Resource* ring = nullptr;
+    uint64_t ringGm = 0, head = 0;
+    bool failed = false;
+    std::mutex mu;
+} g_rtrt;
+constexpr uint64_t kRtRing = 4u << 20, kRtSlice = 512;
+bool compile_layer_shader(const std::string& hlsl, const char* profile, std::vector<uint8_t>& out, std::string& log);
+static bool rtrt_init() {
+    if (g_rtrt.prep) return true;
+    if (g_rtrt.failed || !g_main_device) return false;
+    g_rtrt.failed = true;
+    auto* dev = g_main_device;
+    std::vector<uint8_t> cs;
+    std::string log;
+    if (!compile_layer_shader(std::string(kRtPrep, sizeof kRtPrep - 1), "cs_6_0", cs, log)) { XSL_ERR(CH, "ray prep: %s", log.c_str()); return false; }
+    D3D12_ROOT_PARAMETER params[3] = {};
+    params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    params[0].Constants.Num32BitValues = 28;
+    params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+    params[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
+    D3D12_ROOT_SIGNATURE_DESC rsd{3, params, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_NONE};
+    ID3DBlob *b = nullptr, *e = nullptr;
+    if (FAILED(D3D12SerializeRootSignature(&rsd, D3D_ROOT_SIGNATURE_VERSION_1, &b, &e)) ||
+        FAILED(dev->CreateRootSignature(0, b->GetBufferPointer(), b->GetBufferSize(), IID_PPV_ARGS(&g_rtrt.prepRs))))
+        return false;
+    D3D12_COMPUTE_PIPELINE_STATE_DESC pd{};
+    pd.pRootSignature = g_rtrt.prepRs;
+    pd.CS = {cs.data(), cs.size()};
+    if (FAILED(dev->CreateComputePipelineState(&pd, IID_PPV_ARGS(&g_rtrt.prep)))) return false;
+    D3D12_INDIRECT_ARGUMENT_DESC ad{D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH};
+    D3D12_COMMAND_SIGNATURE_DESC sd{12, 1, &ad, 0};
+    if (FAILED(dev->CreateCommandSignature(&sd, nullptr, IID_PPV_ARGS(&g_rtrt.dispatchSig)))) return false;
+    D3D12_HEAP_PROPERTIES hp{D3D12_HEAP_TYPE_DEFAULT};
+    D3D12_RESOURCE_DESC bd{};
+    bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    bd.Width = kRtRing;
+    bd.Height = bd.DepthOrArraySize = bd.MipLevels = 1;
+    bd.SampleDesc.Count = 1;
+    bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    bd.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+    if (FAILED(dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&g_rtrt.ring)))) return false;
+    g_rtrt.ringGm = kLowBase + (64ull << 20);   // after the descriptor memory
+    gm_register((PcObj)g_rtrt.ring, g_rtrt.ringGm, kRtRing, 0);
+    g_rtrt.failed = false;
+    return true;
+}
+// Sampler descriptor memory for translated ray-tracing code: samplers are not shadowed, so a table
+// handle maps to an identity array (entry k = {k, 0, 0, 0}, 16 bytes) at the heap index of the handle.
+uint64_t sampler_memory_address(PcObj heap, uint64_t gpuHandle) {
+    static uint64_t base = 0;
+    static std::once_flag once;
+    constexpr uint32_t kN = 4096;
+    std::call_once(once, [] {
+        if (!g_main_device) return;
+        auto* m = (uint32_t*)gm_low_buffer((PcObj)g_main_device, 68ull << 20, kN * 16, &base);
+        if (!m) { base = 0; return; }
+        for (uint32_t k = 0; k < kN; k++) { m[4 * k] = k; m[4 * k + 1] = m[4 * k + 2] = m[4 * k + 3] = 0; }
+    });
+    if (!base || !heap || !g_main_device) return 0;
+    uint64_t start = as<ID3D12DescriptorHeap>(heap)->GetGPUDescriptorHandleForHeapStart().ptr;
+    uint32_t inc = g_main_device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER);
+    if (gpuHandle < start || !inc) return 0;
+    uint64_t i = (gpuHandle - start) / inc;
+    return i < kN ? base + i * 16 : 0;
+}
+bool list_rays(PcObj l, PcObj pso, const RtRaysArgs& a) {
+    if (!gm_enabled() || !g_gv || !pso || !g_main_device) return false;
+    {
+        std::lock_guard<std::mutex> g(g_gm_mu);
+        auto h = g_list_global_heap.find(l);
+        if (h == g_list_global_heap.end() || !h->second) return false;
+    }
+    ID3D12RootSignature* rs = rt_root_signature(g_main_device);
+    uint64_t slice;
+    {
+        std::lock_guard<std::mutex> g(g_rtrt.mu);
+        if (!rs || !rtrt_init()) return false;
+        if (g_rtrt.head + kRtSlice > kRtRing) g_rtrt.head = 0;
+        slice = g_rtrt.head;
+        g_rtrt.head += kRtSlice;
+    }
+    {
+        std::lock_guard<std::mutex> g(g_gm_mu);
+        if (!gm_in_table(g_rtrt.ringGm, 64) || !gm_in_table(a.stack, 64)) { g_gm_force = true; g_gm_dirty = true; }
+    }
+    uint64_t table = g_rtrt.ringGm + slice;
+    auto* L2 = as<ID3D12GraphicsCommandList>(l);
+    auto tr = [&](D3D12_RESOURCE_STATES x, D3D12_RESOURCE_STATES y) {
+        D3D12_RESOURCE_BARRIER t{};
+        t.Transition.pResource = g_rtrt.ring;
+        t.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        t.Transition.StateBefore = x;
+        t.Transition.StateAfter = y;
+        L2->ResourceBarrier(1, &t);
+    };
+    D3D12_RESOURCE_BARRIER ub{};
+    ub.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+    L2->ResourceBarrier(1, &ub);
+    // prep: the runtime table and group counts
+    L2->SetPipelineState(g_rtrt.prep);
+    L2->SetComputeRootSignature(g_rtrt.prepRs);
+    uint32_t c[28] = {a.argsVa ? 1u : 0u, a.tables[0], a.tables[1], a.tables[2], a.tables[3], (uint32_t)a.stack, (uint32_t)(a.stack >> 32), a.stackPerLane,
+                      a.traversal[0], a.traversal[1], a.traversal[2], (uint32_t)table, (uint32_t)(table >> 32), a.width, a.height, a.depth,
+                      (uint32_t)a.raygen, (uint32_t)(a.raygen >> 32), (uint32_t)a.miss, (uint32_t)(a.miss >> 32), a.missStride,
+                      (uint32_t)a.hit, (uint32_t)(a.hit >> 32), a.hitStride, (uint32_t)a.callable, (uint32_t)(a.callable >> 32), 0, 0};
+    L2->SetComputeRoot32BitConstants(0, 28, c, 0);
+    L2->SetComputeRootUnorderedAccessView(1, g_rtrt.ring->GetGPUVirtualAddress() + slice);
+    L2->SetComputeRootShaderResourceView(2, a.argsVa ? a.argsVa : g_rtrt.ring->GetGPUVirtualAddress());
+    L2->Dispatch(1, 1, 1);
+    L2->ResourceBarrier(1, &ub);
+    tr(D3D12_RESOURCE_STATE_UNORDERED_ACCESS, (D3D12_RESOURCE_STATES)(D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE));
+    // the translated program
+    L2->SetPipelineState(as<ID3D12PipelineState>(pso));
+    L2->SetComputeRootSignature(rs);
+    uint32_t rc[8] = {(uint32_t)table, (uint32_t)(table >> 32), 4096, 4096, a.stackPerLane * 32 + 0x200, 0, 0, 0};
+    L2->SetComputeRoot32BitConstants(0, 8, rc, 0);
+    uint64_t gpu0 = g_gv->GetGPUDescriptorHandleForHeapStart().ptr;
+    L2->SetComputeRootDescriptorTable(1, D3D12_GPU_DESCRIPTOR_HANDLE{gpu0 + (uint64_t)gm_reserved_start() * g_gv_inc});
+    for (UINT k = 2; k < 21; k++) L2->SetComputeRootDescriptorTable(k, D3D12_GPU_DESCRIPTOR_HANDLE{gpu0});
+    if (a.samplerHeap) L2->SetComputeRootDescriptorTable(21, as<ID3D12DescriptorHeap>(a.samplerHeap)->GetGPUDescriptorHandleForHeapStart());
+    L2->ExecuteIndirect(g_rtrt.dispatchSig, 1, g_rtrt.ring, slice + 0x1C0, nullptr, 0);
+    tr((D3D12_RESOURCE_STATES)(D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE), D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    L2->ResourceBarrier(1, &ub);
+    restore_compute_state(l);
+    return true;
+}
 // DESERIALIZE: the console structure follows the 56-byte serialized header (and its BLAS pointers)
 // at a 64-byte boundary; its node pointers are relative, so it is copied as bytes.
 void list_rt_deserialize(PcObj l, uint64_t dst, uint64_t src) {
@@ -1819,6 +2075,11 @@ std::set<PcObj> g_rays_sigs;   // command signatures that dispatch rays (skipped
 // Z unused) or a DISPATCH_MESH_X (X, then reserved/payload words): PC dispatches read three group
 // counts, so ExecuteIndirect runs from a copy of the arguments with Y = Z = 1.
 std::map<PcObj, uint32_t> g_fix_sigs;   // signature -> byte stride
+bool is_rays_signature(PcObj sig) {
+    std::lock_guard<std::mutex> g(g_rays_mu);
+    return g_rays_sigs.count(sig) != 0;
+}
+
 HRESULT_T create_command_signature(PcObj dev, const void* desc, PcObj rs, PcObj* out) {
     auto* d = static_cast<const D3D12_COMMAND_SIGNATURE_DESC*>(desc);
     bool rays = false;
@@ -3278,7 +3539,7 @@ void list_execute_indirect(PcObj l, PcObj sig, uint32_t max, PcObj args, uint64_
         std::lock_guard<std::mutex> g(g_rays_mu);
         if (g_rays_sigs.count(sig)) {
             static volatile long n = 0;
-            if (InterlockedIncrement(&n) <= 2) XSL_WARN(CH, "indirect ray dispatch skipped (ray tracing is not translated yet)");
+            if (InterlockedIncrement(&n) <= 2) XSL_WARN(CH, "indirect ray dispatch skipped (no translated pipeline ready)");
             return;
         }
     }

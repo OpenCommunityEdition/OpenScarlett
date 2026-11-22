@@ -28,6 +28,7 @@
 #include "container.h"
 #include "meta.h"
 #include "translate.h"
+#include "rtso.h"
 #include "xsl/log.h"
 
 void dxbc_checksum(const uint8_t* data, size_t size, uint32_t out[4]);   // dxbc.cpp
@@ -330,6 +331,29 @@ bool native_translate(const void* in, size_t n, void** out, size_t* outSize) {
     return true;
 }
 
+// Linked console ray-tracing pipelines (gpucode/rtso.h): translated and compiled to DXIL, cached
+// by the image's hash (compiling one takes minutes: callers run this off the title's threads).
+bool rt_build_pipeline(const gpucode::RtLinked& l, std::vector<uint8_t>& dxil, std::string& err) {
+    uint64_t key = fnv(kVersion, strlen(kVersion), fnv(l.image.data(), l.image.size() * 4, fnv("rt", 2)));
+    key = fnv(&l.main, sizeof l.main, key);
+    wchar_t name[64];
+    swprintf(name, 64, L"\\rt_%016llx.dxil", (unsigned long long)key);
+    std::wstring path = cache_dir() + name;
+    if (read_file(path, dxil) && !dxil.empty()) return true;
+    gpucode::Container c;
+    c.kind = gpucode::ProgramKind::CS;
+    gpucode::RootSig rs;
+    gpucode::RsParam p;
+    p.type = gpucode::ParamType::Constants;
+    p.num32 = gpucode::kRtRootConstants;
+    rs.params.push_back(p);
+    gpucode::TranslateResult r = gpucode::translate(c, rs, gpucode::rt_translate_options(l));
+    if (!r.ok) { err = "translation: " + r.error; return false; }
+    std::string log;
+    if (!compile(r.hlsl, "cs_6_0", dxil, log)) { err = "compile: " + log.substr(0, 400); return false; }
+    write_file(path, dxil.data(), dxil.size());
+    return true;
+}
 // The layer's own shaders (HLSL written here, not translated) through the same PC compiler.
 bool compile_layer_shader(const std::string& hlsl, const char* profile, std::vector<uint8_t>& out, std::string& log) {
     return compile(hlsl, profile, out, log);

@@ -75,7 +75,8 @@ TranslateOptions rt_translate_options(const RtLinked& l) {
     o.raw_root_constants = 4;
     o.raw_numthreads = 32;
     o.raw_entry = l.main;
-    o.raw_scratch_offset = "((gid_.z * RC0_d[0].w + gid_.y) * RC0_d[0].z + gid_.x) * RC0_d[1].x";
+    // Stack slots: the flat group index modulo kRtStackSlots (far more slots than waves in flight).
+    o.raw_scratch_offset = "((((gid_.z * RC0_d[0].w + gid_.y) * RC0_d[0].z + gid_.x) % 16384u) * RC0_d[1].x)";
     return o;
 }
 

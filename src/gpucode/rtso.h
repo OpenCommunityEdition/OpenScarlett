@@ -31,6 +31,7 @@ bool rt_link(const std::vector<std::vector<uint8_t>>& blobs, RtLinked& out, std:
 // Root constants of a linked pipeline's program: [0..1] runtime table address, [2] groups in x,
 // [3] groups in y, [4] stack bytes per wave (scratch wave offset = flat group index * [4]).
 constexpr uint32_t kRtRootConstants = 8;
+constexpr uint32_t kRtStackSlots = 16384;   // per-wave stack slots (the scratch offset wraps)
 TranslateOptions rt_translate_options(const RtLinked& l);
 
 }  // namespace gpucode

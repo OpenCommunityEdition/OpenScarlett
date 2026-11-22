@@ -17,4 +17,8 @@ target_link_libraries(xsl_gpucode PUBLIC xsl_zlib)
 if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
   add_executable(xsl-gpucode tool/main.cpp)
   target_link_libraries(xsl-gpucode PRIVATE xsl_gpucode)
+else()
+  # The same tool built with the layer's toolchain (checks Windows-only behaviour): ninja xsl-gpucode
+  add_executable(xsl-gpucode EXCLUDE_FROM_ALL tool/main.cpp)
+  target_link_libraries(xsl-gpucode PRIVATE xsl_gpucode)
 endif()

@@ -10,6 +10,7 @@
 // cross as const void*; any Xbox object pointer inside such a struct is
 // replaced by the matching PC pointer on the Xbox side before the call.
 #pragma once
+#include <string>
 #include <vector>
 #include <cstddef>
 #include <cstdint>
@@ -93,6 +94,27 @@ uint64_t tlas_console_size(uint32_t instances);
 // A CPU-mapped GPU buffer registered in global memory at 0xF0000000 + offset (below 4 GB, for
 // pointers translated code keeps in 32 bits); returns the mapping or nullptr.
 void* gm_low_buffer(PcObj dev, uint64_t offset, uint64_t bytes, uint64_t* address);
+// Console ray-tracing pipelines: build (translate + compile, cached; takes minutes), PSO, dispatch.
+}  // namespace pc
+namespace gpucode { struct RtLinked; }
+namespace pc {
+bool rt_build_pipeline(const gpucode::RtLinked& linked, std::vector<uint8_t>& dxil, std::string& err);
+PcObj rt_create_pso(PcObj dev, const std::vector<uint8_t>& dxil);
+uint64_t rt_stack_buffer(uint64_t bytes);
+struct RtRaysArgs {
+    uint32_t tables[4];        // global-memory addresses of the global root signature's descriptor tables
+    uint64_t stack;            // ray-stack buffer
+    uint32_t stackPerLane;
+    uint32_t traversal[3];     // traversal entry pointers (address >> 8)
+    uint64_t argsVa;           // indirect: PC address of the D3D12_DISPATCH_RAYS_DESC record (0: direct)
+    uint32_t width, height, depth;
+    uint64_t raygen, miss, hit, callable;
+    uint32_t missStride, hitStride;
+    PcObj samplerHeap;         // the title's sampler heap (bound for samplers read from descriptor memory)
+};
+uint64_t sampler_memory_address(PcObj samplerHeap, uint64_t gpuHandle);
+bool list_rays(PcObj l, PcObj pso, const RtRaysArgs& args);
+bool is_rays_signature(PcObj sig);
 uint64_t tlas_scratch_size(uint32_t instances);
 // Bottom-level triangle build in the console layout (into the destination's shadow); false: not built.
 struct BlasGeometry { uint64_t vb, ib, transform; uint32_t vbStride, vbFormat, ibFormat, triangles, flags; };

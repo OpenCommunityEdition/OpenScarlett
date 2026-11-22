@@ -421,6 +421,8 @@ struct ListExtra {
     D3D12_INDEX_BUFFER_VIEW ib;
     PcObj sampler;                // sampler heap last bound by the title
     bool placeholderPso;          // current PSO has no PC pipeline (serialized native code): skip work
+    uint64_t csTables[16];        // console GPU handles of the compute root tables (ray dispatches read them)
+    const void* rtPipeline;       // state object of SetPipelineState1
     // Whole-resource states set by earlier transitions in this recording (see L_ResourceBarrier).
     static constexpr uint32_t kTracked = 64;
     uint32_t nTracked;
@@ -663,7 +665,17 @@ void D3DAPI L_SetGfxRootTable(ID3D12GraphicsCommandList* l, UINT i, D3D12_GPU_DE
     pc::list_gfx_root_table(LPC(l), i, desc_pc_gpu(h.ptr));
 }
 void D3DAPI L_SetComputeRootTable(ID3D12GraphicsCommandList* l, UINT i, D3D12_GPU_DESCRIPTOR_HANDLE h) {
+    if (i < 16) lx(l)->csTables[i] = h.ptr;
     pc::list_compute_root_table(LPC(l), i, desc_pc_gpu(h.ptr));
+}
+void D3DAPI L_SetPipelineState1(ID3D12GraphicsCommandList4* l4, ID3D12StateObject* so) { lx((ID3D12GraphicsCommandList*)l4)->rtPipeline = so; }
+void D3DAPI L_DispatchRays(ID3D12GraphicsCommandList4* l4, const D3D12_DISPATCH_RAYS_DESC* d) {
+    auto* l = (ID3D12GraphicsCommandList*)l4;
+    if (null_graphics()) return;
+    rt_dispatch(LPC(l), lx(l)->rtPipeline, lx(l)->csTables, d, 0, lx(l)->sampler);
+}
+void D3DAPI L_DispatchRaysX(ID3D12GraphicsCommandList6* l6, const D3D12XBOX_DISPATCH_RAYS_DESC* d) {
+    if (d) L_DispatchRays((ID3D12GraphicsCommandList4*)l6, &d->DispatchArgs);
 }
 void D3DAPI L_SetGfxRootCbv(ID3D12GraphicsCommandList* l, UINT i, D3D12_GPU_VIRTUAL_ADDRESS a) {
     XSL_TRACE("gfx.cmd", "list %p RootCBV %u %llx", (void*)l, i, (unsigned long long)a);
@@ -789,6 +801,14 @@ void D3DAPI L_ExecuteIndirect(ID3D12GraphicsCommandList* l, ID3D12CommandSignatu
                               ID3D12Resource* cnt, UINT64 co) {
     if (lx(l)->placeholderPso) InterlockedIncrement(&g_skipped_work);
     if (null_graphics() || lx(l)->placeholderPso) return;   // placeholder PSO: its work is skipped
+    if (sig && args && pc::is_rays_signature(P(sig))) {   // indirect rays on a translated pipeline (count buffer ignored)
+        uint64_t va = pc::res_gpu_va(P(args));
+        if (va && lx(l)->rtPipeline) {
+            bool ran = false;
+            for (UINT k = 0; k < (max ? std::min(max, 1u) : 0u); k++) ran |= rt_dispatch(LPC(l), lx(l)->rtPipeline, lx(l)->csTables, nullptr, va + ao, lx(l)->sampler);
+            if (ran) return;
+        }
+    }
     static bool diag = [] { char b[4]; return GetEnvironmentVariableA("XSL_D3D12_DEBUG", b, 4) && b[0] != '0'; }();
     if (diag) {
         static volatile long n = 0;
@@ -1141,6 +1161,9 @@ HRESULT make_list(Device* dev, PcObj pcl, D3D12_COMMAND_LIST_TYPE t, REFIID riid
         {
             auto* t4 = (D3D12GraphicsCommandList4_Function_Table*)&g_list_tbl;
             t4->BuildRaytracingAccelerationStructure = L_BuildRtAs;
+            t4->SetPipelineState1 = L_SetPipelineState1;
+            t4->DispatchRays = L_DispatchRays;
+            ((D3D12GraphicsCommandList6_Function_Table*)&g_list_tbl)->DispatchRaysX = L_DispatchRaysX;
             t4->EmitRaytracingAccelerationStructurePostbuildInfo = L_EmitRtAsPostbuild;
             t4->CopyRaytracingAccelerationStructure = L_CopyRtAs;
             ((D3D12GraphicsCommandList6_Function_Table*)&g_list_tbl)->BuildRaytracingAccelerationStructureBatched2X = L_BuildRtAsBatched2X;

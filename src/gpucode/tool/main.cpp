@@ -183,7 +183,7 @@ static int translate_cmd(const char* path, const char* rspath, const char* codep
     return 0;
 }
 
-// rtlink <template.cso> <blob>...: link the collections of a ray-tracing pipeline (serialized
+// rtlink <template.cso|-> <blob>...: link the collections of a ray-tracing pipeline (serialized
 // DeserializeStateObjectX blobs) into one program and translate it (gpucode/rtso.h).
 static int rtlink_cmd(const char* tmpl, int n, char** blobs) {
     std::vector<std::vector<uint8_t>> bs;
@@ -193,8 +193,8 @@ static int rtlink_cmd(const char* tmpl, int n, char** blobs) {
     if (!rt_link(bs, l, &err)) return fprintf(stderr, "link: %s\n", err.c_str()), 1;
     fprintf(stderr, "image 0x%zx bytes, scheduler @0x%x, %zu traversal entries, %zu exports\n", l.image.size() * 4, l.main, l.traversal.size(), l.exports.size());
     for (auto& [name, off] : l.exports) fprintf(stderr, "  export %s @0x%x\n", name.c_str(), off);
-    Container c;
-    if (!load_cso(tmpl, c)) return 1;
+    Container c;   // "-": no template (as the layer does)
+    if (strcmp(tmpl, "-") && !load_cso(tmpl, c)) return 1;
     c.kind = ProgramKind::CS;
     RootSig rs;
     RsParam p;

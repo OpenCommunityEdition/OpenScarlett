@@ -308,6 +308,25 @@ struct Translator {
     std::set<size_t> dyn_sbuf;
     bool uses_fmt_comp = false;            // fmt_comp(): typed buffer components from a run-time format
     std::set<size_t> dyn_mimg;             // image loads/stores on descriptors from descriptor memory
+    std::set<size_t> dyn_samp;             // samplers read from descriptor memory (layer payload: sampler-heap index)
+    bool uses_heap_sampler = false;
+    bool uses_heap_cube = false;   // cube textures sampled through descriptor memory (space 919)
+    bool uses_gm_atomic = false;
+    // 32-bit buffer atomics global memory supports: operation code for gm_atomic(), 0 = none.
+    // Byte/short buffer accesses: 1 store_byte 2 store_short 3 load_ubyte 4 load_sbyte 5 load_ushort 6 load_sshort.
+    static unsigned dyn_small_op(const std::string& n) {
+        static const char* ops[] = {"buffer_store_byte", "buffer_store_short", "buffer_load_ubyte", "buffer_load_sbyte", "buffer_load_ushort", "buffer_load_sshort"};
+        for (unsigned k = 0; k < 6; k++)
+            if (n == ops[k]) return k + 1;
+        return 0;
+    }
+    static unsigned dyn_atomic_op(const std::string& n) {
+        static const char* ops[] = {"buffer_atomic_add", "buffer_atomic_sub", "buffer_atomic_umin", "buffer_atomic_umax", "buffer_atomic_smin",
+                                    "buffer_atomic_smax", "buffer_atomic_and", "buffer_atomic_or", "buffer_atomic_xor", "buffer_atomic_swap"};
+        for (unsigned k = 0; k < 10; k++)
+            if (n == ops[k]) return k + 1;
+        return 0;
+    }
     std::set<unsigned> heap_dims;          // MIMG dims used by those (bindless heap arrays to declare)             // s_buffer_load whose descriptor is known only at run time            // raw buffer dword accesses whose descriptor is known only at run time
     bool soft_trace = false;
     std::map<size_t, size_t> dyn_alias;    // load -> representative load
@@ -865,7 +884,8 @@ struct Translator {
         if (in.fmt == Fmt::MUBUF || in.fmt == Fmt::MTBUF) {
             // Raw dword loads/stores may take a descriptor that only exists at run time (loaded from
             // memory): with global memory they address memory from the descriptor words directly.
-            bool rawDw = in.fmt == Fmt::MUBUF && (starts(n, "buffer_load_dword") || starts(n, "buffer_store_dword") || starts(n, "buffer_load_format_")) && !in.lds;
+            bool rawDw = in.fmt == Fmt::MUBUF && (starts(n, "buffer_load_dword") || starts(n, "buffer_store_dword") || starts(n, "buffer_load_format_") || dyn_atomic_op(n) ||
+                                                  dyn_small_op(n)) && !in.lds;
             soft_trace = rawDw && (opt.global_memory || opt.global_memory_test);
             int r = resource(st, in.srsrc, 4, in, false);
             soft_trace = false;
@@ -877,7 +897,8 @@ struct Translator {
             bool bvh = has(n, "bvh");   // inert acceleration structures (emit_mimg): no resource
             // Image loads/stores may take a descriptor read from descriptor memory at run time: the
             // layer stamps its global-heap index and view kind into descriptor dwords 0 and 1.
-            bool dynOk = !bvh && (n == "image_load" || n == "image_store" || n == "image_load_mip") && (opt.global_memory || opt.global_memory_test);
+            bool dynSample = n == "image_sample" || n == "image_sample_l" || n == "image_sample_lz" || n == "image_gather4_lz" || n == "image_gather4";
+            bool dynOk = !bvh && (n == "image_load" || n == "image_store" || n == "image_load_mip" || dynSample) && (opt.global_memory || opt.global_memory_test);
             soft_trace = dynOk;
             int r = bvh ? -2 : resource(st, in.srsrc, 8, in, false);
             soft_trace = false;
@@ -887,7 +908,10 @@ struct Translator {
             if (starts(n, "image_sample") || starts(n, "image_gather4") || n == "image_get_lod") {
                 std::string keep = res_index.count(i) ? res_index[i] : "";
                 res_index.erase(i);
+                soft_trace = dynOk;
                 samp_of[i] = resource(st, in.ssamp, 4, in, true);
+                soft_trace = false;
+                if (samp_of[i] < 0 && dynOk) dyn_samp.insert(i);
                 if (res_index.count(i)) samp_index[i] = res_index[i];
                 res_index.erase(i);
                 if (!keep.empty()) res_index[i] = keep;
@@ -1097,7 +1121,8 @@ struct Translator {
     bool emit_tbuffer_raw(const Instr& in, const Res& R, const std::string& RN, const std::string& addr,
                           const std::function<std::string(const std::string&)>& word);
     bool emit_mimg(const Instr& in, size_t idx);
-    bool emit_heap_image(const Instr& in);
+    bool emit_heap_image(const Instr& in, size_t idx);
+    bool emit_heap_sample(const Instr& in, size_t idx);
     bool emit_ds(const Instr& in, size_t idx);
     bool emit_vintrp(const Instr& in, size_t idx);
     bool emit_exp(const Instr& in, size_t idx);
@@ -2172,6 +2197,43 @@ bool Translator::emit_mubuf(const Instr& in, size_t idx) {
         line("}");
         return true;
     }
+    if (r < 0 && dyn_mubuf.count(idx) && dyn_small_op(n)) {
+        // Byte/short through a run-time descriptor: masked atomic stores, shifted loads.
+        uses_gm = true;
+        unsigned op = dyn_small_op(n);
+        unsigned va = in.vaddr;
+        std::string vidx = in.idxen ? V(va) : "0u";
+        std::string voff = in.offen ? V(in.idxen ? va + 1 : va) : "0u";
+        std::string so = rd(in.soffset, in);
+        const std::string d0 = S(in.srsrc), d1 = S(in.srsrc + 1);
+        line(fmt("if (kexec) { uint off_ = %s + %s + %uu + %s * ((%s >> 16) & 0x3fffu);", voff.c_str(), so.c_str(), uint32_t(in.offset_imm), vidx.c_str(), d1.c_str()));
+        line(fmt("  uint lo_ = %s + off_, hi_ = (%s & 0xffffu) + (lo_ < %s ? 1u : 0u);", d0.c_str(), d1.c_str(), d0.c_str()));
+        uint32_t mask = (op == 1 || op == 3 || op == 4) ? 0xffu : 0xffffu;
+        if (op <= 2) line(fmt("  gm_store_bits(lo_, hi_, %s & 0x%xu, 0x%xu);", V(in.vdata).c_str(), mask, mask));
+        else {
+            line(fmt("  uint w_ = gm_load(lo_ & ~3u, hi_) >> ((lo_ & 3u) * 8u);"));
+            if (op == 3 || op == 5) line(fmt("  %s = w_ & 0x%xu;", V(in.vdata).c_str(), mask));
+            else line(fmt("  %s = uint(int(w_ << %uu) >> %uu);", V(in.vdata).c_str(), mask == 0xff ? 24u : 16u, mask == 0xff ? 24u : 16u));
+        }
+        line("}");
+        return true;
+    }
+    if (r < 0 && dyn_mubuf.count(idx) && dyn_atomic_op(n)) {
+        // 32-bit atomic through a run-time descriptor: global memory at base + offset.
+        uses_gm = true;
+        uses_gm_atomic = true;
+        unsigned va = in.vaddr;
+        std::string vidx = in.idxen ? V(va) : "0u";
+        std::string voff = in.offen ? V(in.idxen ? va + 1 : va) : "0u";
+        std::string so = rd(in.soffset, in);
+        const std::string d0 = S(in.srsrc), d1 = S(in.srsrc + 1);
+        line(fmt("if (kexec) { uint off_ = %s + %s + %uu + %s * ((%s >> 16) & 0x3fffu);", voff.c_str(), so.c_str(), uint32_t(in.offset_imm), vidx.c_str(), d1.c_str()));
+        line(fmt("  uint lo_ = %s + off_, hi_ = (%s & 0xffffu) + (lo_ < %s ? 1u : 0u);", d0.c_str(), d1.c_str(), d0.c_str()));
+        line(fmt("  uint o_ = gm_atomic(lo_, hi_, %uu, %s);", dyn_atomic_op(n), V(in.vdata).c_str()));
+        if (in.glc) line(fmt("  %s = o_;", V(in.vdata).c_str()));
+        line("}");
+        return true;
+    }
     if (r < 0 && dyn_mubuf.count(idx)) {
         // Descriptor words in SGPRs: base [47:0], stride [61:48]; global memory at that address.
         uses_gm = true;
@@ -2366,10 +2428,57 @@ bool Translator::emit_mubuf(const Instr& in, size_t idx) {
 // Image load/store through the global heap: descriptor dword 0 = heap index, dword 1 = view kind
 // (bit 0 UAV, bits 7:4 class 0 float / 1 uint / 2 sint). Arrays HU<dim><cls> (UAVs) and HS<dim><cls>
 // (SRVs) cover the whole heap (spaces 910+). 2D, 2D array and 3D; no A16/D16.
-bool Translator::emit_heap_image(const Instr& in) {
+// Sampling a texture whose descriptor is read from descriptor memory: dword 0 = global-heap index
+// (float views; cubes in space 919); the sampler is a traced one or, read from memory too, dword 0 =
+// sampler-heap index (space 920).
+bool Translator::emit_heap_sample(const Instr& in, size_t idx) {
     std::string n = in.name;
     if (in.a16 || in.d16) return fail(n + ": A16/D16 through descriptor memory not supported");
-    auto areg = [&](unsigned k) { return V(in.nsa && k ? in.addr_extra[k - 1] : in.vaddr + k); };   // NSA: scattered address registers
+    const unsigned dim = in.dim;
+    if (dim != 1 && dim != 5 && dim != 2 && dim != 3) return fail(fmt("%s at 0x%x: dim %u through descriptor memory not supported", in.name, in.offset, dim));
+    if (dim == 3) uses_heap_cube = true;
+    else heap_dims.insert(dim);
+    auto areg = [&](unsigned k) { return V(in.nsa && k ? in.addr_extra[k - 1] : in.vaddr + k); };
+    const char* tag = dim == 1 ? "2" : dim == 5 ? "2A" : dim == 3 ? "C" : "3";
+    unsigned nc = dim == 1 ? 2 : 3;
+    std::string tc = nc == 2 ? fmt("float2(asfloat(%s), asfloat(%s))", areg(0).c_str(), areg(1).c_str())
+                             : dim == 3 ? fmt("cube_dir(asfloat(%s), asfloat(%s), asfloat(%s))", areg(0).c_str(), areg(1).c_str(), areg(2).c_str())
+                             : dim == 5 ? fmt("float3(asfloat(%s), asfloat(%s), round(asfloat(%s)))", areg(0).c_str(), areg(1).c_str(), areg(2).c_str())
+                                        : fmt("float3(asfloat(%s), asfloat(%s), asfloat(%s))", areg(0).c_str(), areg(1).c_str(), areg(2).c_str());
+    std::string lod = n == "image_sample_l" ? fmt("asfloat(%s)", areg(nc).c_str()) : std::string("0.0");   // compute: implicit LOD = level 0
+    std::string SS;
+    int sr = samp_of.count(idx) ? samp_of[idx] : -1;
+    if (sr >= 0) SS = sn(idx, sr);
+    else if (dyn_samp.count(idx)) { uses_heap_sampler = true; SS = fmt("HSMP[NonUniformResourceIndex(%s)]", S(in.ssamp).c_str()); }
+    else return fail(fmt("%s at 0x%x: sampler not known", in.name, in.offset));
+    std::string T = fmt("HS%sF[NonUniformResourceIndex(%s)]", tag, S(in.srsrc).c_str());
+    std::string call;
+    if (starts(n, "image_gather4")) {
+        if (dim == 2) return fail(n + " on 3D through descriptor memory");
+        const char* ch = in.dmask == 1 ? "Red" : in.dmask == 2 ? "Green" : in.dmask == 4 ? "Blue" : "Alpha";
+        call = fmt("%s.Gather%s(%s, %s)", T.c_str(), ch, SS.c_str(), tc.c_str());
+        line(fmt("if (kexec) { float4 t_ = %s;", call.c_str()));
+        for (int b = 0; b < 4; b++) line(fmt("  %s = asuint(t_[%d]);", V(in.vdata + b).c_str(), b));
+        line("}");
+        return true;
+    }
+    line(fmt("if (kexec) { float4 t_ = %s.SampleLevel(%s, %s, %s);", T.c_str(), SS.c_str(), tc.c_str(), lod.c_str()));
+    unsigned o = 0;
+    for (int b = 0; b < 4; b++)
+        if (in.dmask >> b & 1) line(fmt("  %s = asuint(t_[%d]);", V(in.vdata + o++).c_str(), b));
+    line("}");
+    return true;
+}
+bool Translator::emit_heap_image(const Instr& in, size_t idx) {
+    std::string n = in.name;
+    if (starts(n, "image_sample") || starts(n, "image_gather4")) return emit_heap_sample(in, idx);
+    if (in.d16) return fail(n + ": D16 through descriptor memory not supported");
+    auto areg = [&](unsigned k) -> std::string {   // A16: two 16-bit coordinates per register
+        if (!in.a16) return V(in.nsa && k ? in.addr_extra[k - 1] : in.vaddr + k);
+        unsigned r = k / 2;
+        std::string v = V(in.nsa && r ? in.addr_extra[r - 1] : in.vaddr + r);
+        return fmt("((%s >> %uu) & 0xffffu)", v.c_str(), 16 * (k & 1));
+    };   // NSA: scattered address registers
     const unsigned dim = in.dim;
     if (dim != 1 && dim != 5 && dim != 2) return fail(fmt("%s at 0x%x: dim %u through descriptor memory not supported", in.name, in.offset, dim));
     heap_dims.insert(dim);
@@ -2443,7 +2552,7 @@ bool Translator::emit_mimg(const Instr& in, size_t idx) {
         return true;
     }
     int r = res_of.count(idx) ? res_of[idx] : -1;
-    if (r < 0 && dyn_mimg.count(idx)) return emit_heap_image(in);
+    if (r < 0 && dyn_mimg.count(idx)) return emit_heap_image(in, idx);
     if (r < 0) return fail(fmt("%s at 0x%x: image descriptor not known", in.name, in.offset));   // never drop the access silently
     Res& R = res[r];
     const std::string RN = rn(idx, r);
@@ -3423,6 +3532,22 @@ std::string Translator::generate() {
              "  uint3 f = gm_find(lo, hi);\n"
              "  if (f.x != 0u && (f.y & 0x80000000u)) GMU[NonUniformResourceIndex((f.y >> 14) & 0x3fffu)].Store(f.z & ~3u, v);\n"
              "}\n"
+             "uint gm_atomic(uint lo, uint hi, uint op, uint v) {   // 1 add 2 sub 3 umin 4 umax 5 smin 6 smax 7 and 8 or 9 xor 10 swap\n"
+             "  uint3 f = gm_find(lo, hi);\n"
+             "  if (f.x == 0u || !(f.y & 0x80000000u)) return 0u;\n"
+             "  uint i = (f.y >> 14) & 0x3fffu, a = f.z & ~3u, o = 0u; int so = 0;\n"
+             "  switch (op) {\n"
+             "  case 1u: GMU[NonUniformResourceIndex(i)].InterlockedAdd(a, v, o); break;\n"
+             "  case 2u: GMU[NonUniformResourceIndex(i)].InterlockedAdd(a, 0u - v, o); break;\n"
+             "  case 3u: GMU[NonUniformResourceIndex(i)].InterlockedMin(a, v, o); break;\n"
+             "  case 4u: GMU[NonUniformResourceIndex(i)].InterlockedMax(a, v, o); break;\n"
+             "  case 5u: GMU[NonUniformResourceIndex(i)].InterlockedMin(a, int(v), so); o = uint(so); break;\n"
+             "  case 6u: GMU[NonUniformResourceIndex(i)].InterlockedMax(a, int(v), so); o = uint(so); break;\n"
+             "  case 7u: GMU[NonUniformResourceIndex(i)].InterlockedAnd(a, v, o); break;\n"
+             "  case 8u: GMU[NonUniformResourceIndex(i)].InterlockedOr(a, v, o); break;\n"
+             "  case 9u: GMU[NonUniformResourceIndex(i)].InterlockedXor(a, v, o); break;\n"
+             "  default: GMU[NonUniformResourceIndex(i)].InterlockedExchange(a, v, o); break;\n"
+             "  }\n  return o;\n}\n"
              "void gm_store_bits(uint lo, uint hi, uint v, uint mask) {   // byte/short stores: atomic clear and set\n"
              "  uint3 f = gm_find(lo, hi);\n"
              "  if (f.x == 0u || !(f.y & 0x80000000u)) return;\n"
@@ -3487,6 +3612,8 @@ std::string Translator::generate() {
             }
             sp += 3;
         }
+        if (uses_heap_cube) h << "TextureCube<float4> HSCF[] : register(t0, space919);\n";
+        if (uses_heap_sampler) h << "SamplerState HSMP[] : register(s0, space920);\n";
     }
     if (indirect) {   // code address -> dispatcher case (block start); unknown addresses end the invocation
         h << "uint jump_case(uint lo, uint hi) {\n";

@@ -201,6 +201,9 @@ void desc_commit(uint64_t h, D3D12_DESCRIPTOR_HEAP_TYPE type, const DescTag& tag
 constexpr uint32_t kDescTexture = 0x80000000u;   // payload dword 1 flag: dword 0 is the slot's heap index
 void desc_set_payload(const uint32_t words[4]);
 uint64_t desc_memory_address(uint64_t gpuHandle);   // global-memory address of descriptor memory (0: none)
+// DispatchRays on a translated ray-tracing pipeline (xs_device.cpp); tables = console compute root tables.
+// argsVa: PC address of an indirect D3D12_DISPATCH_RAYS_DESC (then d may be null). False: no pipeline ready.
+bool rt_dispatch(PcObj list, const void* stateObject, const uint64_t* tables, const D3D12_DISPATCH_RAYS_DESC* d, uint64_t argsVa, PcObj samplerHeap);
 bool desc_copy(uint32_t n, uint64_t dst, uint64_t src, D3D12_DESCRIPTOR_HEAP_TYPE type);
 uint64_t desc_pc_cpu(uint64_t h, D3D12_DESCRIPTOR_HEAP_TYPE type);
 void desc_publish(uint64_t h);   // after writing a PC descriptor to desc_pc_cpu(h) of a view slot
