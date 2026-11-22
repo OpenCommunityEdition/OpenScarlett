@@ -241,10 +241,18 @@ struct Translator {
         return true;
     }
 
+    bool jumped = false;     // the block's last instruction set pc (indirect jump)
+    bool indirect = false;   // s_setpc_b64 / s_swappc_b64 (not the VS fetch-shader call): jumps through jump_case()
     void build_cfg() {
         std::set<uint32_t> leaders{0};
+        for (uint32_t e : opt.entries) leaders.insert(e);
         for (size_t i = 0; i < ins.size(); i++) {
             auto& in = ins[i];
+            if (in.name && (!strcmp(in.name, "s_setpc_b64") || !strcmp(in.name, "s_swappc_b64")) &&
+                !(!strcmp(in.name, "s_swappc_b64") && c.kind == ProgramKind::VS && i <= 1 && in.src0 == 4)) {
+                indirect = true;
+                leaders.insert(in.offset + 4);   // the return address (s_swappc) or what follows a jump
+            }
             if (in.fmt != Fmt::SOPP || !in.name) continue;
             std::string n = in.name;
             if (starts(n, "s_branch") || starts(n, "s_cbranch")) {
@@ -1274,7 +1282,11 @@ bool Translator::emit_salu(const Instr& in, size_t idx) {
         if (n == "s_abs_i32") { line(fmt("%s = uint(abs(int(%s))); scc = %s != 0u;", S(d).c_str(), a().c_str(), S(d).c_str())); return true; }
         if (n == "s_bitset0_b32") { write_s(d, fmt("%s & ~(1u << (%s & 31u))", S(d).c_str(), a().c_str())); return true; }
         if (n == "s_bitset1_b32") { write_s(d, fmt("%s | (1u << (%s & 31u))", S(d).c_str(), a().c_str())); return true; }
-        if (n == "s_getpc_b64") { line(fmt("%s = 0x%xu; %s = 0u;", S(d).c_str(), in.offset + 4, S(d + 1).c_str())); return true; }
+        if (n == "s_getpc_b64") {
+            uint64_t a = opt.code_base + in.offset + 4;
+            line(fmt("%s = 0x%xu; %s = 0x%xu;", S(d).c_str(), uint32_t(a), S(d + 1).c_str(), uint32_t(a >> 32)));
+            return true;
+        }
         if (has(n, "saveexec") || has(n, "wrexec")) {
             // s_<op>_saveexec: dst = exec; exec = op(src, exec). wrexec: exec = op(src, exec); dst = exec.
             std::string op = n.substr(2, n.find('_', 2) - 2);
@@ -1321,7 +1333,16 @@ bool Translator::emit_salu(const Instr& in, size_t idx) {
             vs_fetch = true;   // call of the driver's fetch shader: the input assembler does it on PC
             return true;
         }
-        if (n == "s_setpc_b64" || n == "s_swappc_b64") return fail(n + " (indirect branch/call) not supported");
+        if (n == "s_setpc_b64" || n == "s_swappc_b64") {   // block terminators: the dispatcher continues at the target
+            line(fmt("{ uint tlo_ = %s, thi_ = %s;", S(in.src0).c_str(), S(in.src0 + 1).c_str()));
+            if (n == "s_swappc_b64") {
+                uint64_t ret = opt.code_base + in.offset + 4;
+                line(fmt("  %s = 0x%xu; %s = 0x%xu;", S(in.dst).c_str(), uint32_t(ret), S(in.dst + 1).c_str(), uint32_t(ret >> 32)));
+            }
+            line("  pc = jump_case(tlo_, thi_); }");
+            jumped = true;
+            return true;
+        }
         if (n == "s_movrels_b32" || n == "s_movreld_b32") return fail(n + " not supported");
         return fail(fmt("%s at 0x%x not supported", in.name, in.offset));
     }
@@ -3109,7 +3130,7 @@ uint quadperm(uint v, uint p0, uint p1, uint p2, uint p3) {
 
 std::string Translator::generate() {
     // Body first (it decides resource usage), then wrap with declarations.
-    const bool loops = [&] {
+    const bool loops = indirect || [&] {
         for (auto& in : ins)
             if (in.fmt == Fmt::SOPP && (starts(in.name, "s_branch") || starts(in.name, "s_cbranch")) && in.simm16 < 0) return true;
         return false;
@@ -3148,8 +3169,8 @@ std::string Translator::generate() {
                  barriers ? opt.loop_guard_barrier : opt.loop_guard));
     }
     // Blocks not reachable from the entry (data after the last instruction) are not emitted.
-    std::vector<bool> live(nb, false);
-    {
+    std::vector<bool> live(nb, indirect);
+    if (!indirect) {
         std::vector<size_t> work{0};
         live[0] = true;
         while (!work.empty()) {
@@ -3173,13 +3194,15 @@ std::string Translator::generate() {
         if (!live[b]) continue;
         if (!loops) line(fmt("if (reach[%zu]) {", b));
         else line(fmt("case %zuu: {", b));
+        jumped = false;
         for (size_t i = block_start[b]; i < e; i++)
             if (!emit(ins[i], i) && !err.empty()) break;
         if (!err.empty()) break;
         const Instr& last = ins[e - 1];
         std::string ln = last.name;
         size_t next = b + 1;
-        if (last.fmt == Fmt::SOPP && ln == "s_endpgm") line("RETURN;");
+        if (jumped) line("break;");   // s_setpc / s_swappc set pc
+        else if (last.fmt == Fmt::SOPP && ln == "s_endpgm") line("RETURN;");
         else if (last.fmt == Fmt::SOPP && (starts(ln, "s_branch") || starts(ln, "s_cbranch"))) {
             size_t t = block_of.count(uint32_t(int32_t(last.offset) + 4 + last.simm16 * 4)) ? block_of[uint32_t(int32_t(last.offset) + 4 + last.simm16 * 4)] : nb;
             if (starts(ln, "s_branch")) line(loops ? fmt("pc = %zuu; break;", t) : fmt("reach[%zu] = true;", t));
@@ -3284,6 +3307,15 @@ std::string Translator::generate() {
              "}\n";
     }
     if (uses_bvh) h << kBvhPrelude;
+    if (indirect) {   // code address -> dispatcher case (block start); unknown addresses end the invocation
+        h << "uint jump_case(uint lo, uint hi) {\n";
+        h << fmt("  if (hi != 0x%xu) return 0xffffffffu;\n  switch (lo) {\n", uint32_t(opt.code_base >> 32));
+        for (size_t b = 0; b < block_start.size(); b++) {
+            uint64_t a = opt.code_base + ins[block_start[b]].offset;
+            h << fmt("  case 0x%xu: return %zuu;\n", uint32_t(a), b);
+        }
+        h << "  default: return 0xffffffffu;\n  }\n}\n";
+    }
     if (uses_codedata) {
         size_t n = (c.precompiled.size() - c.body_begin) / 4;
         h << "static const uint codedata[" << n << "] = {";

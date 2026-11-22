@@ -11,6 +11,7 @@
 // the PC pipeline keeps that root signature.
 #pragma once
 #include <string>
+#include <vector>
 
 #include "container.h"
 #include "meta.h"
@@ -35,6 +36,11 @@ struct TranslateOptions {
     bool global_memory = false;
     // Tests: global memory is the raw buffer at t1 space0 (address = byte offset, high half 0).
     bool global_memory_test = false;
+    // Indirect jumps (s_setpc_b64 / s_swappc_b64, e.g. ray-tracing continuation segments): code
+    // addresses are code_base + byte offset (s_getpc_b64 returns them); jump targets are block
+    // starts, which include every offset in `entries` and every return address after s_swappc.
+    uint64_t code_base = 0;
+    std::vector<uint32_t> entries;
     bool barrier_sync = true;        // false: s_barrier without the group sync (debugging hangs) // the PC runtime takes shader model 6.6 ([WaveSize] on compute)
 };
 
