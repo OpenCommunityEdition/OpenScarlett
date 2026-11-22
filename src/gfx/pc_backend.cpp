@@ -90,6 +90,9 @@ IDXGIFactory4* g_factory = nullptr;
 D3D12_RESOURCE_STATES pc_state(uint32_t x) {
     if (x & 0x100000) x &= ~0x100000u;  // PRESENT -> COMMON (PC PRESENT == 0)
     if ((x & 0x8c3) == 0x8c3) x |= D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT;
+    // PC bits valid on graphics and compute lists only: console-only bits (PRESERVE_COMPRESSED_*,
+    // 0x10000000) and video states are reserved there and invalidate the list.
+    x &= 0x3FFFu | D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE | D3D12_RESOURCE_STATE_SHADING_RATE_SOURCE;
     return (D3D12_RESOURCE_STATES)x;
 }
 
@@ -409,6 +412,8 @@ void set_name(PcObj o, const wchar_t* name) {
 // only copy states (other states remove the device). They run as PC direct queues and lists.
 static int pc_list_type(int t) {
     static bool keep = [] { char b[4]; return GetEnvironmentVariableA("XSL_COPY_QUEUES", b, 4) && b[0] == '1'; }();
+    static bool computeDirect = [] { char b[4]; return GetEnvironmentVariableA("XSL_COMPUTE_AS_DIRECT", b, 4) && b[0] == '1'; }();
+    if (t == D3D12_COMMAND_LIST_TYPE_COMPUTE && computeDirect) return D3D12_COMMAND_LIST_TYPE_DIRECT;
     return t == D3D12_COMMAND_LIST_TYPE_COPY && !keep ? D3D12_COMMAND_LIST_TYPE_DIRECT : t;
 }
 HRESULT_T create_queue(PcObj dev, const void* desc, PcObj* out) {
@@ -1300,6 +1305,12 @@ HRESULT_T create_heap(PcObj dev, const void* desc, PcObj* out) {
     D3D12_HEAP_DESC d = *static_cast<const D3D12_HEAP_DESC*>(desc);
     d.Flags = clean_heap_flags(d.Flags);
     d.Properties.CreationNodeMask = d.Properties.VisibleNodeMask = 0;
+    // Multisampled textures need 4 MB placement alignment on PC; console heaps that can hold
+    // render targets ask for 64 KB. Such heaps get 4 MB alignment when their size allows it.
+    constexpr uint64_t kMsaaAlign = D3D12_DEFAULT_MSAA_RESOURCE_PLACEMENT_ALIGNMENT;
+    if (!(d.Flags & D3D12_HEAP_FLAG_DENY_RT_DS_TEXTURES) && d.Properties.Type == D3D12_HEAP_TYPE_DEFAULT && d.Alignment < kMsaaAlign &&
+        d.SizeInBytes % kMsaaAlign == 0)
+        d.Alignment = kMsaaAlign;
     // Upload heaps (PC upload heaps hold buffers only, so the custom heap places the same resources);
     // the PC upload heap is used if the custom one cannot be created.
     if (d.Properties.Type == D3D12_HEAP_TYPE_UPLOAD) {
@@ -1333,8 +1344,25 @@ HRESULT_T create_placed_resource(PcObj dev, PcObj heap, uint64_t offset, const v
     D3D12_RESOURCE_DESC d = clean_desc(desc);
     const D3D12_CLEAR_VALUE* cv = static_cast<const D3D12_CLEAR_VALUE*>(clear);
     if (!(d.Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL))) cv = nullptr;
-    HRESULT hr = logged(as<ID3D12Device>(dev)->CreatePlacedResource(as<ID3D12Heap>(heap), offset, &d, pc_state(state), cv,
-                                                             IID_PPV_ARGS(reinterpret_cast<ID3D12Resource**>(out))), "CreatePlacedResource");
+    HRESULT hr = as<ID3D12Device>(dev)->CreatePlacedResource(as<ID3D12Heap>(heap), offset, &d, pc_state(state), cv,
+                                                             IID_PPV_ARGS(reinterpret_cast<ID3D12Resource**>(out)));
+    if (hr == E_INVALIDARG && d.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER) {
+        // The PC layout can be larger than the console's (e.g. D32_S8 depth), so a texture placed for
+        // the console's size may run past the heap. It gets its own memory instead (no aliasing
+        // with the heap's other resources).
+        D3D12_HEAP_DESC hd = as<ID3D12Heap>(heap)->GetDesc();
+        D3D12_RESOURCE_ALLOCATION_INFO ai = as<ID3D12Device>(dev)->GetResourceAllocationInfo(0, 1, &d);
+        D3D12_HEAP_PROPERTIES hp = hd.Properties;
+        HRESULT h2 = as<ID3D12Device>(dev)->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &d, pc_state(state), cv,
+                                                                    IID_PPV_ARGS(reinterpret_cast<ID3D12Resource**>(out)));
+        static volatile long n = 0;
+        if (InterlockedIncrement(&n) <= 5)
+            XSL_WARN(CH, "placed texture %llux%u fmt %d at +%llu needs %llu bytes, heap holds %llu: %s", (unsigned long long)d.Width, d.Height, (int)d.Format,
+                     (unsigned long long)offset, (unsigned long long)ai.SizeInBytes, (unsigned long long)hd.SizeInBytes,
+                     SUCCEEDED(h2) ? "given its own memory" : "failed");
+        hr = h2;
+    }
+    if (FAILED(hr)) logged(hr, "CreatePlacedResource");
     if (SUCCEEDED(hr)) note_texture(*out);
     if (SUCCEEDED(hr)) note_buffer(*out);
     if (SUCCEEDED(hr) && d.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
@@ -1764,6 +1792,13 @@ void list_barriers(PcObj l, uint32_t n, const void* b) {
                 XSL_INFO(CH, "plane op: list %p barrier on %p: console %#x -> %#x (sub %#x flags %#x), PC %#x -> %#x", (void*)l, (void*)tmp[k].Transition.pResource,
                          (unsigned)in[i].Transition.StateBefore, (unsigned)in[i].Transition.StateAfter, tmp[k].Transition.Subresource, (unsigned)tmp[k].Flags,
                          (unsigned)pc_state(in[i].Transition.StateBefore), (unsigned)pc_state(in[i].Transition.StateAfter));
+        }
+        if (tmp[k].Type == D3D12_RESOURCE_BARRIER_TYPE_ALIASING) {
+            // Committed resources (e.g. textures that could not be placed) cannot take part in
+            // aliasing barriers; a null side means "any resource".
+            auto committed = [](ID3D12Resource* r) { D3D12_HEAP_PROPERTIES hp; D3D12_HEAP_FLAGS hf; return r && SUCCEEDED(r->GetHeapProperties(&hp, &hf)); };
+            if (committed(tmp[k].Aliasing.pResourceBefore)) tmp[k].Aliasing.pResourceBefore = nullptr;
+            if (committed(tmp[k].Aliasing.pResourceAfter)) tmp[k].Aliasing.pResourceAfter = nullptr;
         }
         if (tmp[k].Type == D3D12_RESOURCE_BARRIER_TYPE_TRANSITION) {
             tmp[k].Transition.StateBefore = pc_state(tmp[k].Transition.StateBefore);

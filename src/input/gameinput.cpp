@@ -60,11 +60,55 @@ float stick(SHORT v) { return v < 0 ? v / 32768.0f : v / 32767.0f; }
 
 std::atomic<bool> g_title_reads_keyboard{false};
 
+// XSL_INPUT_SCRIPT="<seconds>:<button>[,<seconds>:<button>...]" (testing without a person at the
+// machine): from that many seconds after start the button is held for 300 ms, on the first gamepad
+// and as the matching key. Buttons: A B X Y Menu View Up Down Left Right (keys Enter Escape and arrows
+// for A/Menu, B/View and the D-pad).
+struct ScriptedPress { uint64_t at_ms; uint32_t pad; int vk; };
+const std::vector<ScriptedPress>& input_script() {
+    static std::vector<ScriptedPress> v = [] {
+        std::vector<ScriptedPress> r;
+        char b[512];
+        if (!GetEnvironmentVariableA("XSL_INPUT_SCRIPT", b, sizeof b)) return r;
+        static const struct { const char* n; uint32_t pad; int vk; } names[] = {
+            {"A", GameInputGamepadA, VK_RETURN}, {"B", GameInputGamepadB, VK_ESCAPE}, {"X", GameInputGamepadX, 'C'}, {"Y", GameInputGamepadY, 'V'},
+            {"Menu", GameInputGamepadMenu, VK_RETURN}, {"View", GameInputGamepadView, VK_ESCAPE}, {"Up", GameInputGamepadDPadUp, VK_UP},
+            {"Down", GameInputGamepadDPadDown, VK_DOWN}, {"Left", GameInputGamepadDPadLeft, VK_LEFT}, {"Right", GameInputGamepadDPadRight, VK_RIGHT}};
+        for (char* t = strtok(b, ","); t; t = strtok(nullptr, ",")) {
+            double sec = 0;
+            char btn[16] = {};
+            if (sscanf(t, "%lf:%15s", &sec, btn) != 2) continue;
+            for (auto& n : names)
+                if (!_stricmp(n.n, btn)) r.push_back({(uint64_t)(sec * 1000), n.pad, n.vk});
+        }
+        XSL_INFO(CH, "input script: %zu scripted presses", r.size());
+        return r;
+    }();
+    return v;
+}
+uint64_t g_start_ms = GetTickCount64();
+void scripted(uint32_t* pad, std::vector<int>* vks) {
+    uint64_t now = GetTickCount64() - g_start_ms;
+    for (auto& p : input_script())
+        if (now >= p.at_ms && now < p.at_ms + 300) {
+            if (pad) *pad |= p.pad;
+            if (vks) vks->push_back(p.vk);
+        }
+}
+
 // ---- State sources ---------------------------------------------------------------------
 bool pad_state(DWORD slot, GameInputGamepadState* s) {
     *s = {};
     XINPUT_STATE x{};
-    if (!g_xget || g_xget(slot, &x) != ERROR_SUCCESS) return false;
+    if (!g_xget || g_xget(slot, &x) != ERROR_SUCCESS) {
+        if (slot == 0 && !input_script().empty()) {   // scripted presses need no physical pad
+            uint32_t o = 0;
+            scripted(&o, nullptr);
+            s->buttons = (GameInputGamepadButtons)o;
+            return true;
+        }
+        return false;
+    }
     const WORD b = x.Gamepad.wButtons;
     uint32_t o = 0;
     if (b & XINPUT_GAMEPAD_START) o |= GameInputGamepadMenu;
@@ -81,6 +125,7 @@ bool pad_state(DWORD slot, GameInputGamepadState* s) {
     if (b & XINPUT_GAMEPAD_RIGHT_SHOULDER) o |= GameInputGamepadRightShoulder;
     if (b & XINPUT_GAMEPAD_LEFT_THUMB) o |= GameInputGamepadLeftThumbstick;
     if (b & XINPUT_GAMEPAD_RIGHT_THUMB) o |= GameInputGamepadRightThumbstick;
+    if (slot == 0) scripted(&o, nullptr);
     s->buttons = (GameInputGamepadButtons)o;
     s->leftTrigger = x.Gamepad.bLeftTrigger / 255.0f;
     s->rightTrigger = x.Gamepad.bRightTrigger / 255.0f;
@@ -93,8 +138,9 @@ bool pad_state(DWORD slot, GameInputGamepadState* s) {
 
 void keyboard_as_pad(GameInputGamepadState* s) {
     *s = {};
-    if (!our_focus()) return;
     uint32_t o = 0;
+    scripted(&o, nullptr);
+    if (!our_focus()) { s->buttons = (GameInputGamepadButtons)o; return; }
     if (down(VK_ESCAPE)) o |= GameInputGamepadView;
     if (down(VK_RETURN)) o |= GameInputGamepadMenu;
     if (down(VK_UP)) o |= GameInputGamepadDPadUp;
@@ -110,6 +156,17 @@ void keyboard_as_pad(GameInputGamepadState* s) {
 
 void keyboard_state(std::vector<GameInputKeyState>* keys) {
     keys->clear();
+    {
+        std::vector<int> vks;
+        scripted(nullptr, &vks);
+        for (int vk : vks) {
+            GameInputKeyState k{};
+            k.scanCode = MapVirtualKeyW(vk, MAPVK_VK_TO_VSC);
+            k.virtualKey = (uint8_t)vk;
+            keys->push_back(k);
+        }
+        if (!vks.empty()) return;
+    }
     if (!our_focus()) return;
     BYTE kb[256] = {};
     for (int vk = 0; vk < 256; vk++) {
@@ -646,7 +703,7 @@ DWORD WINAPI poll_thread(void*) {
             for (Device* d : devices()) {
                 if (d->type != Dev::Pad) continue;
                 XINPUT_STATE x;
-                bool now = g_xget && g_xget(d->slot, &x) == ERROR_SUCCESS;
+                bool now = (g_xget && g_xget(d->slot, &x) == ERROR_SUCCESS) || (d->slot == 0 && !input_script().empty());
                 if (now == d->connected) continue;
                 GameInputDeviceStatus prev = d->status();
                 d->connected = now;
@@ -706,7 +763,7 @@ void start_threads() {
     std::call_once(once, [] {
         for (Device* d : devices()) {
             XINPUT_STATE x;
-            if (d->type == Dev::Pad) d->connected = g_xget && g_xget(d->slot, &x) == ERROR_SUCCESS;
+            if (d->type == Dev::Pad) d->connected = (g_xget && g_xget(d->slot, &x) == ERROR_SUCCESS) || (d->slot == 0 && !input_script().empty());   // scripted input: a virtual pad
             if (d->connected) record(d);
         }
         CloseHandle(CreateThread(nullptr, 0, raw_thread, nullptr, 0, nullptr));

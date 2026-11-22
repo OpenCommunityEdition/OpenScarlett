@@ -48,6 +48,15 @@ std::map<PcObj, Entry> g_tex;
 std::vector<PcObj> g_queue;
 size_t g_scan = 0;   // round-robin position of the content check
 
+// The whole range is committed (it may span several adjacent regions).
+bool committed(uint64_t va, uint64_t size) {
+    for (uint64_t p = va, end = va + size; p < end;) {
+        MEMORY_BASIC_INFORMATION mbi{};
+        if (!VirtualQuery((const void*)(uintptr_t)p, &mbi, sizeof mbi) || mbi.State != MEM_COMMIT) return false;
+        p = (uint64_t)(uintptr_t)mbi.BaseAddress + mbi.RegionSize;
+    }
+    return true;
+}
 uint64_t content_hash(uint64_t va, uint64_t size) {
     const uint64_t* p = (const uint64_t*)(uintptr_t)va;
     uint64_t h = 0x9e3779b97f4a7c15ull;
@@ -66,15 +75,6 @@ CreateComputer xg() {
     return f;
 }
 
-// The whole range is committed (it may span several adjacent regions).
-bool committed(uint64_t va, uint64_t size) {
-    for (uint64_t p = va, end = va + size; p < end;) {
-        MEMORY_BASIC_INFORMATION mbi{};
-        if (!VirtualQuery((const void*)(uintptr_t)p, &mbi, sizeof mbi) || mbi.State != MEM_COMMIT) return false;
-        p = (uint64_t)(uintptr_t)mbi.BaseAddress + mbi.RegionSize;
-    }
-    return true;
-}
 struct FillCtx { XgComputer* c; uint64_t va; UINT64 size; };
 bool fill(void* ctx, uint32_t sub, void* dst, uint32_t rowPitch, uint32_t rows, uint32_t depth) {
     auto* f = static_cast<FillCtx*>(ctx);
@@ -120,7 +120,8 @@ void detile_flush(PcObj pcDevice, PcObj pcQueue) {
                 Entry& e = it->second;
                 if (e.done && e.size && e.size <= budget) {
                     budget -= e.size;
-                    if (content_hash(e.va, e.size) != e.hash) { e.done = false; e.queued = true; g_queue.push_back(it->first); }
+                    if (!committed(e.va, e.size)) e.size = 0;   // the title released the memory: stop checking
+                    else if (content_hash(e.va, e.size) != e.hash) { e.done = false; e.queued = true; g_queue.push_back(it->first); }
                 }
                 ++it;
             }

@@ -141,9 +141,13 @@ HRESULT D3DAPI D_CreateRootSignature(ID3D12Device* d, UINT, const void* blob, SI
 static HRESULT pso_result(Device* dev, HRESULT hr, PcObj pso, REFIID riid, void** out) {
     if (SUCCEEDED(hr)) return make_simple(dev, Kind::Pso, pso, riid, out);
     static const bool on = [] { char b[4]; return !(GetEnvironmentVariableA("XSL_PLACEHOLDER_PSO", b, 4) && b[0] == '0'); }();
-    if (!on || !pc::had_untranslated()) return hr;
+    const bool translated = *pc::translated_keys() != 0;
+    if (!on || (!pc::had_untranslated() && !translated)) return hr;
     static volatile long n = 0;
-    if (InterlockedIncrement(&n) <= 5) XSL_WARN(CH, "pipeline with untranslated console shaders: placeholder PSO (its work is skipped)");
+    if (InterlockedIncrement(&n) <= 8) {
+        if (pc::had_untranslated()) XSL_WARN(CH, "pipeline with untranslated console shaders: placeholder PSO (its work is skipped)");
+        else XSL_WARN(CH, "pipeline of translated shaders %s rejected by the PC runtime (%08lx): placeholder PSO (its work is skipped)", pc::translated_keys(), hr);
+    }
     return make_simple(dev, Kind::Pso, nullptr, riid, out);
 }
 HRESULT D3DAPI D_CreateGraphicsPipelineState(ID3D12Device* d, const D3D12_GRAPHICS_PIPELINE_STATE_DESC* desc, REFIID riid, void** out) {

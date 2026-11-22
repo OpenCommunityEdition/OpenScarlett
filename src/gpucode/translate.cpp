@@ -3161,24 +3161,38 @@ std::string Translator::generate() {
     } else if (c.kind == ProgramKind::PS) {
         h << "struct PSIn {\n";
         bool has_pos = false, has_face = false, has_sid = false, has_cov = false;
+        // Values the rasterizer generates (front face, sample index, primitive id) go after the
+        // ones the previous stage writes, so the PC signature packs like the previous stage's output.
+        std::string tail;
         for (auto& e : sorted(isg)) {
             if (e.sysval == 1) { h << "  float4 pos_ : SV_Position;\n"; has_pos = true; continue; }
-            if (e.sysval == 9) { h << "  bool face_ : SV_IsFrontFace;\n"; has_face = true; continue; }
-            if (e.sysval == 10) { h << "  uint sid_ : SV_SampleIndex;\n"; has_sid = true; continue; }
+            if (e.sysval == 9) { tail += "  bool face_ : SV_IsFrontFace;\n"; has_face = true; continue; }
+            if (e.sysval == 10) { tail += "  uint sid_ : SV_SampleIndex;\n"; has_sid = true; continue; }
+            if (e.sysval == 7) { tail += "  " + type_of(e) + " sv" + std::to_string(e.reg) + "_ : " + sem(e) + ";\n"; continue; }
             if (e.sysval != 0) { h << "  " << type_of(e) << " sv" << e.reg << "_ : " << sem(e) << ";\n"; continue; }
             unsigned first = unsigned(__builtin_ctz(e.mask));
             auto m = attr_mode.find(e.reg * 4 + first);
             std::string md = m != attr_mode.end() ? m->second : (e.is_float() ? "linear" : "nointerpolation");
+            // Components sharing a register share its first element's mode: the PC compiler packs
+            // differently interpolated values into separate rows, which would no longer line up
+            // with the previous stage's output registers.
+            for (auto& o : isg)
+                if (o.reg == e.reg && o.sysval == 0 && (o.mask & -o.mask) < (e.mask & -e.mask) && o.is_float() == e.is_float()) {
+                    auto mo = attr_mode.find(o.reg * 4 + unsigned(__builtin_ctz(o.mask)));
+                    md = mo != attr_mode.end() ? mo->second : (o.is_float() ? "linear" : "nointerpolation");
+                    break;
+                }
             if (md == "linear") md = "";
             h << "  " << md << (md.empty() ? "" : " ") << type_of(e) << " a" << e.reg << "_" << first << " : " << sem(e) << ";\n";
         }
         for (auto& pr : ps_sysv) {
             const std::string& ini = pr.second;
             if (has(ini, "pos_") && !has_pos) { h << "  float4 pos_ : SV_Position;\n"; has_pos = true; }
-            if (has(ini, "face_") && !has_face) { h << "  bool face_ : SV_IsFrontFace;\n"; has_face = true; }
-            if (has(ini, "sid_") && !has_sid) { h << "  uint sid_ : SV_SampleIndex;\n"; has_sid = true; }
-            if (has(ini, "cov_") && !has_cov) { h << "  uint cov_ : SV_Coverage;\n"; has_cov = true; }
+            if (has(ini, "face_") && !has_face) { tail += "  bool face_ : SV_IsFrontFace;\n"; has_face = true; }
+            if (has(ini, "sid_") && !has_sid) { tail += "  uint sid_ : SV_SampleIndex;\n"; has_sid = true; }
+            if (has(ini, "cov_") && !has_cov) { tail += "  uint cov_ : SV_Coverage;\n"; has_cov = true; }
         }
+        h << tail;
         h << "};\nstruct PSOut {\n";
         for (unsigned t : ps_targets) {
             bool isint = false, sgn = false;
