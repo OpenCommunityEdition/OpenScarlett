@@ -1442,9 +1442,9 @@ bool Translator::emit_valu(const Instr& in, size_t idx) {
         std::string v = e;
         if (t == 'f' || t == 'h' || t == 'd') {
             uint8_t om = vop3 ? in.omod : in.sdwa ? in.sdwa_f.omod : 0;
-            if (om == 1) v = "(" + v + ") * 2.0";
-            if (om == 2) v = "(" + v + ") * 4.0";
-            if (om == 3) v = "(" + v + ") * 0.5";
+            if (om == 1) v = "2.0 * (" + v + ")";
+            if (om == 2) v = "4.0 * (" + v + ")";
+            if (om == 3) v = "0.5 * (" + v + ")";
             if ((vop3 && in.clamp) || (in.sdwa && in.sdwa_f.clamp)) v = "saturate(" + v + ")";
         }
         switch (t) {
@@ -2348,6 +2348,13 @@ bool Translator::emit_mimg(const Instr& in, size_t idx) {
     }
     if (n == "image_load" || n == "image_load_mip") {
         std::string c;
+        if ((dim == 6 || dim == 7) && !R.uav && nc >= 2) {
+            // Multisampled: the last coordinate is the fragment (sample) index, a separate argument.
+            std::string xy = nc - 1 > 1 ? fmt("uint%u(", nc - 1) : "(";
+            for (unsigned i = 0; i + 1 < nc; i++) xy += (i ? ", " : "") + crd[i];
+            write_result(fmt("%s.Load(%s), %s)", RN.c_str(), xy.c_str(), crd[nc - 1].c_str()));
+            return true;
+        }
         if (R.uav) c = icoord(nc, "");
         else c = icoord(nc, lod.empty() ? "0u" : lod);
         write_result(fmt("%s.Load(%s)", RN.c_str(), c.c_str()));
@@ -3059,6 +3066,8 @@ std::string Translator::generate() {
         static const unsigned type[8] = {8, 9, 10, 11, 12, 13, 14, 15};
         h << "uint4 desc_" << r.name << "() {\n  uint w = 1u, h = 1u, d = 1u, l = 1u;\n";
         if (r.uav) h << (dim == 0 ? "  " + r.name + ".GetDimensions(w);\n" : dim == 2 || dim == 5 || dim == 3 ? "  " + r.name + ".GetDimensions(w, h, d);\n" : "  " + r.name + ".GetDimensions(w, h);\n");
+        else if (dim == 6) h << "  " + r.name + ".GetDimensions(w, h, l); l = 1u;\n";   // multisampled: one level
+        else if (dim == 7) h << "  " + r.name + ".GetDimensions(w, h, d, l); l = 1u;\n";
         else h << (dim == 0 ? "  " + r.name + ".GetDimensions(0u, w, l);\n" : dim == 2 || dim == 5 ? "  " + r.name + ".GetDimensions(0u, w, h, d, l);\n" : dim == 3 && r.cube_array ? "  " + r.name + ".GetDimensions(0u, w, h, d, l);\n" : "  " + r.name + ".GetDimensions(0u, w, h, l);\n");
         if (dim == 4) h << "  d = h; h = 1u;\n";
         h << fmt("  return uint4(((w - 1u) & 3u) << 30, ((w - 1u) >> 2) | ((h - 1u) << 14), ((l - 1u) << 16) | (%uu << 28), (d - 1u) & 0x1fffu);\n}\n", type[dim]);
