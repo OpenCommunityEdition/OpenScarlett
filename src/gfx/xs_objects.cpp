@@ -1147,8 +1147,41 @@ HRESULT D3DAPI Q_SuspendX(ID3D12CommandQueue*, UINT) { return S_OK; }
 HRESULT D3DAPI Q_ResumeX(ID3D12CommandQueue*) { return S_OK; }
 HRESULT D3DAPI Q_GetTimestampFrequency(ID3D12CommandQueue* q, UINT64* f) { return pc::queue_timestamp_frequency(pc_of(q), f); }
 HRESULT D3DAPI Q_GetClockCalibration(ID3D12CommandQueue* q, UINT64* g, UINT64* c) { return pc::queue_clock_calibration(pc_of(q), g, c); }
+std::mutex g_keep_mu;
+std::vector<std::pair<IUnknown*, uint64_t>> g_keep;   // (PC object, present count when kept)
+std::atomic<uint64_t> g_keep_frame{0};
+}  // namespace
+void keep_foreign(void* o) {
+    auto* u = (IUnknown*)o;
+    u->AddRef();
+    if (getenv("XSL_D3D12_DEBUG")) {   // name PC objects from other components (debug-layer messages)
+        void* ob = nullptr;
+        if (SUCCEEDED(u->QueryInterface(__uuidof(ID3D12Object), &ob)) && ob) {
+            ((ID3D12Object*)ob)->SetName(L"foreign (Media Foundation?)");
+            ((ID3D12Object*)ob)->Release();
+        }
+    }
+    std::lock_guard<std::mutex> g(g_keep_mu);
+    g_keep.push_back({u, g_keep_frame.load()});
+}
+namespace {
+void release_kept() {   // references older than 8 frames (the frame latency is at most a few)
+    std::vector<IUnknown*> done;
+    {
+        std::lock_guard<std::mutex> g(g_keep_mu);
+        uint64_t now = ++g_keep_frame;
+        size_t k = 0;
+        for (auto& e : g_keep) {
+            if (e.second + 8 < now) done.push_back(e.first);
+            else g_keep[k++] = e;
+        }
+        g_keep.resize(k);
+    }
+    for (auto* u : done) u->Release();
+}
 HRESULT D3DAPI Q_PresentX(ID3D12CommandQueue* q, UINT planes, const D3D12XBOX_PRESENT_PLANE_PARAMETERS* p, const D3D12XBOX_PRESENT_PARAMETERS*) {
     if (planes == 0 || !p || !p->ResourceCount || !p->ppResources) return S_OK;  // "present blank": nothing to show yet
+    release_kept();
     xsl_fixed_time_frame();
     {
         static uint64_t presents = 0;

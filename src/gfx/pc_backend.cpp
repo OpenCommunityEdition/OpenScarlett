@@ -1212,6 +1212,11 @@ HRESULT_T create_committed_resource(PcObj dev, const void* heapProps, uint32_t h
     HRESULT hr = as<ID3D12Device>(dev)->CreateCommittedResource(&hp, clean_heap_flags(heapFlags), &d, st, cv,
                                                                 IID_PPV_ARGS(reinterpret_cast<ID3D12Resource**>(out)));
     if (SUCCEEDED(hr)) note_buffer_fwd(*out);
+    if (SUCCEEDED(hr) && g_info) {   // debug layer: name layer resources (others show as unnamed)
+        wchar_t nm[96];
+        swprintf(nm, 96, L"xsl committed %llux%u fmt %d", (unsigned long long)d.Width, d.Height, (int)d.Format);
+        as<ID3D12Resource>(*out)->SetName(nm);
+    }
     if (SUCCEEDED(hr)) note_texture(*out);
     if (SUCCEEDED(hr) && d.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
         if (!(st & D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE)) gm_register(*out, as<ID3D12Resource>(*out)->GetGPUVirtualAddress(), d.Width, 0);
@@ -1363,6 +1368,11 @@ HRESULT_T create_placed_resource(PcObj dev, PcObj heap, uint64_t offset, const v
         hr = h2;
     }
     if (FAILED(hr)) logged(hr, "CreatePlacedResource");
+    if (SUCCEEDED(hr) && g_info) {
+        wchar_t nm[96];
+        swprintf(nm, 96, L"xsl placed %llux%u fmt %d", (unsigned long long)d.Width, d.Height, (int)d.Format);
+        as<ID3D12Resource>(*out)->SetName(nm);
+    }
     if (SUCCEEDED(hr)) note_texture(*out);
     if (SUCCEEDED(hr)) note_buffer(*out);
     if (SUCCEEDED(hr) && d.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {

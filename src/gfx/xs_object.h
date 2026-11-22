@@ -119,7 +119,15 @@ template <class T> PcObj P(T* o, const char* fn = __builtin_FUNCTION()) {
 // Objects PC components may hand the title's queues (e.g. Media Foundation's fences through
 // IMFD3D12SynchronizationObjectCommands): a layer object becomes its PC object, anything else is
 // already a PC object.
-template <class T> PcObj P_or_pc(T* o) { return !o ? nullptr : is_ours(o) ? hdr(o)->pc : (PcObj)o; }
+// A PC object recorded into a list stays alive until the GPU is done with it (keep_foreign holds a
+// reference for a few frames): the component that made it may release it right after recording.
+void keep_foreign(void* pcObject);
+template <class T> PcObj P_or_pc(T* o) {
+    if (!o) return nullptr;
+    if (is_ours(o)) return hdr(o)->pc;
+    keep_foreign((void*)o);
+    return (PcObj)o;
+}
 
 // ---- Device ----------------------------------------------------------------------------
 using XDevice = ID3D12Device11;
