@@ -48,6 +48,7 @@ struct TranslateOptions {
     std::vector<uint32_t> raw_code;
     uint32_t raw_rsrc2 = 0, raw_numthreads = 32, raw_entry = 0, raw_root_constants = 0;
     std::string raw_scratch_offset;
+    std::vector<std::pair<uint32_t, uint32_t>> raw_skip;   // byte ranges of raw_code left out (not translated)
     bool barrier_sync = true;        // false: s_barrier without the group sync (debugging hangs) // the PC runtime takes shader model 6.6 ([WaveSize] on compute)
 };
 

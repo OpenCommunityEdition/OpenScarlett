@@ -220,6 +220,16 @@ struct Translator {
         }
         code = opt.raw_code.empty() ? c.code() : opt.raw_code;
         ins = decode_all(code.data(), code.size());
+        if (!opt.raw_skip.empty()) {
+            std::vector<Instr> kept;
+            kept.reserve(ins.size());
+            for (auto& in : ins) {
+                bool skip = false;
+                for (auto& [b, e] : opt.raw_skip) skip |= in.offset >= b && in.offset < e;
+                if (!skip) kept.push_back(in);
+            }
+            ins.swap(kept);
+        }
         for (auto& in : ins) {
             if (!in.name) continue;   // data after the code decodes as junk; reported only if reached
             std::string n = in.name;
@@ -3512,30 +3522,44 @@ std::string Translator::generate() {
         h << "StructuredBuffer<uint4> GMT : register(t0, space901);\n"
              "ByteAddressBuffer GMS[8191] : register(t0, space900);\n"
              "RWByteAddressBuffer GMU[8192] : register(u0, space900);\n"
-             "// Entry of the address table holding (lo, hi): (found, view word, byte offset).\n"
-             "uint3 gm_find(uint lo, uint hi) {\n"
-             "  uint a = 0u, b = GMT[0].x;\n"
-             "  while (a < b) { uint m = (a + b) >> 1; uint4 e = GMT[1u + m]; if (e.y < hi || (e.y == hi && e.x <= lo)) a = m + 1u; else b = m; }\n"
-             "  if (a == 0u) return uint3(0u, 0u, 0u);\n"
-             "  uint4 e = GMT[a];\n"
-             "  uint off = lo - e.x, ohi = hi - e.y - (lo < e.x ? 1u : 0u);\n"
-             "  return (ohi == 0u && off < e.z) ? uint3(1u, e.w, off) : uint3(0u, 0u, 0u);\n"
+             "// Entry of the address table holding (lo, hi): found, view word, byte offset. A fixed-step\n"
+             "// search (tables up to 32767 entries) without branches or loops (inlined at every access; loops there made DXC superlinear).\n"
+             "bool gm_find(uint lo, uint hi, out uint view, out uint off) {\n"
+             "  uint a = 0u, n = GMT[0].x, t, ex, ey;\n"
+             "  t = a + 16384u; ex = GMT[min(t, n)].x; ey = GMT[min(t, n)].y; a = select((t <= n) & ((ey < hi) | ((ey == hi) & (ex <= lo))), t, a);\n"
+             "  t = a + 8192u; ex = GMT[min(t, n)].x; ey = GMT[min(t, n)].y; a = select((t <= n) & ((ey < hi) | ((ey == hi) & (ex <= lo))), t, a);\n"
+             "  t = a + 4096u; ex = GMT[min(t, n)].x; ey = GMT[min(t, n)].y; a = select((t <= n) & ((ey < hi) | ((ey == hi) & (ex <= lo))), t, a);\n"
+             "  t = a + 2048u; ex = GMT[min(t, n)].x; ey = GMT[min(t, n)].y; a = select((t <= n) & ((ey < hi) | ((ey == hi) & (ex <= lo))), t, a);\n"
+             "  t = a + 1024u; ex = GMT[min(t, n)].x; ey = GMT[min(t, n)].y; a = select((t <= n) & ((ey < hi) | ((ey == hi) & (ex <= lo))), t, a);\n"
+             "  t = a + 512u; ex = GMT[min(t, n)].x; ey = GMT[min(t, n)].y; a = select((t <= n) & ((ey < hi) | ((ey == hi) & (ex <= lo))), t, a);\n"
+             "  t = a + 256u; ex = GMT[min(t, n)].x; ey = GMT[min(t, n)].y; a = select((t <= n) & ((ey < hi) | ((ey == hi) & (ex <= lo))), t, a);\n"
+             "  t = a + 128u; ex = GMT[min(t, n)].x; ey = GMT[min(t, n)].y; a = select((t <= n) & ((ey < hi) | ((ey == hi) & (ex <= lo))), t, a);\n"
+             "  t = a + 64u; ex = GMT[min(t, n)].x; ey = GMT[min(t, n)].y; a = select((t <= n) & ((ey < hi) | ((ey == hi) & (ex <= lo))), t, a);\n"
+             "  t = a + 32u; ex = GMT[min(t, n)].x; ey = GMT[min(t, n)].y; a = select((t <= n) & ((ey < hi) | ((ey == hi) & (ex <= lo))), t, a);\n"
+             "  t = a + 16u; ex = GMT[min(t, n)].x; ey = GMT[min(t, n)].y; a = select((t <= n) & ((ey < hi) | ((ey == hi) & (ex <= lo))), t, a);\n"
+             "  t = a + 8u; ex = GMT[min(t, n)].x; ey = GMT[min(t, n)].y; a = select((t <= n) & ((ey < hi) | ((ey == hi) & (ex <= lo))), t, a);\n"
+             "  t = a + 4u; ex = GMT[min(t, n)].x; ey = GMT[min(t, n)].y; a = select((t <= n) & ((ey < hi) | ((ey == hi) & (ex <= lo))), t, a);\n"
+             "  t = a + 2u; ex = GMT[min(t, n)].x; ey = GMT[min(t, n)].y; a = select((t <= n) & ((ey < hi) | ((ey == hi) & (ex <= lo))), t, a);\n"
+             "  t = a + 1u; ex = GMT[min(t, n)].x; ey = GMT[min(t, n)].y; a = select((t <= n) & ((ey < hi) | ((ey == hi) & (ex <= lo))), t, a);\n"
+             "  ex = GMT[a].x; ey = GMT[a].y; uint ez = GMT[a].z; view = GMT[a].w;\n"
+             "  off = lo - ex; uint ohi = hi - ey - select(lo < ex, 1u, 0u);\n"
+             "  return (a != 0u) & (ohi == 0u) & (off < ez);\n"
              "}\n"
              "uint gm_load(uint lo, uint hi) {\n"
-             "  uint3 f = gm_find(lo, hi);\n"
-             "  if (f.x == 0u) return 0u;\n"
-             "  if (f.y & 0x40000000u) return GMS[NonUniformResourceIndex(f.y & 0x3fffu)].Load(f.z & ~3u);\n"
-             "  if (f.y & 0x80000000u) return GMU[NonUniformResourceIndex((f.y >> 14) & 0x3fffu)].Load(f.z & ~3u);\n"
+             "  uint fy, fz; bool fx = gm_find(lo, hi, fy, fz);\n"
+             "  if (!fx) return 0u;\n"
+             "  if (fy & 0x40000000u) return GMS[NonUniformResourceIndex(fy & 0x3fffu)].Load(fz & ~3u);\n"
+             "  if (fy & 0x80000000u) return GMU[NonUniformResourceIndex((fy >> 14) & 0x3fffu)].Load(fz & ~3u);\n"
              "  return 0u;\n"
              "}\n"
              "void gm_store(uint lo, uint hi, uint v) {\n"
-             "  uint3 f = gm_find(lo, hi);\n"
-             "  if (f.x != 0u && (f.y & 0x80000000u)) GMU[NonUniformResourceIndex((f.y >> 14) & 0x3fffu)].Store(f.z & ~3u, v);\n"
+             "  uint fy, fz; bool fx = gm_find(lo, hi, fy, fz);\n"
+             "  if (fx && (fy & 0x80000000u)) GMU[NonUniformResourceIndex((fy >> 14) & 0x3fffu)].Store(fz & ~3u, v);\n"
              "}\n"
              "uint gm_atomic(uint lo, uint hi, uint op, uint v) {   // 1 add 2 sub 3 umin 4 umax 5 smin 6 smax 7 and 8 or 9 xor 10 swap\n"
-             "  uint3 f = gm_find(lo, hi);\n"
-             "  if (f.x == 0u || !(f.y & 0x80000000u)) return 0u;\n"
-             "  uint i = (f.y >> 14) & 0x3fffu, a = f.z & ~3u, o = 0u; int so = 0;\n"
+             "  uint fy, fz; bool fx = gm_find(lo, hi, fy, fz);\n"
+             "  if (!fx || !(fy & 0x80000000u)) return 0u;\n"
+             "  uint i = (fy >> 14) & 0x3fffu, a = fz & ~3u, o = 0u; int so = 0;\n"
              "  switch (op) {\n"
              "  case 1u: GMU[NonUniformResourceIndex(i)].InterlockedAdd(a, v, o); break;\n"
              "  case 2u: GMU[NonUniformResourceIndex(i)].InterlockedAdd(a, 0u - v, o); break;\n"
@@ -3549,11 +3573,11 @@ std::string Translator::generate() {
              "  default: GMU[NonUniformResourceIndex(i)].InterlockedExchange(a, v, o); break;\n"
              "  }\n  return o;\n}\n"
              "void gm_store_bits(uint lo, uint hi, uint v, uint mask) {   // byte/short stores: atomic clear and set\n"
-             "  uint3 f = gm_find(lo, hi);\n"
-             "  if (f.x == 0u || !(f.y & 0x80000000u)) return;\n"
-             "  uint s = (f.z & 3u) * 8u, o;\n"
-             "  GMU[NonUniformResourceIndex((f.y >> 14) & 0x3fffu)].InterlockedAnd(f.z & ~3u, ~(mask << s), o);\n"
-             "  GMU[NonUniformResourceIndex((f.y >> 14) & 0x3fffu)].InterlockedOr(f.z & ~3u, v << s, o);\n"
+             "  uint fy, fz; bool fx = gm_find(lo, hi, fy, fz);\n"
+             "  if (!fx || !(fy & 0x80000000u)) return;\n"
+             "  uint s = (fz & 3u) * 8u, o;\n"
+             "  GMU[NonUniformResourceIndex((fy >> 14) & 0x3fffu)].InterlockedAnd(fz & ~3u, ~(mask << s), o);\n"
+             "  GMU[NonUniformResourceIndex((fy >> 14) & 0x3fffu)].InterlockedOr(fz & ~3u, v << s, o);\n"
              "}\n";
     }
     if (uses_bvh) h << kBvhPrelude;

@@ -193,6 +193,14 @@ static int rtlink_cmd(const char* tmpl, int n, char** blobs) {
     if (!rt_link(bs, l, &err)) return fprintf(stderr, "link: %s\n", err.c_str()), 1;
     fprintf(stderr, "image 0x%zx bytes, scheduler @0x%x, %zu traversal entries, %zu exports\n", l.image.size() * 4, l.main, l.traversal.size(), l.exports.size());
     for (auto& [name, off] : l.exports) fprintf(stderr, "  export %s @0x%x\n", name.c_str(), off);
+    for (auto& p : l.parts) fprintf(stderr, "  part 0x%x..0x%x main 0x%x%s\n", p.begin, p.end, p.main, p.raygen ? " (ray generation)" : "");
+    if (const char* k = getenv("RT_PROGRAM")) {   // translate one per-raygen program instead of the full link
+        auto progs = rt_programs(l);
+        size_t i = (size_t)atoi(k);
+        fprintf(stderr, "%zu programs\n", progs.size());
+        if (i >= progs.size()) return 1;
+        l = progs[i];
+    }
     Container c;   // "-": no template (as the layer does)
     if (strcmp(tmpl, "-") && !load_cso(tmpl, c)) return 1;
     c.kind = ProgramKind::CS;

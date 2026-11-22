@@ -1337,7 +1337,7 @@ cbuffer C : register(b0) {
   for (uint k = 0u; k < 32u; k++) T.Store(0xC0u + 4u * k, k == 0u ? trav0 : k == 1u ? trav1 : trav2);
   uint gx, gy, gz = max(D, 1u);
   if (H < 2u) { gx = (W + 31u) / 32u; gy = max(H, 1u); } else { gx = (W + 7u) / 8u; gy = (H + 3u) / 4u; }
-  if (W == 0u) gx = 0u;
+  if (W == 0u || gx > 65535u || gy > 65535u || gz > 65535u) gx = gy = gz = 0u;   // garbage arguments: no work (no GPU hang)
   T.Store3(0x1C0, uint3(gx, gy, gz));
 }
 )";

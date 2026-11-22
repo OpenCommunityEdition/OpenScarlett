@@ -152,7 +152,7 @@ DxcCreateInstanceProc dxc() {
     return p;
 }
 
-bool compile(const std::string& hlsl, const std::string& profile, std::vector<uint8_t>& out, std::string& log) {
+bool compile(const std::string& hlsl, const std::string& profile, std::vector<uint8_t>& out, std::string& log, const wchar_t* optOverride = nullptr) {
     auto create = dxc();
     if (!create) return false;
     IDxcCompiler3* compiler = nullptr;
@@ -166,7 +166,7 @@ bool compile(const std::string& hlsl, const std::string& profile, std::vector<ui
         if (GetEnvironmentVariableA("XSL_DXC_OPT", b, sizeof b) && b[0] == 'O') { w = L"-"; for (char* c = b; *c; c++) w += wchar_t(*c); }
         return w;
     }();
-    LPCWSTR args[] = {L"-T", prof.c_str(), L"-E", L"main", L"-HV", L"2021", opt.c_str(), L"-Qstrip_debug", L"-Qstrip_reflect"};
+    LPCWSTR args[] = {L"-T", prof.c_str(), L"-E", L"main", L"-HV", L"2021", optOverride ? optOverride : opt.c_str(), L"-Qstrip_debug", L"-Qstrip_reflect"};
     DxcBuffer buf{hlsl.data(), hlsl.size(), DXC_CP_UTF8};
     if (SUCCEEDED(hr)) hr = compiler->Compile(&buf, args, UINT32(sizeof args / sizeof *args), nullptr, __uuidof(IDxcResult), (void**)&result);
     HRESULT status = E_FAIL;
@@ -333,9 +333,19 @@ bool native_translate(const void* in, size_t n, void** out, size_t* outSize) {
 
 // Linked console ray-tracing pipelines (gpucode/rtso.h): translated and compiled to DXIL, cached
 // by the image's hash (compiling one takes minutes: callers run this off the title's threads).
+// XSL_RT_DXC_OPT=Od|O1|O2|O3: optimization level of these programs (default Od: DXC takes about
+// 3x longer at O3 on these huge single-function programs; the driver optimizes either way).
 bool rt_build_pipeline(const gpucode::RtLinked& l, std::vector<uint8_t>& dxil, std::string& err) {
+    static std::wstring opt = [] {
+        char b[8];
+        std::wstring w = L"-Od";
+        if (GetEnvironmentVariableA("XSL_RT_DXC_OPT", b, sizeof b) && b[0] == 'O') { w = L"-"; for (char* c = b; *c; c++) w += wchar_t(*c); }
+        return w;
+    }();
     uint64_t key = fnv(kVersion, strlen(kVersion), fnv(l.image.data(), l.image.size() * 4, fnv("rt", 2)));
     key = fnv(&l.main, sizeof l.main, key);
+    for (auto& [b, e] : l.skip) { key = fnv(&b, 4, key); key = fnv(&e, 4, key); }
+    key = fnv(opt.data(), opt.size() * sizeof(wchar_t), key);
     wchar_t name[64];
     swprintf(name, 64, L"\\rt_%016llx.dxil", (unsigned long long)key);
     std::wstring path = cache_dir() + name;
@@ -350,7 +360,7 @@ bool rt_build_pipeline(const gpucode::RtLinked& l, std::vector<uint8_t>& dxil, s
     gpucode::TranslateResult r = gpucode::translate(c, rs, gpucode::rt_translate_options(l));
     if (!r.ok) { err = "translation: " + r.error; return false; }
     std::string log;
-    if (!compile(r.hlsl, "cs_6_0", dxil, log)) { err = "compile: " + log.substr(0, 400); return false; }
+    if (!compile(r.hlsl, "cs_6_0", dxil, log, opt.c_str())) { err = "compile: " + log.substr(0, 400); return false; }
     write_file(path, dxil.data(), dxil.size());
     return true;
 }

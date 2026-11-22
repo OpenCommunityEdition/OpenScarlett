@@ -27,6 +27,21 @@ std::vector<RtSection> rt_sections(const uint8_t* b, size_t n) {
             while (no < n && b[no]) name += char(b[no++]);
             s.syms.push_back({name, u(r + 8)});
         }
+        for (auto& y : s.syms) {   // the export's name record precedes the section: payload dword 16 bytes before it
+            size_t q = y.name.rfind(".ss_0");
+            if (q == std::string::npos || q + 5 != y.name.size() || y.name.rfind("XDXR_", 0) == 0) continue;
+            std::string nm = y.name.substr(0, q);
+            std::vector<uint8_t> pat(4 + 2 * nm.size(), 0);
+            uint32_t len = uint32_t(2 * nm.size());
+            memcpy(pat.data(), &len, 4);
+            for (size_t k = 0; k < nm.size(); k++) pat[4 + 2 * k] = uint8_t(nm[k]);
+            for (size_t o = 16; o + pat.size() <= dx; o++) {   // the first copy of the name (a second, unaligned one follows)
+                if (memcmp(b + o, pat.data(), pat.size())) continue;
+                s.payload = u(o - 16);
+                break;
+            }
+            break;
+        }
         out.push_back(s);
         dx = s.code + s.size;
     }
@@ -47,6 +62,12 @@ bool rt_link(const std::vector<std::vector<uint8_t>>& blobs, RtLinked& out, std:
             out.entries.push_back(base);
             bool traversalSection = true;
             for (auto& y : s.syms) traversalSection &= y.name == "main" || y.name.rfind("XDXR_TraceRay", 0) == 0;
+            if (!traversalSection) {
+                uint32_t m = 0;
+                for (auto& y : s.syms)
+                    if (y.name == "main") m = base + y.offset;
+                out.parts.push_back({base, base + (uint32_t)s.size, m, s.payload == 0});
+            }
             for (auto& y : s.syms) {
                 bool isImportStub = y.name.rfind("XDXR_TraceRay", 0) == 0 && !traversalSection;
                 out.entries.push_back(base + y.offset);
@@ -65,12 +86,35 @@ bool rt_link(const std::vector<std::vector<uint8_t>>& blobs, RtLinked& out, std:
     return true;
 }
 
+std::vector<RtLinked> rt_programs(const RtLinked& l) {
+    size_t n = 0;
+    for (auto& p : l.parts) n += p.raygen && p.main;
+    if (n < 2) return {l};
+    std::vector<RtLinked> out;
+    for (auto& p : l.parts) {
+        if (!p.raygen || !p.main) continue;
+        RtLinked r = l;
+        r.main = p.main;
+        r.entries.clear();
+        for (auto& q : l.parts)
+            if (q.raygen && &q != &p) r.skip.push_back({q.begin, q.end});
+        for (uint32_t e : l.entries) {
+            bool blank = false;
+            for (auto& q : l.parts) blank |= q.raygen && &q != &p && e >= q.begin && e < q.end;
+            if (!blank) r.entries.push_back(e);
+        }
+        out.push_back(std::move(r));
+    }
+    return out;
+}
+
 TranslateOptions rt_translate_options(const RtLinked& l) {
     TranslateOptions o;
     o.code_base = l.base;
     o.entries = l.entries;
     o.global_memory = true;
     o.raw_code = l.image;
+    o.raw_skip = l.skip;
     o.raw_rsrc2 = 1 | (4 << 1) | (7 << 7);   // scratch, 4 user SGPRs (runtime table pointer), group ids x/y/z
     o.raw_root_constants = 4;
     o.raw_numthreads = 32;

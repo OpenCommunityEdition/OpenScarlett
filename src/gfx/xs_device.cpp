@@ -726,10 +726,23 @@ void D3DAPI SO_GetPipelineStateX(ID3D12StateObject* so, ID3D12PipelineState** ou
 // Collections keep their serialized blob; pipelines link their collections into one program that is
 // translated and compiled on a worker thread (minutes; cached afterwards). DispatchRays runs it
 // once it is ready and is skipped until then.
-struct RtPipe {
+struct RtProg {   // one compiled program of a pipeline (gpucode::rt_programs)
     gpucode::RtLinked link;
     std::atomic<PcObj> pso{nullptr};
     std::atomic<int> state{0};   // 0 building, 1 ready, -1 failed
+};
+struct RtPipe {
+    gpucode::RtLinked link;   // the full link: shader identifiers, traversal entries
+    std::vector<std::unique_ptr<RtProg>> progs;
+    int state() const {       // 1 when any program is ready, -1 when all failed, else 0
+        int failed = 0;
+        for (auto& p : progs) {
+            int s = p->state.load();
+            if (s == 1) return 1;
+            failed += s < 0;
+        }
+        return !progs.empty() && failed == (int)progs.size() ? -1 : 0;
+    }
 };
 struct RtState { std::vector<uint8_t> blob; std::shared_ptr<RtPipe> pipe; };
 std::mutex g_rt_mu;
@@ -744,7 +757,8 @@ static std::shared_ptr<RtPipe> rt_pipe_of(const void* so) {
     auto it = g_rt.find(so);
     return it == g_rt.end() ? nullptr : it->second.pipe;
 }
-// One build at a time (each compile takes minutes and much memory), smallest program first.
+// Builds run on a few worker threads (each compile takes seconds to minutes and much memory),
+// smallest program first. XSL_RT_BUILD_THREADS=<n> (default: a quarter of the logical processors, 1..4).
 static void rt_queue_build(size_t size, std::function<void()> job) {
     static std::mutex mu;
     static std::condition_variable cv;
@@ -754,7 +768,10 @@ static void rt_queue_build(size_t size, std::function<void()> job) {
     q.emplace(size, std::move(job));
     if (!started) {
         started = true;
-        std::thread([] {
+        char b[8];
+        unsigned n = GetEnvironmentVariableA("XSL_RT_BUILD_THREADS", b, sizeof b) ? (unsigned)atoi(b) : std::thread::hardware_concurrency() / 4;
+        n = std::max(1u, std::min(n, 4u));
+        for (unsigned t = 0; t < n; t++) std::thread([] {
             for (;;) {
                 std::function<void()> j;
                 {
@@ -776,45 +793,60 @@ static void rt_start_pipeline(Device* dev, const void* so, std::vector<std::vect
     { std::lock_guard<std::mutex> g(g_rt_mu); g_rt[so].pipe = pipe; }
     XSL_INFO(CH, "ray-tracing pipeline %p: %zu collections linked (%zu KiB code), building", so, blobs.size(), pipe->link.image.size() / 256);
     PcObj pcdev = dev_extra(dev)->pcDevice;
-    rt_queue_build(pipe->link.image.size(), [pipe, pcdev, n = blobs.size(), blobs] {
-        DWORD t0 = GetTickCount();
-        std::vector<uint8_t> dxil;
-        std::string e;
-        if (!pc::rt_build_pipeline(pipe->link, dxil, e)) {
-            XSL_WARN(CH, "ray-tracing pipeline (%zu collections) not built: %s", n, e.c_str());
-            pipe->state = -1;
-            char dir[260];
-            if (GetEnvironmentVariableA("XSL_DUMP_STATE_OBJECTS", dir, sizeof dir)) {   // the linked image, for offline study
-                char path[400];
-                snprintf(path, sizeof path, "%s\\rtfail_%zu_%08x.img", dir, n, (unsigned)pipe->link.image.size());
-                if (FILE* f = fopen(path, "wb")) { fwrite(pipe->link.image.data(), 4, pipe->link.image.size(), f); fclose(f); }
-                for (size_t i = 0; i < blobs.size(); i++) {
-                    snprintf(path, sizeof path, "%s\\rtfail_%zu_%08x_c%03zu.bin", dir, n, (unsigned)pipe->link.image.size(), i);
-                    if (FILE* f = fopen(path, "wb")) { fwrite(blobs[i].data(), 1, blobs[i].size(), f); fclose(f); }
-                }
-            }
-            return;
+    for (auto& l : gpucode::rt_programs(pipe->link)) {
+        pipe->progs.push_back(std::make_unique<RtProg>());
+        pipe->progs.back()->link = std::move(l);
+    }
+    for (size_t k = 0; k < pipe->progs.size(); k++) {
+        RtProg* prog = pipe->progs[k].get();
+        size_t size = prog->link.image.size() * 4;
+        for (auto& [b, e] : prog->link.skip) size -= e - b;
+        // XSL_RT_MAX_KIB=<n>: programs with more code are not built (DXC time grows faster than
+        // linearly: a 100 KiB program takes minutes); default 128.
+        static size_t maxBytes = [] { char v[16]; return (GetEnvironmentVariableA("XSL_RT_MAX_KIB", v, sizeof v) ? (size_t)atoi(v) : 128u) * 1024; }();
+        if (size > maxBytes) {
+            prog->state = -1;
+            if (k == 0) XSL_WARN(CH, "ray-tracing pipeline (%zu collections): programs of %zu KiB code not built (over XSL_RT_MAX_KIB)", blobs.size(), size / 1024);
+            continue;
         }
-        PcObj pso = pc::rt_create_pso(pcdev, dxil);
-        if (!pso) { pipe->state = -1; return; }
-        pipe->pso = pso;
-        pipe->state = 1;
-        XSL_INFO(CH, "ray-tracing pipeline ready (%zu collections, %zu KiB code, %zu exports) after %lu s", n, pipe->link.image.size() / 256,
-                 pipe->link.exports.size(), (unsigned long)((GetTickCount() - t0) / 1000));
-    });
+        rt_queue_build(size, [pipe, prog, pcdev, k, size, n = blobs.size(), blobs] {
+            DWORD t0 = GetTickCount();
+            std::vector<uint8_t> dxil;
+            std::string e;
+            if (!pc::rt_build_pipeline(prog->link, dxil, e)) {
+                XSL_WARN(CH, "ray-tracing pipeline (%zu collections) program %zu not built: %s", n, k, e.c_str());
+                prog->state = -1;
+                char dir[260];
+                if (GetEnvironmentVariableA("XSL_DUMP_STATE_OBJECTS", dir, sizeof dir)) {   // the collections, for offline study
+                    char path[400];
+                    for (size_t i = 0; i < blobs.size(); i++) {
+                        snprintf(path, sizeof path, "%s\\rtfail_%zu_%08x_c%03zu.bin", dir, n, (unsigned)pipe->link.image.size(), i);
+                        if (FILE* f = fopen(path, "wb")) { fwrite(blobs[i].data(), 1, blobs[i].size(), f); fclose(f); }
+                    }
+                }
+                return;
+            }
+            PcObj pso = pc::rt_create_pso(pcdev, dxil);
+            if (!pso) { prog->state = -1; return; }
+            prog->pso = pso;
+            prog->state = 1;
+            XSL_INFO(CH, "ray-tracing pipeline ready: %zu collections, program %zu of %zu (%zu KiB code) after %lu s", n, k + 1, pipe->progs.size(), size / 1024,
+                     (unsigned long)((GetTickCount() - t0) / 1000));
+        });
+    }
 }
 // DispatchRays on a translated pipeline: the runtime table its scheduler reads (layout inferred
 // from the code: docs/gpucode.md), then a compute dispatch of the program.
 // Returns false when no translated pipeline is ready (the dispatch is then skipped).
 bool rt_dispatch_impl(PcObj list, const void* so, const uint64_t* tables, const D3D12_DISPATCH_RAYS_DESC* d, uint64_t argsVa, PcObj samplerHeap) {
     auto pipe = rt_pipe_of(so);
-    if (!pipe || pipe->state.load() != 1 || (!d && !argsVa)) {
+    if (!pipe || pipe->state() != 1 || (!d && !argsVa)) {
         static volatile long n = 0;
         if (InterlockedIncrement(&n) <= 12) {
             std::lock_guard<std::mutex> g(g_rt_mu);
             auto it = g_rt.find(so);
             XSL_INFO(CH, "ray dispatch skipped: state object %p %s, pipeline %s (%zu state objects known)", so, it == g_rt.end() ? "unknown" : it->second.blob.empty() ? "known" : "is a collection",
-                     !pipe ? "none" : pipe->state.load() == 0 ? "building" : pipe->state.load() < 0 ? "failed" : "ready", g_rt.size());
+                     !pipe ? "none" : pipe->state() == 0 ? "building" : pipe->state() < 0 ? "failed" : "ready", g_rt.size());
         }
         return false;
     }
@@ -844,7 +876,10 @@ bool rt_dispatch_impl(PcObj list, const void* so, const uint64_t* tables, const 
     if (InterlockedIncrement(&n) <= 5)
         XSL_INFO(CH, "DispatchRays %s%ux%ux%u through a translated pipeline (tables %x %x %x %x)", argsVa ? "(indirect) " : "", a.width, a.height, a.depth,
                  a.tables[0], a.tables[1], a.tables[2], a.tables[3]);
-    return pc::list_rays(list, pipe->pso.load(), a);
+    bool ran = false;   // every ready program: the one holding the raygen record's shader runs it, the others end at once
+    for (auto& p : pipe->progs)
+        if (p->state.load() == 1) ran |= pc::list_rays(list, p->pso.load(), a);
+    return ran;
 }
 namespace {
 const void* D3DAPI SOP_GetShaderIdentifier(ID3D12StateObjectProperties* self, LPCWSTR name) {
