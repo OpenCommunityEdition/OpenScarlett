@@ -416,6 +416,7 @@ struct Translator {
                     setd(in.dst, v);
                 }
             } else if (n == "v_readfirstlane_b32") setd(in.dst, AV::top());
+            if (n == "v_movreld_b32" || starts(n, "v_movrelsd")) st.spill.clear();   // indexed write: any VGPR
             // Any other write to a VGPR invalidates scalar values spilled to it.
             if ((in.fmt == Fmt::VOP1 || in.fmt == Fmt::VOP2 || (in.fmt == Fmt::VOP3 && in.op >= 256) || in.fmt == Fmt::VOP3P) &&
                 n != "v_writelane_b32" && n != "v_readlane_b32" && n != "v_readfirstlane_b32" && !st.spill.empty())
@@ -886,6 +887,37 @@ struct Translator {
     }
 
     void line(const std::string& s) { out << "  " << s << "\n"; }
+    // v_movrel*: "@@MOVREL{mode|dst|src|suffix|value}@@" -> switches over VGPRs 0..nv-1 (index = M0).
+    static std::string expand_movrel(const std::string& b, unsigned nv) {
+        std::string r;
+        size_t p = 0;
+        for (size_t q; (q = b.find("@@MOVREL{", p)) != std::string::npos;) {
+            size_t e = b.find("}@@", q);
+            r += b.substr(p, q - p);
+            std::vector<std::string> f;
+            std::string body = b.substr(q + 9, e - q - 9);
+            for (size_t a = 0, c; ; a = c + 1) { c = body.find('|', a); f.push_back(body.substr(a, c == std::string::npos ? std::string::npos : c - a)); if (c == std::string::npos || f.size() == 4) { if (c != std::string::npos) f.push_back(body.substr(c + 1)); break; } }
+            char mode = f[0][0];
+            unsigned d = (unsigned)std::stoul(f[1]), so = (unsigned)std::stoul(f[2]);
+            const std::string& sf = f[3];
+            std::string val = f.size() > 4 ? f[4] : "";
+            std::string out = "if (kexec) { uint mr_ = 0u; ";
+            if (mode != 'd') {   // read VGPR[src + M0]
+                out += "switch (s124 + " + std::to_string(so) + "u) { ";
+                for (unsigned k = 0; k < nv; k++) out += "case " + std::to_string(k) + "u: mr_ = v" + std::to_string(k) + sf + "; break; ";
+                out += "default: break; } ";
+            } else out += "mr_ = " + val + "; ";
+            if (mode == 's') out += "v" + std::to_string(d) + sf + " = mr_; }";
+            else {   // write VGPR[dst + M0]
+                out += "switch (s124 + " + std::to_string(d) + "u) { ";
+                for (unsigned k = 0; k < nv; k++) out += "case " + std::to_string(k) + "u: v" + std::to_string(k) + sf + " = mr_; break; ";
+                out += "default: break; } }";
+            }
+            r += out;
+            p = e + 3;
+        }
+        return r + b.substr(p);
+    }
     void write_s(unsigned r, const std::string& v) {
         if (r == src::kNull || r >= kNumS) return;
         line(S(r) + " = " + v + ";");
@@ -1585,6 +1617,17 @@ bool Translator::emit_valu(const Instr& in, size_t idx) {
 
     // ---- moves / selects ----
     if (n == "v_mov_b32") { wv(src_bits(0, 'u')); return true; }
+    if (n == "v_movrels_b32" || n == "v_movreld_b32" || n == "v_movrelsd_b32" || n == "v_movrelsd_2_b32") {
+        // VGPRs indexed by M0 (s124): expanded into switches over every VGPR once their count is known.
+        if (n != "v_movreld_b32" && in.src0 < src::kVgpr0) return fail(n + " with a non-VGPR source");
+        std::string sfx = V(0).substr(2);   // per-copy suffix in dual mode ("_0", "_1")
+        unsigned so = in.src0 >= src::kVgpr0 ? in.src0 - src::kVgpr0 : 0;
+        std::string val = n == "v_movreld_b32" ? src_bits(0, 'u') : "";
+        // @@MOVREL{mode|dst|src|suffix|value}@@ (mode: s = indexed source, d = indexed destination, b = both)
+        char mode = n == "v_movrels_b32" ? 's' : n == "v_movreld_b32" ? 'd' : 'b';
+        line(fmt("@@MOVREL{%c|%u|%u|%s|%s}@@", mode, dst, so, sfx.c_str(), val.c_str()));
+        return true;
+    }
     if (n == "v_mov_b64") { wv64(rd64(se[0], in)); return true; }
     if (n == "v_cndmask_b32") {
         std::string m = mask_src(2);
@@ -3348,7 +3391,7 @@ std::string Translator::generate() {
     if (dual) h << "  s126 = ballot2(true).x; s127 = s126;\n";
     else h << "  { uint2 b_ = ballot2(true); s126 = b_.x; s127 = " << (W == 64 ? "b_.y" : "0u") << "; }\n";
     h << init;
-    h << body.str();
+    h << expand_movrel(body.str(), nv);
     h << "}\n";
     if (c.kind == ProgramKind::MS && dual) {
         unsigned nt = meta.numthreads[0] * meta.numthreads[1] * meta.numthreads[2];
