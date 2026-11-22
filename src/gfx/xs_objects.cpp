@@ -65,9 +65,14 @@ ULONG D3DAPI Release(IGraphicsUnknown* self) {
     }
     return n;
 }
+void keep_foreign(void* pcObject);
 void free_object(IGraphicsUnknown* self) {
     ObjHeader* h = hdr(self);
-    if (h->pc) pc::release(h->pc);
+    // Resources: the PC object outlives the console one by a few frames. Titles free resources once
+    // their own fences say the GPU is done, but other components given the PC object (Media
+    // Foundation's decoder) may still have work referencing it.
+    if (h->pc && h->kind == Kind::Resource) { keep_foreign(h->pc); pc::release(h->pc); }
+    else if (h->pc) pc::release(h->pc);
     h->magic = 0;
     _aligned_free(h);
 }

@@ -412,7 +412,9 @@ void set_name(PcObj o, const wchar_t* name) {
 // only copy states (other states remove the device). They run as PC direct queues and lists.
 static int pc_list_type(int t) {
     static bool keep = [] { char b[4]; return GetEnvironmentVariableA("XSL_COPY_QUEUES", b, 4) && b[0] == '1'; }();
-    static bool computeDirect = [] { char b[4]; return GetEnvironmentVariableA("XSL_COMPUTE_AS_DIRECT", b, 4) && b[0] == '1'; }();
+    // Console compute lists may also use graphics-only states in barriers: compute queues and lists
+    // run as direct ones too (XSL_COMPUTE_AS_DIRECT=0 keeps PC compute queues).
+    static bool computeDirect = [] { char b[4]; return !(GetEnvironmentVariableA("XSL_COMPUTE_AS_DIRECT", b, 4) && b[0] == '0'); }();
     if (t == D3D12_COMMAND_LIST_TYPE_COMPUTE && computeDirect) return D3D12_COMMAND_LIST_TYPE_DIRECT;
     return t == D3D12_COMMAND_LIST_TYPE_COPY && !keep ? D3D12_COMMAND_LIST_TYPE_DIRECT : t;
 }

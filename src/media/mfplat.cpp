@@ -45,12 +45,12 @@ void resolve() {
 }
 }  // namespace
 
-// GPU (D3D12) video decoding through Media Foundation is off by default: with it, the decoder shares
-// the title's queues and its frames enter console command lists, which can still hang the GPU.
-// Without a device the title's player reports a decoder error and the
-// title runs on without that video. XSL_MF_GPU=1 turns GPU decoding on.
+// GPU (D3D12) video decoding through Media Foundation: the decoder gets the PC device; its fences
+// and frames enter the title's queues and lists (d3d12_xs passes PC objects through and keeps them
+// alive while in flight). XSL_MF_GPU=0 refuses the device: the title's player then reports a decoder
+// error and the title runs on without video.
 static bool mf_gpu() {
-    static bool on = [] { char b[4]; return GetEnvironmentVariableA("XSL_MF_GPU", b, 4) && b[0] == '1'; }();
+    static bool on = [] { char b[4]; return !(GetEnvironmentVariableA("XSL_MF_GPU", b, 4) && b[0] == '0'); }();
     return on;
 }
 
