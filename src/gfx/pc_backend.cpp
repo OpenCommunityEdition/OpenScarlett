@@ -5,6 +5,8 @@
 #include <dxgi1_6.h>
 
 #include <algorithm>
+#include <cmath>
+#include <cstdarg>
 #include <atomic>
 #include <cstring>
 #include <map>
@@ -521,8 +523,93 @@ HRESULT_T create_compute_pso(PcObj dev, const void* desc, PcObj* out) {
     return hr;
 }
 
+namespace {
+template <class T> struct alignas(void*) StreamSub { D3D12_PIPELINE_STATE_SUBOBJECT_TYPE t; T v; };
+std::string fmt(const char* f, ...) {
+    char b[512];
+    va_list a;
+    va_start(a, f);
+    vsnprintf(b, sizeof b, f, a);
+    va_end(a);
+    return b;
+}
+bool pso_traced() {   // XSL_TRACE_PSO matches one of the shaders of the pipeline being created
+    static char want[512] = "";
+    static bool wi = (GetEnvironmentVariableA("XSL_TRACE_PSO", want, sizeof want), true);
+    (void)wi;
+    if (!want[0]) return false;
+    std::string_view k = translated_keys();
+    for (const char* t = want; *t;) {
+        const char* e = strchr(t, ',');
+        size_t n = e ? (size_t)(e - t) : strlen(t);
+        if (n && k.find(std::string_view(t, n)) != std::string_view::npos) return true;
+        t += n + (e ? 1 : 0);
+    }
+    return false;
+}
+// XSL_TRACE_PSO: the output-affecting state of a traced pipeline stream.
+void trace_pso_stream(const void* stream, size_t size) {
+    const uint8_t* p = (const uint8_t*)stream;
+    size_t o = 0;
+    std::string out;
+    while (o + 4 <= size) {
+        auto t = *(const D3D12_PIPELINE_STATE_SUBOBJECT_TYPE*)(p + o);
+        size_t n = 0;
+        switch (t) {
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE: n = sizeof(StreamSub<void*>); break;
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS: case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS: case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DS:
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_HS: case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_GS: case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CS:
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS: case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS:
+            n = sizeof(StreamSub<D3D12_SHADER_BYTECODE>);
+            out += fmt(" stage%d:%zu", (int)t, ((const StreamSub<D3D12_SHADER_BYTECODE>*)(p + o))->v.BytecodeLength);
+            break;
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_STREAM_OUTPUT: n = sizeof(StreamSub<D3D12_STREAM_OUTPUT_DESC>); break;
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND: {
+            n = sizeof(StreamSub<D3D12_BLEND_DESC>);
+            auto& b = ((const StreamSub<D3D12_BLEND_DESC>*)(p + o))->v;
+            auto& r = b.RenderTarget[0];
+            out += fmt(" blend(a2c %d indep %d rt0 en %d src %d dst %d op %d srcA %d dstA %d mask %#x)", b.AlphaToCoverageEnable, b.IndependentBlendEnable, r.BlendEnable,
+                       r.SrcBlend, r.DestBlend, r.BlendOp, r.SrcBlendAlpha, r.DestBlendAlpha, r.RenderTargetWriteMask);
+            break;
+        }
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK: n = sizeof(StreamSub<UINT>); out += fmt(" samplemask %#x", ((const StreamSub<UINT>*)(p + o))->v); break;
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER: {
+            n = sizeof(StreamSub<D3D12_RASTERIZER_DESC>);
+            auto& r = ((const StreamSub<D3D12_RASTERIZER_DESC>*)(p + o))->v;
+            out += fmt(" raster(fill %d cull %d ccw %d clip %d)", r.FillMode, r.CullMode, r.FrontCounterClockwise, r.DepthClipEnable);
+            break;
+        }
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL: case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL1: {
+            n = sizeof(StreamSub<D3D12_DEPTH_STENCIL_DESC>);
+            auto& d = ((const StreamSub<D3D12_DEPTH_STENCIL_DESC>*)(p + o))->v;
+            out += fmt(" depth(en %d write %d func %d stencil %d)", d.DepthEnable, d.DepthWriteMask, d.DepthFunc, d.StencilEnable);
+            break;
+        }
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_INPUT_LAYOUT: n = sizeof(StreamSub<D3D12_INPUT_LAYOUT_DESC>); break;
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_IB_STRIP_CUT_VALUE: n = sizeof(StreamSub<UINT>); break;
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY: n = sizeof(StreamSub<UINT>); out += fmt(" topo %u", ((const StreamSub<UINT>*)(p + o))->v); break;
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS: {
+            n = sizeof(StreamSub<D3D12_RT_FORMAT_ARRAY>);
+            auto& f = ((const StreamSub<D3D12_RT_FORMAT_ARRAY>*)(p + o))->v;
+            out += fmt(" rtvs %u (%d %d)", f.NumRenderTargets, (int)f.RTFormats[0], (int)f.RTFormats[1]);
+            break;
+        }
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL_FORMAT: n = sizeof(StreamSub<DXGI_FORMAT>); out += fmt(" dsv %d", (int)((const StreamSub<DXGI_FORMAT>*)(p + o))->v); break;
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_DESC: n = sizeof(StreamSub<DXGI_SAMPLE_DESC>); break;
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_NODE_MASK: n = sizeof(StreamSub<UINT>); break;
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CACHED_PSO: n = sizeof(StreamSub<D3D12_CACHED_PIPELINE_STATE>); break;
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_FLAGS: n = sizeof(StreamSub<D3D12_PIPELINE_STATE_FLAGS>); break;
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VIEW_INSTANCING: n = sizeof(StreamSub<D3D12_VIEW_INSTANCING_DESC>); break;
+        default: out += fmt(" (subobject %d: stop)", (int)t); n = size; break;
+        }
+        o += n;
+    }
+    XSL_INFO(CH, "pso %s:%s", translated_keys(), out.c_str());
+}
+}  // namespace
 HRESULT_T create_pso_stream(PcObj dev, void* stream, size_t size, PcObj* out) {
     *out = nullptr;
+    if (getenv("XSL_TRACE_WRITERS") && pso_traced()) trace_pso_stream(stream, size);
     D3D12_PIPELINE_STATE_STREAM_DESC d{size, stream};
     ID3D12Device2* d2 = nullptr;
     HRESULT hr = as<ID3D12Device>(dev)->QueryInterface(IID_PPV_ARGS(&d2));
@@ -882,6 +969,9 @@ HRESULT_T create_heap(PcObj dev, const void* desc, PcObj* out) {
     }
     return logged(as<ID3D12Device>(dev)->CreateHeap(&d, IID_PPV_ARGS(reinterpret_cast<ID3D12Heap**>(out))), "CreateHeap");
 }
+struct Placed { PcObj res, heap; uint64_t offset, size; };
+std::mutex g_placed_mu;
+std::vector<Placed> g_placed;
 HRESULT_T create_placed_resource(PcObj dev, PcObj heap, uint64_t offset, const void* desc, uint32_t state, const void* clear, PcObj* out) {
     D3D12_RESOURCE_DESC d = clean_desc(desc);
     const D3D12_CLEAR_VALUE* cv = static_cast<const D3D12_CLEAR_VALUE*>(clear);
@@ -889,7 +979,27 @@ HRESULT_T create_placed_resource(PcObj dev, PcObj heap, uint64_t offset, const v
     HRESULT hr = logged(as<ID3D12Device>(dev)->CreatePlacedResource(as<ID3D12Heap>(heap), offset, &d, pc_state(state), cv,
                                                              IID_PPV_ARGS(reinterpret_cast<ID3D12Resource**>(out))), "CreatePlacedResource");
     if (SUCCEEDED(hr)) note_texture(*out);
+    if (SUCCEEDED(hr) && getenv("XSL_TRACE_WRITERS")) {   // placed resources, for aliasing checks at present
+        D3D12_RESOURCE_ALLOCATION_INFO ai = as<ID3D12Device>(dev)->GetResourceAllocationInfo(0, 1, &d);
+        std::lock_guard<std::mutex> g(g_placed_mu);
+        g_placed.push_back({*out, heap, offset, ai.SizeInBytes});
+    }
     return hr;
+}
+void report_aliases(PcObj r) {   // resources placed over r's memory
+    std::lock_guard<std::mutex> g(g_placed_mu);
+    const Placed* me = nullptr;
+    for (auto& p : g_placed) if (p.res == r) me = &p;
+    if (!me) { XSL_INFO(CH, "alias check: %p is not a placed resource", (void*)r); return; }
+    unsigned n = 0;
+    for (auto& p : g_placed) {
+        if (p.res == r || p.heap != me->heap || p.offset >= me->offset + me->size || me->offset >= p.offset + p.size) continue;
+        D3D12_RESOURCE_DESC d = as<ID3D12Resource>(p.res)->GetDesc();
+        if (n++ < 16) XSL_INFO(CH, "alias check: %p (heap %p +%llx, %llu bytes) overlaps %p (%llux%u fmt %d dim %d flags %#x, +%llx)", (void*)r, (void*)me->heap,
+                               (unsigned long long)me->offset, (unsigned long long)me->size, (void*)p.res, (unsigned long long)d.Width, d.Height, (int)d.Format,
+                               (int)d.Dimension, (unsigned)d.Flags, (unsigned long long)p.offset);
+    }
+    XSL_INFO(CH, "alias check: %p placed in heap %p at +%llx: %u overlapping resources", (void*)r, (void*)me->heap, (unsigned long long)me->offset, n);
 }
 
 // XSL_TRACE_WRITERS=1: which pipeline last drew into each render target (the presented image's
@@ -934,7 +1044,17 @@ static void note_draw(PcObj l) {
 void create_rtv(PcObj dev, PcObj res, const void* desc, uint64_t h) {
     if (trace_writers()) { std::lock_guard<std::mutex> g(g_wr_mu); g_rtv_res[h] = res; }
     D3D12_RENDER_TARGET_VIEW_DESC t;
-    as<ID3D12Device>(dev)->CreateRenderTargetView(as<ID3D12Resource>(res), view_fix(res, desc, t), cpu(h));
+    const D3D12_RENDER_TARGET_VIEW_DESC* vd = view_fix(res, desc, t);
+    if (trace_writers() && res) {
+        D3D12_RESOURCE_DESC rd = as<ID3D12Resource>(res)->GetDesc();
+        if (rd.Width == 1920 && rd.Height == 1080 && rd.Format == DXGI_FORMAT_R10G10B10A2_UNORM) {
+            static volatile long n = 0;
+            if (InterlockedIncrement(&n) <= 40)
+                XSL_INFO(CH, "RTV %llx on %p (flags %#x mips %u): %s dim %d fmt %d mip %u", (unsigned long long)h, (void*)res, (unsigned)rd.Flags, rd.MipLevels,
+                         vd ? "desc" : "default", vd ? (int)vd->ViewDimension : -1, vd ? (int)vd->Format : -1, vd ? vd->Texture2D.MipSlice : 0);
+        }
+    }
+    as<ID3D12Device>(dev)->CreateRenderTargetView(as<ID3D12Resource>(res), vd, cpu(h));
 }
 void create_dsv(PcObj dev, PcObj res, const void* desc, uint64_t h) {
     as<ID3D12Device>(dev)->CreateDepthStencilView(as<ID3D12Resource>(res), static_cast<const D3D12_DEPTH_STENCIL_VIEW_DESC*>(desc), cpu(h));
@@ -948,6 +1068,13 @@ void create_uav(PcObj dev, PcObj res, PcObj counter, const void* desc, uint64_t 
     if (trace_writers()) { std::lock_guard<std::mutex> g(g_wr_mu); g_uav_res[h] = res; g_srv_res.erase(h); }
     if (res && !(as<ID3D12Resource>(res)->GetDesc().Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)) {
         // e.g. a depth-stencil resource whose UAV flag was dropped: null view of the requested dimension
+        {
+            D3D12_RESOURCE_DESC rd = as<ID3D12Resource>(res)->GetDesc();
+            static volatile long n = 0;
+            if (InterlockedIncrement(&n) <= 20)
+                XSL_WARN(CH, "UAV on a resource without unordered access (%llux%u format %d flags 0x%x): null view, writes are lost",
+                         (unsigned long long)rd.Width, rd.Height, (int)rd.Format, (unsigned)rd.Flags);
+        }
         D3D12_UNORDERED_ACCESS_VIEW_DESC nd{};
         nd.Format = DXGI_FORMAT_R32_FLOAT;
         nd.ViewDimension = desc ? static_cast<const D3D12_UNORDERED_ACCESS_VIEW_DESC*>(desc)->ViewDimension : D3D12_UAV_DIMENSION_TEXTURE2D;
@@ -956,7 +1083,18 @@ void create_uav(PcObj dev, PcObj res, PcObj counter, const void* desc, uint64_t 
         return;
     }
     D3D12_UNORDERED_ACCESS_VIEW_DESC t;
-    as<ID3D12Device>(dev)->CreateUnorderedAccessView(as<ID3D12Resource>(res), as<ID3D12Resource>(counter), view_fix(res, desc, t), cpu(h));
+    const D3D12_UNORDERED_ACCESS_VIEW_DESC* vd = view_fix(res, desc, t);
+    if (trace_writers() && res) {
+        D3D12_RESOURCE_DESC rd = as<ID3D12Resource>(res)->GetDesc();
+        if (rd.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && rd.Width >= 1900 && rd.Format == DXGI_FORMAT_R11G11B10_FLOAT) {
+            static volatile long n = 0;
+            if (InterlockedIncrement(&n) <= 60)
+                XSL_INFO(CH, "UAV %p (%llux%u fmt %d mips %u): %s dim %d fmt %d mip %u plane %u", (void*)res, (unsigned long long)rd.Width, rd.Height,
+                         (int)rd.Format, rd.MipLevels, vd ? "desc" : "default", vd ? (int)vd->ViewDimension : -1, vd ? (int)vd->Format : -1,
+                         vd ? vd->Texture2D.MipSlice : 0, vd ? vd->Texture2D.PlaneSlice : 0);
+        }
+    }
+    as<ID3D12Device>(dev)->CreateUnorderedAccessView(as<ID3D12Resource>(res), as<ID3D12Resource>(counter), vd, cpu(h));
 }
 void create_cbv(PcObj dev, const void* desc, uint64_t h) {
     if (trace_writers() && desc) {
@@ -1006,6 +1144,20 @@ void copy_descriptors_simple(PcObj dev, uint32_t n, uint64_t dst, uint64_t src, 
             auto jt = g_srv_res.find(src + (uint64_t)k * inc);
             if (jt != g_srv_res.end()) g_srv_res[dst + (uint64_t)k * inc] = jt->second;
             else g_srv_res.erase(dst + (uint64_t)k * inc);
+        }
+    }
+    if (trace_writers() && type == D3D12_DESCRIPTOR_HEAP_TYPE_RTV) {
+        std::lock_guard<std::mutex> g(g_wr_mu);
+        uint32_t inc = as<ID3D12Device>(dev)->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+        static volatile long logged = 0;
+        for (uint32_t k = 0; k < n; k++) {
+            auto it = g_rtv_res.find(src + (uint64_t)k * inc);
+            PcObj before = g_rtv_res.count(dst + (uint64_t)k * inc) ? g_rtv_res[dst + (uint64_t)k * inc] : nullptr;
+            if (it != g_rtv_res.end()) g_rtv_res[dst + (uint64_t)k * inc] = it->second;
+            else g_rtv_res.erase(dst + (uint64_t)k * inc);
+            if (InterlockedIncrement(&logged) <= 20)
+                XSL_INFO(CH, "RTV copy %llx -> %llx: %p (was %p)", (unsigned long long)(src + k * inc), (unsigned long long)(dst + k * inc),
+                         it == g_rtv_res.end() ? nullptr : (void*)it->second, (void*)before);
         }
     }
     as<ID3D12Device>(dev)->CopyDescriptorsSimple(n, cpu(dst), cpu(src), (D3D12_DESCRIPTOR_HEAP_TYPE)type);
@@ -1142,6 +1294,8 @@ HRESULT_T list_reset(PcObj l, PcObj a, PcObj pso) {
     if (pso && SUCCEEDED(hr)) list_set_pso(l, pso);   // initial pipeline: marked like SetPipelineState
     return hr;
 }
+static bool plane_ops_now();
+extern std::set<PcObj> g_planes;
 void list_barriers(PcObj l, uint32_t n, const void* b) {
     if (!n) return;
     D3D12_RESOURCE_BARRIER tmp[64];
@@ -1149,10 +1303,17 @@ void list_barriers(PcObj l, uint32_t n, const void* b) {
     uint32_t k = 0;
     for (uint32_t i = 0; i < n && i < 64; i++) {
         tmp[k] = in[i];
+        if (tmp[k].Type == D3D12_RESOURCE_BARRIER_TYPE_TRANSITION && trace_writers() && plane_ops_now()) {
+            std::lock_guard<std::mutex> g(g_wr_mu);
+            if (g_planes.count(tmp[k].Transition.pResource))
+                XSL_INFO(CH, "plane op: list %p barrier on %p: console %#x -> %#x (sub %#x flags %#x), PC %#x -> %#x", (void*)l, (void*)tmp[k].Transition.pResource,
+                         (unsigned)in[i].Transition.StateBefore, (unsigned)in[i].Transition.StateAfter, tmp[k].Transition.Subresource, (unsigned)tmp[k].Flags,
+                         (unsigned)pc_state(in[i].Transition.StateBefore), (unsigned)pc_state(in[i].Transition.StateAfter));
+        }
         if (tmp[k].Type == D3D12_RESOURCE_BARRIER_TYPE_TRANSITION) {
             tmp[k].Transition.StateBefore = pc_state(tmp[k].Transition.StateBefore);
             tmp[k].Transition.StateAfter = pc_state(tmp[k].Transition.StateAfter);
-            if (trace_writers() && tmp[k].Transition.Subresource == D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES &&
+            if (trace_writers() && (tmp[k].Transition.Subresource == D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES || tmp[k].Transition.Subresource == 0) &&
                 !(tmp[k].Flags & D3D12_RESOURCE_BARRIER_FLAG_BEGIN_ONLY)) {
                 std::lock_guard<std::mutex> g(g_wr_mu);
                 g_last_state[tmp[k].Transition.pResource] = tmp[k].Transition.StateAfter;
@@ -1163,6 +1324,7 @@ void list_barriers(PcObj l, uint32_t n, const void* b) {
     }
     if (k) L->ResourceBarrier(k, tmp);
 }
+std::map<PcObj, uint64_t> g_wr_rtv0;   // writer tracing: RTV handle 0 per list
 void list_om_set_render_targets(PcObj l, uint32_t n, const uint64_t* rtvs, int single, const uint64_t* dsv) {
     D3D12_CPU_DESCRIPTOR_HANDLE r[8];
     uint32_t cnt = single ? (n ? 1 : 0) : n;
@@ -1171,16 +1333,34 @@ void list_om_set_render_targets(PcObj l, uint32_t n, const uint64_t* rtvs, int s
         std::lock_guard<std::mutex> g(g_wr_mu);
         auto it = cnt ? g_rtv_res.find(rtvs[0]) : g_rtv_res.end();
         g_wr_rt0[l] = it == g_rtv_res.end() ? nullptr : it->second;
+        g_wr_rtv0[l] = cnt ? rtvs[0] : 0;
     }
     D3D12_CPU_DESCRIPTOR_HANDLE d = dsv ? cpu(*dsv) : D3D12_CPU_DESCRIPTOR_HANDLE{};
     L->OMSetRenderTargets(n, n ? r : nullptr, single, dsv ? &d : nullptr);
 }
-void list_clear_rtv(PcObj l, uint64_t rtv, const float* c, uint32_t n, const void* rects) { L->ClearRenderTargetView(cpu(rtv), c, n, static_cast<const D3D12_RECT*>(rects)); }
+extern std::set<PcObj> g_plane_lists;
+static bool plane_ops_now();
+static void plane_op(PcObj l, PcObj r, const char* what);
+void list_clear_rtv(PcObj l, uint64_t rtv, const float* c, uint32_t n, const void* rects) {
+    if (trace_writers() && plane_ops_now()) {
+        PcObj r = nullptr;
+        { std::lock_guard<std::mutex> g(g_wr_mu); auto it = g_rtv_res.find(rtv); if (it != g_rtv_res.end()) r = it->second; }
+        if (r) plane_op(l, r, n ? "clear (rects)" : "clear");
+    }
+    L->ClearRenderTargetView(cpu(rtv), c, n, static_cast<const D3D12_RECT*>(rects)); }
 void list_clear_dsv(PcObj l, uint64_t dsv, uint32_t f, float d, uint8_t s, uint32_t n, const void* rects) {
     L->ClearDepthStencilView(cpu(dsv), (D3D12_CLEAR_FLAGS)f, d, s, n, static_cast<const D3D12_RECT*>(rects));
 }
-void list_viewports(PcObj l, uint32_t n, const void* v) { L->RSSetViewports(n, static_cast<const D3D12_VIEWPORT*>(v)); }
-void list_scissors(PcObj l, uint32_t n, const void* r) { L->RSSetScissorRects(n, static_cast<const D3D12_RECT*>(r)); }
+std::map<PcObj, D3D12_VIEWPORT> g_wr_vp;   // writer tracing: viewport 0 and scissor 0 per list
+std::map<PcObj, D3D12_RECT> g_wr_sc;
+void list_viewports(PcObj l, uint32_t n, const void* v) {
+    if (trace_writers() && n) { std::lock_guard<std::mutex> g(g_wr_mu); g_wr_vp[l] = *static_cast<const D3D12_VIEWPORT*>(v); }
+    L->RSSetViewports(n, static_cast<const D3D12_VIEWPORT*>(v));
+}
+void list_scissors(PcObj l, uint32_t n, const void* r) {
+    if (trace_writers() && n) { std::lock_guard<std::mutex> g(g_wr_mu); g_wr_sc[l] = *static_cast<const D3D12_RECT*>(r); }
+    L->RSSetScissorRects(n, static_cast<const D3D12_RECT*>(r));
+}
 void note_pso_rs(PcObj pso, PcObj rs, bool compute) {
     if (!g_info || !pso) return;
     std::lock_guard<std::mutex> g(g_rs_mu);
@@ -1229,9 +1409,102 @@ void list_set_pso(PcObj l, PcObj pso) {
 void list_ia_topology(PcObj l, int t) { L->IASetPrimitiveTopology((D3D12_PRIMITIVE_TOPOLOGY)t); }
 void list_ia_vbs(PcObj l, uint32_t s, uint32_t n, const void* v) { L->IASetVertexBuffers(s, n, static_cast<const D3D12_VERTEX_BUFFER_VIEW*>(v)); }
 void list_ia_ib(PcObj l, const void* v) { L->IASetIndexBuffer(static_cast<const D3D12_INDEX_BUFFER_VIEW*>(v)); }
-void list_draw(PcObj l, uint32_t a, uint32_t b, uint32_t c, uint32_t d) { note_draw(l); note_reads(l, false); L->DrawInstanced(a, b, c, d); }
-void list_draw_indexed(PcObj l, uint32_t a, uint32_t b, uint32_t c, int32_t d, uint32_t e) { note_draw(l); note_reads(l, false); L->DrawIndexedInstanced(a, b, c, d, e); }
-void list_dispatch(PcObj l, uint32_t x, uint32_t y, uint32_t z) { note_dispatch(l); note_reads(l, true); L->Dispatch(x, y, z); }
+static bool trace_dispatch_size(PcObj l, const char* how, uint32_t x, uint32_t y, uint32_t z, std::string* name);
+// XSL_PLANE_OPS=<present> (with XSL_TRACE_WRITERS=1): every draw, clear and copy that writes a
+// presented image during the frame before that present, in recording order.
+std::set<PcObj> g_planes;   // resources presented so far
+static bool plane_ops_now() {
+    static uint64_t at = [] { char b[16]; return GetEnvironmentVariableA("XSL_PLANE_OPS", b, sizeof b) ? _strtoui64(b, nullptr, 10) : 0ull; }();
+    uint64_t now = g_wr_present.load();
+    return at && now + 1 == at;
+}
+static void plane_op(PcObj l, PcObj r, const char* what) {
+    if (!trace_writers() || !plane_ops_now()) return;
+    std::lock_guard<std::mutex> g(g_wr_mu);
+    if (!g_planes.count(r)) return;
+    PcObj pso = g_wr_pso.count(l) ? g_wr_pso[l] : nullptr;
+    wchar_t wn[128] = L"-";
+    UINT sz = sizeof wn;
+    if (pso) as<ID3D12PipelineState>(pso)->GetPrivateData(WKPDID_D3DDebugObjectNameW, &sz, wn);
+    static int n = 0;
+    g_plane_lists.insert(l);
+    if (n++ < 200) XSL_INFO(CH, "plane op: list %p %s on %p (pipeline %ls)", (void*)l, what, (void*)r, wn);
+}
+extern std::map<PcObj, uint64_t> g_wr_rtv0;
+static void trace_draw_target(PcObj l, uint32_t n) {
+    if (trace_writers() && plane_ops_now()) {
+        PcObj r = nullptr;
+        { std::lock_guard<std::mutex> g(g_wr_mu); auto rt = g_wr_rt0.find(l); if (rt != g_wr_rt0.end()) r = rt->second; }
+        if (r) plane_op(l, r, "draw");
+    }
+    // XSL_PLANE_CLEAR_TEST=1: clear presented images to red through the bound RTV before each draw.
+    static bool ct = getenv("XSL_PLANE_CLEAR_TEST") != nullptr;
+    if (ct && trace_writers()) {
+        uint64_t h = 0;
+        bool plane = false;
+        {
+            std::lock_guard<std::mutex> g(g_wr_mu);
+            auto rt = g_wr_rt0.find(l);
+            plane = rt != g_wr_rt0.end() && g_planes.count(rt->second);
+            h = g_wr_rtv0.count(l) ? g_wr_rtv0[l] : 0;
+        }
+        if (plane && h) {
+            static const float red[4] = {1, 0, 0, 1};
+            as<ID3D12GraphicsCommandList>(l)->ClearRenderTargetView(cpu(h), red, 0, nullptr);
+        }
+    }
+    std::string tn;
+    if (!trace_dispatch_size(l, "Draw", n, 0, 0, &tn)) return;
+    std::lock_guard<std::mutex> g(g_wr_mu);
+    auto rt = g_wr_rt0.find(l);
+    PcObj r = rt == g_wr_rt0.end() ? nullptr : rt->second;
+    static int shown = 0;
+    if (shown++ < 12) {
+        if (r) {
+            D3D12_RESOURCE_DESC d = as<ID3D12Resource>(r)->GetDesc();
+            D3D12_VIEWPORT vp = g_wr_vp.count(l) ? g_wr_vp[l] : D3D12_VIEWPORT{};
+            D3D12_RECT sc = g_wr_sc.count(l) ? g_wr_sc[l] : D3D12_RECT{};
+            XSL_INFO(CH, "pso %s: draws into %p (%llux%u x%u fmt %d dim %d), viewport %g %g %g %g depth %g..%g, scissor %ld %ld %ld %ld", tn.c_str(), (void*)r,
+                     (unsigned long long)d.Width, d.Height, d.DepthOrArraySize, (int)d.Format, (int)d.Dimension, vp.TopLeftX, vp.TopLeftY, vp.Width, vp.Height,
+                     vp.MinDepth, vp.MaxDepth, sc.left, sc.top, sc.right, sc.bottom);
+        } else XSL_INFO(CH, "pso %s: draws with no render target 0 bound", tn.c_str());
+    }
+}
+void list_draw(PcObj l, uint32_t a, uint32_t b, uint32_t c, uint32_t d) { trace_draw_target(l, a * b); note_draw(l); note_reads(l, false); L->DrawInstanced(a, b, c, d); }
+void list_draw_indexed(PcObj l, uint32_t a, uint32_t b, uint32_t c, int32_t d, uint32_t e) { trace_draw_target(l, a * b); note_draw(l); note_reads(l, false); L->DrawIndexedInstanced(a, b, c, d, e); }
+struct EiTrace { long slot; std::string name; uint64_t present; };
+static std::vector<EiTrace> g_ei_trace;   // traced indirect dispatches whose arguments are printed later
+static bool trace_dispatch_size(PcObj l, const char* how, uint32_t x, uint32_t y, uint32_t z, std::string* name) {
+    static char want[512] = "";
+    static bool wi = (GetEnvironmentVariableA("XSL_TRACE_PSO", want, sizeof want), true);
+    (void)wi;
+    if (!want[0] || !trace_writers()) return false;
+    std::lock_guard<std::mutex> g(g_wr_mu);
+    PcObj pso = g_wr_pso.count(l) ? g_wr_pso[l] : nullptr;
+    wchar_t wn[128] = L"?";
+    UINT sz = sizeof wn;
+    if (pso) as<ID3D12PipelineState>(pso)->GetPrivateData(WKPDID_D3DDebugObjectNameW, &sz, wn);
+    char nm[128];
+    snprintf(nm, sizeof nm, "%ls", wn);
+    // want: comma-separated name substrings
+    bool match = false;
+    for (const char* t = want; *t;) {
+        const char* e = strchr(t, ',');
+        size_t n = e ? (size_t)(e - t) : strlen(t);
+        if (n && std::string_view(nm).find(std::string_view(t, n)) != std::string_view::npos) match = true;
+        t += n + (e ? 1 : 0);
+    }
+    static int shown = 0;
+    if (match && shown++ < 60) XSL_INFO(CH, "pso %s: %s %u x %u x %u (present %llu)", nm, how, x, y, z, (unsigned long long)g_wr_present);
+    if (match && name) *name = nm;
+    return match;
+}
+void list_dispatch(PcObj l, uint32_t x, uint32_t y, uint32_t z) {
+    trace_dispatch_size(l, "Dispatch", x, y, z, nullptr);
+    note_dispatch(l);
+    note_reads(l, true);
+    L->Dispatch(x, y, z);
+}
 // A dispatch writes the big textures whose UAVs are in the first slots of its compute tables.
 static void note_dispatch(PcObj l) {
     if (!trace_writers() || !g_gv) return;
@@ -1267,8 +1540,12 @@ void list_dispatch_mesh(PcObj l, uint32_t x, uint32_t y, uint32_t z) {
     if (SUCCEEDED(L->QueryInterface(IID_PPV_ARGS(&l6)))) { l6->DispatchMesh(x, y, z); l6->Release(); }
 }
 bool dred_on() { return g_dred; }
+static long record_indirect(PcObj l, PcObj args, uint64_t ao, PcObj cnt, uint64_t co);
 void list_record_indirect(PcObj l, PcObj args, uint64_t ao, PcObj cnt, uint64_t co) {
-    if (!g_dred || !g_main_device) return;
+    if (g_dred) record_indirect(l, args, ao, cnt, co);
+}
+static long record_indirect(PcObj l, PcObj args, uint64_t ao, PcObj cnt, uint64_t co) {
+    if (!g_main_device) return -1;
     static std::once_flag once;
     std::call_once(once, [] {
         D3D12_HEAP_PROPERTIES hp{D3D12_HEAP_TYPE_READBACK};
@@ -1281,7 +1558,7 @@ void list_record_indirect(PcObj l, PcObj args, uint64_t ao, PcObj cnt, uint64_t 
         if (SUCCEEDED(g_main_device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&g_ei_rb))))
             g_ei_rb->Map(0, nullptr, (void**)&g_ei_map);
     });
-    if (!g_ei_map) return;
+    if (!g_ei_map) return -1;
     uint32_t slot = (uint32_t)InterlockedIncrement(&g_ei_next) % kEiSlots;
     {
         std::lock_guard<std::mutex> g(g_mark_lock);
@@ -1293,6 +1570,7 @@ void list_record_indirect(PcObj l, PcObj args, uint64_t ao, PcObj cnt, uint64_t 
     uint64_t n = std::min<uint64_t>(32, a->GetDesc().Width - std::min(ao, a->GetDesc().Width));
     if (n) L->CopyBufferRegion(g_ei_rb, (uint64_t)slot * kEiBytes, a, ao, n);
     if (cnt) L->CopyBufferRegion(g_ei_rb, (uint64_t)slot * kEiBytes + 32, as<ID3D12Resource>(cnt), co, 4);
+    return (long)slot;
 }
 void rt_prebuild_info(PcObj dev, const void* inputs, void* info) {
     ID3D12Device5* d5 = nullptr;
@@ -1399,6 +1677,16 @@ static bool fixed_indirect(PcObj l, PcObj sig, uint32_t max, PcObj args, uint64_
     return true;
 }
 void list_execute_indirect(PcObj l, PcObj sig, uint32_t max, PcObj args, uint64_t ao, PcObj cnt, uint64_t co) {
+    std::string tn;
+    if (trace_writers()) note_reads(l, true);   // the views of indirect (compute) dispatches too
+    if (trace_dispatch_size(l, "ExecuteIndirect max", max, cnt ? 1 : 0, 0, &tn)) {
+        static int recorded = 0;
+        if (recorded++ < 24) {
+            long slot = record_indirect(l, args, ao, cnt, co);
+            std::lock_guard<std::mutex> g(g_wr_mu);
+            if (slot >= 0) g_ei_trace.push_back({slot, tn, g_wr_present.load()});
+        }
+    }
     note_dispatch(l);
     {   // ray dispatches need a ray-tracing pipeline, which is not translated yet (inert state objects)
         std::lock_guard<std::mutex> g(g_rays_mu);
@@ -1459,7 +1747,7 @@ static void note_reads(PcObj l, bool compute) {
     UINT sz = sizeof wn;
     if (pso) as<ID3D12PipelineState>(pso)->GetPrivateData(WKPDID_D3DDebugObjectNameW, &sz, wn);
     // XSL_TRACE_PSO=<name substring>: every view in that pipeline's tables, with its format.
-    static char want[64] = "";
+    static char want[512] = "";
     static bool wi = (GetEnvironmentVariableA("XSL_TRACE_PSO", want, sizeof want), true);
     (void)wi;
     if (want[0]) {
@@ -1636,6 +1924,7 @@ bool stage_footprint(ID3D12GraphicsCommandList* l, D3D12_TEXTURE_COPY_LOCATION* 
 }
 
 void list_copy_texture_region(PcObj l, const void* dst, uint32_t x, uint32_t y, uint32_t z, const void* src, const void* box) {
+    plane_op(l, (PcObj) static_cast<const D3D12_TEXTURE_COPY_LOCATION*>(dst)->pResource, "copy region");
     // Buffer footprints: the console places them at 256-byte offsets, PC D3D12 requires 512
     // (D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT) and fails the whole list otherwise. Such a
     // footprint is rebased to the aligned offset below it, and the copy region shifted by the
@@ -1667,7 +1956,7 @@ void list_copy_texture_region(PcObj l, const void* dst, uint32_t x, uint32_t y, 
     }
     L->CopyTextureRegion(&d, x, y, z, &s, pb);
 }
-void list_copy_resource(PcObj l, PcObj dst, PcObj src) { L->CopyResource(as<ID3D12Resource>(dst), as<ID3D12Resource>(src)); }
+void list_copy_resource(PcObj l, PcObj dst, PcObj src) { plane_op(l, dst, "copy resource"); L->CopyResource(as<ID3D12Resource>(dst), as<ID3D12Resource>(src)); }
 void list_resolve_subresource(PcObj l, PcObj dst, uint32_t ds, PcObj src, uint32_t ss, int fmt) {
     // The console resolves between resources whose sizes may differ (a 1080p target into a plane
     // sized from the window's client area); PC D3D12 requires identical sizes and puts the list in
@@ -1694,7 +1983,13 @@ void list_blend_factor(PcObj l, const float* f) { L->OMSetBlendFactor(f); }
 void list_stencil_ref(PcObj l, uint32_t r) { L->OMSetStencilRef(r); }
 #undef L
 
+std::set<PcObj> g_plane_lists;   // XSL_PLANE_OPS: lists that wrote a presented image this frame
 void queue_execute(PcObj q, uint32_t n, PcObj* lists) {
+    if (trace_writers() && plane_ops_now()) {
+        std::lock_guard<std::mutex> g(g_wr_mu);
+        for (uint32_t i = 0; i < n; i++)
+            XSL_INFO(CH, "plane op: queue %p executes list %p%s", (void*)q, (void*)lists[i], g_plane_lists.count(lists[i]) ? " (wrote the plane)" : "");
+    }
     as<ID3D12CommandQueue>(q)->ExecuteCommandLists(n, reinterpret_cast<ID3D12CommandList* const*>(lists));
 }
 HRESULT_T queue_signal(PcObj q, PcObj f, uint64_t v) {
@@ -1792,7 +2087,7 @@ void capture_plane(ID3D12Device* dev, ID3D12CommandQueue* q, ID3D12Resource* res
     dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&f));
     D3D12_RESOURCE_BARRIER b{};
     b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-    b.Transition = {res, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, state, D3D12_RESOURCE_STATE_COPY_SOURCE};
+    b.Transition = {res, 0, state, D3D12_RESOURCE_STATE_COPY_SOURCE};   // only subresource 0 is copied (its state is the one tracked)
     l->ResourceBarrier(1, &b);
     D3D12_TEXTURE_COPY_LOCATION dst{rb, D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, {}};
     dst.PlacedFootprint = fp;
@@ -1821,13 +2116,42 @@ void capture_plane(ID3D12Device* dev, ID3D12CommandQueue* q, ID3D12Resource* res
         UINT w = fp.Footprint.Width, h = fp.Footprint.Height;
         size_t bpt = fp.Footprint.RowPitch / (w ? w : 1) >= 8 ? 8 : 4, nz = 0, n = 0;
         uint32_t mx = 0;
+        // R11G11B10_FLOAT: per-channel mean of finite values and counts of NaN/infinite texels
+        const bool f111110 = rd.Format == DXGI_FORMAT_R11G11B10_FLOAT;
+        double sum[3] = {};
+        size_t nan = 0, inf = 0;
+        auto small_float = [](uint32_t bits, int mant, bool& isnan, bool& isinf) {
+            uint32_t e = bits >> mant, m = bits & ((1u << mant) - 1);
+            isnan = e == 31 && m;
+            isinf = e == 31 && !m;
+            if (e == 31) return 0.0;
+            return e ? std::ldexp(1.0 + m / double(1u << mant), (int)e - 15) : std::ldexp(m / double(1u << mant), -14);
+        };
         for (UINT y = 0; y < h; y += 7)
             for (UINT x = 0; x < w; x += 7, n++) {
                 auto* t = (uint8_t*)p + fp.Offset + (size_t)y * fp.Footprint.RowPitch + x * bpt;
-                uint32_t v = bpt == 4 ? (t[0] | t[1] << 8 | t[2] << 16) : (t[0] | t[1] << 8 | t[2] << 16 | t[3] << 24 | t[4] | t[5]);
+                uint32_t v = bpt == 4 ? (t[0] | t[1] << 8 | t[2] << 16 | (uint32_t)t[3] << 24) : (t[0] | t[1] << 8 | t[2] << 16 | t[3] << 24 | t[4] | t[5] | t[6] | t[7]);
                 if (v) nz++;
-                mx = std::max<uint32_t>(mx, t[0] | t[1] | t[2]);
+                mx = std::max<uint32_t>(mx, t[0] | t[1] | t[2] | (bpt == 8 || f111110 ? t[3] : 0));
+                if (f111110) {
+                    bool a, b, c2[3] = {};
+                    bool any_nan = false, any_inf = false;
+                    const uint32_t ch[3] = {v & 0x7ff, (v >> 11) & 0x7ff, v >> 22};
+                    for (int k = 0; k < 3; k++) {
+                        sum[k] += small_float(ch[k], k < 2 ? 6 : 5, a, b);
+                        any_nan |= a;
+                        any_inf |= b;
+                        (void)c2;
+                    }
+                    nan += any_nan;
+                    inf += any_inf;
+                }
             }
+        if (f111110 && n)
+            XSL_INFO(CH, "%s stats (present %llu, %llux%u format %d): %.1f%% non-zero, mean %g %g %g, NaN %.1f%%, infinite %.1f%%", state == D3D12_RESOURCE_STATE_PRESENT ? "plane" : "target",
+                     (unsigned long long)g_present_count, (unsigned long long)rd.Width, rd.Height, rd.Format, 100.0 * nz / n, sum[0] / n, sum[1] / n, sum[2] / n,
+                     100.0 * nan / n, 100.0 * inf / n);
+        else
         XSL_INFO(CH, "%s stats (present %llu, %llux%u format %d): %.1f%% non-zero, max byte %u", state == D3D12_RESOURCE_STATE_PRESENT ? "plane" : "target",
                  (unsigned long long)g_present_count, (unsigned long long)rd.Width, rd.Height, rd.Format, n ? 100.0 * nz / n : 0.0, mx);
         rb->Unmap(0, nullptr);
@@ -2190,7 +2514,21 @@ HRESULT_T present(PcObj devObj, PcObj queueObj, PcObj resObj, void* hwndPtr, uin
             }
         }
         ++g_present_count;
+        if (g_info && g_present_count % 30 == 0) dump_debug_messages();   // debug layer: what it reported since the last dump
+        if (trace_writers()) { std::lock_guard<std::mutex> g(g_wr_mu); g_planes.insert((PcObj)res); }
+        if (trace_writers() && plane_ops_now()) { XSL_INFO(CH, "plane op: present %llu of %p on queue %p", (unsigned long long)g_present_count, (void*)res, (void*)q); report_aliases((PcObj)res); }
         g_wr_present = g_present_count;
+        if (trace_writers() && g_ei_map) {   // traced indirect dispatches: their arguments, once the GPU has written them
+            std::lock_guard<std::mutex> g(g_wr_mu);
+            for (size_t i = 0; i < g_ei_trace.size();) {
+                auto& e = g_ei_trace[i];
+                if (e.present + 3 > g_present_count) { i++; continue; }
+                const uint32_t* w = g_ei_map + e.slot * (kEiBytes / 4);
+                XSL_INFO(CH, "pso %s: indirect arguments %08x %08x %08x %08x %08x %08x %08x %08x, count %08x (present %llu)", e.name.c_str(), w[0], w[1], w[2], w[3],
+                         w[4], w[5], w[6], w[7], w[8], (unsigned long long)e.present);
+                g_ei_trace.erase(g_ei_trace.begin() + i);
+            }
+        }
         // XSL_PLANE_STATS=<n>: every n presents, log how much of the title's plane is non-black.
         static uint64_t statsEvery = [] { char b[16]; return GetEnvironmentVariableA("XSL_PLANE_STATS", b, sizeof b) ? _strtoui64(b, nullptr, 10) : 0ull; }();
         if (statsEvery && g_present_count % statsEvery == 0) capture_plane(dev, q, res, nullptr);
@@ -2215,7 +2553,15 @@ HRESULT_T present(PcObj devObj, PcObj queueObj, PcObj resObj, void* hwndPtr, uin
                 }
             }
             std::vector<PcObj> big;
-            { std::lock_guard<std::mutex> g(g_wr_mu); big = g_big_textures; }
+            {
+                std::lock_guard<std::mutex> g(g_wr_mu);
+                big = g_big_textures;
+                for (auto& [r, w] : g_cs_writer) {   // compute-written textures that were not noted at creation
+                    if (std::find(big.begin(), big.end(), r) != big.end()) continue;
+                    D3D12_RESOURCE_DESC d = as<ID3D12Resource>(r)->GetDesc();
+                    if (d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && d.Width >= 1920 && d.Height >= 1080) big.push_back(r);
+                }
+            }
             for (PcObj r : big) {   // 1080p textures (written by compute passes too), in their last transitioned state
                 if (as<ID3D12Resource>(r) == res) continue;
                 uint32_t st;

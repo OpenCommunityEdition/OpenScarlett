@@ -2217,7 +2217,7 @@ bool Translator::emit_ds(const Instr& in, size_t idx) {
     if (in.gds) return fail(n + " with GDS not supported");
     if (n == "ds_swizzle_b32") {
         uint32_t off = uint32_t(in.offset_imm) | (uint32_t(in.gds_offset1) << 8);
-        std::string v = V(in.data0);
+        std::string v = V(in.vaddr);   // the swizzled value is the ADDR operand (no DATA0)
         if (off & 0x8000) {   // quad permute
             unsigned p[4] = {off & 3, (off >> 2) & 3, (off >> 4) & 3, (off >> 6) & 3};
             write_v(in.dst, fmt("quadperm(%s, %uu, %uu, %uu, %uu)", v.c_str(), p[0], p[1], p[2], p[3]));
@@ -3030,8 +3030,265 @@ std::string Translator::generate() {
 
 }  // namespace
 
+// ---- Geometry shaders that copy their input vertices -------------------------------------------
+// Console geometry shaders read the vertex shader's outputs from LDS (ES-GS items at the per-vertex
+// offsets in v0..v2) and write emitted vertices back to LDS before s_sendmsg(GS, EMIT). Many (e.g.
+// passes that pick a render-target slice) only copy fields. The program is run for one lane with
+// every input dword tagged; when each written output dword is an unmodified input dword (or a
+// constant), the shader becomes a PC geometry shader that appends those copies.
+namespace {
+struct GsVal { uint32_t v = 0; int tag = -1; };   // tag: input (vertex << 12 | dword), -1 none
+constexpr uint32_t kGsIn = 0x4000, kGsVtx = 0x1000;  // tagged input items: byte 0x4000 + vertex * 0x1000
+
+bool translate_gs_copy(const Container& c, TranslateResult& r) {
+    auto fail = [&](const std::string& e) { r.error = "GS: " + e; return false; };
+    std::vector<SigElem> isg, osg;
+    if (auto* p = c.part("ISG1")) isg = parse_signature(*p);
+    if (auto* p = c.part("OSG1")) osg = parse_signature(*p);
+    if (isg.empty() || osg.empty()) return fail("no signatures");
+    unsigned in_prim = 3, out_topo = 5;   // D3D_PRIMITIVE_TRIANGLE, D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP
+    if (auto* p = c.part("PSV0"); p && p->size() >= 12) {
+        memcpy(&in_prim, p->data() + 4, 4);
+        memcpy(&out_topo, p->data() + 8, 4);
+    }
+    unsigned nverts = in_prim == 1 ? 1 : in_prim == 2 ? 2 : in_prim == 3 ? 3 : in_prim == 6 ? 4 : in_prim == 7 ? 6 : 0;
+    if (!nverts) return fail(fmt("input primitive %u not supported", in_prim));
+    if (!c.has_native || c.code_end <= c.body_begin) return fail("no machine code");
+    auto ins = decode_all(reinterpret_cast<const uint32_t*>(c.precompiled.data() + c.body_begin), (c.code_end - c.body_begin) / 4);
+
+    GsVal S[128], V[256];
+    uint32_t vcc = 0, exec = 1, m0 = 0;
+    bool scc = false;
+    for (unsigned k = 0; k < 3; k++)   // v0..v2: ES-GS offsets (dwords) of vertices 2k and 2k+1
+        V[k].v = (kGsIn / 4 + 2 * k * (kGsVtx / 4)) | ((kGsIn / 4 + (2 * k + 1) * (kGsVtx / 4)) << 16);
+    std::map<uint32_t, GsVal> lds_out;   // written LDS dwords
+    struct Out { unsigned vtx; uint32_t addr; GsVal val; };
+    std::vector<Out> outs;
+    std::vector<int> events;             // per emitted vertex: 0 = emit, 1 = emit then cut, 2 = cut only
+    unsigned emitted = 0;
+    auto lit = [](const Instr& in) { return in.literal; };
+    auto rd = [&](const Instr& in, uint16_t e) -> GsVal {
+        if (e < 106) return S[e];
+        if (e == 106) return {vcc, -1};
+        if (e == 124) return {m0, -1};
+        if (e == 126) return {exec, -1};
+        if (e == 127 || e == 107) return {0, -1};
+        if (e >= 128 && e <= 192) return {uint32_t(e - 128), -1};
+        if (e >= 193 && e <= 208) return {uint32_t(-(int)(e - 192)), -1};
+        if (e == 255) return {lit(in), -1};
+        if (e >= 256) return V[e - 256];
+        static const uint32_t fc[8] = {0x3f000000, 0xbf000000, 0x3f800000, 0xbf800000, 0x40000000, 0xc0000000, 0x40800000, 0xc0800000};
+        if (e >= 240 && e <= 247) return {fc[e - 240], -1};
+        return {0, -1};
+    };
+    auto ws = [&](uint16_t d, uint32_t v) {
+        if (d < 106) S[d] = {v, -1};
+        else if (d == 106) vcc = v;
+        else if (d == 124) m0 = v;
+        else if (d == 126) exec = v;
+    };
+    auto sel = [](uint32_t v, uint8_t s) {
+        if (s <= 3) return (v >> (8 * s)) & 0xff;
+        if (s == 4) return v & 0xffff;
+        if (s == 5) return v >> 16;
+        return v;
+    };
+    auto lds_read = [&](uint32_t a) -> GsVal {
+        if (auto it = lds_out.find(a); it != lds_out.end()) return it->second;
+        if (a >= kGsIn && a < kGsIn + nverts * kGsVtx) {
+            uint32_t k = (a - kGsIn) / kGsVtx, dw = ((a - kGsIn) % kGsVtx) / 4;
+            return {0, int(k << 12 | dw)};
+        }
+        return {0, -1};
+    };
+    auto lds_write = [&](uint32_t a, GsVal v) {
+        lds_out[a] = v;
+        outs.push_back({emitted, a, v});
+    };
+    for (auto& in : ins) {
+        std::string n = in.name ? in.name : "";
+        if (n.empty()) return fail(fmt("unknown instruction at 0x%x", in.offset));
+        if (n == "s_endpgm") break;
+        if (n == "s_inst_prefetch" || n == "s_waitcnt" || n == "s_nop" || n == "s_waitcnt_vscnt" || n == "s_waitcnt_vmcnt" ||
+            n == "s_waitcnt_lgkmcnt" || n == "s_waitcnt_expcnt" || n == "s_dcache_inv")
+            continue;
+        if (n == "s_sendmsg") {
+            unsigned id = in.simm16 & 0xf, op = (in.simm16 >> 4) & 3, stream = (in.simm16 >> 8) & 3;
+            if (id == 3) continue;   // GS_DONE
+            if (id != 2 || stream) return fail(fmt("message 0x%x not supported", in.simm16));
+            if (op == 2 || op == 3) { events.push_back(op == 3 ? 1 : 0); emitted++; }
+            else if (op == 1) events.push_back(2);
+            continue;
+        }
+        if (starts(n, "s_load_") || starts(n, "s_buffer_load_")) {   // GS ring/state constants: zero
+            unsigned cnt = ends(n, "x16") ? 16 : ends(n, "x8") ? 8 : ends(n, "x4") ? 4 : ends(n, "x2") ? 2 : 1;
+            for (unsigned k = 0; k < cnt; k++) ws(in.sdata + k, 0);
+            continue;
+        }
+        if (in.fmt == Fmt::SOP1 || in.fmt == Fmt::SOP2 || in.fmt == Fmt::SOPC || in.fmt == Fmt::SOPK) {
+            uint32_t a = rd(in, in.src0).v, b = rd(in, in.src1).v;
+            if (in.fmt == Fmt::SOPK) a = uint32_t(in.simm16);
+            uint32_t d;
+            if (n == "s_mov_b32" || n == "s_movk_i32") d = a;
+            else if (n == "s_mov_b64") { ws(in.dst, a); ws(in.dst + 1, in.src0 >= 128 && in.src0 <= 208 ? (in.src0 >= 193 ? ~0u : 0u) : rd(in, in.src0 + 1).v); continue; }
+            else if (n == "s_and_b32") d = a & b;
+            else if (n == "s_or_b32") d = a | b;
+            else if (n == "s_xor_b32") d = a ^ b;
+            else if (n == "s_lshl_b32") d = a << (b & 31);
+            else if (n == "s_lshr_b32") d = a >> (b & 31);
+            else if (n == "s_add_i32" || n == "s_add_u32") d = a + b;
+            else if (n == "s_sub_i32" || n == "s_sub_u32") d = a - b;
+            else if (n == "s_mul_i32") d = a * b;
+            else if (n == "s_bfe_u32" || n == "s_bfe_i32") {
+                unsigned off = b & 31, w = (b >> 16) & 0x7f;
+                d = w ? (a >> off) & (w >= 32 ? ~0u : ((1u << w) - 1)) : 0;
+                if (n == "s_bfe_i32" && w && w < 32 && (d >> (w - 1)) & 1) d |= ~((1u << w) - 1);
+            }
+            else if (n == "s_bfm_b32") d = ((1u << (a & 31)) - 1) << (b & 31);
+            else if (n == "s_bfm_b64") { uint64_t m = ((a & 63) ? (~0ull >> (64 - (a & 63))) : 0) << (b & 63); ws(in.dst, uint32_t(m)); ws(in.dst + 1, uint32_t(m >> 32)); continue; }
+            else if (n == "s_cmp_eq_u32" || n == "s_cmp_eq_i32") { scc = a == b; continue; }
+            else if (n == "s_cmp_lg_u32" || n == "s_cmp_lg_i32") { scc = a != b; continue; }
+            else if (n == "s_cselect_b32") d = scc ? a : b;
+            else if (n == "s_cselect_b64") { uint32_t hi_a = in.src0 >= 128 ? (in.src0 >= 193 && in.src0 <= 208 ? ~0u : 0u) : rd(in, in.src0 + 1).v;
+                                             uint32_t hi_b = in.src1 >= 128 ? (in.src1 >= 193 && in.src1 <= 208 ? ~0u : 0u) : rd(in, in.src1 + 1).v;
+                                             ws(in.dst, scc ? a : b); ws(in.dst + 1, scc ? hi_a : hi_b); continue; }
+            else return fail(n + " not supported");
+            ws(in.dst, d);
+            continue;
+        }
+        if (starts(n, "v_")) {
+            if (in.dpp) return fail(n + " with DPP not supported");
+            GsVal a = rd(in, in.src0), b = rd(in, in.src1), c2 = rd(in, in.src2);
+            if (in.sdwa) {
+                a = in.sdwa_f.s0 ? S[in.sdwa_f.src0] : V[in.sdwa_f.src0];
+                a.v = sel(a.v, in.sdwa_f.src0_sel);
+                b.v = sel(b.v, in.sdwa_f.src1_sel);
+                if (in.sdwa_f.src0_sel != 6) a.tag = -1;
+            }
+            GsVal d{0, -1};
+            if (n == "v_mov_b32") d = a;
+            else if (n == "v_and_b32") d.v = a.v & b.v;
+            else if (n == "v_or_b32") d.v = a.v | b.v;
+            else if (n == "v_xor_b32") d.v = a.v ^ b.v;
+            else if (n == "v_lshlrev_b32") d.v = b.v << (a.v & 31);
+            else if (n == "v_lshrrev_b32") d.v = b.v >> (a.v & 31);
+            else if (n == "v_add_nc_u32" || n == "v_add_u32") d.v = a.v + b.v;
+            else if (n == "v_sub_nc_u32") d.v = a.v - b.v;
+            else if (n == "v_mul_u32_u24") d.v = (a.v & 0xffffff) * (b.v & 0xffffff);
+            else if (n == "v_mad_u32_u24") d.v = (a.v & 0xffffff) * (b.v & 0xffffff) + c2.v;
+            else if (n == "v_lshl_add_u32") d.v = (a.v << (b.v & 31)) + c2.v;
+            else if (n == "v_lshl_or_b32") d.v = (a.v << (b.v & 31)) | c2.v;
+            else if (n == "v_and_or_b32") d.v = (a.v & b.v) | c2.v;
+            else if (n == "v_bfe_u32") d.v = (c2.v & 31) ? (a.v >> (b.v & 31)) & ((1u << (c2.v & 31)) - 1) : 0;
+            else if (n == "v_mbcnt_lo_u32_b32" || n == "v_mbcnt_hi_u32_b32") d.v = b.v;   // lane 0
+            else return fail(n + " not supported");
+            V[in.dst] = d;
+            continue;
+        }
+        if (in.fmt == Fmt::DS) {
+            uint32_t base = V[in.vaddr].v, o0 = uint32_t(in.offset_imm), o1 = uint32_t(in.gds_offset1);
+            if (n == "ds_read_b32") { V[in.dst] = lds_read(base + (o0 | o1 << 8)); continue; }
+            if (n == "ds_read_b64") { for (unsigned k = 0; k < 2; k++) V[in.dst + k] = lds_read(base + (o0 | o1 << 8) + 4 * k); continue; }
+            if (n == "ds_read2_b32") { V[in.dst] = lds_read(base + o0 * 4); V[in.dst + 1] = lds_read(base + o1 * 4); continue; }
+            if (n == "ds_write_b32") { lds_write(base + (o0 | o1 << 8), V[in.data0]); continue; }
+            if (n == "ds_write_b64") { for (unsigned k = 0; k < 2; k++) lds_write(base + (o0 | o1 << 8) + 4 * k, V[in.data0 + k]); continue; }
+            if (n == "ds_write2_b32") { lds_write(base + o0 * 4, V[in.data0]); lds_write(base + o1 * 4, V[in.data1]); continue; }
+            return fail(n + " not supported");
+        }
+        return fail(fmt("%s at 0x%x not supported (only copying geometry shaders are translated)", n.c_str(), in.offset));
+    }
+    if (!emitted) return fail("no vertices emitted");
+    // Output layout: vertex k's dword d at base + (k * stride + d) * 4.
+    unsigned regs = 0;
+    for (auto& e : osg) regs = std::max(regs, e.reg + 1);
+    const unsigned stride = regs * 4;
+    uint32_t base = UINT32_MAX;
+    for (auto& o : outs) base = std::min(base, o.addr);
+    std::map<std::pair<unsigned, unsigned>, GsVal> vtx_dw;   // (vertex, dword) -> value (last write)
+    for (auto& o : outs) {
+        unsigned rel = (o.addr - base) / 4, k = rel / stride, d = rel % stride;
+        if (k != o.vtx) return fail(fmt("output write for vertex %u lands in slot %u", o.vtx, k));
+        vtx_dw[{k, d}] = o.val;
+    }
+    auto sorted = [](std::vector<SigElem> v) {
+        std::sort(v.begin(), v.end(), [](const SigElem& a, const SigElem& b) { return a.reg != b.reg ? a.reg < b.reg : (a.mask & -a.mask) < (b.mask & -b.mask); });
+        return v;
+    };
+    auto sem = [](const SigElem& e) { return e.index ? fmt("%s%u", e.name.c_str(), e.index) : e.name; };
+    auto field = [](const SigElem& e, unsigned comp) -> std::string {
+        static const char* xyzw = "xyzw";
+        unsigned first = __builtin_ctz(e.mask), w = __builtin_popcount(e.mask);
+        std::string f = e.sysval == 1 ? "pos_" : e.sysval == 4 ? "rtai_" : e.sysval == 5 ? "vpi_" : fmt("o%u_%u", e.reg, first);
+        if (e.sysval == 1) return f + "." + xyzw[comp];
+        return w > 1 ? f + "." + xyzw[comp - first] : f;
+    };
+    auto decl = [&](const std::vector<SigElem>& sig, const char* name) {
+        std::string o = fmt("struct %s {\n", name);
+        bool pos = false;
+        for (auto& e : sorted(sig)) {
+            if (e.sysval == 1) { o += "  float4 pos_ : SV_Position;\n"; pos = true; continue; }
+            if (e.sysval == 4) { o += "  uint rtai_ : SV_RenderTargetArrayIndex;\n"; continue; }
+            if (e.sysval == 5) { o += "  uint vpi_ : SV_ViewportArrayIndex;\n"; continue; }
+            if (e.sysval != 0) continue;
+            unsigned w = unsigned(__builtin_popcount(e.mask));
+            const char* b = e.comptype == 1 ? "uint" : e.comptype == 2 ? "int" : "float";
+            o += "  " + (w > 1 ? fmt("%s%u", b, w) : std::string(b)) + fmt(" o%u_%u : ", e.reg, __builtin_ctz(e.mask)) + sem(e) + ";\n";
+        }
+        if (!pos) o += "  float4 pos_ : SV_Position;\n";
+        return o + "};\n";
+    };
+    auto elem_at = [](const std::vector<SigElem>& sig, unsigned reg, unsigned comp) -> const SigElem* {
+        for (auto& e : sig) if (e.reg == reg && (e.mask >> comp & 1) && (e.sysval <= 1 || e.sysval == 4 || e.sysval == 5)) return &e;
+        return nullptr;
+    };
+    std::ostringstream h;
+    h << "// Translated by OpenScarlett gpucode from console GPU machine code (copying geometry shader).\n";
+    h << decl(isg, "GSIn") << decl(osg, "GSOut");
+    static const char* prim[] = {"", "point", "line", "triangle", "", "", "lineadj", "triangleadj"};
+    const char* stream = out_topo == 1 ? "PointStream" : out_topo == 3 ? "LineStream" : "TriangleStream";
+    h << "[maxvertexcount(" << emitted << ")]\nvoid main(" << prim[in_prim] << " GSIn I[" << nverts << "], inout " << stream << "<GSOut> S) {\n  GSOut O;\n";
+    unsigned k = 0;
+    for (int ev : events) {
+        if (ev == 2) { h << "  S.RestartStrip();\n"; continue; }
+        h << "  O = (GSOut)0;\n";
+        for (auto& e : osg) {
+            for (unsigned comp = 0; comp < 4; comp++) {
+                if (!(e.mask >> comp & 1)) continue;
+                if (e.sysval > 1 && e.sysval != 4 && e.sysval != 5) continue;
+                auto it = vtx_dw.find({k, e.reg * 4 + comp});
+                if (it == vtx_dw.end()) continue;   // not written: stays zero
+                std::string bits;
+                if (it->second.tag >= 0) {
+                    unsigned sv = unsigned(it->second.tag) >> 12, sd = unsigned(it->second.tag) & 0xfff;
+                    const SigElem* ie = elem_at(isg, sd / 4, sd % 4);
+                    if (!ie || sv >= nverts) return fail(fmt("vertex %u copies input dword %u of vertex %u, which is not in the input signature", k, sd, sv));
+                    bits = fmt("asuint(I[%u].%s)", sv, field(*ie, sd % 4).c_str());
+                } else {
+                    bits = fmt("%uu", it->second.v);
+                }
+                const char* cast = e.sysval == 4 || e.sysval == 5 || e.comptype == 1 ? "" : e.comptype == 2 ? "asint" : "asfloat";
+                h << "  O." << field(e, comp) << " = " << cast << "(" << bits << ");\n";
+            }
+        }
+        h << "  S.Append(O);\n";
+        if (ev == 1) h << "  S.RestartStrip();\n";
+        k++;
+    }
+    h << "}\n";
+    r.hlsl = h.str();
+    r.profile = "gs_6_0";
+    r.wave_size = 32;
+    r.ok = true;
+    return true;
+}
+}  // namespace
+
 TranslateResult translate(const Container& c, const RootSig& rs, const TranslateOptions& opt) {
     TranslateResult r;
+    if (c.kind == ProgramKind::GS) {
+        translate_gs_copy(c, r);
+        return r;
+    }
     Translator t(c, rs, opt);
     if (c.kind != ProgramKind::CS && c.kind != ProgramKind::PS && c.kind != ProgramKind::VS && c.kind != ProgramKind::MS) {
         r.error = std::string("stage ") + kind_name(c.kind) + " not supported yet";

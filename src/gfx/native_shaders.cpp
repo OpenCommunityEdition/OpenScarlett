@@ -77,7 +77,7 @@ std::vector<uint8_t> with_root_signature(const std::vector<uint8_t>& dxil, const
     parts.push_back({gpucode::fourcc("RTS0"), *rs});
     return build_container(parts, dxil.data());
 }
-constexpr const char* kVersion = "gpucode-22";
+constexpr const char* kVersion = "gpucode-23";
 
 int mode() {
     static int m = [] {
@@ -248,6 +248,17 @@ bool native_translate(const void* in, size_t n, void** out, size_t* outSize) {
     swprintf(name, 32, L"%016llx.dxil", (unsigned long long)key);
     std::wstring cpath = cache_dir().empty() ? L"" : cache_dir() + name;
     std::vector<uint8_t> dxil;
+    // XSL_SHADER_OVERRIDE=<dir>: <dir>\<key>.hlsl, when present, is compiled instead of the
+    // translation and never cached (debugging: edit a dumped translation and run it in place).
+    std::vector<uint8_t> ovr;
+    if (const char* od = getenv("XSL_SHADER_OVERRIDE"); od && *od) {
+        char p2[600];
+        snprintf(p2, sizeof p2, "%s\\%016llx.hlsl", od, (unsigned long long)key);
+        if (read_file(std::wstring(p2, p2 + strlen(p2)), ovr)) {
+            XSL_INFO(CH, "shader %016llx: HLSL override %s", (unsigned long long)key, p2);
+            cpath.clear();
+        }
+    }
     bool cached = !cpath.empty() && read_file(cpath, dxil);
     if (cached) XSL_INFO(CH, "shader %016llx (%s): from cache", (unsigned long long)key, gpucode::kind_name(c.kind));
     if (!cached) {
@@ -269,6 +280,7 @@ bool native_translate(const void* in, size_t n, void** out, size_t* outSize) {
         if (getenv("XSL_NO_BARRIER_SYNC")) o.barrier_sync = false;
         o.wave64_dual = g_host_wave_min <= 32 && (g_host_wave_max <= 32 || g_host_sm66);
         gpucode::TranslateResult r = gpucode::translate(c, rs, o);
+        if (r.ok && !ovr.empty()) r.hlsl.assign(ovr.begin(), ovr.end());
         if (!r.ok) {
             XSL_WARN(CH, "shader %016llx (%s): not translated: %s", (unsigned long long)key, gpucode::kind_name(c.kind), r.error.c_str());
             dump(key, in, n, "", r.error);
