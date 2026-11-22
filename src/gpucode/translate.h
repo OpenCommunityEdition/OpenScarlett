@@ -41,6 +41,13 @@ struct TranslateOptions {
     // starts, which include every offset in `entries` and every return address after s_swappc.
     uint64_t code_base = 0;
     std::vector<uint32_t> entries;
+    // Raw compute programs (code without a container, e.g. linked ray-tracing pipelines): when
+    // raw_code is set, the container only supplies its kind; the code, rsrc2 (user SGPRs, group-id
+    // enables, scratch), thread count and arguments come from here, and execution starts at the
+    // block at raw_entry. raw_scratch_offset is the HLSL for the scratch wave offset SGPR.
+    std::vector<uint32_t> raw_code;
+    uint32_t raw_rsrc2 = 0, raw_numthreads = 32, raw_entry = 0, raw_root_constants = 0;
+    std::string raw_scratch_offset;
     bool barrier_sync = true;        // false: s_barrier without the group sync (debugging hangs) // the PC runtime takes shader model 6.6 ([WaveSize] on compute)
 };
 

@@ -168,7 +168,13 @@ struct Translator {
         if (auto* pp = c.part("ISG1")) isg = parse_signature(*pp);
         if (auto* pp = c.part("OSG1")) osg = parse_signature(*pp);
         if (auto* pp = c.part("PSG1")) psg = parse_signature(*pp);
-        if (!parse_meta(c, meta, &e)) return fail("metadata: " + e);
+        if (!opt.raw_code.empty()) {   // raw program: metadata from the options
+            meta = Meta{};
+            meta.valid = true;
+            meta.rsrc2 = opt.raw_rsrc2;
+            meta.numthreads[0] = opt.raw_numthreads;
+            if (opt.raw_root_constants) meta.args.push_back(UserArg{0, opt.raw_root_constants, 0, 0, 0});
+        } else if (!parse_meta(c, meta, &e)) return fail("metadata: " + e);
         if (c.kind == ProgramKind::MS) {
             // Mesh shaders run as merged (primitive) shaders: argument locations are 8 SGPRs higher.
             for (auto& a : meta.args) if (a.loc < 32) a.loc += 8;
@@ -212,7 +218,7 @@ struct Translator {
             }
             for (size_t k = 0; k < meta.ps_inputs.size(); k++) attr_reg[unsigned(k)] = meta.ps_inputs[k].reg;
         }
-        code = c.code();
+        code = opt.raw_code.empty() ? c.code() : opt.raw_code;
         ins = decode_all(code.data(), code.size());
         for (auto& in : ins) {
             if (!in.name) continue;   // data after the code decodes as junk; reported only if reached
@@ -246,6 +252,7 @@ struct Translator {
     void build_cfg() {
         std::set<uint32_t> leaders{0};
         for (uint32_t e : opt.entries) leaders.insert(e);
+        if (!opt.raw_code.empty()) leaders.insert(opt.raw_entry);
         for (size_t i = 0; i < ins.size(); i++) {
             auto& in = ins[i];
             if (in.name && (!strcmp(in.name, "s_setpc_b64") || !strcmp(in.name, "s_swappc_b64")) &&
@@ -680,7 +687,17 @@ struct Translator {
         return int(res.size() - 1);
     }
     // Identifies the resource whose descriptor is in SGPRs [s, s+n).
+    // With soft_trace, any descriptor that cannot be traced returns -1 without failing the
+    // translation (the caller has a run-time path).
     int resource(const SState& st, uint16_t s, unsigned n, const Instr& in, bool sampler) {
+        if (!soft_trace) return resource_traced(st, s, n, in, sampler);
+        std::string saved = err;
+        size_t nres = res.size();
+        int r = resource_traced(st, s, n, in, sampler);
+        if (err != saved) { err = saved; res.resize(nres); return -1; }
+        return r;
+    }
+    int resource_traced(const SState& st, uint16_t s, unsigned n, const Instr& in, bool sampler) {
         AV w0 = st[s], w1 = st[s + 1];
         std::string nm = in.name;
         Res r{};
@@ -1079,7 +1096,11 @@ struct Translator {
         }
     }
     bool emit(const Instr& in, size_t idx) {
+        // Section markers in linked code: v_nop in its VOP3 encoding (opcode 384, absent from the
+        // generated table) and v_illegal; they are never reached by execution.
+        if (!in.name && in.fmt == Fmt::VOP3 && in.op == 384) return true;
         if (!in.name) return fail(fmt("unknown %s opcode %u at 0x%x", fmt_name(in.fmt), in.op, in.offset));
+        if (!strcmp(in.name, "v_illegal")) return true;
         if (dual && per_lane(in)) {
             // Once per console lane copy: L/LG = console lane, EXEC/VCC bits and captured outputs renamed.
             static const char* names[] = {"kexec", "kvcc", "O", "P", "prim_", "hasv_", "hasp_", "clipcull_"};
@@ -1195,7 +1216,7 @@ bool Translator::emit_salu(const Instr& in, size_t idx) {
     if (in.fmt == Fmt::SOPP) {
         if (n == "s_endpgm" || starts(n, "s_branch") || starts(n, "s_cbranch")) return true;   // control flow: emitted by caller
         static const char* nops[] = {"s_nop", "s_waitcnt", "s_inst_prefetch", "s_clause", "s_setprio", "s_sleep",
-                                     "s_ttracedata", "s_code_end", "s_round_mode", "s_denorm_mode", "s_icache_inv",
+                                     "s_ttracedata", "s_ttracedata_imm", "s_code_end", "s_round_mode", "s_denorm_mode", "s_icache_inv",
                                      "s_waitcnt_depctr", "s_incperflevel", "s_decperflevel", "s_sethalt", "s_trap",
                                      "s_wakeup", "s_set_gpr_idx_off", "s_endpgm_saved", "s_wait_idle"};
         for (auto p : nops)
@@ -1229,6 +1250,7 @@ bool Translator::emit_salu(const Instr& in, size_t idx) {
             line(fmt("scc = %s %s %s;", x.c_str(), o, y.c_str()));
         } else if (n == "s_getreg_b32") write_s(in.dst, "0u");
         else if (n == "s_setreg_b32" || n == "s_setreg_imm32_b32") {}
+        else if (n == "s_waitcnt_vscnt" || n == "s_waitcnt_vmcnt" || n == "s_waitcnt_lgkmcnt" || n == "s_waitcnt_expcnt") {}   // memory is coherent per lane here
         else if (n == "s_call_b64") return fail("s_call_b64 not supported");
         else return fail(fmt("%s at 0x%x not supported", in.name, in.offset));
         return true;
@@ -2334,7 +2356,7 @@ bool Translator::emit_mimg(const Instr& in, size_t idx) {
         return true;
     }
     int r = res_of.count(idx) ? res_of[idx] : -1;
-    if (r < 0) return false;
+    if (r < 0) return fail(fmt("%s at 0x%x: image descriptor not known", in.name, in.offset));   // never drop the access silently
     Res& R = res[r];
     const std::string RN = rn(idx, r);
     if (R.kind != ResKind::Image) return fail(fmt("%s at 0x%x: not an image resource", in.name, in.offset));
@@ -3179,7 +3201,8 @@ std::string Translator::generate() {
                 first_head = std::min(first_head, uint32_t(int32_t(i.offset) + 4 + i.simm16 * 4));
         bool barriers = false;
         for (auto& i : ins) barriers |= i.name && !strcmp(i.name, "s_barrier") && i.offset >= first_head;
-        line(fmt("uint pc = 0u, guard_ = 0u;\n  [loop] for (;;) {\n  if (++guard_ > %uu) RETURN;\n  [forcecase] switch (pc) {",
+        size_t start = opt.raw_code.empty() || !block_of.count(opt.raw_entry) ? 0 : block_of[opt.raw_entry];
+        line(fmt("uint pc = %zuu, guard_ = 0u;\n  [loop] for (;;) {\n  if (++guard_ > %uu) RETURN;\n  [forcecase] switch (pc) {", start,
                  barriers ? opt.loop_guard_barrier : opt.loop_guard));
     }
     // Blocks not reachable from the entry (data after the last instruction) are not emitted.
@@ -3382,6 +3405,8 @@ std::string Translator::generate() {
             unsigned nt = meta.numthreads[0] * meta.numthreads[1] * meta.numthreads[2];
             init += fmt("  s%u = ((gi_ / WAVE) << 6) | %uu;   // TG_SIZE: wave id in group, wave count\n", s++, (nt + W - 1) / W);
         }
+        if ((meta.rsrc2 & 1) && !opt.raw_scratch_offset.empty())   // SCRATCH_EN: the scratch wave offset follows
+            init += fmt("  s%u = %s;   // scratch wave offset\n", s++, opt.raw_scratch_offset.c_str());
         for (unsigned k = 0; k < meta.tid_comps(); k++) init += fmt("  v%u = tid_.%c;\n", k, "xyz"[k]);
     } else if (c.kind == ProgramKind::PS) {
         h << "struct PSIn {\n";
