@@ -891,13 +891,21 @@ const void* D3DAPI SOP_GetShaderIdentifier(ID3D12StateObjectProperties* self, LP
     std::array<uint8_t, 64> id{};
     if (auto pipe = rt_pipe_of((const void*)hdr(self)->user[0])) {   // translated pipeline: dword 0 = entry address >> 8
         std::string u8(n.begin(), n.end());
-        auto it = pipe->link.exports.find(u8);
-        if (it != pipe->link.exports.end()) {
-            uint32_t ptr = (uint32_t)((pipe->link.base + it->second) >> 8);
-            memcpy(id.data(), &ptr, 4);
+        auto ptr = [&](const std::string& x) -> uint32_t {
+            auto it = pipe->link.exports.find(x);
+            return it == pipe->link.exports.end() ? 0u : (uint32_t)((pipe->link.base + it->second) >> 8);
+        };
+        uint32_t w[3] = {ptr(u8), 0, 0};
+        auto hg = pipe->link.hitgroups.find(u8);
+        if (hg != pipe->link.hitgroups.end())   // hit group: closest-hit, any-hit, intersection entries (0: none)
+            for (int k = 0; k < 3; k++) w[k] = hg->second[k].empty() ? 0u : ptr(hg->second[k]);
+        if (w[0] || hg != pipe->link.hitgroups.end()) {
+            memcpy(id.data(), w, sizeof w);
             e->ids.push_back({n, id});
             return e->ids.back().second.data();
         }
+        static volatile long miss = 0;
+        if (InterlockedIncrement(&miss) <= 8) XSL_WARN(CH, "GetShaderIdentifier(%s): not an export or hit group of the translated pipeline", u8.c_str());
     }
     uint64_t h = 1469598103934665603ull;
     for (wchar_t c : n) h = (h ^ uint64_t(c)) * 1099511628211ull;

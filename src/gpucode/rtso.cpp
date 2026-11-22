@@ -79,6 +79,37 @@ bool rt_link(const std::vector<std::vector<uint8_t>>& blobs, RtLinked& out, std:
             }
         }
     }
+    // Hit groups (see rtso.h): a name that is not an export, then three export names or empty strings.
+    for (auto& blob : blobs) {
+        const uint8_t* b = blob.data();
+        size_t n = blob.size();
+        auto str = [&](size_t o, std::string& s) -> size_t {   // length-prefixed UTF-16 ASCII at o: bytes used, 0 if not one
+            if (o + 4 > n) return 0;
+            uint32_t len;
+            memcpy(&len, b + o, 4);
+            if (len % 2 || len > 512 || o + 4 + len > n) return 0;
+            s.clear();
+            for (uint32_t k = 0; k < len; k += 2) {
+                if (b[o + 4 + k + 1] || b[o + 4 + k] < 0x20 || b[o + 4 + k] > 0x7e) return 0;
+                s += char(b[o + 4 + k]);
+            }
+            return 4 + len;
+        };
+        for (size_t o = 0; o + 20 <= n; o++) {
+            std::string g, sh[3];
+            size_t u = str(o, g);
+            if (!u || g.empty() || out.exports.count(g) || out.hitgroups.count(g)) continue;
+            size_t p = o + u;
+            bool ok = true, any = false;
+            for (int k = 0; k < 3 && ok; k++) {
+                size_t v = str(p, sh[k]);
+                ok = v && (sh[k].empty() || out.exports.count(sh[k]));
+                any |= ok && !sh[k].empty();
+                p += v;
+            }
+            if (ok && any) out.hitgroups[g] = {sh[0], sh[1], sh[2]};
+        }
+    }
     if (img.empty()) { if (err) *err = "no sections"; return false; }
     if (!haveMain) { if (err) *err = "no ray-generation scheduler"; return false; }
     while (img.size() % 4) img.push_back(0);

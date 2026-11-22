@@ -193,6 +193,7 @@ static int rtlink_cmd(const char* tmpl, int n, char** blobs) {
     if (!rt_link(bs, l, &err)) return fprintf(stderr, "link: %s\n", err.c_str()), 1;
     fprintf(stderr, "image 0x%zx bytes, scheduler @0x%x, %zu traversal entries, %zu exports\n", l.image.size() * 4, l.main, l.traversal.size(), l.exports.size());
     for (auto& [name, off] : l.exports) fprintf(stderr, "  export %s @0x%x\n", name.c_str(), off);
+    for (auto& [g, s] : l.hitgroups) fprintf(stderr, "  hit group %s: closest %s, any %s, intersection %s\n", g.c_str(), s[0].c_str(), s[1].c_str(), s[2].c_str());
     for (auto& p : l.parts) fprintf(stderr, "  part 0x%x..0x%x main 0x%x%s\n", p.begin, p.end, p.main, p.raygen ? " (ray generation)" : "");
     if (const char* k = getenv("RT_PROGRAM")) {   // translate one per-raygen program instead of the full link
         auto progs = rt_programs(l);

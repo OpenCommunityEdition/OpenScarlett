@@ -30,6 +30,10 @@ struct RtLinked {
     struct Part { uint32_t begin, end, main; bool raygen; };
     std::vector<Part> parts;                   // non-traversal sections: image range, scheduler, kind
     std::vector<std::pair<uint32_t, uint32_t>> skip;   // ranges left out of this program (rt_programs)
+    // Hit groups: name -> closest-hit, any-hit, intersection export names (empty: none). Parsed from
+    // records {u32 byte length, UTF-16 name} x 4 (group, closest hit, any hit, intersection) whose
+    // shader names are exports of the pipeline.
+    std::map<std::string, std::vector<std::string>> hitgroups;
 };
 bool rt_link(const std::vector<std::vector<uint8_t>>& blobs, RtLinked& out, std::string* err);
 
