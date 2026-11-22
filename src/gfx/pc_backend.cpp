@@ -1608,11 +1608,11 @@ D3D12_HEAP_FLAGS clean_heap_flags(uint32_t f) {
 
 // Console memory is unified: titles Map DEFAULT-heap buffers (FramePacing reads its query buffer that
 // way). Such buffers get CPU-visible memory chosen once per device: the GPU-upload heap (resizable BAR)
-// where supported, else write-back system memory on UMA GPUs, else (discrete GPUs on runtimes
-// without the GPU upload heap, e.g. Windows 10's) write-back system memory the GPU reads over
-// the bus: slower for GPU-heavy buffers, but titles' CPU writes then reach the GPU.
-// XSL_MAPPABLE_DEFAULT=0 disables this.
-enum class MappableDefault { None, GpuUpload, UmaCustom, SystemCustom };
+// where supported, else write-back system memory on UMA GPUs. Discrete GPUs on runtimes without the
+// GPU upload heap (Windows 10's) keep DEFAULT buffers in video memory: in system memory every GPU
+// access crosses the bus, which made GPU-heavy passes (character deformation over ~1M elements)
+// 50x slower and real-time scenes dark. XSL_MAPPABLE_DEFAULT=0 never maps, =1 forces system memory.
+enum class MappableDefault { None, GpuUpload, UmaCustom, SystemCustom, SmallSystem };
 MappableDefault mappable_default(ID3D12Device* dev) {
     static MappableDefault m = [dev] {
         char b[4];
@@ -1627,8 +1627,13 @@ MappableDefault mappable_default(ID3D12Device* dev) {
             XSL_INFO(CH, "DEFAULT-heap buffers are CPU-mappable (UMA, write-back system memory)");
             return MappableDefault::UmaCustom;
         }
-        XSL_WARN(CH, "no GPU upload heap on this runtime: DEFAULT-heap buffers live in system memory (CPU-mappable, slower GPU access)");
-        return MappableDefault::SystemCustom;
+        if (GetEnvironmentVariableA("XSL_MAPPABLE_DEFAULT", b, 4) && b[0] == '1') {
+            XSL_WARN(CH, "DEFAULT-heap buffers live in system memory (XSL_MAPPABLE_DEFAULT=1: CPU-mappable, slower GPU access)");
+            return MappableDefault::SystemCustom;
+        }
+        XSL_INFO(CH, "no GPU upload heap on this runtime: DEFAULT-heap buffers up to 1 MiB are CPU-mappable system memory, larger ones stay in "
+                     "video memory (XSL_MAPPABLE_DEFAULT=1 maps all)");
+        return MappableDefault::SmallSystem;
     }();
     return m;
 }
@@ -1660,6 +1665,9 @@ HRESULT_T create_committed_resource(PcObj dev, const void* heapProps, uint32_t h
     if (hp.Type == D3D12_HEAP_TYPE_DEFAULT && d.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
         switch (mappable_default(as<ID3D12Device>(dev))) {
             case MappableDefault::GpuUpload: hp.Type = D3D12_HEAP_TYPE_GPU_UPLOAD; break;
+            case MappableDefault::SmallSystem:   // small buffers (queries, constants) are the ones titles map
+                if (d.Width > (1u << 20)) break;
+                [[fallthrough]];
             case MappableDefault::UmaCustom:
             case MappableDefault::SystemCustom:
                 hp.Type = D3D12_HEAP_TYPE_CUSTOM;
@@ -1960,7 +1968,9 @@ void create_dsv(PcObj dev, PcObj res, const void* desc, uint64_t h) {
     as<ID3D12Device>(dev)->CreateDepthStencilView(as<ID3D12Resource>(res), static_cast<const D3D12_DEPTH_STENCIL_VIEW_DESC*>(desc), cpu(h));
 }
 void create_srv(PcObj dev, PcObj res, const void* desc, uint64_t h) {
-    if (trace_writers()) { std::lock_guard<std::mutex> g(g_wr_mu); g_srv_res[h] = res; g_uav_res.erase(h); }
+    if (trace_writers() || (trace_rtvs() && res && as<ID3D12Resource>(res)->GetDesc().Dimension == D3D12_RESOURCE_DIMENSION_BUFFER)) {
+        std::lock_guard<std::mutex> g(g_wr_mu); g_srv_res[h] = res; g_uav_res.erase(h);
+    }
     D3D12_SHADER_RESOURCE_VIEW_DESC t;
     const D3D12_SHADER_RESOURCE_VIEW_DESC* vd = view_fix(res, desc, t);
     if (res && as<ID3D12Resource>(res)->GetDesc().Format == DXGI_FORMAT_NV12) {   // views of decoded video frames
@@ -1984,8 +1994,12 @@ void create_srv(PcObj dev, PcObj res, const void* desc, uint64_t h) {
     }
     as<ID3D12Device>(dev)->CreateShaderResourceView(as<ID3D12Resource>(res), vd, cpu(h));
 }
+struct FormatSize;
+UINT format_bytes_of(DXGI_FORMAT f);
 void create_uav(PcObj dev, PcObj res, PcObj counter, const void* desc, uint64_t h) {
-    if (trace_writers()) { std::lock_guard<std::mutex> g(g_wr_mu); g_uav_res[h] = res; g_srv_res.erase(h); }
+    if (trace_writers() || (trace_rtvs() && res && as<ID3D12Resource>(res)->GetDesc().Dimension == D3D12_RESOURCE_DIMENSION_BUFFER)) {
+        std::lock_guard<std::mutex> g(g_wr_mu); g_uav_res[h] = res; g_srv_res.erase(h);
+    }
     if (res && !(as<ID3D12Resource>(res)->GetDesc().Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)) {
         // e.g. a depth-stencil resource whose UAV flag was dropped: null view of the requested dimension
         {
@@ -2004,6 +2018,19 @@ void create_uav(PcObj dev, PcObj res, PcObj counter, const void* desc, uint64_t 
     }
     D3D12_UNORDERED_ACCESS_VIEW_DESC t;
     const D3D12_UNORDERED_ACCESS_VIEW_DESC* vd = view_fix(res, desc, t);
+    if (res && desc && getenv("XSL_TRACE_BIG_VIEWS")) {   // buffer views reaching past their resource
+        auto* td = static_cast<const D3D12_UNORDERED_ACCESS_VIEW_DESC*>(desc);
+        D3D12_RESOURCE_DESC rd = as<ID3D12Resource>(res)->GetDesc();
+        if (td->ViewDimension == D3D12_UAV_DIMENSION_BUFFER) {
+            uint64_t es = td->Buffer.StructureByteStride ? td->Buffer.StructureByteStride : td->Format == DXGI_FORMAT_UNKNOWN || td->Format == DXGI_FORMAT_R32_TYPELESS ? 4 : format_bytes_of(td->Format);
+            uint64_t end = (td->Buffer.FirstElement + td->Buffer.NumElements) * (es ? es : 4);
+            static volatile long n = 0;
+            if (end > rd.Width && InterlockedIncrement(&n) <= 20)
+                XSL_WARN(CH, "buffer UAV past its resource: first %llu count %u stride %u fmt %d (%llu bytes) on %llu bytes; PC view %s count %u",
+                         (unsigned long long)td->Buffer.FirstElement, td->Buffer.NumElements, td->Buffer.StructureByteStride, (int)td->Format, (unsigned long long)end,
+                         (unsigned long long)rd.Width, vd ? "desc" : "default", vd ? vd->Buffer.NumElements : 0);
+        }
+    }
     if (trace_writers() && res) {
         D3D12_RESOURCE_DESC rd = as<ID3D12Resource>(res)->GetDesc();
         if (rd.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && rd.Width >= 1900 && rd.Format == DXGI_FORMAT_R11G11B10_FLOAT) {
@@ -2209,7 +2236,12 @@ HRESULT_T res_map(PcObj r, uint32_t sub, const void* range, void** out) {
     }
     if (SUCCEEDED(hr) || !out) return hr;
     D3D12_RESOURCE_DESC d = res->GetDesc();
-    if (d.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) return logged(hr, "Map");
+    if (d.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
+        static volatile long n = 0;
+        if (InterlockedIncrement(&n) <= 5)
+            XSL_WARN(CH, "Map of a %llu-byte buffer in video memory failed (XSL_MAPPABLE_DEFAULT=1 puts DEFAULT buffers in mappable memory)", (unsigned long long)d.Width);
+        return logged(hr, "Map");
+    }
     std::lock_guard<std::mutex> l(g_shadow_lock);
     auto it = g_shadows.find(r);
     if (it == g_shadows.end()) {
@@ -3141,6 +3173,7 @@ FormatSize format_size(DXGI_FORMAT f) {
     if ((v >= 73 && v <= 78) || (v >= 82 && v <= 84) || (v >= 94 && v <= 99)) return {16, 4};
     return {0, 0};
 }
+UINT format_bytes_of(DXGI_FORMAT f) { return format_size(f).bytes; }
 bool misaligned_footprint(const D3D12_TEXTURE_COPY_LOCATION& c) {
     return c.Type == D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT && c.PlacedFootprint.Offset % D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT;
 }
@@ -3834,10 +3867,11 @@ HRESULT_T present(PcObj devObj, PcObj queueObj, PcObj resObj, void* hwndPtr, uin
     ID3D12CommandList* lists[] = {s.list};
     q->ExecuteCommandLists(1, lists);
     {
-        // XSL_CAPTURE=<path.bmp>[@start[+count]]: dump presented frames (count > 1 adds _<frame>).
+        // XSL_CAPTURE=<path.bmp>[@start[+count[/step]]]: dump presented frames (count > 1 adds _<frame>;
+        // with a step, every step-th frame from start, count frames in all).
         // The swap-chain buffer is captured, i.e. what is displayed after format/HDR conversion.
         static char cap[MAX_PATH] = "";
-        static uint64_t capFrame = 0, capCount = 1;
+        static uint64_t capFrame = 0, capCount = 1, capStep = 1;
         static bool init = false;
         if (!init) {
             init = true;
@@ -3845,6 +3879,7 @@ HRESULT_T present(PcObj devObj, PcObj queueObj, PcObj resObj, void* hwndPtr, uin
                 char* at = strrchr(cap, '@');
                 capFrame = at ? _strtoui64(at + 1, nullptr, 10) : 60;
                 if (char* plus = at ? strchr(at, '+') : nullptr) capCount = _strtoui64(plus + 1, nullptr, 10);
+                if (char* sl = at ? strchr(at, '/') : nullptr) capStep = std::max<uint64_t>(1, _strtoui64(sl + 1, nullptr, 10));
                 if (at) *at = 0;
             }
         }
@@ -3951,7 +3986,7 @@ HRESULT_T present(PcObj devObj, PcObj queueObj, PcObj resObj, void* hwndPtr, uin
                 }
             }
         }
-        if (cap[0] && g_present_count >= capFrame && g_present_count < capFrame + capCount) {
+        if (cap[0] && g_present_count >= capFrame && g_present_count < capFrame + capCount * capStep && (g_present_count - capFrame) % capStep == 0) {
             char path[MAX_PATH];
             if (capCount > 1) {
                 snprintf(path, sizeof path, "%s", cap);

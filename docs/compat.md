@@ -107,7 +107,10 @@ zlib, BCPack, zlib+BCPack; error records; cancellation; fence signals) — all p
   thread with Win32 reads, zlib (vendored 1.3.1) and BCPack (the SDK's `BCPack.dll`, copied from the user's
   SDK at run time); swizzle modes are not implemented.
 - **Unified memory, CPU side**: console titles `Map` DEFAULT-heap buffers. Such buffers are created
-  CPU-visible on PC (GPU upload heap, or write-back system memory on UMA GPUs; `XSL_MAPPABLE_DEFAULT=0`).
+  CPU-visible on PC (GPU upload heap, or write-back system memory on UMA GPUs). Discrete GPUs without
+  the GPU upload heap (Windows 10) map only DEFAULT buffers up to 1 MiB; larger ones stay in video
+  memory, since GPU-heavy buffers in system memory made real-time scenes slow and dark
+  (`XSL_MAPPABLE_DEFAULT=0` never maps, `=1` maps all).
 - **GPU page mapping**: page pools become PC heaps, placed resources on reserved address space become
   reserved resources, page mappings become `UpdateTileMappings` on the same queue.
 - **Window titles**: the FPS suffix is written without `WM_GETTEXT`, which deadlocks against a window
