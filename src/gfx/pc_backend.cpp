@@ -518,6 +518,14 @@ std::vector<ID3D12Resource*> g_gm_tables;       // table buffers (recent ones ke
 std::map<ID3D12Resource*, ID3D12Resource*> g_as_shadow;   // acceleration-structure buffer -> shadow
 std::vector<uint32_t> g_gm_free_srv, g_gm_free_uav;   // view slots of destroyed buffers
 uint64_t g_gm_built_at = UINT64_MAX;            // present count of the last table rebuild
+bool g_gm_force = false;                         // rebuild at the next submission even if one ran this frame
+std::vector<std::pair<uint64_t, uint64_t>> g_gm_built;   // address ranges in the current GPU table (sorted)
+static bool gm_in_table(uint64_t va, uint64_t bytes) {   // caller holds g_gm_mu
+    auto it = std::upper_bound(g_gm_built.begin(), g_gm_built.end(), std::make_pair(va, UINT64_MAX));
+    if (it == g_gm_built.begin()) return false;
+    --it;
+    return va >= it->first && va + bytes <= it->first + it->second;
+}
 std::map<PcObj, uint32_t> g_rs_gm;              // root signature -> appended parameter index
 std::map<PcObj, bool> g_list_global_heap;       // list -> the global heap is bound
 std::map<PcObj, std::pair<PcObj, PcObj>> g_list_gm_rs;   // list -> current (graphics, compute) root signatures
@@ -576,6 +584,339 @@ static void gm_shadow_as(ID3D12Device* dev, ID3D12Resource* as, uint64_t size) {
     { std::lock_guard<std::mutex> g(g_gm_mu); g_as_shadow[as] = sh; }
     gm_register((PcObj)sh, as->GetGPUVirtualAddress(), size, 0);
 }
+// ---- Top-level acceleration structures in the console format ----------------------------------
+// Translated ray-query code traverses console BVHs itself (image_bvh*_intersect_ray plus memory
+// loads), so a TLAS build writes the console layout into the structure's shadow:
+//   header (64 B: flags = version 2008, numElements, sceneBounds, rootNodePtr at +48, offsets)
+//   box32 nodes (128 B: 4 child pointers, 4 x {min, max}), bottom level first, root last
+//   instance nodes (128 B: ObjectToWorld, ID|mask, contribution|flags, BLAS root pointer at +56,
+//                   BLAS address >> 8 at +60, WorldToObject at +64, instance index at +112)
+// Node pointers are (byte offset / 64) << 3 | type (5 box32, 6 instance). Instances are sorted by
+// the Morton code of their bounds' centre (up to 2048 per build; more stay in input order). An
+// instance whose BLAS has no console header (a BLAS this layer did not provide) gets an invalid
+// root pointer and empty bounds, so rays skip it. One 1024-thread group does the whole build.
+static const char kTlasBuilder[] = R"(
+StructuredBuffer<uint4> GMT : register(t0, space901);
+ByteAddressBuffer GMS[8191] : register(t0, space900);
+globallycoherent RWByteAddressBuffer GMU[8192] : register(u0, space900);
+cbuffer C : register(b0) { uint dstLo, dstHi, instLo, instHi, scrLo, scrHi, N, layout, instOff, pad0, pad1, pad2; };
+uint3 gm_find(uint lo, uint hi) {
+  uint a = 0u, b = GMT[0].x;
+  while (a < b) { uint m = (a + b) >> 1; uint4 e = GMT[1u + m]; if (e.y < hi || (e.y == hi && e.x <= lo)) a = m + 1u; else b = m; }
+  if (a == 0u) return uint3(0u, 0u, 0u);
+  uint4 e = GMT[a];
+  uint off = lo - e.x, ohi = hi - e.y - (lo < e.x ? 1u : 0u);
+  return (ohi == 0u && off < e.z) ? uint3(1u, e.w, off) : uint3(0u, 0u, 0u);
+}
+uint2 at(uint lo, uint hi, uint o) { uint r = lo + o; return uint2(r, hi + (r < lo ? 1u : 0u)); }
+uint ld(uint2 a) {   // title memory (read-only use)
+  uint3 f = gm_find(a.x, a.y);
+  if (f.x == 0u) return 0u;
+  if (f.y & 0x80000000u) return GMU[NonUniformResourceIndex((f.y >> 14) & 0x3fffu)].Load(f.z & ~3u);
+  if (f.y & 0x40000000u) return GMS[NonUniformResourceIndex(f.y & 0x3fffu)].Load(f.z & ~3u);
+  return 0u;
+}
+void st(uint2 a, uint v) {
+  uint3 f = gm_find(a.x, a.y);
+  if (f.x != 0u && (f.y & 0x80000000u)) GMU[NonUniformResourceIndex((f.y >> 14) & 0x3fffu)].Store(f.z & ~3u, v);
+}
+float ldf(uint2 a) { return asfloat(ld(a)); }
+void stf(uint2 a, float v) { st(a, asuint(v)); }
+groupshared uint keys[2048];
+groupshared uint idxs[2048];
+groupshared uint smin[3], smax[3];
+uint ford(float f) { uint u = asuint(f); return (u & 0x80000000u) ? ~u : (u | 0x80000000u); }
+float unord(uint u) { return asfloat((u & 0x80000000u) ? (u & 0x7fffffffu) : ~u); }
+uint spread(uint x) { x &= 0x3ffu; x = (x | (x << 16)) & 0x030000FFu; x = (x | (x << 8)) & 0x0300F00Fu; x = (x | (x << 4)) & 0x030C30C3u; x = (x | (x << 2)) & 0x09249249u; return x; }
+void box_of(uint2 a, out float3 mn, out float3 mx) {
+  mn = float3(ldf(a), ldf(at(a.x, a.y, 4u)), ldf(at(a.x, a.y, 8u)));
+  mx = float3(ldf(at(a.x, a.y, 12u)), ldf(at(a.x, a.y, 16u)), ldf(at(a.x, a.y, 20u)));
+}
+void put_box(uint2 a, float3 mn, float3 mx) {
+  stf(a, mn.x); stf(at(a.x, a.y, 4u), mn.y); stf(at(a.x, a.y, 8u), mn.z);
+  stf(at(a.x, a.y, 12u), mx.x); stf(at(a.x, a.y, 16u), mx.y); stf(at(a.x, a.y, 20u), mx.z);
+}
+[numthreads(1024, 1, 1)]
+void main(uint t : SV_GroupIndex) {
+  if (t < 3u) { smin[t] = 0xffffffffu; smax[t] = 0u; }
+  GroupMemoryBarrierWithGroupSync();
+  const float BIG = 3.0e38;
+  for (uint i = t; i < N; i += 1024u) {
+    uint2 da;
+    if (layout == 0u) da = at(instLo, instHi, i * 64u);
+    else { uint2 pa = at(instLo, instHi, i * 8u); da = uint2(ld(pa), ld(at(pa.x, pa.y, 4u))); }
+    float w[12];
+    [unroll] for (uint k = 0u; k < 12u; k++) w[k] = ldf(at(da.x, da.y, 4u * k));
+    uint idm = ld(at(da.x, da.y, 48u)), cfl = ld(at(da.x, da.y, 52u));
+    uint2 blas = uint2(ld(at(da.x, da.y, 56u)), ld(at(da.x, da.y, 60u)));
+    bool valid = false;
+    uint root = 0x3fffffffu;
+    float3 bmn = 0, bmx = 0;
+    if ((blas.x | blas.y) != 0u && (blas.x & 0xffu) == 0u) {
+      uint fl = ld(blas);
+      if ((fl & 0x8000ffffu) == 0x80000004u) {
+        uint r = ld(at(blas.x, blas.y, 48u));
+        if ((r & 7u) != 6u && r != 0xffffffffu) {
+          valid = true;
+          root = r & 0x3fffffffu;
+          box_of(at(blas.x, blas.y, 16u), bmn, bmx);
+        }
+      }
+    }
+    uint2 node = at(dstLo, dstHi, instOff + i * 128u);
+    [unroll] for (uint k2 = 0u; k2 < 12u; k2++) stf(at(node.x, node.y, 4u * k2), w[k2]);
+    st(at(node.x, node.y, 48u), idm);
+    st(at(node.x, node.y, 52u), cfl);
+    st(at(node.x, node.y, 56u), root);
+    st(at(node.x, node.y, 60u), (blas.x >> 8) | (blas.y << 24));
+    float3x3 R = float3x3(w[0], w[1], w[2], w[4], w[5], w[6], w[8], w[9], w[10]);
+    float3 tr = float3(w[3], w[7], w[11]);
+    float det = determinant(R);
+    float3x3 Ri = float3x3(0, 0, 0, 0, 0, 0, 0, 0, 0);
+    if (abs(det) > 1e-30) {
+      float id = 1.0 / det;
+      Ri[0] = float3(R[1][1] * R[2][2] - R[1][2] * R[2][1], R[0][2] * R[2][1] - R[0][1] * R[2][2], R[0][1] * R[1][2] - R[0][2] * R[1][1]) * id;
+      Ri[1] = float3(R[1][2] * R[2][0] - R[1][0] * R[2][2], R[0][0] * R[2][2] - R[0][2] * R[2][0], R[0][2] * R[1][0] - R[0][0] * R[1][2]) * id;
+      Ri[2] = float3(R[1][0] * R[2][1] - R[1][1] * R[2][0], R[0][1] * R[2][0] - R[0][0] * R[2][1], R[0][0] * R[1][1] - R[0][1] * R[1][0]) * id;
+    }
+    float3 ti = -mul(Ri, tr);
+    [unroll] for (uint r2 = 0u; r2 < 3u; r2++) {
+      stf(at(node.x, node.y, 64u + r2 * 16u), Ri[r2].x);
+      stf(at(node.x, node.y, 68u + r2 * 16u), Ri[r2].y);
+      stf(at(node.x, node.y, 72u + r2 * 16u), Ri[r2].z);
+      stf(at(node.x, node.y, 76u + r2 * 16u), ti[r2]);
+    }
+    st(at(node.x, node.y, 112u), i);
+    st(at(node.x, node.y, 116u), 0u);
+    st(at(node.x, node.y, 120u), 0x007F7F7Fu);
+    st(at(node.x, node.y, 124u), 0u);
+    float3 wmn = float3(BIG, BIG, BIG), wmx = float3(-BIG, -BIG, -BIG);
+    if (valid) {
+      [unroll] for (uint c = 0u; c < 8u; c++) {
+        float3 p = float3((c & 1u) ? bmx.x : bmn.x, (c & 2u) ? bmx.y : bmn.y, (c & 4u) ? bmx.z : bmn.z);
+        float3 q = mul(R, p) + tr;
+        wmn = min(wmn, q); wmx = max(wmx, q);
+      }
+      float3 ce = (wmn + wmx) * 0.5;
+      uint o;
+      InterlockedMin(smin[0], ford(ce.x), o); InterlockedMin(smin[1], ford(ce.y), o); InterlockedMin(smin[2], ford(ce.z), o);
+      InterlockedMax(smax[0], ford(ce.x), o); InterlockedMax(smax[1], ford(ce.y), o); InterlockedMax(smax[2], ford(ce.z), o);
+    }
+    put_box(at(scrLo, scrHi, i * 32u), wmn, wmx);
+  }
+  DeviceMemoryBarrierWithGroupSync();
+  bool sortIt = N <= 2048u;
+  uint P = 1u;
+  while (P < N) P <<= 1;
+  if (sortIt) {
+    float3 lo = float3(unord(smin[0]), unord(smin[1]), unord(smin[2]));
+    float3 hi = float3(unord(smax[0]), unord(smax[1]), unord(smax[2]));
+    float3 sc = 1023.0 / max(hi - lo, 1e-20);
+    for (uint i2 = t; i2 < P; i2 += 1024u) {
+      uint key = 0xffffffffu;
+      if (i2 < N) {
+        float3 mn, mx;
+        box_of(at(scrLo, scrHi, i2 * 32u), mn, mx);
+        if (mn.x <= mx.x) {
+          uint3 q = uint3(clamp(((mn + mx) * 0.5 - lo) * sc, 0.0, 1023.0));
+          key = (spread(q.x) << 2) | (spread(q.y) << 1) | spread(q.z);
+        }
+      }
+      keys[i2] = key;
+      idxs[i2] = i2;
+    }
+    GroupMemoryBarrierWithGroupSync();
+    for (uint k3 = 2u; k3 <= P; k3 <<= 1) {
+      for (uint j = k3 >> 1; j > 0u; j >>= 1) {
+        for (uint i3 = t; i3 < P; i3 += 1024u) {
+          uint l = i3 ^ j;
+          if (l > i3) {
+            bool up = (i3 & k3) == 0u;
+            if ((keys[i3] > keys[l]) == up) { uint a = keys[i3]; keys[i3] = keys[l]; keys[l] = a; a = idxs[i3]; idxs[i3] = idxs[l]; idxs[l] = a; }
+          }
+        }
+        GroupMemoryBarrierWithGroupSync();
+      }
+    }
+  }
+  uint cnt = N, base = 0u, prev = 0u, level = 0u;
+  while (cnt > 0u) {
+    uint lc = (cnt + 3u) / 4u;
+    for (uint j2 = t; j2 < lc; j2 += 1024u) {
+      uint2 nd = at(dstLo, dstHi, 64u + (base + j2) * 128u);
+      float3 umn = float3(BIG, BIG, BIG), umx = float3(-BIG, -BIG, -BIG);
+      [unroll] for (uint k4 = 0u; k4 < 4u; k4++) {
+        uint c2 = j2 * 4u + k4;
+        uint ptr = 0xffffffffu;
+        float3 mn = float3(BIG, BIG, BIG), mx = float3(-BIG, -BIG, -BIG);
+        if (c2 < cnt) {
+          if (level == 0u) {
+            uint ii = sortIt ? idxs[c2] : c2;
+            ptr = (((instOff + ii * 128u) >> 6) << 3) | 6u;
+            box_of(at(scrLo, scrHi, ii * 32u), mn, mx);
+          } else {
+            uint bi = prev + c2;
+            ptr = (((64u + bi * 128u) >> 6) << 3) | 5u;
+            box_of(at(scrLo, scrHi, N * 32u + bi * 32u), mn, mx);
+          }
+          if (mn.x <= mx.x) { umn = min(umn, mn); umx = max(umx, mx); }
+        }
+        st(at(nd.x, nd.y, 4u * k4), ptr);
+        put_box(at(nd.x, nd.y, 16u + 24u * k4), mn, mx);
+      }
+      st(at(nd.x, nd.y, 112u), 0u); st(at(nd.x, nd.y, 116u), 0u); st(at(nd.x, nd.y, 120u), 0u); st(at(nd.x, nd.y, 124u), 0u);
+      put_box(at(scrLo, scrHi, N * 32u + (base + j2) * 32u), umn, umx);
+    }
+    DeviceMemoryBarrierWithGroupSync();
+    prev = base;
+    base += lc;
+    level++;
+    cnt = lc == 1u ? 0u : lc;
+  }
+  if (t == 0u) {
+    uint2 h = uint2(dstLo, dstHi);
+    float3 mn = float3(0, 0, 0), mx = float3(0, 0, 0);
+    uint root = 0xffffffffu;
+    if (N > 0u) { root = (((64u + (base - 1u) * 128u) >> 6) << 3) | 5u; box_of(at(scrLo, scrHi, N * 32u + (base - 1u) * 32u), mn, mx); }
+    st(h, 0x00000004u);
+    st(at(h.x, h.y, 4u), (instOff + N * 128u) / 64u);
+    st(at(h.x, h.y, 8u), 0u);
+    st(at(h.x, h.y, 12u), N);
+    put_box(at(h.x, h.y, 16u), mn, mx);
+    st(at(h.x, h.y, 40u), 64u);
+    st(at(h.x, h.y, 44u), 0u);
+    st(at(h.x, h.y, 48u), root);
+    st(at(h.x, h.y, 52u), instOff);
+    st(at(h.x, h.y, 56u), 0u);
+    st(at(h.x, h.y, 60u), 0x007F7F7Fu);
+  }
+}
+)";
+struct AsDump { ID3D12Resource* rb; uint64_t va; uint64_t frame; };
+std::vector<AsDump> g_as_dumps;   // XSL_AS_DUMP / XSL_TLAS_DUMP readbacks
+bool compile_layer_shader(const std::string& hlsl, const char* profile, std::vector<uint8_t>& out, std::string& log);
+struct TlasBuilder { ID3D12RootSignature* rs = nullptr; ID3D12PipelineState* pso = nullptr; bool failed = false; std::mutex mu; } g_tlas;
+static bool tlas_init(ID3D12Device* dev) {
+    std::lock_guard<std::mutex> g(g_tlas.mu);
+    if (g_tlas.pso) return true;
+    if (g_tlas.failed) return false;
+    g_tlas.failed = true;
+    std::vector<uint8_t> cs;
+    std::string log;
+    if (!compile_layer_shader(std::string(kTlasBuilder, sizeof kTlasBuilder - 1), "cs_6_0", cs, log)) {
+        XSL_ERR(CH, "TLAS builder: compile failed: %s", log.c_str());
+        return false;
+    }
+    ID3DBlob* err = nullptr;
+    static const D3D12_DESCRIPTOR_RANGE ranges[3] = {
+        {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0, 901, 0},
+        {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, kGmHalf - 1, 0, 900, 1},
+        {D3D12_DESCRIPTOR_RANGE_TYPE_UAV, kGmSlots - kGmHalf, 0, 900, kGmHalf}};
+    D3D12_ROOT_PARAMETER params[2] = {};
+    params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    params[0].Constants.Num32BitValues = 12;
+    params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    params[1].DescriptorTable = {3, ranges};
+    D3D12_ROOT_SIGNATURE_DESC rsd{2, params, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_NONE};
+    ID3DBlob* rsb = nullptr;
+    if (FAILED(D3D12SerializeRootSignature(&rsd, D3D_ROOT_SIGNATURE_VERSION_1, &rsb, &err)) ||
+        FAILED(dev->CreateRootSignature(0, rsb->GetBufferPointer(), rsb->GetBufferSize(), IID_PPV_ARGS(&g_tlas.rs)))) {
+        XSL_ERR(CH, "TLAS builder: root signature failed");
+        return false;
+    }
+    D3D12_COMPUTE_PIPELINE_STATE_DESC pd{};
+    pd.pRootSignature = g_tlas.rs;
+    pd.CS = {cs.data(), cs.size()};
+    if (FAILED(dev->CreateComputePipelineState(&pd, IID_PPV_ARGS(&g_tlas.pso)))) { XSL_ERR(CH, "TLAS builder: pipeline failed"); return false; }
+    g_tlas.failed = false;
+    XSL_INFO(CH, "top-level acceleration structures are built in the console layout");
+    return true;
+}
+uint64_t tlas_console_size(uint32_t n) {   // bytes of the layout above for n instances
+    uint64_t boxes = 0;
+    for (uint64_t c = n; c > 0;) { uint64_t lc = (c + 3) / 4; boxes += lc; c = lc == 1 ? 0 : lc; }
+    return 64 + boxes * 128 + (uint64_t)n * 128;
+}
+uint64_t tlas_scratch_size(uint32_t n) { return (uint64_t)n * 32 + (tlas_console_size(n) / 128) * 32 + 256; }
+static void restore_compute_state(PcObj l);
+bool list_rt_build_tlas(PcObj l, uint64_t dst, uint64_t inst, uint32_t n, uint32_t layout, uint64_t scratch) {
+    if (!gm_enabled() || !g_gv || !g_main_device) return false;
+    {
+        std::lock_guard<std::mutex> g(g_gm_mu);
+        auto h = g_list_global_heap.find(l);
+        if (h == g_list_global_heap.end() || !h->second) {
+            static volatile long w = 0;
+            if (InterlockedIncrement(&w) <= 3) XSL_WARN(CH, "TLAS build on a list without the global heap bound: skipped");
+            return false;
+        }
+    }
+    {   // memory made this frame (transient instance buffers) may not be in the GPU table yet
+        std::lock_guard<std::mutex> g(g_gm_mu);
+        if (!gm_in_table(inst, (uint64_t)n * (layout ? 8 : 64)) || !gm_in_table(dst, 64) || !gm_in_table(scratch, 32)) { g_gm_force = true; g_gm_dirty = true; }
+    }
+    PcObj dr, sr; uint64_t doff, davail, soff, savail;
+    uint64_t boxes = (tlas_console_size(n) - 64 - (uint64_t)n * 128) / 128;
+    uint64_t instOff = 64 + boxes * 128;
+    if (!gm_resolve(dst, &dr, &doff, &davail) || davail < tlas_console_size(n) || !gm_resolve(scratch, &sr, &soff, &savail) ||
+        savail < (uint64_t)n * 32 + boxes * 32) {
+        static volatile long w = 0;
+        if (InterlockedIncrement(&w) <= 5)
+            XSL_WARN(CH, "TLAS build (%u instances) at %llx: destination or scratch too small or not addressable", n, (unsigned long long)dst);
+        return false;
+    }
+    if (!tlas_init(g_main_device)) return false;
+    auto* L2 = as<ID3D12GraphicsCommandList>(l);
+    D3D12_RESOURCE_BARRIER ub{};
+    ub.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+    L2->ResourceBarrier(1, &ub);   // instance data written just before
+    L2->SetPipelineState(g_tlas.pso);
+    L2->SetComputeRootSignature(g_tlas.rs);
+    uint32_t c[12] = {(uint32_t)dst, (uint32_t)(dst >> 32), (uint32_t)inst, (uint32_t)(inst >> 32), (uint32_t)scratch, (uint32_t)(scratch >> 32),
+                      n, layout, (uint32_t)instOff, 0, 0, 0};
+    L2->SetComputeRoot32BitConstants(0, 12, c, 0);
+    L2->SetComputeRootDescriptorTable(1, D3D12_GPU_DESCRIPTOR_HANDLE{g_gv->GetGPUDescriptorHandleForHeapStart().ptr + (uint64_t)gm_reserved_start() * g_gv_inc});
+    L2->Dispatch(1, 1, 1);
+    L2->ResourceBarrier(1, &ub);
+    static volatile long dumped = 0;
+    if (n && getenv("XSL_TLAS_DUMP") && InterlockedIncrement(&dumped) == 1) {   // header, first box nodes, first instance nodes
+        auto tr = [&](D3D12_RESOURCE_STATES a, D3D12_RESOURCE_STATES b) {
+            D3D12_RESOURCE_BARRIER t{};
+            t.Transition.pResource = as<ID3D12Resource>(dr);
+            t.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+            t.Transition.StateBefore = a;
+            t.Transition.StateAfter = b;
+            L2->ResourceBarrier(1, &t);
+        };
+        tr(D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        for (uint64_t part : {0ull, instOff}) {
+            D3D12_HEAP_PROPERTIES hp{D3D12_HEAP_TYPE_READBACK};
+            D3D12_RESOURCE_DESC bd{};
+            bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+            bd.Width = 512;
+            bd.Height = bd.DepthOrArraySize = bd.MipLevels = 1;
+            bd.SampleDesc.Count = 1;
+            bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+            ID3D12Resource* rb = nullptr;
+            if (FAILED(g_main_device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&rb)))) continue;
+            L2->CopyBufferRegion(rb, 0, as<ID3D12Resource>(dr), doff + part, 512);
+            std::lock_guard<std::mutex> g(g_gm_mu);
+            g_as_dumps.push_back({rb, dst + part, g_gm_frame.load()});
+        }
+        tr(D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    }
+    restore_compute_state(l);
+    static volatile long logged = 0;
+    if (InterlockedIncrement(&logged) <= 3) {
+        PcObj ir; uint64_t io = 0, ia = 0;
+        bool ok = gm_resolve(inst, &ir, &io, &ia);
+        D3D12_HEAP_PROPERTIES ihp{};
+        if (ok) as<ID3D12Resource>(ir)->GetHeapProperties(&ihp, nullptr);
+        XSL_INFO(CH, "TLAS build: %u instances at %llx (console layout, %llu bytes), instance descs %llx %s (heap type %d, %llu bytes there)", n,
+                 (unsigned long long)dst, (unsigned long long)tlas_console_size(n), (unsigned long long)inst, ok ? "addressable" : "NOT addressable",
+                 (int)ihp.Type, (unsigned long long)ia);
+    }
+    return true;
+}
 // DESERIALIZE: the console structure follows the 56-byte serialized header (and its BLAS pointers)
 // at a 64-byte boundary; its node pointers are relative, so it is copied as bytes.
 void list_rt_deserialize(PcObj l, uint64_t dst, uint64_t src) {
@@ -607,8 +948,6 @@ bool gm_resolve(uint64_t va, PcObj* res, uint64_t* off, uint64_t* avail) {
 }
 // XSL_AS_DUMP=1: the first 512 bytes of serialized acceleration structures, logged a few frames later.
 namespace {
-struct AsDump { ID3D12Resource* rb; uint64_t va; uint64_t frame; };
-std::vector<AsDump> g_as_dumps;
 }  // namespace
 void list_dump_memory(PcObj l, uint64_t va, const char* what) {
     static int n = 0;
@@ -696,8 +1035,11 @@ void gm_flush(PcObj devObj) {
     }
     std::lock_guard<std::mutex> g(g_gm_mu);
     if (!g_gm_dirty) return;
-    if (g_gm_built_at == g_gm_frame.load()) return;   // at most one rebuild per frame
+    if (g_gm_built_at == g_gm_frame.load() && !g_gm_force) return;   // at most one rebuild per frame (unless needed)
     g_gm_built_at = g_gm_frame.load();
+    g_gm_force = false;
+    g_gm_built.clear();
+    for (auto& [va, e] : g_gm) g_gm_built.push_back({va, e.size});
     g_gm_dirty = false;
     auto* dev = as<ID3D12Device>(devObj);
     const uint32_t base = gm_reserved_start();
@@ -3502,7 +3844,7 @@ HRESULT_T present(PcObj devObj, PcObj queueObj, PcObj resObj, void* hwndPtr, uin
         probe_present(g_present_count);
         prof_report(as<ID3D12CommandQueue>(q));
         ++g_gm_frame;
-        if (getenv("XSL_AS_DUMP")) print_dumps();
+        if (getenv("XSL_AS_DUMP") || getenv("XSL_TLAS_DUMP")) print_dumps();
         if (g_info && g_present_count % 30 == 0) dump_debug_messages();   // debug layer: what it reported since the last dump
         if (trace_writers()) { std::lock_guard<std::mutex> g(g_wr_mu); g_planes.insert((PcObj)res); }
         if (trace_writers() && plane_ops_now()) { XSL_INFO(CH, "plane op: present %llu of %p on queue %p", (unsigned long long)g_present_count, (void*)res, (void*)q); report_aliases((PcObj)res); }

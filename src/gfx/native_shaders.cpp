@@ -330,4 +330,8 @@ bool native_translate(const void* in, size_t n, void** out, size_t* outSize) {
     return true;
 }
 
+// The layer's own shaders (HLSL written here, not translated) through the same PC compiler.
+bool compile_layer_shader(const std::string& hlsl, const char* profile, std::vector<uint8_t>& out, std::string& log) {
+    return compile(hlsl, profile, out, log);
+}
 }  // namespace pc

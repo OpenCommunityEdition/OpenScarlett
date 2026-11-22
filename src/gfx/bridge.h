@@ -87,6 +87,10 @@ void gm_forget(PcObj res);             // the resource is being destroyed
 void gm_flush(PcObj dev);
 bool gm_resolve(uint64_t va, PcObj* res, uint64_t* off, uint64_t* avail);
 void list_rt_deserialize(PcObj l, uint64_t dst, uint64_t src);   // console structure bytes into the destination's shadow
+// Top-level build in the console layout (into the destination's shadow); false: not built.
+bool list_rt_build_tlas(PcObj l, uint64_t dst, uint64_t instances, uint32_t count, uint32_t layout, uint64_t scratch);
+uint64_t tlas_console_size(uint32_t instances);
+uint64_t tlas_scratch_size(uint32_t instances);
 void list_dump_memory(PcObj l, uint64_t va, const char* what);   // XSL_AS_DUMP diagnostics              // before each submission: views and address table
 uint32_t gm_reserved_start();
 bool gm_active();                      // translated shaders may use global memory          // first global-heap slot reserved for it (UINT32_MAX: none)   // console D3D12_RESOURCE_STATES -> PC

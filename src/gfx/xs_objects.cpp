@@ -940,6 +940,9 @@ void D3DAPI L_BuildRtAs(ID3D12GraphicsCommandList4* l4, const D3D12_BUILD_RAYTRA
                      (unsigned long long)d->ScratchAccelerationStructureData);
     }
     if (!rt_build_on()) {
+        if (d->Inputs.Type == D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL)   // translated ray queries read the console layout
+            pc::list_rt_build_tlas(LPC(l), d->DestAccelerationStructureData, d->Inputs.InstanceDescs, d->Inputs.NumDescs,
+                                   d->Inputs.DescsLayout == D3D12_ELEMENTS_LAYOUT_ARRAY_OF_POINTERS ? 1u : 0u, d->ScratchAccelerationStructureData);
         for (UINT i = 0; i < np; i++) rt_fake_postbuild(l, hdr(l)->device, post[i], 1);
         return;
     }

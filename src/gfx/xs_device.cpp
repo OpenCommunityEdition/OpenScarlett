@@ -696,6 +696,12 @@ void D3DAPI D_GetRaytracingAccelerationStructurePrebuildInfo(ID3D12Device5* d, c
         info->ScratchDataSizeInBytes = 64 * 1024;
         info->UpdateScratchDataSizeInBytes = 64 * 1024;
     }
+    if (in && in->Type == D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL) {   // room for the console layout (pc::list_rt_build_tlas)
+        UINT64 need = (pc::tlas_console_size(in->NumDescs) + 255) & ~255ull, scr = (pc::tlas_scratch_size(in->NumDescs) + 255) & ~255ull;
+        if (info->ResultDataMaxSizeInBytes < need) info->ResultDataMaxSizeInBytes = need;
+        if (info->ScratchDataSizeInBytes < scr) info->ScratchDataSizeInBytes = scr;
+        if (info->UpdateScratchDataSizeInBytes < scr) info->UpdateScratchDataSizeInBytes = scr;
+    }
 }
 
 void D3DAPI D_GetRaytracingAccelerationStructurePrebuildInfoX(ID3D12Device8* d, const D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS* in,
