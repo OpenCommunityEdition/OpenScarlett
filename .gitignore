@@ -24,3 +24,12 @@
 patches.txt
 __pycache__/
 *.pyc
+
+# Binaries, libraries and compiled shaders never belong in the tree (tools/check-files).
+*.dll
+*.exe
+*.lib
+*.dxbc
+*.dxil
+*.fssm
+*.bk2

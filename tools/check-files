@@ -1,0 +1,21 @@
+#!/bin/sh
+# SPDX-License-Identifier: MIT
+# Repository hygiene (AGENTS.md rules 1, 2 and 5), for CI and as a pre-commit hook:
+#  - no Microsoft or title binaries, symbols, images or compiled shaders among the tracked files;
+#  - no SDK header text;
+#  - an SPDX licence tag in every source file.
+# Usage: tools/check-files [--staged]   (exit 1 on a problem)
+cd "$(dirname "$0")/.." || exit 2
+if [ "$1" = "--staged" ]; then files=$(git diff --cached --name-only --diff-filter=ACM); else files=$(git ls-files); fi
+status=0
+bad=$(printf '%s\n' "$files" | grep -iE '\.(dll|exe|lib|pdb|xvd|cso|dxbc|dxil|fssm|bk2|xex|msixvc)$' | grep -v '^third_party/')
+if [ -n "$bad" ]; then echo "binaries, symbols or shader objects must not be committed:"; echo "$bad"; status=1; fi
+# SDK headers carry Microsoft's copyright banner; none may enter the tree.
+sdk=$(printf '%s\n' "$files" | grep -E '\.(h|hpp|inc|idl)$' | grep -v '^third_party/' | while read -r f; do
+    [ -f "$f" ] && grep -lE 'Copyright \(c\) Microsoft Corporation|Microsoft Confidential' "$f"; done)
+if [ -n "$sdk" ]; then echo "files with Microsoft copyright banners (SDK content?):"; echo "$sdk"; status=1; fi
+nospdx=$(printf '%s\n' "$files" | grep -E '^(src|tools|tests)/.*\.(c|cc|cpp|h|hpp|py|sh|hlsl|hlsli|cmake)$|^tools/[^./]+$' | while read -r f; do
+    [ -f "$f" ] && ! head -5 "$f" | grep -q 'SPDX-License-Identifier' && echo "$f"; done)
+if [ -n "$nospdx" ]; then echo "files without an SPDX-License-Identifier in their first lines:"; echo "$nospdx"; status=1; fi
+[ $status -eq 0 ] && echo "check-files: ok ($(printf '%s\n' "$files" | wc -l) files)"
+exit $status
