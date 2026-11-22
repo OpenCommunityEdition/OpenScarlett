@@ -424,11 +424,33 @@ HRESULT_T create_list(PcObj dev, int type, PcObj alloc, PcObj pso, PcObj* out) {
     }
     return hr;
 }
+// Writer tracing: shader-visible view heaps other than the global one (GPU start, CPU start, bytes).
+struct SvHeap { uint64_t gpu, cpu, bytes; };
+std::vector<SvHeap> g_sv_heaps;
+std::mutex g_sv_mu;
 HRESULT_T create_descriptor_heap(PcObj dev, const void* desc, PcObj* out) {
     D3D12_DESCRIPTOR_HEAP_DESC d = *static_cast<const D3D12_DESCRIPTOR_HEAP_DESC*>(desc);
     d.Flags &= D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
     if ((int)d.Type > 3) d.Type = D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER;  // Xbox "sampler unbounded"
-    return logged(as<ID3D12Device>(dev)->CreateDescriptorHeap(&d, IID_PPV_ARGS(reinterpret_cast<ID3D12DescriptorHeap**>(out))), "CreateDescriptorHeap");
+    HRESULT hr = logged(as<ID3D12Device>(dev)->CreateDescriptorHeap(&d, IID_PPV_ARGS(reinterpret_cast<ID3D12DescriptorHeap**>(out))), "CreateDescriptorHeap");
+    if (SUCCEEDED(hr) && (d.Flags & D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE) && d.Type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) {
+        auto* h = as<ID3D12DescriptorHeap>(*out);
+        std::lock_guard<std::mutex> g(g_sv_mu);
+        g_sv_heaps.push_back({h->GetGPUDescriptorHandleForHeapStart().ptr, h->GetCPUDescriptorHandleForHeapStart().ptr,
+                              (uint64_t)d.NumDescriptors * as<ID3D12Device>(dev)->GetDescriptorHandleIncrementSize(d.Type)});
+    }
+    return hr;
+}
+// GPU view handle -> CPU handle in the global heap or another shader-visible view heap (0 if none).
+uint64_t sv_gpu_to_cpu(uint64_t h) {
+    if (g_gv) {
+        uint64_t g0 = g_gv->GetGPUDescriptorHandleForHeapStart().ptr;
+        if (h >= g0 && h < g0 + (uint64_t)g_gv_size * g_gv_inc) return g_gv->GetCPUDescriptorHandleForHeapStart().ptr + (h - g0);
+    }
+    std::lock_guard<std::mutex> g(g_sv_mu);
+    for (auto& e : g_sv_heaps)
+        if (h >= e.gpu && h < e.gpu + e.bytes) return e.cpu + (h - e.gpu);
+    return 0;
 }
 uint32_t descriptor_increment(PcObj dev, int type) {
     if (type > 3) type = D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER;
@@ -828,6 +850,8 @@ bool cached_upload(D3D12_HEAP_PROPERTIES* hp) {
 }
 
 static void note_texture(PcObj r);
+static void note_buffer(PcObj r);
+static void note_buffer_fwd(PcObj r) { note_buffer(r); }
 HRESULT_T create_committed_resource(PcObj dev, const void* heapProps, uint32_t heapFlags, const void* desc,
                                     uint32_t state, const void* clear, PcObj* out) {
     D3D12_RESOURCE_DESC d = clean_desc(desc);
@@ -864,6 +888,7 @@ HRESULT_T create_committed_resource(PcObj dev, const void* heapProps, uint32_t h
     else if (hp.Type == D3D12_HEAP_TYPE_READBACK) st = D3D12_RESOURCE_STATE_COPY_DEST;
     HRESULT hr = as<ID3D12Device>(dev)->CreateCommittedResource(&hp, clean_heap_flags(heapFlags), &d, st, cv,
                                                                 IID_PPV_ARGS(reinterpret_cast<ID3D12Resource**>(out)));
+    if (SUCCEEDED(hr)) note_buffer_fwd(*out);
     if (SUCCEEDED(hr)) note_texture(*out);
     if (SUCCEEDED(hr) && remap) {
         std::lock_guard<std::mutex> g(g_remap_mu);
@@ -969,6 +994,16 @@ HRESULT_T create_heap(PcObj dev, const void* desc, PcObj* out) {
     }
     return logged(as<ID3D12Device>(dev)->CreateHeap(&d, IID_PPV_ARGS(reinterpret_cast<ID3D12Heap**>(out))), "CreateHeap");
 }
+std::map<uint64_t, std::pair<PcObj, uint64_t>> g_buf_va;   // writer tracing: buffer GPU VA -> (resource, size)
+std::mutex g_buf_va_mu;
+static void note_buffer(PcObj r) {
+    if (false) return;
+    if (!r || !getenv("XSL_TRACE_BUFFER")) return;
+    D3D12_RESOURCE_DESC d = as<ID3D12Resource>(r)->GetDesc();
+    if (d.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER) return;
+    std::lock_guard<std::mutex> g(g_buf_va_mu);
+    g_buf_va[as<ID3D12Resource>(r)->GetGPUVirtualAddress()] = {r, d.Width};
+}
 struct Placed { PcObj res, heap; uint64_t offset, size; };
 std::mutex g_placed_mu;
 std::vector<Placed> g_placed;
@@ -979,6 +1014,7 @@ HRESULT_T create_placed_resource(PcObj dev, PcObj heap, uint64_t offset, const v
     HRESULT hr = logged(as<ID3D12Device>(dev)->CreatePlacedResource(as<ID3D12Heap>(heap), offset, &d, pc_state(state), cv,
                                                              IID_PPV_ARGS(reinterpret_cast<ID3D12Resource**>(out))), "CreatePlacedResource");
     if (SUCCEEDED(hr)) note_texture(*out);
+    if (SUCCEEDED(hr)) note_buffer(*out);
     if (SUCCEEDED(hr) && getenv("XSL_TRACE_WRITERS")) {   // placed resources, for aliasing checks at present
         D3D12_RESOURCE_ALLOCATION_INFO ai = as<ID3D12Device>(dev)->GetResourceAllocationInfo(0, 1, &d);
         std::lock_guard<std::mutex> g(g_placed_mu);
@@ -1023,6 +1059,7 @@ std::vector<uint64_t> g_traced_cbvs;                          // CBVs of the tra
 static void note_reads(PcObj l, bool compute);
 std::map<PcObj, std::pair<PcObj, uint64_t>> g_cs_writer;      // big texture -> (compute pipeline, present)
 static void note_dispatch(PcObj l);
+static void note_dispatch(PcObj l, bool compute);
 static uint64_t rt_stats_at() { static uint64_t v = [] { char b[16]; return GetEnvironmentVariableA("XSL_RT_STATS", b, sizeof b) ? _strtoui64(b, nullptr, 10) : 0ull; }(); return v; }
 static void note_texture(PcObj r) {
     if (!trace_writers() || !r) return;
@@ -1491,8 +1528,8 @@ static void trace_draw_target(PcObj l, uint32_t n) {
         } else XSL_INFO(CH, "pso %s: draws with no render target 0 bound", tn.c_str());
     }
 }
-void list_draw(PcObj l, uint32_t a, uint32_t b, uint32_t c, uint32_t d) { trace_draw_target(l, a * b); note_draw(l); note_reads(l, false); L->DrawInstanced(a, b, c, d); }
-void list_draw_indexed(PcObj l, uint32_t a, uint32_t b, uint32_t c, int32_t d, uint32_t e) { trace_draw_target(l, a * b); note_draw(l); note_reads(l, false); L->DrawIndexedInstanced(a, b, c, d, e); }
+void list_draw(PcObj l, uint32_t a, uint32_t b, uint32_t c, uint32_t d) { trace_draw_target(l, a * b); if (getenv("XSL_TRACE_BUFFER")) note_dispatch(l, false); note_draw(l); note_reads(l, false); L->DrawInstanced(a, b, c, d); }
+void list_draw_indexed(PcObj l, uint32_t a, uint32_t b, uint32_t c, int32_t d, uint32_t e) { trace_draw_target(l, a * b); if (getenv("XSL_TRACE_BUFFER")) note_dispatch(l, false); note_draw(l); note_reads(l, false); L->DrawIndexedInstanced(a, b, c, d, e); }
 struct EiTrace { long slot; std::string name; uint64_t present; };
 static std::vector<EiTrace> g_ei_trace;   // traced indirect dispatches whose arguments are printed later
 static bool trace_dispatch_size(PcObj l, const char* how, uint32_t x, uint32_t y, uint32_t z, std::string* name) {
@@ -1527,18 +1564,51 @@ void list_dispatch(PcObj l, uint32_t x, uint32_t y, uint32_t z) {
     L->Dispatch(x, y, z);
 }
 // A dispatch writes the big textures whose UAVs are in the first slots of its compute tables.
-static void note_dispatch(PcObj l) {
+static void note_dispatch(PcObj l) { note_dispatch(l, true); }
+static void note_dispatch(PcObj l, bool compute) {
     if (!trace_writers() || !g_gv) return;
     std::lock_guard<std::mutex> g(g_wr_mu);
-    auto t = g_cs_tables.find(l);
-    if (t == g_cs_tables.end()) return;
+    auto& tabs = compute ? g_cs_tables : g_gfx_tables;
+    auto t = tabs.find(l);
+    if (t == tabs.end()) return;
     uint64_t gpu0 = g_gv->GetGPUDescriptorHandleForHeapStart().ptr, cpu0 = g_gv->GetCPUDescriptorHandleForHeapStart().ptr;
     for (auto& [idx, h] : t->second) {
-        if (h < gpu0 || h >= gpu0 + (uint64_t)g_gv_size * g_gv_inc) continue;
-        uint64_t c = cpu0 + (h - gpu0);
+        uint64_t c = sv_gpu_to_cpu(h);
+        if (!c) continue;
+        (void)gpu0; (void)cpu0;
         for (uint32_t k = 0; k < 64; k++) {
             auto it = g_uav_res.find(c + (uint64_t)k * g_gv_inc);
             if (it == g_uav_res.end()) continue;
+            // XSL_TRACE_BUFFER=<size in bytes>: every compute writer of buffers of that size in the examined frame
+            static uint64_t tb = [] { char b[24]; return GetEnvironmentVariableA("XSL_TRACE_BUFFER", b, sizeof b) ? _strtoui64(b, nullptr, 10) : 0ull; }();
+            if (tb) {
+                D3D12_RESOURCE_DESC d = as<ID3D12Resource>(it->second)->GetDesc();
+                static std::set<std::pair<PcObj, PcObj>> seen;   // (buffer, pipeline) pairs already logged
+                PcObj pso0 = g_wr_pso.count(l) ? g_wr_pso[l] : nullptr;
+                if (d.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER && d.Width == tb && seen.insert({it->second, pso0}).second) {
+                    PcObj pso = g_wr_pso.count(l) ? g_wr_pso[l] : nullptr;
+                    wchar_t wn[128] = L"?";
+                    UINT sz = sizeof wn;
+                    if (pso) as<ID3D12PipelineState>(pso)->GetPrivateData(WKPDID_D3DDebugObjectNameW, &sz, wn);
+                    XSL_INFO(CH, "frame writer of buffer %p: %ls (table %u slot %u, present %llu)", (void*)it->second, wn, idx, k, (unsigned long long)g_wr_present.load());
+                }
+            }
+            // XSL_TRACE_TEX=<width>x<height>: every (texture, pipeline) pair writing textures of that size
+            static uint32_t tw = 0, th = 0;
+            static bool ti = [] { char b[32]; if (GetEnvironmentVariableA("XSL_TRACE_TEX", b, sizeof b)) sscanf(b, "%ux%u", &tw, &th); return true; }();
+            (void)ti;
+            if (tw) {
+                D3D12_RESOURCE_DESC d = as<ID3D12Resource>(it->second)->GetDesc();
+                static std::set<std::pair<PcObj, PcObj>> seen_t;
+                PcObj pso0 = g_wr_pso.count(l) ? g_wr_pso[l] : nullptr;
+                if (d.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER && d.Width == tw && d.Height == th && seen_t.insert({it->second, pso0}).second) {
+                    wchar_t wn[128] = L"?";
+                    UINT sz = sizeof wn;
+                    if (pso0) as<ID3D12PipelineState>(pso0)->GetPrivateData(WKPDID_D3DDebugObjectNameW, &sz, wn);
+                    XSL_INFO(CH, "writer of texture %p (%ux%u fmt %d): %ls (table %u slot %u, present %llu)", (void*)it->second, tw, th, (int)d.Format, wn, idx, k,
+                             (unsigned long long)g_wr_present.load());
+                }
+            }
             for (PcObj b : g_big_textures)
                 if (b == it->second) {
                     PcObj pso = g_wr_pso.count(l) ? g_wr_pso[l] : nullptr;
@@ -1778,8 +1848,9 @@ static void note_reads(PcObj l, bool compute) {
             static int shown = 0;
             if (shown++ < 3)
                 for (auto& [idx, h] : t->second) {
-                    if (h < gpu0 || h >= gpu0 + (uint64_t)g_gv_size * g_gv_inc) continue;
-                    uint64_t c = cpu0 + (h - gpu0);
+                    uint64_t c = sv_gpu_to_cpu(h);
+                    if (!c) continue;
+                    (void)gpu0; (void)cpu0;
                     for (uint32_t k = 0; k < 16; k++) {
                         if (auto cb = g_cbv_va.find(c + (uint64_t)k * g_gv_inc); cb != g_cbv_va.end()) {
                             const float* f = nullptr;
@@ -1797,15 +1868,20 @@ static void note_reads(PcObj l, bool compute) {
                         PcObj r = it != g_srv_res.end() ? it->second : ju != g_uav_res.end() ? ju->second : nullptr;
                         if (!r) continue;
                         D3D12_RESOURCE_DESC d = as<ID3D12Resource>(r)->GetDesc();
-                        XSL_INFO(CH, "pso %s table %u slot %u: %s %p %llux%u fmt %d", nm, idx, k, it != g_srv_res.end() ? "SRV" : "UAV", r,
-                                 (unsigned long long)d.Width, d.Height, (int)d.Format);
+                        D3D12_HEAP_PROPERTIES hp{};
+                        D3D12_HEAP_FLAGS hf{};
+                        bool committed = SUCCEEDED(as<ID3D12Resource>(r)->GetHeapProperties(&hp, &hf));
+                        XSL_INFO(CH, "pso %s table %u slot %u: %s %p %llux%u fmt %d (%s heap type %d cpu page %d) va %llx", nm, idx, k, it != g_srv_res.end() ? "SRV" : "UAV", r,
+                                 (unsigned long long)d.Width, d.Height, (int)d.Format, committed ? "committed" : "placed", (int)hp.Type, (int)hp.CPUPageProperty,
+                                 d.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER ? (unsigned long long)as<ID3D12Resource>(r)->GetGPUVirtualAddress() : 0ull);
                     }
                 }
         }
     }
     for (auto& [idx, h] : t->second) {
-        if (h < gpu0 || h >= gpu0 + (uint64_t)g_gv_size * g_gv_inc) continue;
-        uint64_t c = cpu0 + (h - gpu0);
+        uint64_t c = sv_gpu_to_cpu(h);
+        if (!c) continue;
+        (void)gpu0; (void)cpu0;
         for (uint32_t k = 0; k < 64; k++) {
             auto it = g_srv_res.find(c + (uint64_t)k * g_gv_inc);
             if (it == g_srv_res.end() || !it->second) continue;
@@ -1825,8 +1901,22 @@ void list_gfx_root_cbv(PcObj l, uint32_t i, uint64_t va) { L->SetGraphicsRootCon
 void list_compute_root_cbv(PcObj l, uint32_t i, uint64_t va) { L->SetComputeRootConstantBufferView(i, va); }
 void list_gfx_root_srv(PcObj l, uint32_t i, uint64_t va) { L->SetGraphicsRootShaderResourceView(i, va); }
 void list_compute_root_srv(PcObj l, uint32_t i, uint64_t va) { L->SetComputeRootShaderResourceView(i, va); }
-void list_gfx_root_uav(PcObj l, uint32_t i, uint64_t va) { L->SetGraphicsRootUnorderedAccessView(i, va); }
-void list_compute_root_uav(PcObj l, uint32_t i, uint64_t va) { L->SetComputeRootUnorderedAccessView(i, va); }
+// XSL_TRACE_BUFFER=<size>: root UAVs into buffers of that size during the examined frame.
+static void trace_root_uav(PcObj l, uint32_t i, uint64_t va, const char* kind) {
+    static uint64_t tb = [] { char b[24]; return GetEnvironmentVariableA("XSL_TRACE_BUFFER", b, sizeof b) ? _strtoui64(b, nullptr, 10) : 0ull; }();
+    if (!tb || !trace_writers()) return;
+    std::lock_guard<std::mutex> g(g_buf_va_mu);
+    auto m = g_buf_va.upper_bound(va);
+    if (m == g_buf_va.begin() || (--m, va >= m->first + m->second.second) || m->second.second != tb) return;
+    PcObj pso = nullptr;
+    { std::lock_guard<std::mutex> g2(g_wr_mu); pso = g_wr_pso.count(l) ? g_wr_pso[l] : nullptr; }
+    wchar_t wn[128] = L"?";
+    UINT sz = sizeof wn;
+    if (pso) as<ID3D12PipelineState>(pso)->GetPrivateData(WKPDID_D3DDebugObjectNameW, &sz, wn);
+    XSL_INFO(CH, "frame %s root UAV %u of buffer %p +%llu: %ls", kind, i, (void*)m->second.first, (unsigned long long)(va - m->first), wn);
+}
+void list_gfx_root_uav(PcObj l, uint32_t i, uint64_t va) { trace_root_uav(l, i, va, "graphics"); L->SetGraphicsRootUnorderedAccessView(i, va); }
+void list_compute_root_uav(PcObj l, uint32_t i, uint64_t va) { trace_root_uav(l, i, va, "compute"); L->SetComputeRootUnorderedAccessView(i, va); }
 void list_gfx_root_constants(PcObj l, uint32_t i, uint32_t n, const void* d, uint32_t o) { L->SetGraphicsRoot32BitConstants(i, n, d, o); }
 void list_compute_root_constants(PcObj l, uint32_t i, uint32_t n, const void* d, uint32_t o) { L->SetComputeRoot32BitConstants(i, n, d, o); }
 // Bytes per element and block width (1, or 4 for block-compressed) of a DXGI format; {0, 0} for
@@ -1875,6 +1965,10 @@ bool rebase_footprint(D3D12_PLACED_SUBRESOURCE_FOOTPRINT* p, UINT* x0, UINT* y0)
     return true;
 }
 void list_copy_buffer_region(PcObj l, PcObj dst, uint64_t doff, PcObj src, uint64_t soff, uint64_t n) {
+    static uint64_t tb = [] { char b[24]; return GetEnvironmentVariableA("XSL_TRACE_BUFFER", b, sizeof b) ? _strtoui64(b, nullptr, 10) : 0ull; }();
+    if (tb && trace_writers() && as<ID3D12Resource>(dst)->GetDesc().Width == tb)
+        XSL_INFO(CH, "frame copy into buffer %p +%llu: %llu bytes from %p (%llu bytes) +%llu", (void*)dst, (unsigned long long)doff, (unsigned long long)n, (void*)src,
+                 (unsigned long long)as<ID3D12Resource>(src)->GetDesc().Width, (unsigned long long)soff);
     L->CopyBufferRegion(as<ID3D12Resource>(dst), doff, as<ID3D12Resource>(src), soff, n);
 }
 void warn_unaligned_copy(const D3D12_PLACED_SUBRESOURCE_FOOTPRINT& p) {
@@ -1977,7 +2071,12 @@ void list_copy_texture_region(PcObj l, const void* dst, uint32_t x, uint32_t y, 
     }
     L->CopyTextureRegion(&d, x, y, z, &s, pb);
 }
-void list_copy_resource(PcObj l, PcObj dst, PcObj src) { plane_op(l, dst, "copy resource"); L->CopyResource(as<ID3D12Resource>(dst), as<ID3D12Resource>(src)); }
+void list_copy_resource(PcObj l, PcObj dst, PcObj src) {
+    static uint64_t tb = [] { char b[24]; return GetEnvironmentVariableA("XSL_TRACE_BUFFER", b, sizeof b) ? _strtoui64(b, nullptr, 10) : 0ull; }();
+    if (tb && trace_writers() && g_wr_present.load() + 1 == rt_stats_at() && as<ID3D12Resource>(dst)->GetDesc().Dimension == D3D12_RESOURCE_DIMENSION_BUFFER &&
+        as<ID3D12Resource>(dst)->GetDesc().Width == tb)
+        XSL_INFO(CH, "frame copy of resource %p into buffer %p", (void*)src, (void*)dst);
+    plane_op(l, dst, "copy resource"); L->CopyResource(as<ID3D12Resource>(dst), as<ID3D12Resource>(src)); }
 void list_resolve_subresource(PcObj l, PcObj dst, uint32_t ds, PcObj src, uint32_t ss, int fmt) {
     // The console resolves between resources whose sizes may differ (a 1080p target into a plane
     // sized from the window's client area); PC D3D12 requires identical sizes and puts the list in
