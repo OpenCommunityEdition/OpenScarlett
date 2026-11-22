@@ -41,6 +41,8 @@ struct AV {
     uint32_t b = 0;   // Desc: byte offset of this word in the table; RootLo: byte offset added
     uint32_t c = 0;   // RootHi: bits ORed in; Desc: 1 if modified
     uint32_t d = 0;   // Arg: 1 if a run-time offset was added; Desc: 1 + index of the load that used a run-time offset
+                      // (or of the representative of loads merged at a join, see merge_desc)
+    uint32_t e = 0;   // Desc with a constant offset: 1 + index of the s_load that produced it (not compared)
     bool operator==(const AV& o) const { return k == o.k && a == o.a && b == o.b && c == o.c && d == o.d; }
     bool operator!=(const AV& o) const { return !(*this == o); }
     static AV top() { return AV{Top}; }
@@ -281,6 +283,39 @@ struct Translator {
     }
     size_t cur_idx = 0;
     std::set<size_t> dyn_loads;            // s_load instructions whose offset is known only at run time
+    // Descriptor loads from one table at different constant offsets that meet at a join (a shader
+    // picking one of several descriptors by branch): the loads of a group write their offset into
+    // the representative's dyn variable, and the use indexes the table range with it.
+    std::map<size_t, size_t> dyn_alias;    // load -> representative load
+    std::set<size_t> merged_reps;
+    std::map<size_t, std::pair<uint32_t, uint32_t>> merged_span;   // representative -> lowest, highest slot byte offset
+    AV merge_desc(const AV& x, const AV& y) {
+        if (x.k != AV::Desc || y.k != AV::Desc || x == y || x.a != y.a || x.c != y.c) return merge(x, y);
+        auto rep = [&](const AV& v) -> long {
+            if (v.d) return merged_reps.count(v.d - 1) ? long(v.d - 1) : -1;
+            return v.e ? long(v.e - 1) : -1;
+        };
+        long rx = rep(x), ry = rep(y);
+        uint32_t wx = x.d ? x.b : x.b % 32, wy = y.d ? y.b : y.b % 32;   // byte within the 32-byte slot
+        if (rx < 0 || ry < 0 || wx != wy) return merge(x, y);
+        size_t r = size_t(std::min(rx, ry)), o = size_t(std::max(rx, ry));
+        auto span = [&](const AV& v, long rp) {
+            if (v.d) return merged_span.count(size_t(rp)) ? merged_span[size_t(rp)] : std::make_pair(0u, 0u);
+            uint32_t b0 = v.b - v.b % 32;
+            return std::make_pair(b0, b0);
+        };
+        auto sx = span(x, rx), sy = span(y, ry);
+        merged_span[r] = {std::min(sx.first, sy.first), std::max(sx.second, sy.second)};
+        if (o != r) merged_span.erase(o);
+        for (auto& [ld, rp] : dyn_alias)
+            if (rp == o) rp = r;
+        dyn_alias[size_t(rx)] = r;
+        dyn_alias[size_t(ry)] = r;
+        merged_reps.erase(o);
+        merged_reps.insert(r);
+        AV m{AV::Desc, x.a, wx, x.c, uint32_t(r + 1)};
+        return m;
+    }
     std::map<size_t, std::string> res_index;   // instruction -> array index expression (resource arrays)
     std::map<size_t, std::string> samp_index;
     std::string rn(size_t idx, int r) const {   // resource name at an instruction (indexed when an array)
@@ -390,7 +425,10 @@ struct Translator {
                     uint32_t at = uint32_t(off) + (soc ? so.a : 0) + 4 * i;
                     const UserArg* a = arg_at(base.a);
                     bool dyn = base.d || !soc;
-                    if (a && a->kind == 3) v = AV{AV::Desc, a->param, base.b + at, 0, dyn ? uint32_t(cur_idx + 1) : 0};
+                    if (a && a->kind == 3) {
+                        v = AV{AV::Desc, a->param, base.b + at, 0, dyn ? uint32_t(cur_idx + 1) : 0};
+                        if (!dyn && !base.d) v.e = uint32_t(cur_idx + 1);
+                    }
                 } else if (starts(n, "s_load_dword") && soc) {
                     uint32_t at = uint32_t(off) + so.a + 4 * i;
                     if (base.k == AV::Pc) {
@@ -482,7 +520,7 @@ struct Translator {
                     SState m = block_in[s];
                     bool ch = !seen[s];
                     for (unsigned k = 0; k < kNumS; k++) {
-                        AV v = seen[s] ? merge(m[k], st[k]) : st[k];
+                        AV v = seen[s] ? merge_desc(m[k], st[k]) : st[k];
                         if (!(v == m[k])) {
                             m[k] = v;
                             ch = true;
@@ -639,6 +677,29 @@ struct Translator {
             r.offset = w0.b;
             RangeType type;
             const ResRecord* rec = record(w0.a, 3, w0.b / 4);
+            if (w0.d && merged_reps.count(w0.d - 1) && merged_span.count(w0.d - 1) && !sampler) {
+                // One of several table slots chosen by branch: bind just those slots as an array.
+                auto [lo, hi] = merged_span[w0.d - 1];
+                RangeType t0, t1;
+                uint32_t reg1 = 0, space1 = 0;
+                if (!table_binding(w0.a, lo, false, t0, r.reg, r.space) || !table_binding(w0.a, hi, false, t1, reg1, space1) || t0 != t1 ||
+                    space1 != r.space || reg1 != r.reg + (hi - lo) / 32) {
+                    fail(fmt("%s at 0x%x: descriptors chosen by branch span several root-signature ranges", in.name, in.offset));
+                    return -1;
+                }
+                r.offset = 0xC0000000u | lo;
+                r.array = (hi - lo) / 32 + 1;
+                r.dyn = true;
+                res_index[cur_idx] = fmt("((dyn%u + %uu) / 32u - %uu)", w0.d - 1, w0.b, lo / 32);
+                dyn_loads.insert(w0.d - 1);
+                r.uav = t0 == RangeType::UAV;
+                const ResRecord* rec = record(w0.a, 3, lo / 4);
+                if (in.fmt == Fmt::MTBUF || has(nm, "_format")) r.kind = ResKind::TypedBuf;
+                else if (n == 8) r.kind = ResKind::Image;
+                else if (!rec || rec->elem <= 1) r.kind = ResKind::RawBuf;
+                else { r.kind = ResKind::StructBuf; r.stride = rec->elem; }
+                return add_res(r);
+            }
             if (w0.d) {
                 // Run-time slot: bind the whole root-signature range as an array.
                 rec = record(w0.a, 3, 0, true);
@@ -1337,9 +1398,10 @@ bool Translator::emit_smem(const Instr& in, size_t idx) {
         return true;
     }
     if (starts(n, "s_load_dword")) {
-        if (dyn_loads.count(idx)) {
+        size_t dk = dyn_alias.count(idx) ? dyn_alias[idx] : idx;   // merged loads write their group's variable
+        if (dyn_loads.count(dk)) {
             std::string so = in.soffset == src::kNull ? std::string("0u") : rd(in.soffset, in);
-            line(fmt("dyn%zu = %s + %uu + %s;", idx, S(in.sbase).c_str(), uint32_t(in.offset_imm), so.c_str()));
+            line(fmt("dyn%zu = %s + %uu + %s;", dk, S(in.sbase).c_str(), uint32_t(in.offset_imm), so.c_str()));
         }
         auto it = sval.find(idx);
         for (unsigned k = 0; k < cnt; k++) write_s(in.sdata + k, it != sval.end() ? it->second[k] : std::string("0u"));

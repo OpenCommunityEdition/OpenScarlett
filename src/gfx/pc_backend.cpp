@@ -10,6 +10,7 @@
 #include <atomic>
 #include <cstring>
 #include <map>
+#include <unordered_map>
 #include <set>
 #include <deque>
 #include <mutex>
@@ -1084,7 +1085,20 @@ bool translate_indirect_args(const D3D12_COMMAND_SIGNATURE_DESC* in, std::vector
     return changed;
 }
 
+// Compute bindings of each list, so the layer's own dispatches (indirect-argument checks) can put
+// the title's state back afterwards.
+struct CsShadow {
+    PcObj rs = nullptr, pso = nullptr;
+    std::map<uint32_t, std::pair<int, uint64_t>> params;   // index -> (0 table, 1 CBV, 2 SRV, 3 UAV, address/handle)
+    std::map<uint32_t, std::vector<uint32_t>> consts;      // index -> 32-bit constants
+};
+std::mutex g_cs_mu;
+std::unordered_map<PcObj, CsShadow> g_cs_shadow;
 std::mutex g_rays_mu;
+static bool guard_on() { static bool on = [] { char b[4]; return !(GetEnvironmentVariableA("XSL_INDIRECT_GUARD", b, 4) && b[0] == '0'); }(); return on; }
+// Signatures the guard handles: byte offset of the dispatch/draw argument in a record, and its kind.
+struct GuardSig { uint32_t argOff; uint32_t kind; uint32_t stride; };
+std::map<PcObj, GuardSig> g_guard_sigs;
 std::set<PcObj> g_rays_sigs;   // command signatures that dispatch rays (skipped while ray tracing is inert)
 // Command signatures whose single argument is a console 1-D dispatch (DISPATCH_SINGLE: X only, Y and
 // Z unused) or a DISPATCH_MESH_X (X, then reserved/payload words): PC dispatches read three group
@@ -1120,6 +1134,28 @@ HRESULT_T create_command_signature(PcObj dev, const void* desc, PcObj rs, PcObj*
                                                                IID_PPV_ARGS(reinterpret_cast<ID3D12CommandSignature**>(out)));
     if (SUCCEEDED(hr) && rays) { std::lock_guard<std::mutex> g(g_rays_mu); g_rays_sigs.insert(*out); }
     if (SUCCEEDED(hr) && fix_args) { std::lock_guard<std::mutex> g(g_rays_mu); g_fix_sigs[*out] = fix_stride; }
+    if (SUCCEEDED(hr) && d && guard_on()) {   // where the dispatch/draw argument sits in a record (PC layout, console stride)
+        uint32_t o = 0;
+        for (UINT i = 0; i < d->NumArgumentDescs; i++) {
+            const auto& a = d->pArgumentDescs[i];
+            const int ct = i < static_cast<const D3D12_COMMAND_SIGNATURE_DESC*>(desc)->NumArgumentDescs
+                               ? (int)static_cast<const D3D12_COMMAND_SIGNATURE_DESC*>(desc)->pArgumentDescs[i].Type : -1;
+            switch (a.Type) {
+            case D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH: case D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_MESH:
+                { std::lock_guard<std::mutex> g(g_rays_mu); g_guard_sigs[*out] = {o, 0, d->ByteStride}; }
+                o += ct == kXboxArgDispatchX ? 16 : 12; break;
+            case D3D12_INDIRECT_ARGUMENT_TYPE_DRAW: case D3D12_INDIRECT_ARGUMENT_TYPE_DRAW_INDEXED:
+                { std::lock_guard<std::mutex> g(g_rays_mu); g_guard_sigs[*out] = {o, 1, d->ByteStride}; }
+                o += a.Type == D3D12_INDIRECT_ARGUMENT_TYPE_DRAW ? 16 : 20; break;
+            case D3D12_INDIRECT_ARGUMENT_TYPE_VERTEX_BUFFER_VIEW: case D3D12_INDIRECT_ARGUMENT_TYPE_INDEX_BUFFER_VIEW: o += 16; break;
+            case D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT: o += 4 * a.Constant.Num32BitValuesToSet; break;
+            case D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT_BUFFER_VIEW: case D3D12_INDIRECT_ARGUMENT_TYPE_SHADER_RESOURCE_VIEW:
+            case D3D12_INDIRECT_ARGUMENT_TYPE_UNORDERED_ACCESS_VIEW: o += 8; break;
+            default: o += 1u << 20; break;   // unknown layout: no guard
+            }
+        }
+        if (o >= (1u << 20)) { std::lock_guard<std::mutex> g(g_rays_mu); g_guard_sigs.erase(*out); }
+    }
     if (FAILED(hr) && d) {
         std::string args;
         for (UINT i = 0; i < d->NumArgumentDescs && i < 16; i++) {
@@ -1844,7 +1880,9 @@ void name_recording(PcObj l) {
         while (g_mark_order.size() > 8192) { g_marks.erase(g_mark_order.front()); g_mark_order.pop_front(); }
     }
 }
+void list_shadow_reset(PcObj l);
 HRESULT_T list_reset(PcObj l, PcObj a, PcObj pso) {
+    list_shadow_reset(l);
     if (gm_enabled()) { std::lock_guard<std::mutex> g(g_gm_mu); g_list_global_heap.erase(l); g_list_gm_rs.erase(l); }
     name_recording(l);
     if (g_info) { std::lock_guard<std::mutex> g(g_rs_mu); g_list_rs.erase(l); }
@@ -1936,7 +1974,21 @@ void list_set_gfx_root_signature(PcObj l, PcObj rs) {
     L->SetGraphicsRootSignature(as<ID3D12RootSignature>(rs));
     gm_bind(l, rs, false);
 }
+static void shadow_param(PcObj l, uint32_t i, int kind, uint64_t v) {
+    std::lock_guard<std::mutex> g(g_cs_mu);
+    g_cs_shadow[l].params[i] = {kind, v};
+}
+void list_shadow_reset(PcObj l) {
+    std::lock_guard<std::mutex> g(g_cs_mu);
+    g_cs_shadow.erase(l);
+}
 void list_set_compute_root_signature(PcObj l, PcObj rs) {
+    {
+        std::lock_guard<std::mutex> g(g_cs_mu);
+        auto& sh = g_cs_shadow[l];
+        if (sh.rs != rs) { sh.params.clear(); sh.consts.clear(); }
+        sh.rs = rs;
+    }
     if (g_info) { std::lock_guard<std::mutex> g(g_rs_mu); g_list_rs[l].cs = rs; }
     L->SetComputeRootSignature(as<ID3D12RootSignature>(rs));
     gm_bind(l, rs, true);
@@ -1958,6 +2010,7 @@ static void check_rs(PcObj l, const char* what) {
              p->second.first, bound);
 }
 void list_set_pso(PcObj l, PcObj pso) {
+    { std::lock_guard<std::mutex> g(g_cs_mu); g_cs_shadow[l].pso = pso; }
     if (trace_writers()) { std::lock_guard<std::mutex> g(g_wr_mu); g_wr_pso[l] = pso; }
     if (g_info) { std::lock_guard<std::mutex> g(g_rs_mu); g_list_rs[l].pso = pso; }
     L->SetPipelineState(as<ID3D12PipelineState>(pso));
@@ -2037,8 +2090,10 @@ static void trace_draw_target(PcObj l, uint32_t n) {
         } else XSL_INFO(CH, "pso %s: draws with no render target 0 bound", tn.c_str());
     }
 }
-void list_draw(PcObj l, uint32_t a, uint32_t b, uint32_t c, uint32_t d) { trace_draw_target(l, a * b); if (getenv("XSL_TRACE_BUFFER")) note_dispatch(l, false); note_draw(l); note_reads(l, false); L->DrawInstanced(a, b, c, d); }
-void list_draw_indexed(PcObj l, uint32_t a, uint32_t b, uint32_t c, int32_t d, uint32_t e) { trace_draw_target(l, a * b); if (getenv("XSL_TRACE_BUFFER")) note_dispatch(l, false); note_draw(l); note_reads(l, false); L->DrawIndexedInstanced(a, b, c, d, e); }
+static int32_t prof_begin(PcObj l);
+static void prof_end(PcObj l, int32_t q);
+void list_draw(PcObj l, uint32_t a, uint32_t b, uint32_t c, uint32_t d) { trace_draw_target(l, a * b); if (getenv("XSL_TRACE_BUFFER")) note_dispatch(l, false); note_draw(l); note_reads(l, false); int32_t pq = prof_begin(l); L->DrawInstanced(a, b, c, d); prof_end(l, pq); }
+void list_draw_indexed(PcObj l, uint32_t a, uint32_t b, uint32_t c, int32_t d, uint32_t e) { trace_draw_target(l, a * b); if (getenv("XSL_TRACE_BUFFER")) note_dispatch(l, false); note_draw(l); note_reads(l, false); int32_t pq = prof_begin(l); L->DrawIndexedInstanced(a, b, c, d, e); prof_end(l, pq); }
 struct EiTrace { long slot; std::string name; uint64_t present; };
 static std::vector<EiTrace> g_ei_trace;   // traced indirect dispatches whose arguments are printed later
 static bool trace_dispatch_size(PcObj l, const char* how, uint32_t x, uint32_t y, uint32_t z, std::string* name) {
@@ -2066,11 +2121,122 @@ static bool trace_dispatch_size(PcObj l, const char* how, uint32_t x, uint32_t y
     if (match && name) *name = nm;
     return match;
 }
+// XSL_GPU_PROFILE=<present>: GPU time of every draw, dispatch and indirect execute recorded during
+// the frame before that present, summed per pipeline and logged a few presents later.
+struct GpuProf {
+    std::mutex mu;
+    ID3D12QueryHeap* heap = nullptr;
+    ID3D12Resource* rb = nullptr;
+    uint32_t next = 0;
+    std::vector<std::pair<uint32_t, PcObj>> ops;   // first query, pipeline
+    bool done = false;
+} g_prof;
+constexpr uint32_t kProfQueries = 1u << 16;
+// XSL_GPU_PROFILE=slow: the frame after the first present (past the 300th) that took over 250 ms.
+std::atomic<uint64_t> g_prof_at{0};
+static bool prof_slow() { static bool v = [] { char b[16]; return GetEnvironmentVariableA("XSL_GPU_PROFILE", b, sizeof b) && !strcmp(b, "slow"); }(); return v; }
+static uint64_t prof_at() {
+    static uint64_t fixed = [] { char b[16]; return GetEnvironmentVariableA("XSL_GPU_PROFILE", b, sizeof b) ? _strtoui64(b, nullptr, 10) : 0ull; }();
+    return fixed ? fixed : g_prof_at.load();
+}
+// Also: presents per 10 s in the log (frame rate over a run), and the slowest present of each period.
+static void prof_slow_check(uint64_t present) {
+    static LARGE_INTEGER last{}, f{}, period{};
+    static uint64_t periodStart = 0;
+    static double worst = 0;
+    static int slowRun = 0;
+    LARGE_INTEGER now;
+    QueryPerformanceCounter(&now);
+    if (!f.QuadPart) QueryPerformanceFrequency(&f);
+    double ms = last.QuadPart ? double(now.QuadPart - last.QuadPart) * 1000.0 / double(f.QuadPart) : 0;
+    last = now;
+    worst = std::max(worst, ms);
+    if (!period.QuadPart) { period = now; periodStart = present; }
+    double ps = double(now.QuadPart - period.QuadPart) / double(f.QuadPart);
+    if (ps >= 10.0) {
+        XSL_INFO(CH, "frame rate: %.1f presents/s (presents %llu..%llu, slowest %.0f ms)", double(present - periodStart) / ps, (unsigned long long)periodStart,
+                 (unsigned long long)present, worst);
+        period = now;
+        periodStart = present;
+        worst = 0;
+    }
+    if (!prof_slow() || g_prof_at.load()) return;
+    slowRun = ms > 250 ? slowRun + 1 : 0;
+    if (present > 300 && slowRun >= 3) {
+        g_prof_at = present + 2;
+        XSL_INFO(CH, "presents up to %llu took over 250 ms each: profiling present %llu", (unsigned long long)present, (unsigned long long)(present + 2));
+    }
+}
+static int32_t prof_begin(PcObj l) {
+    uint64_t at = prof_at();
+    if (!at || g_wr_present.load() + 1 != at || !g_main_device) return -1;
+    std::lock_guard<std::mutex> g(g_prof.mu);
+    if (!g_prof.heap) {
+        D3D12_QUERY_HEAP_DESC qd{D3D12_QUERY_HEAP_TYPE_TIMESTAMP, kProfQueries, 0};
+        D3D12_HEAP_PROPERTIES hp{D3D12_HEAP_TYPE_READBACK};
+        D3D12_RESOURCE_DESC rd{};
+        rd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        rd.Width = kProfQueries * 8ull;
+        rd.Height = rd.DepthOrArraySize = rd.MipLevels = 1;
+        rd.SampleDesc.Count = 1;
+        rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        if (FAILED(g_main_device->CreateQueryHeap(&qd, IID_PPV_ARGS(&g_prof.heap))) ||
+            FAILED(g_main_device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&g_prof.rb))))
+            return -1;
+    }
+    if (g_prof.next + 2 > kProfQueries) return -1;
+    uint32_t q = g_prof.next;
+    g_prof.next += 2;
+    PcObj pso = nullptr;
+    { std::lock_guard<std::mutex> g2(g_cs_mu); auto it = g_cs_shadow.find(l); if (it != g_cs_shadow.end()) pso = it->second.pso; }
+    g_prof.ops.push_back({q, pso});
+    L->EndQuery(g_prof.heap, D3D12_QUERY_TYPE_TIMESTAMP, q);
+    return (int32_t)q;
+}
+static void prof_end(PcObj l, int32_t q) {
+    if (q < 0) return;
+    L->EndQuery(g_prof.heap, D3D12_QUERY_TYPE_TIMESTAMP, q + 1);
+    L->ResolveQueryData(g_prof.heap, D3D12_QUERY_TYPE_TIMESTAMP, q, 2, g_prof.rb, q * 8ull);
+}
+static void prof_report(ID3D12CommandQueue* queue) {
+    uint64_t at = prof_at();
+    if (!at || g_prof.done || g_wr_present.load() < at + 8) return;
+    std::lock_guard<std::mutex> g(g_prof.mu);
+    g_prof.done = true;
+    if (!g_prof.rb) return;
+    uint64_t freq = 0;
+    queue->GetTimestampFrequency(&freq);
+    uint64_t* t = nullptr;
+    D3D12_RANGE r{0, g_prof.next * 8ull};
+    if (FAILED(g_prof.rb->Map(0, &r, (void**)&t)) || !freq) return;
+    std::map<PcObj, std::pair<double, uint32_t>> per;
+    double total = 0;
+    for (auto& [q, pso] : g_prof.ops) {
+        if (t[q + 1] < t[q]) continue;
+        double us = double(t[q + 1] - t[q]) * 1e6 / double(freq);
+        per[pso].first += us;
+        per[pso].second++;
+        total += us;
+    }
+    g_prof.rb->Unmap(0, nullptr);
+    std::vector<std::pair<double, PcObj>> v;
+    for (auto& [p, e] : per) v.push_back({e.first, p});
+    std::sort(v.rbegin(), v.rend());
+    XSL_INFO(CH, "GPU profile of present %llu: %zu operations, %.1f ms in total", (unsigned long long)at, g_prof.ops.size(), total / 1000.0);
+    for (size_t i = 0; i < v.size() && i < 25; i++) {
+        wchar_t name[128] = L"(none)";
+        UINT sz = sizeof name;
+        if (v[i].second) as<ID3D12PipelineState>(v[i].second)->GetPrivateData(WKPDID_D3DDebugObjectNameW, &sz, name);
+        XSL_INFO(CH, "  %9.1f us in %4u ops: %ls", v[i].first, per[v[i].second].second, name);
+    }
+}
 void list_dispatch(PcObj l, uint32_t x, uint32_t y, uint32_t z) {
     trace_dispatch_size(l, "Dispatch", x, y, z, nullptr);
     note_dispatch(l);
     note_reads(l, true);
+    int32_t pq = prof_begin(l);
     L->Dispatch(x, y, z);
+    prof_end(l, pq);
 }
 // A dispatch writes the big textures whose UAVs are in the first slots of its compute tables.
 static void note_dispatch(PcObj l) { note_dispatch(l, true); }
@@ -2137,7 +2303,9 @@ static void note_dispatch(PcObj l, bool compute) {
 void list_dispatch_mesh(PcObj l, uint32_t x, uint32_t y, uint32_t z) {
     if (!g_caps.meshShaders) return;
     ID3D12GraphicsCommandList6* l6 = nullptr;
+    int32_t pq = prof_begin(l);
     if (SUCCEEDED(L->QueryInterface(IID_PPV_ARGS(&l6)))) { l6->DispatchMesh(x, y, z); l6->Release(); }
+    prof_end(l, pq);
 }
 bool dred_on() { return g_dred; }
 static long record_indirect(PcObj l, PcObj args, uint64_t ao, PcObj cnt, uint64_t co);
@@ -2223,11 +2391,62 @@ void list_depth_bounds(PcObj l, float lo, float hi) {
 void list_rt_copy(PcObj l, uint64_t dst, uint64_t src, uint32_t mode) {
     if (auto* l4 = list4(l)) l4->CopyRaytracingAccelerationStructure(dst, src, (D3D12_RAYTRACING_ACCELERATION_STRUCTURE_COPY_MODE)mode);
 }
+// Indirect-argument guard: every ExecuteIndirect that dispatches or draws runs from a copy of its
+// arguments in which a dispatch with a group count above the D3D12 limit (65535), or a draw with a
+// vertex/index/instance count of 2^28 or more, becomes empty. Arguments like that are never valid;
+// they come from work that did not run as on the console, and executing them hangs the GPU.
+// XSL_INDIRECT_GUARD=0 turns it off.
+static void restore_compute_state(PcObj l);
+struct ArgGuard { ID3D12RootSignature* rs = nullptr; ID3D12PipelineState* pso = nullptr; bool failed = false; std::mutex mu; } g_guard;
+static bool guard_init(ID3D12Device* dev) {
+    std::lock_guard<std::mutex> g(g_guard.mu);
+    if (g_guard.pso) return true;
+    if (g_guard.failed) return false;
+    g_guard.failed = true;
+    HMODULE m = LoadLibraryW(L"d3dcompiler_47.dll");
+    typedef HRESULT(WINAPI * Compile)(const void*, SIZE_T, const char*, const void*, void*, const char*, const char*, UINT, UINT, ID3DBlob**, ID3DBlob**);
+    auto compile = m ? (Compile)GetProcAddress(m, "D3DCompile") : nullptr;
+    if (!compile) return false;
+    // kind 0: dispatch (three group counts), 1: draw (vertex/index count, instance count)
+    static const char src[] =
+        "RWByteAddressBuffer a : register(u0);\n"
+        "cbuffer C : register(b0) { uint off, stride, count, kind; };\n"
+        "[numthreads(64, 1, 1)] void main(uint i : SV_DispatchThreadID) {\n"
+        "  if (i >= count) return;\n"
+        "  uint o = off + i * stride;\n"
+        "  if (kind == 0u) { uint3 g = a.Load3(o); if (any(g > 65535u)) a.Store3(o, uint3(0, 0, 0)); }\n"
+        "  else { uint2 c = a.Load2(o); if (any(c >= 0x10000000u)) a.Store2(o, uint2(0, 0)); }\n"
+        "}\n";
+    ID3DBlob *cs = nullptr, *err = nullptr;
+    if (FAILED(compile(src, sizeof src - 1, "xsl_arg_guard", nullptr, nullptr, "main", "cs_5_0", 0, 0, &cs, &err))) {
+        XSL_ERR(CH, "indirect guard: compile failed: %s", err ? (const char*)err->GetBufferPointer() : "?");
+        return false;
+    }
+    D3D12_ROOT_PARAMETER params[2] = {};
+    params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+    params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    params[1].Constants.Num32BitValues = 4;
+    D3D12_ROOT_SIGNATURE_DESC rsd{2, params, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_NONE};
+    ID3DBlob* rsb = nullptr;
+    if (FAILED(D3D12SerializeRootSignature(&rsd, D3D_ROOT_SIGNATURE_VERSION_1, &rsb, &err)) ||
+        FAILED(dev->CreateRootSignature(0, rsb->GetBufferPointer(), rsb->GetBufferSize(), IID_PPV_ARGS(&g_guard.rs))))
+        return false;
+    D3D12_COMPUTE_PIPELINE_STATE_DESC pd{};
+    pd.pRootSignature = g_guard.rs;
+    pd.CS = {cs->GetBufferPointer(), cs->GetBufferSize()};
+    if (FAILED(dev->CreateComputePipelineState(&pd, IID_PPV_ARGS(&g_guard.pso)))) return false;
+    g_guard.failed = false;
+    XSL_INFO(CH, "indirect arguments are checked before use (dispatches over 65535 groups, draws of 2^28+ items become empty)");
+    return true;
+}
 // Scratch ring for rewritten indirect arguments (default heap, COPY_DEST between uses).
 struct ArgRing { ID3D12Resource* res = nullptr; uint64_t head = 0; std::mutex mu; } g_arg_ring;
 constexpr uint64_t kArgRing = 16ull << 20;
-static bool fixed_indirect(PcObj l, PcObj sig, uint32_t max, PcObj args, uint64_t ao, PcObj cnt, uint64_t co, uint32_t stride) {
+static bool fixed_indirect(PcObj l, PcObj sig, uint32_t max, PcObj args, uint64_t ao, PcObj cnt, uint64_t co, uint32_t stride, bool yz1,
+                           const GuardSig* gs) {
     if (!max || !stride || max > 4096 || !g_main_device) return false;
+    if (gs && !guard_init(g_main_device)) gs = nullptr;
+    if (!yz1 && !gs) return false;
     uint64_t bytes = ((uint64_t)max * stride + 255) & ~255ull, off;
     {
         std::lock_guard<std::mutex> g(g_arg_ring.mu);
@@ -2239,6 +2458,7 @@ static bool fixed_indirect(PcObj l, PcObj sig, uint32_t max, PcObj args, uint64_
             rd.Height = rd.DepthOrArraySize = rd.MipLevels = 1;
             rd.SampleDesc.Count = 1;
             rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+            rd.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;   // the argument guard rewrites in place
             if (FAILED(g_main_device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
                                                               IID_PPV_ARGS(&g_arg_ring.res))))
                 return false;
@@ -2263,16 +2483,35 @@ static bool fixed_indirect(PcObj l, PcObj sig, uint32_t max, PcObj args, uint64_
     barrier(a, ind, (D3D12_RESOURCE_STATES)(ind | D3D12_RESOURCE_STATE_COPY_SOURCE));
     L->CopyBufferRegion(g_arg_ring.res, off, a, ao, (uint64_t)max * stride);
     barrier(a, (D3D12_RESOURCE_STATES)(ind | D3D12_RESOURCE_STATE_COPY_SOURCE), ind);
-    std::vector<uint64_t> wa;
-    std::vector<uint32_t> wv;
     uint64_t base = g_arg_ring.res->GetGPUVirtualAddress() + off;
-    for (uint32_t i = 0; i < max; i++) {
-        wa.push_back(base + (uint64_t)i * stride + 4); wv.push_back(1);
-        wa.push_back(base + (uint64_t)i * stride + 8); wv.push_back(1);
+    if (yz1) {
+        std::vector<uint64_t> wa;
+        std::vector<uint32_t> wv;
+        for (uint32_t i = 0; i < max; i++) {
+            wa.push_back(base + (uint64_t)i * stride + 4); wv.push_back(1);
+            wa.push_back(base + (uint64_t)i * stride + 8); wv.push_back(1);
+        }
+        list_write_immediate(l, (uint32_t)wa.size(), wa.data(), wv.data());
     }
-    list_write_immediate(l, (uint32_t)wa.size(), wa.data(), wv.data());
-    barrier(g_arg_ring.res, D3D12_RESOURCE_STATE_COPY_DEST, ind);
+    if (gs) {
+        const auto uav = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+        barrier(g_arg_ring.res, D3D12_RESOURCE_STATE_COPY_DEST, uav);
+        L->SetPipelineState(g_guard.pso);
+        L->SetComputeRootSignature(g_guard.rs);
+        L->SetComputeRootUnorderedAccessView(0, g_arg_ring.res->GetGPUVirtualAddress());
+        uint32_t c[4] = {(uint32_t)off + gs->argOff, stride, max, gs->kind};
+        L->SetComputeRoot32BitConstants(1, 4, c, 0);
+        L->Dispatch((max + 63) / 64, 1, 1);
+        D3D12_RESOURCE_BARRIER ub{};
+        ub.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+        ub.UAV.pResource = g_arg_ring.res;
+        L->ResourceBarrier(1, &ub);
+        barrier(g_arg_ring.res, uav, ind);
+        restore_compute_state(l);
+    } else barrier(g_arg_ring.res, D3D12_RESOURCE_STATE_COPY_DEST, ind);
+    int32_t pq = prof_begin(l);
     L->ExecuteIndirect(as<ID3D12CommandSignature>(sig), max, g_arg_ring.res, off, as<ID3D12Resource>(cnt), co);
+    prof_end(l, pq);
     barrier(g_arg_ring.res, ind, D3D12_RESOURCE_STATE_COPY_DEST);
     return true;
 }
@@ -2302,9 +2541,19 @@ void list_execute_indirect(PcObj l, PcObj sig, uint32_t max, PcObj args, uint64_
         auto it = g_fix_sigs.find(sig);
         if (it != g_fix_sigs.end()) fix_stride = it->second;
     }
-    if (fix_stride && fixed_indirect(l, sig, max, args, ao, cnt, co, fix_stride)) return;
+    GuardSig gs{};
+    bool guarded = false;
+    {
+        std::lock_guard<std::mutex> g(g_rays_mu);
+        auto it = g_guard_sigs.find(sig);
+        if (it != g_guard_sigs.end()) { gs = it->second; guarded = true; }
+    }
+    uint32_t stride = fix_stride ? fix_stride : guarded ? gs.stride : 0;
+    if (stride && fixed_indirect(l, sig, max, args, ao, cnt, co, stride, fix_stride != 0, guarded ? &gs : nullptr)) return;
     if (g_info) check_rs(l, "ExecuteIndirect");
+    int32_t pq = prof_begin(l);
     L->ExecuteIndirect(as<ID3D12CommandSignature>(sig), max, as<ID3D12Resource>(args), ao, as<ID3D12Resource>(cnt), co);
+    prof_end(l, pq);
 }
 void list_clear_uav_uint(PcObj l, uint64_t g, uint64_t c, PcObj r, const uint32_t* v, uint32_t n, const void* rects) {
     L->ClearUnorderedAccessViewUint(gpu(g), cpu(c), as<ID3D12Resource>(r), v, n, static_cast<const D3D12_RECT*>(rects));
@@ -2322,6 +2571,12 @@ void list_write_immediate(PcObj l, uint64_t va, uint32_t value, bool bottom) {
 }
 void list_discard(PcObj l, PcObj r) { L->DiscardResource(as<ID3D12Resource>(r), nullptr); }
 void list_set_heaps(PcObj l, uint32_t n, PcObj* h) {
+    {   // table bindings refer to the previous heaps: not restored after this
+        std::lock_guard<std::mutex> g(g_cs_mu);
+        auto it = g_cs_shadow.find(l);
+        if (it != g_cs_shadow.end())
+            for (auto p = it->second.params.begin(); p != it->second.params.end();) p = p->second.first == 0 ? it->second.params.erase(p) : std::next(p);
+    }
     if (gm_enabled()) {
         bool global = false;
         for (uint32_t i = 0; i < n; i++) global |= as<ID3D12DescriptorHeap>(h[i]) == g_gv;
@@ -2419,12 +2674,13 @@ static void note_reads(PcObj l, bool compute) {
 }
 void list_compute_root_table(PcObj l, uint32_t i, uint64_t h) {
     if (trace_writers()) { std::lock_guard<std::mutex> g(g_wr_mu); g_cs_tables[l][i] = h; }
+    shadow_param(l, i, 0, h);
     L->SetComputeRootDescriptorTable(i, gpu(h));
 }
 void list_gfx_root_cbv(PcObj l, uint32_t i, uint64_t va) { L->SetGraphicsRootConstantBufferView(i, va); }
-void list_compute_root_cbv(PcObj l, uint32_t i, uint64_t va) { L->SetComputeRootConstantBufferView(i, va); }
+void list_compute_root_cbv(PcObj l, uint32_t i, uint64_t va) { shadow_param(l, i, 1, va); L->SetComputeRootConstantBufferView(i, va); }
 void list_gfx_root_srv(PcObj l, uint32_t i, uint64_t va) { L->SetGraphicsRootShaderResourceView(i, va); }
-void list_compute_root_srv(PcObj l, uint32_t i, uint64_t va) { L->SetComputeRootShaderResourceView(i, va); }
+void list_compute_root_srv(PcObj l, uint32_t i, uint64_t va) { shadow_param(l, i, 2, va); L->SetComputeRootShaderResourceView(i, va); }
 // XSL_TRACE_BUFFER=<size>: root UAVs into buffers of that size during the examined frame.
 static void trace_root_uav(PcObj l, uint32_t i, uint64_t va, const char* kind) {
     static uint64_t tb = [] { char b[24]; return GetEnvironmentVariableA("XSL_TRACE_BUFFER", b, sizeof b) ? _strtoui64(b, nullptr, 10) : 0ull; }();
@@ -2440,9 +2696,39 @@ static void trace_root_uav(PcObj l, uint32_t i, uint64_t va, const char* kind) {
     XSL_INFO(CH, "frame %s root UAV %u of buffer %p +%llu: %ls", kind, i, (void*)m->second.first, (unsigned long long)(va - m->first), wn);
 }
 void list_gfx_root_uav(PcObj l, uint32_t i, uint64_t va) { trace_root_uav(l, i, va, "graphics"); L->SetGraphicsRootUnorderedAccessView(i, va); }
-void list_compute_root_uav(PcObj l, uint32_t i, uint64_t va) { trace_root_uav(l, i, va, "compute"); L->SetComputeRootUnorderedAccessView(i, va); }
+void list_compute_root_uav(PcObj l, uint32_t i, uint64_t va) { trace_root_uav(l, i, va, "compute"); shadow_param(l, i, 3, va); L->SetComputeRootUnorderedAccessView(i, va); }
 void list_gfx_root_constants(PcObj l, uint32_t i, uint32_t n, const void* d, uint32_t o) { L->SetGraphicsRoot32BitConstants(i, n, d, o); }
-void list_compute_root_constants(PcObj l, uint32_t i, uint32_t n, const void* d, uint32_t o) { L->SetComputeRoot32BitConstants(i, n, d, o); }
+void list_compute_root_constants(PcObj l, uint32_t i, uint32_t n, const void* d, uint32_t o) {
+    {
+        std::lock_guard<std::mutex> g(g_cs_mu);
+        auto& c = g_cs_shadow[l].consts[i];
+        if (c.size() < o + n) c.resize(o + n);
+        memcpy(c.data() + o, d, n * 4);
+    }
+    L->SetComputeRoot32BitConstants(i, n, d, o);
+}
+static void restore_compute_state(PcObj l) {
+    CsShadow sh;
+    {
+        std::lock_guard<std::mutex> g(g_cs_mu);
+        auto it = g_cs_shadow.find(l);
+        if (it == g_cs_shadow.end()) return;
+        sh = it->second;
+    }
+    if (sh.pso) L->SetPipelineState(as<ID3D12PipelineState>(sh.pso));
+    if (!sh.rs) return;
+    L->SetComputeRootSignature(as<ID3D12RootSignature>(sh.rs));
+    gm_bind(l, sh.rs, true);
+    for (auto& [i, p] : sh.params) {
+        switch (p.first) {
+        case 0: L->SetComputeRootDescriptorTable(i, gpu(p.second)); break;
+        case 1: L->SetComputeRootConstantBufferView(i, p.second); break;
+        case 2: L->SetComputeRootShaderResourceView(i, p.second); break;
+        default: L->SetComputeRootUnorderedAccessView(i, p.second); break;
+        }
+    }
+    for (auto& [i, c] : sh.consts) L->SetComputeRoot32BitConstants(i, (UINT)c.size(), c.data(), 0);
+}
 // Bytes per element and block width (1, or 4 for block-compressed) of a DXGI format; {0, 0} for
 // formats this does not know.
 struct FormatSize { UINT bytes, block; };
@@ -3166,6 +3452,8 @@ HRESULT_T present(PcObj devObj, PcObj queueObj, PcObj resObj, void* hwndPtr, uin
             }
         }
         ++g_present_count;
+        prof_slow_check(g_present_count);
+        prof_report(as<ID3D12CommandQueue>(q));
         ++g_gm_frame;
         if (getenv("XSL_AS_DUMP")) print_dumps();
         if (g_info && g_present_count % 30 == 0) dump_debug_messages();   // debug layer: what it reported since the last dump

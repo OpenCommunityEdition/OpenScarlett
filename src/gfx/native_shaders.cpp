@@ -6,7 +6,8 @@
 // XSL_NATIVE_SHADERS=0 never translates; =1 translates every shader that has precompiled code
 // (A/B testing against the DXIL path); default: only shaders without DXIL.
 // XSL_SHADER_CACHE=<dir> overrides the cache directory (%LOCALAPPDATA%\OpenScarlett\shadercache).
-// XSL_DUMP_SHADERS=<dir> writes each translated container and its HLSL.
+// XSL_DUMP_SHADERS=<dir> writes each translated container and its HLSL (XSL_DUMP_KEYS=<keys>: these
+// are translated again even when cached, so they are dumped too).
 // XSL_NATIVE_STAGES=VS,PS,... limits translation to those stages (testing).
 // XSL_SKIP_SHADERS=<key,...> treats those shaders as untranslatable (debugging GPU hangs).
 // XSL_LOOP_GUARD=<n> ends a shader invocation after n loop iterations (default 64K, 4M with barriers; runaway loops).
@@ -157,7 +158,14 @@ bool compile(const std::string& hlsl, const std::string& profile, std::vector<ui
     IDxcResult* result = nullptr;
     HRESULT hr = create(CLSID_DxcCompiler, __uuidof(IDxcCompiler3), (void**)&compiler);
     std::wstring prof(profile.begin(), profile.end());
-    LPCWSTR args[] = {L"-T", prof.c_str(), L"-E", L"main", L"-HV", L"2021", L"-O3", L"-Qstrip_debug", L"-Qstrip_reflect"};
+    // XSL_DXC_OPT=Od|O0|O1|O2|O3 (diagnostics): optimization level of compiles (cached shaders keep theirs).
+    static std::wstring opt = [] {
+        char b[8];
+        std::wstring w = L"-O3";
+        if (GetEnvironmentVariableA("XSL_DXC_OPT", b, sizeof b) && b[0] == 'O') { w = L"-"; for (char* c = b; *c; c++) w += wchar_t(*c); }
+        return w;
+    }();
+    LPCWSTR args[] = {L"-T", prof.c_str(), L"-E", L"main", L"-HV", L"2021", opt.c_str(), L"-Qstrip_debug", L"-Qstrip_reflect"};
     DxcBuffer buf{hlsl.data(), hlsl.size(), DXC_CP_UTF8};
     if (SUCCEEDED(hr)) hr = compiler->Compile(&buf, args, UINT32(sizeof args / sizeof *args), nullptr, __uuidof(IDxcResult), (void**)&result);
     HRESULT status = E_FAIL;
@@ -258,6 +266,11 @@ bool native_translate(const void* in, size_t n, void** out, size_t* outSize) {
             XSL_INFO(CH, "shader %016llx: HLSL override %s", (unsigned long long)key, p2);
             cpath.clear();
         }
+    }
+    if (const char* dk = getenv("XSL_DUMP_KEYS"); dk && *dk) {   // these keys are translated again (and dumped)
+        char k[20];
+        snprintf(k, sizeof k, "%016llx", (unsigned long long)key);
+        if (strstr(dk, k)) cpath.clear();
     }
     bool cached = !cpath.empty() && read_file(cpath, dxil);
     if (cached) XSL_INFO(CH, "shader %016llx (%s): from cache", (unsigned long long)key, gpucode::kind_name(c.kind));

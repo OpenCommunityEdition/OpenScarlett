@@ -55,6 +55,13 @@ Shaders that cannot be translated yet make their pipeline a placeholder (its wor
 | `XSL_SHADER_OVERRIDE=<dir>` | Compile `<dir>\<key>.hlsl` instead of the translation (hand-edited probes; never cached) |
 | `XSL_TRACE_WRITERS=1` | Frame diagnostics: with `XSL_RT_STATS=<present>` (target statistics, R11G11B10 decoded), `XSL_TRACE_PSO=<keys>` (views, constants, sizes, pipeline state, indirect arguments), `XSL_PLANE_OPS=<present>` (every write to presented images), `XSL_TRACE_BUFFER=<bytes>`, `XSL_TRACE_TEX=<w>x<h>` (writers) |
 | `XSL_DETILE_RECHECK=0` | Do not re-check uploaded console-tiled textures for later CPU writes |
+| `XSL_RT_STATS=<present>`, `XSL_PLANE_OPS=<present>` | Without `XSL_TRACE_WRITERS=1`, writer tracing runs only for the 30 presents before that one |
+| `XSL_GPU_PROFILE=<present>` / `slow` | GPU time per pipeline (draws, dispatches, indirect executes) of the frame before that present; `slow`: the frame after the first present over 250 ms |
+| `XSL_INDIRECT_GUARD=0` | Execute indirect arguments as they are (by default dispatches over 65535 groups and draws of 2^28+ items become empty) |
+| `XSL_DUMP_FAILED_PSO=<dir>` | Save the shaders of pipeline streams the PC runtime rejects |
+| `XSL_MF_GPU=0` | Refuse Media Foundation a D3D12 device (no GPU video decoding) |
+| `XSL_COMPUTE_AS_DIRECT=0` | Keep PC compute queues for console compute queues (default: direct queues) |
+| `XSL_TRACE_VIDEO_PLANES=1` | Log placements of R8/R8G8 textures (video plane aliases) |
 
 ## Tests
 
