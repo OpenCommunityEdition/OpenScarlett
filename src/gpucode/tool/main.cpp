@@ -19,6 +19,7 @@
 #include "container.h"
 #include "isa.h"
 #include "meta.h"
+#include "rtso.h"
 #include "translate.h"
 
 using namespace gpucode;
@@ -182,73 +183,26 @@ static int translate_cmd(const char* path, const char* rspath, const char* codep
     return 0;
 }
 
-// Serialized console ray-tracing state objects (tools/gpucode/rtso describes the layout): sections
-// of {DXBC root signature, 15-dword code header (dword 14 = code size), code, 60-byte trailer,
-// symbol count, value, 24-byte records {name offset, ?, code offset, ...}, string table}.
-struct RtSection { size_t code = 0, size = 0; std::vector<std::pair<std::string, uint32_t>> syms; };
-static std::vector<RtSection> rt_sections(const std::vector<uint8_t>& b) {
-    std::vector<RtSection> out;
-    auto u = [&](size_t o) { uint32_t v = 0; if (o + 4 <= b.size()) memcpy(&v, b.data() + o, 4); return v; };
-    for (size_t dx = 4; dx + 28 <= b.size(); dx++) {
-        if (memcmp(b.data() + dx, "DXBC", 4)) continue;
-        uint32_t sz = u(dx - 4);
-        if (u(dx + 24) != sz) continue;
-        size_t h = dx + sz;
-        if (u(h) != 0x1c) break;
-        RtSection s;
-        s.code = h + 60;
-        s.size = u(h + 56);
-        size_t tr = s.code + s.size + 0x3c, recs = tr + 8;
-        uint32_t cnt = u(tr);
-        for (uint32_t i = 0; i < cnt && recs + i * 24 + 24 <= b.size(); i++) {
-            size_t r = recs + i * 24, no = recs + u(r);
-            std::string name;
-            while (no < b.size() && b[no]) name += char(b[no++]);
-            s.syms.push_back({name, u(r + 8)});
-        }
-        out.push_back(s);
-        dx = s.code + s.size;
-    }
-    return out;
-}
-// rtlink <blob> <section> [template.cso]: link all sections of a serialized pipeline into one code
-// image (256-byte aligned, at 0x100000000) and translate it with <section>'s main as the entry.
-static int rtlink_cmd(const char* path, int entrySec, const char* tmpl) {
-    std::vector<uint8_t> b = read_file(path);
-    auto secs = rt_sections(b);
-    if (secs.empty() || entrySec < 0 || entrySec >= (int)secs.size()) return fprintf(stderr, "%s: %zu sections\n", path, secs.size()), 1;
-    std::vector<uint8_t> image;
-    TranslateOptions o;
-    o.code_base = 0x100000000ull;
-    o.global_memory = true;
-    uint32_t entry = 0;
-    for (size_t i = 0; i < secs.size(); i++) {
-        while (image.size() % 256) image.push_back(0);
-        uint32_t base = (uint32_t)image.size();
-        image.insert(image.end(), b.begin() + secs[i].code, b.begin() + secs[i].code + secs[i].size);
-        o.entries.push_back(base);
-        for (auto& [n, v] : secs[i].syms) {
-            if (v || n.find("XDXR_TraceRay") == std::string::npos) o.entries.push_back(base + v);
-            if (n == "main" && (int)i == entrySec) entry = base + v;
-            fprintf(stderr, "section %zu at 0x%x: %s @0x%x\n", i, base, n.c_str(), base + v);
-        }
-    }
-    while (image.size() % 4) image.push_back(0);
-    o.raw_code.assign((const uint32_t*)image.data(), (const uint32_t*)(image.data() + image.size()));
-    o.raw_rsrc2 = 1 | (4 << 1) | (7 << 7);   // scratch, 4 user SGPRs (runtime table), group ids x/y/z
-    o.raw_root_constants = 4;
-    o.raw_entry = entry;
-    o.raw_scratch_offset = "0u";
+// rtlink <template.cso> <blob>...: link the collections of a ray-tracing pipeline (serialized
+// DeserializeStateObjectX blobs) into one program and translate it (gpucode/rtso.h).
+static int rtlink_cmd(const char* tmpl, int n, char** blobs) {
+    std::vector<std::vector<uint8_t>> bs;
+    for (int i = 0; i < n; i++) bs.push_back(read_file(blobs[i]));
+    RtLinked l;
+    std::string err;
+    if (!rt_link(bs, l, &err)) return fprintf(stderr, "link: %s\n", err.c_str()), 1;
+    fprintf(stderr, "image 0x%zx bytes, scheduler @0x%x, %zu traversal entries, %zu exports\n", l.image.size() * 4, l.main, l.traversal.size(), l.exports.size());
+    for (auto& [name, off] : l.exports) fprintf(stderr, "  export %s @0x%x\n", name.c_str(), off);
     Container c;
     if (!load_cso(tmpl, c)) return 1;
     c.kind = ProgramKind::CS;
     RootSig rs;
     RsParam p;
     p.type = ParamType::Constants;
-    p.num32 = 4;
+    p.num32 = kRtRootConstants;
     rs.params.push_back(p);
-    TranslateResult r = translate(c, rs, o);
-    if (!r.ok) return fprintf(stderr, "%s: %s\n", path, r.error.c_str()), 1;
+    TranslateResult r = translate(c, rs, rt_translate_options(l));
+    if (!r.ok) return fprintf(stderr, "%s\n", r.error.c_str()), 1;
     printf("// profile %s, wave%u\n%s", r.profile.c_str(), r.wave_size, r.hlsl.c_str());
     return 0;
 }
@@ -283,7 +237,7 @@ int main(int argc, char** argv) {
         return translate_cmd(argv[2], rs, code, dual, gm, gmt);
     }
     if (argc >= 3 && !strcmp(argv[1], "meta")) return meta_cmd(argv[2]);
-    if (argc >= 5 && !strcmp(argv[1], "rtlink")) return rtlink_cmd(argv[2], atoi(argv[3]), argv[4]);
+    if (argc >= 4 && !strcmp(argv[1], "rtlink")) return rtlink_cmd(argv[2], argc - 3, argv + 3);
     if (argc >= 4 && !strcmp(argv[1], "cso2elf")) return cso2elf(argv[2], argc - 3, argv + 3);
     if (argc >= 3 && !strcmp(argv[1], "dis")) {
         auto d = read_file(argv[2]);
