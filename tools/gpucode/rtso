@@ -1,0 +1,51 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
+"""Console serialized ray-tracing state objects (DeserializeStateObjectX blobs, dumped with
+XSL_DUMP_STATE_OBJECTS=<dir>): list each section's code range and symbols.
+
+Layout (observed on The Matrix Awakens' blobs): per section, UTF-16 export names, a size-prefixed
+DXBC root signature, a 15-dword code header (dword 0 = 0x1c, dword 14 = code size), the machine
+code (wave32), a 60-byte trailer, then a symbol count, a 32-bit value, `count` 24-byte records
+{name offset (from the record array), ?, code offset, ?, ?, ?} and the string table. Symbols
+`<export>.ss_N` are continuation segments (256-byte aligned), `main` is the scheduler, and
+`XDXR_TraceRay.ss_0` with offset 0 is an import.
+Usage: tools/gpucode/rtso <blob>..."""
+import re
+import struct
+import sys
+
+
+def parse(b):
+    u = lambda o: struct.unpack_from('<I', b, o)[0]
+    secs = []
+    for m in re.finditer(rb'DXBC', b):
+        dx = m.start()
+        if dx < 4:
+            continue
+        sz = u(dx - 4)
+        if dx + 28 > len(b) or u(dx + 24) != sz:   # the DXBC total-size field matches the prefix
+            continue
+        h = dx + sz
+        if u(h) != 0x1c:
+            return None
+        code, csz = h + 60, u(h + 56)
+        tr = code + csz + 0x3c
+        cnt, recs = u(tr), tr + 8
+        syms = []
+        for i in range(cnt):
+            r = recs + i * 24
+            no = u(r)
+            end = b.index(b'\0', recs + no)
+            syms.append((b[recs + no:end].decode(), u(r + 8)))
+        secs.append({'dxbc': dx, 'code': code, 'size': csz, 'syms': syms})
+    return secs
+
+
+if __name__ == '__main__':
+    for f in sys.argv[1:]:
+        s = parse(open(f, 'rb').read())
+        if not s:
+            print(f'{f}: not a serialized state object')
+            continue
+        for x in s:
+            print(f"{f}: code at 0x{x['code']:x}, 0x{x['size']:x} bytes: " + ', '.join(f'{n} @0x{v:x}' for n, v in x['syms']))

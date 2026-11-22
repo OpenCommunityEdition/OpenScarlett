@@ -5,6 +5,7 @@
 #include <thread>
 #include <array>
 #include <mutex>
+#include <string>
 #include <vector>
 
 #include "xs_object.h"
@@ -725,6 +726,27 @@ void D3DAPI D_GetRaytracingAccelerationStructurePrebuildInfoX(ID3D12Device8* d, 
 // that is translated (plan step R1), CreateStateObject also returns an inert state object.
 HRESULT D3DAPI D_CreateStateObject(ID3D12Device5* d, const D3D12_STATE_OBJECT_DESC* desc, REFIID riid, void** out) {
     if (out) *out = nullptr;
+    char dir[MAX_PATH];
+    if (desc && GetEnvironmentVariableA("XSL_DUMP_STATE_OBJECTS", dir, sizeof dir)) {   // subobject types and DXIL libraries
+        static volatile long k = 0;
+        long so = InterlockedIncrement(&k);
+        std::string types;
+        for (UINT i = 0; i < desc->NumSubobjects; i++) {
+            const D3D12_STATE_SUBOBJECT& sub = desc->pSubobjects[i];
+            char t[16];
+            snprintf(t, sizeof t, "%d ", (int)sub.Type);
+            types += t;
+            if (sub.Type == D3D12_STATE_SUBOBJECT_TYPE_DXIL_LIBRARY && so <= 16) {
+                auto* lib = static_cast<const D3D12_DXIL_LIBRARY_DESC*>(sub.pDesc);
+                char path[MAX_PATH + 48];
+                snprintf(path, sizeof path, "%s\\so%02ld_lib%03u.cso", dir, so, i);
+                HANDLE f = CreateFileA(path, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, 0, nullptr);
+                if (f != INVALID_HANDLE_VALUE) { DWORD w; WriteFile(f, lib->DXILLibrary.pShaderBytecode, (DWORD)lib->DXILLibrary.BytecodeLength, &w, nullptr); CloseHandle(f); }
+                XSL_INFO(CH, "state object %ld library %u: %zu bytes, %u exports", so, i, lib->DXILLibrary.BytecodeLength, lib->NumExports);
+            }
+        }
+        XSL_INFO(CH, "state object %ld (type %d): subobject types %s", so, (int)desc->Type, types.c_str());
+    }
     static volatile long n = 0;
     if (InterlockedIncrement(&n) <= 3)
         XSL_WARN(CH, "CreateStateObject (type %d, %u subobjects): ray tracing not translated yet; inert state object returned",
