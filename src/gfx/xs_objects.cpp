@@ -406,6 +406,7 @@ struct ListExtra {
     uint32_t nTracked;
     struct { void* res; uint32_t state; } tracked[kTracked];
 };
+volatile long g_skipped_work = 0;   // draws/dispatches skipped for placeholder pipelines
 ListExtra* lx(ID3D12GraphicsCommandList* l) { return ex<XList, ListExtra>((XList*)l); }
 
 // Quad emulation: a layer-owned index buffer turning every 4 vertices into 2 triangles.
@@ -605,7 +606,7 @@ void D3DAPI L_DrawInstanced(ID3D12GraphicsCommandList* l, UINT a, UINT b, UINT c
 }
 void D3DAPI L_DrawIndexedInstanced(ID3D12GraphicsCommandList* l, UINT a, UINT b, UINT c, INT d, UINT e) {
     if (null_graphics()) return;
-    if (lx(l)->placeholderPso) return;
+    if (lx(l)->placeholderPso) { InterlockedIncrement(&g_skipped_work); return; }
     XSL_TRACE("gfx.cmd", "list %p DrawIndexed %u x%u", (void*)l, a, b);
     pc::list_draw_indexed(LPC(l), a, b, c, d, e);
 }
@@ -615,7 +616,8 @@ void D3DAPI L_Dispatch(ID3D12GraphicsCommandList* l, UINT x, UINT y, UINT z) {
         static volatile long n = 0;
         if (InterlockedIncrement(&n) <= 20) XSL_INFO(CH, "large Dispatch(%u, %u, %u) on list %p", x, y, z, (void*)l);
     }
-    if (!null_graphics() && !lx(l)->placeholderPso) pc::list_dispatch(LPC(l), x, y, z);
+    if (lx(l)->placeholderPso) { InterlockedIncrement(&g_skipped_work); return; }
+    if (!null_graphics()) pc::list_dispatch(LPC(l), x, y, z);
 }
 // Console lists have no heap binding: descriptor tables address descriptors directly. The layer's
 // global view heap stays bound; the title's call only chooses the sampler heap (or a heap that did not
@@ -721,6 +723,7 @@ void D3DAPI L_FlushPipelineX(ID3D12GraphicsCommandList* l, D3D12XBOX_FLUSH, D3D1
 }
 void D3DAPI L_ExecuteIndirect(ID3D12GraphicsCommandList* l, ID3D12CommandSignature* sig, UINT max, ID3D12Resource* args, UINT64 ao,
                               ID3D12Resource* cnt, UINT64 co) {
+    if (lx(l)->placeholderPso) InterlockedIncrement(&g_skipped_work);
     if (null_graphics() || lx(l)->placeholderPso) return;   // placeholder PSO: its work is skipped
     static bool diag = [] { char b[4]; return GetEnvironmentVariableA("XSL_D3D12_DEBUG", b, 4) && b[0] != '0'; }();
     if (diag) {
@@ -1049,6 +1052,13 @@ HRESULT D3DAPI Q_GetClockCalibration(ID3D12CommandQueue* q, UINT64* g, UINT64* c
 HRESULT D3DAPI Q_PresentX(ID3D12CommandQueue* q, UINT planes, const D3D12XBOX_PRESENT_PLANE_PARAMETERS* p, const D3D12XBOX_PRESENT_PARAMETERS*) {
     if (planes == 0 || !p || !p->ResourceCount || !p->ppResources) return S_OK;  // "present blank": nothing to show yet
     xsl_fixed_time_frame();
+    {
+        static uint64_t presents = 0;
+        if (++presents % 100 == 0) {
+            long n = InterlockedExchange(&g_skipped_work, 0);
+            if (n) XSL_INFO(CH, "placeholder pipelines skipped %ld draws/dispatches over the last 100 presents", n);
+        }
+    }
     LARGE_INTEGER callQpc;
     QueryPerformanceCounter(&callQpc);
     Device* dev = hdr(q)->device;

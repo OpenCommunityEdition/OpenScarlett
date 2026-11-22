@@ -905,6 +905,9 @@ std::vector<PcObj> g_big_textures;        // 2D textures of 1080p and more (writ
 std::map<PcObj, uint32_t> g_last_state;   // last whole-resource transition target (writer tracing)
 std::map<uint64_t, PcObj> g_uav_res;      // CPU descriptor handle -> resource of the UAV there (writer tracing)
 std::map<PcObj, std::map<uint32_t, uint64_t>> g_cs_tables;   // list -> compute root table GPU handles
+std::map<PcObj, std::map<uint32_t, uint64_t>> g_gfx_tables;  // list -> graphics root table GPU handles
+std::map<uint64_t, PcObj> g_srv_res;                          // CPU descriptor handle -> resource of the SRV there
+static void note_reads(PcObj l, bool compute);
 std::map<PcObj, std::pair<PcObj, uint64_t>> g_cs_writer;      // big texture -> (compute pipeline, present)
 static void note_dispatch(PcObj l);
 static uint64_t rt_stats_at() { static uint64_t v = [] { char b[16]; return GetEnvironmentVariableA("XSL_RT_STATS", b, sizeof b) ? _strtoui64(b, nullptr, 10) : 0ull; }(); return v; }
@@ -934,11 +937,12 @@ void create_dsv(PcObj dev, PcObj res, const void* desc, uint64_t h) {
     as<ID3D12Device>(dev)->CreateDepthStencilView(as<ID3D12Resource>(res), static_cast<const D3D12_DEPTH_STENCIL_VIEW_DESC*>(desc), cpu(h));
 }
 void create_srv(PcObj dev, PcObj res, const void* desc, uint64_t h) {
+    if (trace_writers()) { std::lock_guard<std::mutex> g(g_wr_mu); g_srv_res[h] = res; g_uav_res.erase(h); }
     D3D12_SHADER_RESOURCE_VIEW_DESC t;
     as<ID3D12Device>(dev)->CreateShaderResourceView(as<ID3D12Resource>(res), view_fix(res, desc, t), cpu(h));
 }
 void create_uav(PcObj dev, PcObj res, PcObj counter, const void* desc, uint64_t h) {
-    if (trace_writers()) { std::lock_guard<std::mutex> g(g_wr_mu); g_uav_res[h] = res; }
+    if (trace_writers()) { std::lock_guard<std::mutex> g(g_wr_mu); g_uav_res[h] = res; g_srv_res.erase(h); }
     if (res && !(as<ID3D12Resource>(res)->GetDesc().Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)) {
         // e.g. a depth-stencil resource whose UAV flag was dropped: null view of the requested dimension
         D3D12_UNORDERED_ACCESS_VIEW_DESC nd{};
@@ -987,6 +991,9 @@ void copy_descriptors_simple(PcObj dev, uint32_t n, uint64_t dst, uint64_t src, 
             auto it = g_uav_res.find(src + (uint64_t)k * inc);
             if (it != g_uav_res.end()) g_uav_res[dst + (uint64_t)k * inc] = it->second;
             else g_uav_res.erase(dst + (uint64_t)k * inc);
+            auto jt = g_srv_res.find(src + (uint64_t)k * inc);
+            if (jt != g_srv_res.end()) g_srv_res[dst + (uint64_t)k * inc] = jt->second;
+            else g_srv_res.erase(dst + (uint64_t)k * inc);
         }
     }
     as<ID3D12Device>(dev)->CopyDescriptorsSimple(n, cpu(dst), cpu(src), (D3D12_DESCRIPTOR_HEAP_TYPE)type);
@@ -1206,9 +1213,9 @@ void list_set_pso(PcObj l, PcObj pso) {
 void list_ia_topology(PcObj l, int t) { L->IASetPrimitiveTopology((D3D12_PRIMITIVE_TOPOLOGY)t); }
 void list_ia_vbs(PcObj l, uint32_t s, uint32_t n, const void* v) { L->IASetVertexBuffers(s, n, static_cast<const D3D12_VERTEX_BUFFER_VIEW*>(v)); }
 void list_ia_ib(PcObj l, const void* v) { L->IASetIndexBuffer(static_cast<const D3D12_INDEX_BUFFER_VIEW*>(v)); }
-void list_draw(PcObj l, uint32_t a, uint32_t b, uint32_t c, uint32_t d) { note_draw(l); L->DrawInstanced(a, b, c, d); }
-void list_draw_indexed(PcObj l, uint32_t a, uint32_t b, uint32_t c, int32_t d, uint32_t e) { note_draw(l); L->DrawIndexedInstanced(a, b, c, d, e); }
-void list_dispatch(PcObj l, uint32_t x, uint32_t y, uint32_t z) { note_dispatch(l); L->Dispatch(x, y, z); }
+void list_draw(PcObj l, uint32_t a, uint32_t b, uint32_t c, uint32_t d) { note_draw(l); note_reads(l, false); L->DrawInstanced(a, b, c, d); }
+void list_draw_indexed(PcObj l, uint32_t a, uint32_t b, uint32_t c, int32_t d, uint32_t e) { note_draw(l); note_reads(l, false); L->DrawIndexedInstanced(a, b, c, d, e); }
+void list_dispatch(PcObj l, uint32_t x, uint32_t y, uint32_t z) { note_dispatch(l); note_reads(l, true); L->Dispatch(x, y, z); }
 // A dispatch writes the big textures whose UAVs are in the first slots of its compute tables.
 static void note_dispatch(PcObj l) {
     if (!trace_writers() || !g_gv) return;
@@ -1411,7 +1418,69 @@ void list_write_immediate(PcObj l, uint64_t va, uint32_t value, bool bottom) {
 }
 void list_discard(PcObj l, PcObj r) { L->DiscardResource(as<ID3D12Resource>(r), nullptr); }
 void list_set_heaps(PcObj l, uint32_t n, PcObj* h) { L->SetDescriptorHeaps(n, reinterpret_cast<ID3D12DescriptorHeap* const*>(h)); }
-void list_gfx_root_table(PcObj l, uint32_t i, uint64_t h) { L->SetGraphicsRootDescriptorTable(i, gpu(h)); }
+void list_gfx_root_table(PcObj l, uint32_t i, uint64_t h) {
+    if (trace_writers()) { std::lock_guard<std::mutex> g(g_wr_mu); g_gfx_tables[l][i] = h; }
+    L->SetGraphicsRootDescriptorTable(i, gpu(h));
+}
+// During the examined frame: every pass that reads one of the frame's large render targets (or a
+// 1080p texture) through an SRV in its first 64 table slots.
+static void note_reads(PcObj l, bool compute) {
+    uint64_t at = rt_stats_at(), now = g_wr_present.load();
+    static volatile long dbg = 0;
+    if (trace_writers() && InterlockedIncrement(&dbg) % 20000 == 1) XSL_INFO(CH, "reader check: now %llu at %llu gv %p", (unsigned long long)now, (unsigned long long)at, (void*)g_gv);
+    if (!trace_writers() || !g_gv || !at || now + 6 < at || now >= at) return;
+    std::lock_guard<std::mutex> g(g_wr_mu);
+    static uint64_t calls = 0, with_tables = 0, srvs = 0;
+    if (++calls % 500 == 0) XSL_INFO(CH, "reader scan: %llu passes, %llu with tables, %llu SRVs seen, %zu SRV handles known", (unsigned long long)calls,
+                                     (unsigned long long)with_tables, (unsigned long long)srvs, g_srv_res.size());
+    auto& tabs = compute ? g_cs_tables : g_gfx_tables;
+    auto t = tabs.find(l);
+    if (t == tabs.end()) return;
+    with_tables++;
+    uint64_t gpu0 = g_gv->GetGPUDescriptorHandleForHeapStart().ptr, cpu0 = g_gv->GetCPUDescriptorHandleForHeapStart().ptr;
+    PcObj pso = g_wr_pso.count(l) ? g_wr_pso[l] : nullptr;
+    wchar_t wn[128] = L"?";
+    UINT sz = sizeof wn;
+    if (pso) as<ID3D12PipelineState>(pso)->GetPrivateData(WKPDID_D3DDebugObjectNameW, &sz, wn);
+    // XSL_TRACE_PSO=<name substring>: every view in that pipeline's tables, with its format.
+    static char want[64] = "";
+    static bool wi = (GetEnvironmentVariableA("XSL_TRACE_PSO", want, sizeof want), true);
+    (void)wi;
+    if (want[0]) {
+        char nm[128];
+        snprintf(nm, sizeof nm, "%ls", wn);
+        if (strstr(nm, want)) {
+            static int shown = 0;
+            if (shown++ < 3)
+                for (auto& [idx, h] : t->second) {
+                    if (h < gpu0 || h >= gpu0 + (uint64_t)g_gv_size * g_gv_inc) continue;
+                    uint64_t c = cpu0 + (h - gpu0);
+                    for (uint32_t k = 0; k < 16; k++) {
+                        auto it = g_srv_res.find(c + (uint64_t)k * g_gv_inc);
+                        auto ju = g_uav_res.find(c + (uint64_t)k * g_gv_inc);
+                        PcObj r = it != g_srv_res.end() ? it->second : ju != g_uav_res.end() ? ju->second : nullptr;
+                        if (!r) continue;
+                        D3D12_RESOURCE_DESC d = as<ID3D12Resource>(r)->GetDesc();
+                        XSL_INFO(CH, "pso %s table %u slot %u: %s %p %llux%u fmt %d", nm, idx, k, it != g_srv_res.end() ? "SRV" : "UAV", r,
+                                 (unsigned long long)d.Width, d.Height, (int)d.Format);
+                    }
+                }
+        }
+    }
+    for (auto& [idx, h] : t->second) {
+        if (h < gpu0 || h >= gpu0 + (uint64_t)g_gv_size * g_gv_inc) continue;
+        uint64_t c = cpu0 + (h - gpu0);
+        for (uint32_t k = 0; k < 64; k++) {
+            auto it = g_srv_res.find(c + (uint64_t)k * g_gv_inc);
+            if (it == g_srv_res.end() || !it->second) continue;
+            srvs++;
+            D3D12_RESOURCE_DESC d = as<ID3D12Resource>(it->second)->GetDesc();
+            if (d.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || d.Width < 1024) continue;
+            XSL_INFO(CH, "frame reader: %s %ls reads %p (%llux%u fmt %d)", compute ? "compute" : "draw", wn, it->second,
+                     (unsigned long long)d.Width, d.Height, (int)d.Format);
+        }
+    }
+}
 void list_compute_root_table(PcObj l, uint32_t i, uint64_t h) {
     if (trace_writers()) { std::lock_guard<std::mutex> g(g_wr_mu); g_cs_tables[l][i] = h; }
     L->SetComputeRootDescriptorTable(i, gpu(h));
