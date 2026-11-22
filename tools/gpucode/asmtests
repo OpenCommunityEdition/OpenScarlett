@@ -1,0 +1,63 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
+"""Hand-assembled ISA tests: each tests/gpucode/asm/*.s is assembled with llvm-mc (gfx1013, wave64
+when its header has ';! wave64'), spliced into the template container (template.hlsl compiled
+with the console compiler) in place of its machine code, translated and compiled for PC. The
+output directory then holds run.cmd, which runs every test on a Windows PC with dispatch_check
+--expect (input: dword i = i; one dword per lane, 64 lanes, results in u0).
+
+Expectations, in the .s header: ';! lanes <expr>' gives words 0..63 (the expression may use L,
+the lane), ';! lanes+<n> <expr>' words n..n+63, ';! word <index> <value>' one word.
+Usage: tools/gpucode/asmtests <outdir>   (needs build/ and build-native/ built, sdk/ linked)"""
+import os, re, shutil, subprocess, sys
+from pathlib import Path
+
+root = Path(__file__).resolve().parents[2]
+out = Path(sys.argv[1]).resolve()
+out.mkdir(parents=True, exist_ok=True)
+env = dict(os.environ, WINEPREFIX=os.environ.get("WINEPREFIX", str(root / "build/wineprefix-tools")), WINEDEBUG="-all")
+asm = root / "tests/gpucode/asm"
+xdxc = root / "sdk/GXDK/bin/Scarlett/dxc.exe"
+pdxc = root / "build/deps/dxc-pc/bin/x64/dxc.exe"
+tool = root / "build-native/xsl-gpucode"
+
+def run(cmd, **kw):
+    return subprocess.run(cmd, env=env, capture_output=True, text=True, **kw)
+
+tmpl = out / "template.cso"
+r = run(["wine", str(xdxc), "-nologo", "-T", "cs_6_5", "-E", "main", "-I", f"Z:{asm}", f"Z:{asm / 'template.hlsl'}", "-Fo", f"Z:{tmpl}"])
+if r.returncode:
+    sys.exit("template does not compile:\n" + r.stdout + r.stderr)
+shutil.copy(root / "build/tests/unit/dispatch_check.exe", out)
+lines = ["@echo off", "set fails=0"]
+for src in sorted(asm.glob("*.s")):
+    n = src.stem
+    text = src.read_text()
+    wave64 = re.search(r"^;!\s*wave64\s*$", text, re.M) is not None
+    words = {}
+    for m in re.finditer(r"^;!\s*lanes(?:\+(\d+))?\s+(.+)$", text, re.M):
+        base = int(m.group(1) or 0)
+        for L in range(64):
+            words[base + L] = eval(m.group(2), {"L": L}) & 0xffffffff
+    for m in re.finditer(r"^;!\s*word\s+(\S+)\s+(\S+)", text, re.M):
+        words[int(m.group(1), 0)] = int(m.group(2), 0) & 0xffffffff
+    body = "\n".join(l for l in text.splitlines() if not l.startswith("//") and not l.startswith(";")) + "\n"
+    (out / f"{n}.asm").write_text(body)
+    attrs = ["-mattr=+wavefrontsize64"] if wave64 else ["-mattr=-wavefrontsize64,+wavefrontsize32"]
+    r = run(["llvm-mc", "-arch=amdgcn", "-mcpu=gfx1013", *attrs, "-filetype=obj", str(out / f"{n}.asm"), "-o", str(out / f"{n}.o")])
+    if r.returncode:
+        print(f"{n}: does not assemble:\n{r.stderr}"); continue
+    run(["llvm-objcopy", "-O", "binary", "-j", ".text", str(out / f"{n}.o"), str(out / f"{n}.bin")])
+    r = run([str(tool), "translate", str(tmpl), "--code", str(out / f"{n}.bin")])
+    if r.returncode:
+        print(f"{n}: not translated: {r.stderr.strip()}"); continue
+    (out / f"{n}.hlsl").write_text(r.stdout)
+    prof = r.stdout.split()[2].rstrip(",")
+    r = run(["wine", str(pdxc), "-nologo", "-T", prof, "-E", "main", f"Z:{out / (n + '.hlsl')}", "-Fo", f"Z:{out / (n + '.dxil')}"])
+    if r.returncode:
+        print(f"{n}: translation does not compile: {(r.stdout + r.stderr)[:300]}"); continue
+    (out / f"{n}.expect").write_text("".join(f"{k} {v:#x}\n" for k, v in sorted(words.items())))
+    lines += [f"echo == {n}", f"dispatch_check.exe {n}.dxil template.cso {n}.hlsl -g 1 1 --expect {n}.expect || set /a fails+=1"]
+    print(f"{n}: built ({len(words)} expected words)")
+lines += ["echo failures: %fails%", "exit /b %fails%"]
+(out / "run.cmd").write_text("\r\n".join(lines) + "\r\n")

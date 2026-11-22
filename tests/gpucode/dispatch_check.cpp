@@ -5,6 +5,8 @@
 //   --ref R.dxil  also run a reference shader (the same kernel compiled for PC) and compare the
 //                 memory both leave behind
 //   --show        print the first dwords of every UAV window
+//   --expect F    check words of the u0 window against F (lines "<dword index> <value>", values
+//                 decimal or 0x hex; '#' starts a comment): hand-assembled ISA tests
 //
 // Runs one translated compute shader in isolation: the root signature comes from the original
 // console container, every descriptor-table entry gets a view of pattern-filled memory (view kinds
@@ -105,11 +107,13 @@ int main(int argc, char** argv) {
     unsigned gx = 1, gy = 1;
     std::string fill = "ramp";
     bool show = false;
+    const char* expect = nullptr;
     for (int i = 4; i < argc; i++) {
         if (!strcmp(argv[i], "-g") && i + 2 < argc) gx = atoi(argv[++i]), gy = atoi(argv[++i]);
         else if (!strcmp(argv[i], "-f") && i + 1 < argc) fill = argv[++i];
         else if (!strcmp(argv[i], "--ref") && i + 1 < argc) ref = read(argv[++i]);
         else if (!strcmp(argv[i], "--show")) show = true;
+        else if (!strcmp(argv[i], "--expect") && i + 1 < argc) expect = argv[++i];
     }
     if (dxil.empty() || cso.empty()) { printf("cannot read inputs\n"); return 1; }
     hlsl.push_back(0);
@@ -397,6 +401,31 @@ int main(int argc, char** argv) {
         for (auto& w : uav_windows)
             printf("  u%u: %08x %08x %08x %08x\n", w.first, got[w.second / 4], got[w.second / 4 + 1], got[w.second / 4 + 2], got[w.second / 4 + 3]);
     dump_messages();
+    if (expect) {
+        uint64_t base = UINT64_MAX;
+        for (auto& w : uav_windows) if (w.first == 0) base = w.second;
+        FILE* f = fopen(expect, "r");
+        if (!f || base == UINT64_MAX) { printf("cannot check: %s\n", f ? "no u0 window" : "expectation file missing"); return 1; }
+        char line[256];
+        size_t n = 0, bad = 0;
+        while (fgets(line, sizeof line, f)) {
+            if (char* h = strchr(line, '#')) *h = 0;
+            unsigned long long idx, val;
+            char *e1, *e2;
+            idx = strtoull(line, &e1, 0);
+            if (e1 == line) continue;
+            val = strtoull(e1, &e2, 0);
+            if (e2 == e1) continue;
+            n++;
+            uint32_t g = got[base / 4 + idx];
+            if (g != (uint32_t)val) {
+                if (bad++ < 12) printf("  dword %llu: got 0x%08x expected 0x%08x\n", idx, g, (uint32_t)val);
+            }
+        }
+        fclose(f);
+        printf("%s: %zu of %zu words differ\n", bad ? "MISMATCH" : "match", bad, n);
+        return bad ? 4 : 0;
+    }
     if (!ref_pso) return 0;
     if (!run(ref_pso, want, ref_ms)) return 3;
     printf("reference: %.3f ms\n", ref_ms);

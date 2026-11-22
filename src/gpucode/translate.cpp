@@ -1244,6 +1244,11 @@ bool Translator::emit_salu(const Instr& in, size_t idx) {
     if (n == "s_lshl_b64") { line(fmt("{ uint64_t r_ = %s << (%s & 63u); %s = uint(r_); %s = uint(r_ >> 32); scc = r_ != 0; }", a64().c_str(), b().c_str(), D.c_str(), S(d + 1).c_str())); sync_mask_from_int(d); return true; }
     if (n == "s_lshr_b64") { line(fmt("{ uint64_t r_ = %s >> (%s & 63u); %s = uint(r_); %s = uint(r_ >> 32); scc = r_ != 0; }", a64().c_str(), b().c_str(), D.c_str(), S(d + 1).c_str())); sync_mask_from_int(d); return true; }
     if (n == "s_ashr_i64") { line(fmt("{ uint64_t r_ = uint64_t(int64_t(%s) >> (%s & 63u)); %s = uint(r_); %s = uint(r_ >> 32); scc = r_ != 0; }", a64().c_str(), b().c_str(), D.c_str(), S(d + 1).c_str())); return true; }
+    if (n == "s_bfm_b64") {   // ((1 << S0[5:0]) - 1) << S1[5:0], 64-bit
+        line(fmt("{ uint w_ = %s & 63u, o_ = %s & 63u; uint64_t m_ = (w_ == 0u ? 0ull : (0xffffffffffffffffull >> (64u - w_))) << o_; %s = uint(m_); %s = uint(m_ >> 32); }",
+                 a().c_str(), b().c_str(), D.c_str(), S(d + 1).c_str()));
+        return true;
+    }
     if (n == "s_bfm_b32") { write_s(d, fmt("(((1u << (%s & 31u)) - 1u) << (%s & 31u))", a().c_str(), b().c_str())); return true; }
     if (n == "s_bfe_u32") { line(fmt("%s = bfe_u(%s, %s & 31u, (%s >> 16) & 127u); scc = %s != 0u;", D.c_str(), a().c_str(), b().c_str(), b().c_str(), D.c_str())); return true; }
     if (n == "s_bfe_i32") { line(fmt("%s = uint(bfe_i(int(%s), %s & 31u, (%s >> 16) & 127u)); scc = %s != 0u;", D.c_str(), a().c_str(), b().c_str(), b().c_str(), D.c_str())); return true; }
