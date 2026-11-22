@@ -3,6 +3,7 @@
 // Instruction semantics follow AMD's public RDNA instruction-set documentation.
 #include "translate.h"
 
+#include <atomic>
 #include <algorithm>
 #include <array>
 #include <cstdarg>
@@ -2272,11 +2273,33 @@ bool Translator::emit_mimg(const Instr& in, size_t idx) {
         Res& SR = res[s];
         if (!zc.empty()) SR.cmp_sampler = true;
         std::string tc;
-        if (dim == 3) tc = fmt("cube_dir(asfloat(%s), asfloat(%s), asfloat(%s))", crd[0].c_str(), crd[1].c_str(), crd[2].c_str());
-        else if (dim == 4) tc = fmt("float2(asfloat(%s), round(asfloat(%s)))", crd[0].c_str(), crd[1].c_str());
-        else if (dim == 5) tc = fmt("float3(asfloat(%s), asfloat(%s), round(asfloat(%s)))", crd[0].c_str(), crd[1].c_str(), crd[2].c_str());
+        if (dim == 3) {
+            // AMD cube coordinates: face-relative s, t in [1, 2] and face id + 8 * array slice.
+            tc = fmt("cube_dir(asfloat(%s), asfloat(%s), asfloat(%s))", crd[0].c_str(), crd[1].c_str(), crd[2].c_str());
+            if (R.cube_array) tc = fmt("float4(%s, floor(round(asfloat(%s)) / 8.0))", tc.c_str(), crd[2].c_str());
+        } else if (dim == 4) tc = fmt("float2(asfloat(%s), round(asfloat(%s)))", crd[0].c_str(), crd[1].c_str());
+        else if (dim == 5 && R.dim == 3) {
+            // A cube resource sampled as a 2D array (layer = face + 6 * slice, u, v in [0, 1]): the PC
+            // view is a cube, so the face texel becomes a direction again.
+            tc = fmt("cube_dir(asfloat(%s) + 1.0, asfloat(%s) + 1.0, float(uint(round(asfloat(%s))) %% 6u))", crd[0].c_str(), crd[1].c_str(), crd[2].c_str());
+            if (R.cube_array) tc = fmt("float4(%s, float(uint(round(asfloat(%s))) / 6u))", tc.c_str(), crd[2].c_str());
+        } else if (dim == 5) tc = fmt("float3(asfloat(%s), asfloat(%s), round(asfloat(%s)))", crd[0].c_str(), crd[1].c_str(), crd[2].c_str());
         else tc = fcoord(nc);
-        if (!offs.empty()) return fail(n + ": texel offsets not supported yet");
+        if (!offs.empty()) {
+            // Texel offsets (signed 6-bit x [5:0], y [13:8]): on 2D textures and 2D arrays sampled at an
+            // explicit level they become a UV shift of offset / mip size (exact at level 0).
+            bool explicit_lod = has(n, "_lz") || !lod.empty();
+            bool flat = dim == 1 || (dim == 5 && R.dim != 3);
+            if (!flat || !explicit_lod || has(n, "gather")) return fail(n + ": texel offsets not supported yet");
+            std::string mip = has(n, "_lz") ? std::string("0u") : fmt("uint(max(round(asfloat(%s)), 0.0))", lod.c_str());
+            static std::atomic<unsigned> ofsSerial{0};   // one name per instruction (a resource may be sampled many times)
+            std::string ofs = fmt("ofs%u_", ofsSerial.fetch_add(1));
+            line(fmt("float2 %s; { uint o_ = %s; int ox_ = int(o_ << 26) >> 26, oy_ = int(o_ << 18) >> 26; uint w_, h_, d_, l_; %s.GetDimensions(%s, w_, h_, %sl_); "
+                     "%s = float2(ox_, oy_) / float2(max(w_, 1u), max(h_, 1u)); }",
+                     ofs.c_str(), offs.c_str(), RN.c_str(), mip.c_str(), dim == 5 ? "d_, " : "", ofs.c_str()));
+            if (dim == 1) tc = fmt("(%s + %s)", tc.c_str(), ofs.c_str());
+            else tc = fmt("(%s + float3(%s, 0.0))", tc.c_str(), ofs.c_str());
+        }
         std::string call;
         const std::string T = RN;
         const std::string SS = sn(idx, s);

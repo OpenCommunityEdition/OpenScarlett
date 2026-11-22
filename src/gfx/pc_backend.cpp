@@ -965,6 +965,48 @@ HRESULT_T create_pso_stream(PcObj dev, void* stream, size_t size, PcObj* out) {
         d2->Release();
     }
     if (FAILED(hr)) { dump_debug_messages(); XSL_ERR(CH, "CreatePipelineState (stream, %zu bytes) failed %08lx (translated shaders: %s)", size, hr, translated_keys()); note_removed(hr); }
+    // XSL_DUMP_FAILED_PSO=<dir>: the shaders of failed pipeline streams (<dir>\pso<n>_s<type>.bin).
+    static char dumpDir[MAX_PATH] = "";
+    static bool dumpInit = (GetEnvironmentVariableA("XSL_DUMP_FAILED_PSO", dumpDir, sizeof dumpDir), true);
+    (void)dumpInit;
+    static volatile long dumped = 0;
+    if (FAILED(hr) && dumpDir[0] && InterlockedIncrement(&dumped) <= 12) {
+        const uint8_t* p = (const uint8_t*)stream;
+        for (size_t o = 0; o + sizeof(void*) <= size;) {
+            auto t = *(const D3D12_PIPELINE_STATE_SUBOBJECT_TYPE*)(p + o);
+            size_t n = 0;
+            switch (t) {
+            case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS: case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS: case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DS:
+            case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_HS: case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_GS: case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CS:
+            case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS: case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS: {
+                n = sizeof(StreamSub<D3D12_SHADER_BYTECODE>);
+                auto& bc = ((const StreamSub<D3D12_SHADER_BYTECODE>*)(p + o))->v;
+                if (bc.pShaderBytecode && bc.BytecodeLength) {
+                    char path[MAX_PATH + 64];
+                    snprintf(path, sizeof path, "%s\\pso%ld_s%d.bin", dumpDir, dumped, (int)t);
+                    if (FILE* f = fopen(path, "wb")) { fwrite(bc.pShaderBytecode, 1, bc.BytecodeLength, f); fclose(f); }
+                }
+                break;
+            }
+            case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE: n = sizeof(StreamSub<void*>); break;
+            case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_STREAM_OUTPUT: n = sizeof(StreamSub<D3D12_STREAM_OUTPUT_DESC>); break;
+            case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND: n = sizeof(StreamSub<D3D12_BLEND_DESC>); break;
+            case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK: case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_IB_STRIP_CUT_VALUE:
+            case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY: case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_NODE_MASK: n = sizeof(StreamSub<UINT>); break;
+            case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER: n = sizeof(StreamSub<D3D12_RASTERIZER_DESC>); break;
+            case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL: case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL1: n = sizeof(StreamSub<D3D12_DEPTH_STENCIL_DESC>); break;
+            case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_INPUT_LAYOUT: n = sizeof(StreamSub<D3D12_INPUT_LAYOUT_DESC>); break;
+            case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS: n = sizeof(StreamSub<D3D12_RT_FORMAT_ARRAY>); break;
+            case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL_FORMAT: n = sizeof(StreamSub<DXGI_FORMAT>); break;
+            case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_DESC: n = sizeof(StreamSub<DXGI_SAMPLE_DESC>); break;
+            case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CACHED_PSO: n = sizeof(StreamSub<D3D12_CACHED_PIPELINE_STATE>); break;
+            case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_FLAGS: n = sizeof(StreamSub<D3D12_PIPELINE_STATE_FLAGS>); break;
+            case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VIEW_INSTANCING: n = sizeof(StreamSub<D3D12_VIEW_INSTANCING_DESC>); break;
+            default: n = size; break;
+            }
+            o += n;
+        }
+    }
     if (SUCCEEDED(hr)) name_translated(*out);
     if (hr == DXGI_ERROR_DEVICE_REMOVED) report_device_removed(as<ID3D12Device>(dev));
     return hr;
