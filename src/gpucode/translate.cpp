@@ -295,7 +295,8 @@ struct Translator {
     // picking one of several descriptors by branch): the loads of a group write their offset into
     // the representative's dyn variable, and the use indexes the table range with it.
     std::set<size_t> gm_sloads;            // s_load from run-time pointers: read through global memory
-    std::set<size_t> dyn_mubuf;            // raw buffer dword accesses whose descriptor is known only at run time
+    std::set<size_t> dyn_mubuf;
+    std::set<size_t> dyn_sbuf;             // s_buffer_load whose descriptor is known only at run time            // raw buffer dword accesses whose descriptor is known only at run time
     bool soft_trace = false;
     std::map<size_t, size_t> dyn_alias;    // load -> representative load
     std::set<size_t> merged_reps;
@@ -857,7 +858,11 @@ struct Translator {
                 if (!keep.empty()) res_index[i] = keep;
             }
         } else if (in.fmt == Fmt::SMEM && starts(n, "s_buffer_load")) {
+            // A descriptor known only at run time: its base address through global memory.
+            soft_trace = opt.global_memory || opt.global_memory_test;
             res_of[i] = resource(st, in.sbase, 4, in, false);
+            soft_trace = false;
+            if (res_of[i] < 0 && (opt.global_memory || opt.global_memory_test)) dyn_sbuf.insert(i);
         } else if (in.fmt == Fmt::SMEM && starts(n, "s_load")) {
             // Descriptor loads: values come from synthesized descriptor words when read as data.
             unsigned cnt = has(n, "x16") ? 16 : has(n, "x8") ? 8 : has(n, "x4") ? 4 : has(n, "x2") ? 2 : 1;
@@ -1452,6 +1457,15 @@ bool Translator::emit_smem(const Instr& in, size_t idx) {
     }
     if (starts(n, "s_buffer_load_dword")) {
         int r = res_of.count(idx) ? res_of[idx] : -1;
+        if (r < 0 && dyn_sbuf.count(idx)) {   // descriptor words in SGPRs: base [47:0]
+            uses_gm = true;
+            unsigned cnt = has(n, "x16") ? 16 : has(n, "x8") ? 8 : has(n, "x4") ? 4 : has(n, "x2") ? 2 : 1;
+            std::string off = in.soffset == src::kNull ? fmt("%uu", uint32_t(in.offset_imm)) : fmt("(%s + %uu)", rd(in.soffset, in).c_str(), uint32_t(in.offset_imm));
+            line(fmt("{ uint lo_ = %s + (%s & ~3u), hi_ = (%s & 0xffffu) + (lo_ < %s ? 1u : 0u);", S(in.sbase).c_str(), off.c_str(), S(in.sbase + 1).c_str(), S(in.sbase).c_str()));
+            for (unsigned k = 0; k < cnt; k++) line(fmt("  %s = gm_load(lo_ + %uu, hi_ + (lo_ + %uu < lo_ ? 1u : 0u));", S(in.sdata + k).c_str(), 4 * k, 4 * k));
+            line("}");
+            return true;
+        }
         if (r < 0) return false;
         const Res& R = res[r];
         if (R.dyn) return fail(n + ": scalar loads from resource arrays not supported");

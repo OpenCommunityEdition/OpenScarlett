@@ -2,13 +2,15 @@
 // Run-time descriptors and pointers (global-memory test mode: memory = the t1 buffer).
 // A raw buffer descriptor built in SGPRs (base 0x100, stride 8): buffer_load_dword offen with
 // offset:4 reads 0x104; idxen with index 2 reads 0x100 + 2 * 8 = 0x110. s_load_dword through a
-// pointer from v_readfirstlane (unknown when translating) reads 0x204.
+// pointer from v_readfirstlane (unknown when translating) reads 0x204; s_buffer_load_dword through
+// the descriptor at 0x10 reads 0x110.
 ;! gmtest
 ;! mem 0x100 0x0 0x1234 0x0 0x0 0x5678
 ;! mem 0x200 0x0 0x9abc
 ;! lanes 0x1234
 ;! lanes+64 0x5678
 ;! lanes+128 0x9abc
+;! lanes+192 0x5678
 s_mov_b32 s6, s5
 s_mov_b32 s5, 0
 s_mov_b32 s7, 0
@@ -37,4 +39,8 @@ s_load_dword s26, s[24:25], 0x4
 s_waitcnt lgkmcnt(0)
 v_mov_b32 v1, s26
 buffer_store_dword v1, v0, s[4:7], 0 offen offset:512
+s_buffer_load_dword s27, s[20:23], 0x10
+s_waitcnt lgkmcnt(0)
+v_mov_b32 v1, s27
+buffer_store_dword v1, v0, s[4:7], 0 offen offset:768
 s_endpgm
