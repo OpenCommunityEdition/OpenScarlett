@@ -8,6 +8,7 @@
 #include <cstdarg>
 #include <cstdio>
 #include <cstring>
+#include <functional>
 #include <map>
 #include <set>
 #include <sstream>
@@ -923,6 +924,8 @@ struct Translator {
     bool emit_valu(const Instr& in, size_t idx);
     bool emit_smem(const Instr& in, size_t idx);
     bool emit_mubuf(const Instr& in, size_t idx);
+    bool emit_tbuffer_raw(const Instr& in, const Res& R, const std::string& RN, const std::string& addr,
+                          const std::function<std::string(const std::string&)>& word);
     bool emit_mimg(const Instr& in, size_t idx);
     bool emit_ds(const Instr& in, size_t idx);
     bool emit_vintrp(const Instr& in, size_t idx);
@@ -1835,6 +1838,99 @@ bool Translator::emit_valu(const Instr& in, size_t idx) {
 }
 
 // ---- buffers -----------------------------------------------------------------------------
+// Typed buffer access on a raw or structured view: the instruction's format field (GFX10 unified
+// format, names generated from LLVM: buf_formats.inc) says how the element is packed and converted.
+namespace {
+struct BufFmt { unsigned id; const char* name; };
+const BufFmt kBufFmts[] = {
+#include "buf_formats.inc"
+};
+}  // namespace
+bool Translator::emit_tbuffer_raw(const Instr& in, const Res& R, const std::string& RN, const std::string& addr,
+                                  const std::function<std::string(const std::string&)>& word) {
+    std::string n = in.name;
+    const char* fname = nullptr;
+    for (auto& f : kBufFmts) if (f.id == in.format) fname = f.name;
+    if (!fname) return fail(fmt("%s: buffer format %u unknown", in.name, in.format));
+    if (in.d16) return fail(n + " (16-bit data) on a raw buffer not supported");
+    std::string fs = fname;   // e.g. "16_16_UNORM", "10_10_10_2_UNORM", "32_32_FLOAT"
+    size_t us = fs.rfind('_');
+    std::string type = fs.substr(us + 1);
+    std::vector<unsigned> bits;
+    for (size_t p = 0; p < us;) {
+        size_t q = fs.find('_', p);
+        if (q == std::string::npos || q > us) q = us;
+        bits.push_back((unsigned)atoi(fs.substr(p, q - p).c_str()));
+        p = q + 1;
+    }
+    if (bits.empty() || bits.size() > 4) return fail(fmt("%s: buffer format %s not supported", in.name, fname));
+    bool packed = false;
+    for (unsigned b : bits) if (b != bits[0]) packed = true;
+    unsigned total = 0;
+    for (unsigned b : bits) total += b;
+    if (packed && total != 32) return fail(fmt("%s: buffer format %s not supported", in.name, fname));
+    if (!packed && bits[0] != 8 && bits[0] != 16 && bits[0] != 32) return fail(fmt("%s: buffer format %s not supported", in.name, fname));
+    if (type == "FLOAT" && (packed || bits[0] == 8)) return fail(fmt("%s: buffer format %s not supported", in.name, fname));
+    unsigned cnt = ends(n, "_xyzw") ? 4 : ends(n, "_xyz") ? 3 : ends(n, "_xy") ? 2 : 1;
+    auto dw = [&](const std::string& a) { return R.kind == ResKind::RawBuf ? fmt("%s.Load((%s) & ~3u)", RN.c_str(), a.c_str()) : word(fmt("((%s) & ~3u)", a.c_str())); };
+    // Bit position of component c, relative to the element start (components are packed from bit 0).
+    auto pos = [&](unsigned c) { unsigned p = 0; for (unsigned k = 0; k < c; k++) p += bits[k]; return p; };
+    bool load = starts(n, "tbuffer_load");
+    line(fmt("if (kexec) { uint a_ = %s;", addr.c_str()));
+    for (unsigned c = 0; c < cnt; c++) {
+        if (c >= bits.size()) {   // missing components read (0, 0, 0, 1)
+            if (load) {
+                bool fl = type == "FLOAT" || type == "UNORM" || type == "SNORM" || type == "USCALED" || type == "SSCALED";
+                line(fmt("  %s = %s;", V(in.vdata + c).c_str(), c == 3 ? (fl ? "0x3f800000u" : "1u") : "0u"));
+            }
+            continue;
+        }
+        unsigned b = bits[c], p = pos(c);
+        std::string byte = fmt("(a_ + %uu)", p / 8);
+        unsigned sh = p % 32;   // within the dword holding the component (element dword-aligned for packed and 32-bit formats)
+        std::string shift = b == 32 ? "0u" : (packed ? fmt("%uu", sh) : fmt("((%s & 3u) * 8u)", byte.c_str()));
+        std::string mask = b == 32 ? "0xffffffffu" : fmt("0x%xu", (1u << b) - 1);
+        std::string src = packed ? "a_" : byte;
+        if (load) {
+            std::string raw = fmt("((%s >> %s) & %s)", dw(src).c_str(), shift.c_str(), mask.c_str());
+            std::string sx = b == 32 ? fmt("int(%s)", raw.c_str()) : fmt("(int(%s << %uu) >> %u)", raw.c_str(), 32 - b, 32 - b);
+            std::string v;
+            if (type == "UINT") v = raw;
+            else if (type == "SINT") v = fmt("uint(%s)", sx.c_str());
+            else if (type == "FLOAT") v = b == 32 ? raw : fmt("asuint(f16tof32(%s))", raw.c_str());
+            else if (type == "UNORM") v = fmt("asuint(ndiv(float(%s), %.1f))", raw.c_str(), double((1ull << b) - 1));
+            else if (type == "SNORM") v = fmt("asuint(max(ndiv(float(%s), %.1f), -1.0))", sx.c_str(), double((1ull << (b - 1)) - 1));
+            else if (type == "USCALED") v = fmt("asuint(float(%s))", raw.c_str());
+            else if (type == "SSCALED") v = fmt("asuint(float(%s))", sx.c_str());
+            else return fail(fmt("%s: buffer format %s not supported", in.name, fname));
+            line(fmt("  %s = %s;", V(in.vdata + c).c_str(), v.c_str()));
+        } else {
+            std::string x = V(in.vdata + c), v;
+            if (type == "UINT" || type == "SINT") v = fmt("(%s & %s)", x.c_str(), mask.c_str());
+            else if (type == "FLOAT") v = b == 32 ? x : fmt("(f32tof16(asfloat(%s)) & 0xffffu)", x.c_str());
+            else if (type == "UNORM") v = fmt("(uint(round(saturate(asfloat(%s)) * %.1f)) & %s)", x.c_str(), double((1ull << b) - 1), mask.c_str());
+            else if (type == "SNORM") v = fmt("(uint(int(round(clamp(asfloat(%s), -1.0, 1.0) * %.1f))) & %s)", x.c_str(), double((1ull << (b - 1)) - 1), mask.c_str());
+            else return fail(fmt("%s: buffer format %s not supported", in.name, fname));
+            if (b == 32) {
+                if (R.kind == ResKind::RawBuf) line(fmt("  %s.Store((%s) & ~3u, %s);", RN.c_str(), src.c_str(), v.c_str()));
+                else line(fmt("  %s = %s;", word(fmt("((%s) & ~3u)", src.c_str())).c_str(), v.c_str()));
+            } else {
+                // Sub-dword component: clear and set its bits atomically (neighbouring lanes may share the dword).
+                line(fmt("  { uint s_ = %s; uint o_;", shift.c_str()));
+                if (R.kind == ResKind::RawBuf) {
+                    line(fmt("    %s.InterlockedAnd((%s) & ~3u, ~(%s << s_), o_);", RN.c_str(), src.c_str(), mask.c_str()));
+                    line(fmt("    %s.InterlockedOr((%s) & ~3u, %s << s_, o_); }", RN.c_str(), src.c_str(), v.c_str()));
+                } else {
+                    std::string t = word(fmt("((%s) & ~3u)", src.c_str()));
+                    line(fmt("    InterlockedAnd(%s, ~(%s << s_), o_);", t.c_str(), mask.c_str()));
+                    line(fmt("    InterlockedOr(%s, %s << s_, o_); }", t.c_str(), v.c_str()));
+                }
+            }
+        }
+    }
+    line("}");
+    return true;
+}
 bool Translator::emit_mubuf(const Instr& in, size_t idx) {
     std::string n = in.name;
     int r = res_of.count(idx) ? res_of[idx] : -1;
@@ -1922,6 +2018,7 @@ bool Translator::emit_mubuf(const Instr& in, size_t idx) {
     }
     if (R.kind != ResKind::RawBuf && R.kind != ResKind::StructBuf) return fail(fmt("%s at 0x%x: not a buffer resource", in.name, in.offset));
     if (in.lds) return fail(n + " with LDS not supported");
+    if (starts(n, "tbuffer_load_format_") || starts(n, "tbuffer_store_format_")) return emit_tbuffer_raw(in, R, RN, addr, word);
     if (starts(n, "buffer_load_dword") || starts(n, "buffer_load_ubyte") || starts(n, "buffer_load_sbyte") || starts(n, "buffer_load_ushort") ||
         starts(n, "buffer_load_sshort") || starts(n, "buffer_load_short_d16") || starts(n, "buffer_load_ubyte_d16") || starts(n, "buffer_load_sbyte_d16")) {
         unsigned cnt = has(n, "x4") ? 4 : has(n, "x3") ? 3 : has(n, "x2") ? 2 : 1;
@@ -2590,6 +2687,7 @@ uint first_lane(bool e) { uint2 b = ballot2(e); return b.x != 0u ? firstbitlow(b
 uint ff1_64(uint lo, uint hi) { return lo != 0u ? firstbitlow(lo) : (hi != 0u ? 32u + firstbitlow(hi) : 0xffffffffu); }
 uint flbit_i32(uint x) { int v = int(x); if (v == 0 || v == -1) return 0xffffffffu; return 31u - firstbithigh(v < 0 ? ~x : x); }
 uint wqm32(uint x) { uint r = 0u; [unroll] for (uint q = 0u; q < 32u; q += 4u) if (((x >> q) & 15u) != 0u) r |= 15u << q; return r; }
+float ndiv(float x, float d) { float q = x * (1.0f / d); float e = mad(-q, d, x); return mad(e, 1.0f / d, q); }   // x / d, correctly rounded for small integers
 float mul_legacy(float a, float b) { return (a == 0.0f || b == 0.0f) ? 0.0f : a * b; }
 float mad_legacy(float a, float b, float c) { precise float p = mul_legacy(a, b); precise float r = p + c; return r; }   // unfused
 float fma_legacy(float a, float b, float c) { return (a == 0.0f || b == 0.0f) ? c : mad(a, b, c); }                       // fused

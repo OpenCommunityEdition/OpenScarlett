@@ -9,7 +9,7 @@ output directory then holds run.cmd, which runs every test on a Windows PC with 
 Expectations, in the .s header: ';! lanes <expr>' gives words 0..63 (the expression may use L,
 the lane), ';! lanes+<n> <expr>' words n..n+63, ';! word <index> <value>' one word.
 Usage: tools/gpucode/asmtests <outdir>   (needs build/ and build-native/ built, sdk/ linked)"""
-import os, re, shutil, subprocess, sys
+import os, re, shutil, struct, subprocess, sys
 from pathlib import Path
 
 root = Path(__file__).resolve().parents[2]
@@ -38,7 +38,7 @@ for src in sorted(asm.glob("*.s")):
     for m in re.finditer(r"^;!\s*lanes(?:\+(\d+))?\s+(.+)$", text, re.M):
         base = int(m.group(1) or 0)
         for L in range(64):
-            words[base + L] = eval(m.group(2), {"L": L}) & 0xffffffff
+            words[base + L] = eval(m.group(2), {"L": L, "struct": struct}) & 0xffffffff
     for m in re.finditer(r"^;!\s*word\s+(\S+)\s+(\S+)", text, re.M):
         words[int(m.group(1), 0)] = int(m.group(2), 0) & 0xffffffff
     body = "\n".join(l for l in text.splitlines() if not l.startswith("//") and not l.startswith(";")) + "\n"
