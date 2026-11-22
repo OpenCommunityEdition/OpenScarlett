@@ -177,11 +177,14 @@ bool materialize_xbox_cbv(uint32_t i, const uint64_t* q) {
     return true;
 }
 
+constexpr size_t kTagOffset = 16;   // view slots: payload in bytes 0..15, tag in 16..31
+thread_local uint32_t t_payload[4];
+thread_local bool t_has_payload = false;
 // Make global slot i match its shadow bytes. Caller holds g_mu.
 void materialize(uint32_t i) {
     const uint8_t* s = g_view + (size_t)i * kViewSlot;
     Tag t;
-    memcpy(&t, s, sizeof t);
+    memcpy(&t, s + kTagOffset, sizeof t);
     uint64_t rec;
     if (t.magic == kMagic) {
         if (g_rec[D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV].resolve(t, &rec)) {
@@ -240,6 +243,10 @@ uint32_t desc_increment(D3D12_DESCRIPTOR_HEAP_TYPE t, uint32_t pcInc) {
 
 // ---- Descriptor creation: returns the PC handle to write, or 0 to use `h` itself ----------------
 // After the PC descriptor is written there, desc_commit() publishes it to the title's slot.
+void desc_set_payload(const uint32_t words[4]) {
+    memcpy(t_payload, words, sizeof t_payload);
+    t_has_payload = true;
+}
 uint64_t desc_begin_write(uint64_t h, D3D12_DESCRIPTOR_HEAP_TYPE type, Tag* tagOut) {
     std::lock_guard<std::mutex> g(g_mu);
     if (!g_ready) return 0;
@@ -258,7 +265,13 @@ void desc_commit(uint64_t h, D3D12_DESCRIPTOR_HEAP_TYPE type, const Tag& tag) {
         if (!view_slot(h, &i)) return;
         uint8_t* s = g_view + (size_t)i * kViewSlot;
         memset(s, 0, kViewSlot);
-        memcpy(s, &tag, sizeof tag);
+        if (t_has_payload) {
+            uint32_t w[4] = {t_payload[0], t_payload[1], t_payload[2], t_payload[3]};
+            if (w[1] & kDescTexture) w[0] = i;   // textures: the slot's own heap index
+            memcpy(s, w, sizeof w);
+            t_has_payload = false;
+        }
+        memcpy(s + kTagOffset, &tag, sizeof tag);
         uint64_t rec;
         if (g_rec[type].resolve(tag, &rec)) set_slot(i, rec);
         memcpy(&g_snapshot[(size_t)i * kViewSlot], s, kViewSlot);
@@ -283,6 +296,8 @@ bool desc_copy(uint32_t n, uint64_t dst, uint64_t src, D3D12_DESCRIPTOR_HEAP_TYP
             uint32_t k = di > si ? n - 1 - q : q;
             if (di + k == si + k) continue;
             set_slot(di + k, mirror_cpu(si + k));
+            uint32_t* w = (uint32_t*)(g_view + (size_t)(di + k) * kViewSlot);
+            if (w[1] & kDescTexture) w[0] = di + k;   // texture payloads name their own slot
             memcpy(&g_snapshot[(size_t)(di + k) * kViewSlot], g_view + (size_t)(di + k) * kViewSlot, kViewSlot);
         }
         return true;

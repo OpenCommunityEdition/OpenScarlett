@@ -876,7 +876,7 @@ struct Translator {
         else if (in.fmt == Fmt::MIMG) {
             bool bvh = has(n, "bvh");   // inert acceleration structures (emit_mimg): no resource
             // Image loads/stores may take a descriptor read from descriptor memory at run time: the
-            // layer stamps its global-heap index and view kind into descriptor dwords 4 and 5.
+            // layer stamps its global-heap index and view kind into descriptor dwords 0 and 1.
             bool dynOk = !bvh && (n == "image_load" || n == "image_store" || n == "image_load_mip") && (opt.global_memory || opt.global_memory_test);
             soft_trace = dynOk;
             int r = bvh ? -2 : resource(st, in.srsrc, 8, in, false);
@@ -2363,7 +2363,7 @@ bool Translator::emit_mubuf(const Instr& in, size_t idx) {
 }
 
 // ---- images ------------------------------------------------------------------------------
-// Image load/store through the global heap: descriptor dword 4 = heap index, dword 5 = view kind
+// Image load/store through the global heap: descriptor dword 0 = heap index, dword 1 = view kind
 // (bit 0 UAV, bits 7:4 class 0 float / 1 uint / 2 sint). Arrays HU<dim><cls> (UAVs) and HS<dim><cls>
 // (SRVs) cover the whole heap (spaces 910+). 2D, 2D array and 3D; no A16/D16.
 bool Translator::emit_heap_image(const Instr& in) {
@@ -2378,7 +2378,7 @@ bool Translator::emit_heap_image(const Instr& in) {
     std::string c = nc == 2 ? fmt("uint2(%s, %s)", areg(0).c_str(), areg(1).c_str())
                             : fmt("uint3(%s, %s, %s)", areg(0).c_str(), areg(1).c_str(), areg(2).c_str());
     std::string mip = n == "image_load_mip" ? areg(nc) : std::string("0u");
-    const std::string hi = S(in.srsrc + 4), hk = S(in.srsrc + 5);
+    const std::string hi = S(in.srsrc), hk = S(in.srsrc + 1);   // layer payload: heap index, view kind
     if (n == "image_store") {
         std::string fv, uv, iv;
         unsigned o = 0;

@@ -6,6 +6,7 @@
 #include <array>
 #include <mutex>
 #include <string>
+#include <map>
 #include <vector>
 
 #include "xs_object.h"
@@ -128,11 +129,26 @@ HRESULT D3DAPI D_CreateDescriptorHeap(ID3D12Device* d, const D3D12_DESCRIPTOR_HE
 UINT D3DAPI D_GetDescriptorHandleIncrementSize(ID3D12Device* d, D3D12_DESCRIPTOR_HEAP_TYPE t) {
     return desc_increment(t, pc::descriptor_increment(DPC(d), t));
 }
+// Serialized root signatures by PC object (ray-tracing pipelines lay out their argument memory from
+// the global root signature).
+std::mutex g_rs_blob_mu;
+std::map<PcObj, std::vector<uint8_t>> g_rs_blobs;
+bool root_signature_blob(PcObj rs, std::vector<uint8_t>* out) {
+    std::lock_guard<std::mutex> g(g_rs_blob_mu);
+    auto it = g_rs_blobs.find(rs);
+    if (it == g_rs_blobs.end()) return false;
+    *out = it->second;
+    return true;
+}
 HRESULT D3DAPI D_CreateRootSignature(ID3D12Device* d, UINT, const void* blob, SIZE_T n, REFIID riid, void** out) {
     XSL_TRACE("gfx.cmd", "CreateRootSignature %zu bytes", (size_t)n);
     PcObj rs = nullptr;
     HRESULT hr = pc::create_root_signature(DPC(d), blob, n, &rs);
     if (FAILED(hr)) return hr;
+    if (blob && n) {
+        std::lock_guard<std::mutex> g(g_rs_blob_mu);
+        g_rs_blobs[rs].assign((const uint8_t*)blob, (const uint8_t*)blob + n);
+    }
     XSL_TRACE("gfx.cmd", "CreateRootSignature -> %p", rs);
     return make_simple(DEV(d), Kind::RootSignature, rs, riid, out);
 }
@@ -393,6 +409,56 @@ HRESULT D3DAPI D_CreatePlacedResource(ID3D12Device* d, ID3D12Heap* heap, UINT64 
     if (FAILED(hr)) return hr;
     return make_resource(DEV(d), r, riid, out);
 }
+// ---- Console-style payloads of view slots (desc_set_payload) ----
+static uint32_t dxgi_class(DXGI_FORMAT f) {   // 0 float/norm, 1 uint, 2 sint
+    switch (f) {
+        case DXGI_FORMAT_R32G32B32A32_UINT: case DXGI_FORMAT_R32G32B32_UINT: case DXGI_FORMAT_R16G16B16A16_UINT: case DXGI_FORMAT_R32G32_UINT:
+        case DXGI_FORMAT_R10G10B10A2_UINT: case DXGI_FORMAT_R8G8B8A8_UINT: case DXGI_FORMAT_R16G16_UINT: case DXGI_FORMAT_R32_UINT:
+        case DXGI_FORMAT_R8G8_UINT: case DXGI_FORMAT_R16_UINT: case DXGI_FORMAT_R8_UINT: return 1;
+        case DXGI_FORMAT_R32G32B32A32_SINT: case DXGI_FORMAT_R32G32B32_SINT: case DXGI_FORMAT_R16G16B16A16_SINT: case DXGI_FORMAT_R32G32_SINT:
+        case DXGI_FORMAT_R8G8B8A8_SINT: case DXGI_FORMAT_R16G16_SINT: case DXGI_FORMAT_R32_SINT: case DXGI_FORMAT_R8G8_SINT:
+        case DXGI_FORMAT_R16_SINT: case DXGI_FORMAT_R8_SINT: return 2;
+        default: return 0;
+    }
+}
+struct BufFmt { unsigned id; const char* name; };
+static const BufFmt kBufFmts[] = {
+#include "../gpucode/buf_formats.inc"
+};
+static uint32_t gfx10_buffer_format(DXGI_FORMAT f, uint32_t* bytes) {   // GFX10 unified buffer format id (0: unknown)
+    struct M { DXGI_FORMAT f; const char* n; uint32_t b; };
+    static const M m[] = {
+        {DXGI_FORMAT_R32G32B32A32_FLOAT, "32_32_32_32_FLOAT", 16}, {DXGI_FORMAT_R32G32B32A32_UINT, "32_32_32_32_UINT", 16},
+        {DXGI_FORMAT_R32G32B32A32_SINT, "32_32_32_32_SINT", 16}, {DXGI_FORMAT_R32G32B32_FLOAT, "32_32_32_FLOAT", 12},
+        {DXGI_FORMAT_R32G32B32_UINT, "32_32_32_UINT", 12}, {DXGI_FORMAT_R16G16B16A16_FLOAT, "16_16_16_16_FLOAT", 8},
+        {DXGI_FORMAT_R16G16B16A16_UNORM, "16_16_16_16_UNORM", 8}, {DXGI_FORMAT_R16G16B16A16_UINT, "16_16_16_16_UINT", 8},
+        {DXGI_FORMAT_R16G16B16A16_SNORM, "16_16_16_16_SNORM", 8}, {DXGI_FORMAT_R32G32_FLOAT, "32_32_FLOAT", 8},
+        {DXGI_FORMAT_R32G32_UINT, "32_32_UINT", 8}, {DXGI_FORMAT_R8G8B8A8_UNORM, "8_8_8_8_UNORM", 4}, {DXGI_FORMAT_R8G8B8A8_UINT, "8_8_8_8_UINT", 4},
+        {DXGI_FORMAT_R8G8B8A8_SNORM, "8_8_8_8_SNORM", 4}, {DXGI_FORMAT_R16G16_FLOAT, "16_16_FLOAT", 4}, {DXGI_FORMAT_R16G16_UNORM, "16_16_UNORM", 4},
+        {DXGI_FORMAT_R16G16_UINT, "16_16_UINT", 4}, {DXGI_FORMAT_R32_FLOAT, "32_FLOAT", 4}, {DXGI_FORMAT_R32_UINT, "32_UINT", 4},
+        {DXGI_FORMAT_R32_SINT, "32_SINT", 4}, {DXGI_FORMAT_R16_FLOAT, "16_FLOAT", 2}, {DXGI_FORMAT_R16_UNORM, "16_UNORM", 2},
+        {DXGI_FORMAT_R16_UINT, "16_UINT", 2}, {DXGI_FORMAT_R8_UNORM, "8_UNORM", 1}, {DXGI_FORMAT_R8_UINT, "8_UINT", 1},
+        {DXGI_FORMAT_R8G8_UNORM, "8_8_UNORM", 2}, {DXGI_FORMAT_R10G10B10A2_UNORM, "10_10_10_2_UNORM", 4}};
+    for (auto& e : m)
+        if (e.f == f)
+            for (auto& b : kBufFmts)
+                if (!strcmp(b.name, e.n)) { if (bytes) *bytes = e.b; return b.id; }
+    if (bytes) *bytes = 4;
+    return 0;
+}
+// Buffer views: {base, base[47:32] | stride << 16, records, format << 12}.
+static void buffer_payload(PcObj res, DXGI_FORMAT f, uint64_t first, uint32_t count, uint32_t stride, bool raw) {
+    uint32_t eb = 4;
+    uint32_t fmt = raw || stride ? 20u /* 32_UINT */ : gfx10_buffer_format(f, &eb);
+    if (stride) eb = stride;
+    uint64_t base = pc::res_gpu_va(res) + first * eb;
+    uint32_t w[4] = {(uint32_t)base, (uint32_t)((base >> 32) & 0xffff) | ((stride & 0x3fff) << 16), raw ? count * 4 : count, fmt << 12};
+    desc_set_payload(w);
+}
+static void texture_payload(DXGI_FORMAT f, bool uav) {
+    uint32_t w[4] = {0, kDescTexture | (uav ? 1u : 0u) | (dxgi_class(f) << 4), 0, 0};
+    desc_set_payload(w);
+}
 // View creation writes a PC descriptor into a record and publishes it to the console-layout slot.
 template <class F> void write_view(uint64_t h, D3D12_DESCRIPTOR_HEAP_TYPE type, F create) {
     DescTag tag;
@@ -412,10 +478,34 @@ void D3DAPI D_CreateDSV(ID3D12Device* d, ID3D12Resource* r, const D3D12_DEPTH_ST
 }
 void D3DAPI D_CreateSRV(ID3D12Device* d, ID3D12Resource* r, const D3D12_SHADER_RESOURCE_VIEW_DESC* v, D3D12_CPU_DESCRIPTOR_HANDLE h) {
     if (r) { D3D12_RESOURCE_DESC rd; pc::res_desc(P(r), &rd); XSL_TRACE("gfx.desc", "SRV handle %llx fmt %d %llux%u viewdesc %p", (unsigned long long)h.ptr, (int)rd.Format, (unsigned long long)rd.Width, rd.Height, (void*)v); }
+    if (v && v->ViewDimension == D3D12_SRV_DIMENSION_RAYTRACING_ACCELERATION_STRUCTURE) {
+        uint64_t a = v->RaytracingAccelerationStructure.Location;
+        uint32_t w[4] = {(uint32_t)a, (uint32_t)(a >> 32), 0, 0};
+        desc_set_payload(w);
+    } else if (r) {
+        D3D12_RESOURCE_DESC rd;
+        pc::res_desc(P_or_pc(r), &rd);
+        DXGI_FORMAT f = v && v->Format != DXGI_FORMAT_UNKNOWN ? v->Format : rd.Format;
+        if (rd.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
+            if (v && v->ViewDimension == D3D12_SRV_DIMENSION_BUFFER)
+                buffer_payload(P_or_pc(r), f, v->Buffer.FirstElement, v->Buffer.NumElements, v->Buffer.StructureByteStride, (v->Buffer.Flags & D3D12_BUFFER_SRV_FLAG_RAW) != 0);
+            else buffer_payload(P_or_pc(r), DXGI_FORMAT_UNKNOWN, 0, (uint32_t)(rd.Width / 4), 0, true);
+        } else texture_payload(f, false);
+    }
     write_view(h.ptr, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, [&](uint64_t ph) { pc::create_srv(DPC(d), P_or_pc(r), v, ph); });   // video frames: PC resources
     if (r && is_ours(r)) detile_view_created(P(r));   // CPU-written console texture: convert before the next submission
 }
 void D3DAPI D_CreateUAV(ID3D12Device* d, ID3D12Resource* r, ID3D12Resource* c, const D3D12_UNORDERED_ACCESS_VIEW_DESC* v, D3D12_CPU_DESCRIPTOR_HANDLE h) {
+    if (r) {
+        D3D12_RESOURCE_DESC rd;
+        pc::res_desc(P(r), &rd);
+        DXGI_FORMAT f = v && v->Format != DXGI_FORMAT_UNKNOWN ? v->Format : rd.Format;
+        if (rd.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
+            if (v && v->ViewDimension == D3D12_UAV_DIMENSION_BUFFER)
+                buffer_payload(P(r), f, v->Buffer.FirstElement, v->Buffer.NumElements, v->Buffer.StructureByteStride, (v->Buffer.Flags & D3D12_BUFFER_UAV_FLAG_RAW) != 0);
+            else buffer_payload(P(r), DXGI_FORMAT_UNKNOWN, 0, (uint32_t)(rd.Width / 4), 0, true);
+        } else texture_payload(f, true);
+    }
     write_view(h.ptr, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, [&](uint64_t ph) { pc::create_uav(DPC(d), P(r), P(c), v, ph); });
 }
 void D3DAPI D_CreateCBV(ID3D12Device* d, const D3D12_CONSTANT_BUFFER_VIEW_DESC* v, D3D12_CPU_DESCRIPTOR_HANDLE h) {
@@ -424,6 +514,9 @@ void D3DAPI D_CreateCBV(ID3D12Device* d, const D3D12_CONSTANT_BUFFER_VIEW_DESC* 
     if (v && v->BufferLocation) {
         x = *v;
         x.BufferLocation = gpu_va(DEV(d), v->BufferLocation);
+        uint64_t a = x.BufferLocation;   // payload: the title's range (translated code reads it through global memory)
+        uint32_t w[4] = {(uint32_t)a, (uint32_t)((a >> 32) & 0xffff), v->SizeInBytes, 20u << 12};
+        desc_set_payload(w);
         if (x.BufferLocation & 255) x.BufferLocation = cbv_fix_view(DEV(d), v->BufferLocation, x.BufferLocation, v->SizeInBytes);
         v = &x;
     }
@@ -736,6 +829,16 @@ HRESULT D3DAPI D_CreateStateObject(ID3D12Device5* d, const D3D12_STATE_OBJECT_DE
             char t[16];
             snprintf(t, sizeof t, "%d ", (int)sub.Type);
             types += t;
+            if (sub.Type == D3D12_STATE_SUBOBJECT_TYPE_GLOBAL_ROOT_SIGNATURE && so <= 16) {
+                auto* g = static_cast<const D3D12_GLOBAL_ROOT_SIGNATURE*>(sub.pDesc);
+                std::vector<uint8_t> rb;
+                if (g && g->pGlobalRootSignature && root_signature_blob(P(g->pGlobalRootSignature), &rb)) {
+                    char path[MAX_PATH + 48];
+                    snprintf(path, sizeof path, "%s\\so%02ld_global_rs.bin", dir, so);
+                    HANDLE f = CreateFileA(path, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, 0, nullptr);
+                    if (f != INVALID_HANDLE_VALUE) { DWORD w; WriteFile(f, rb.data(), (DWORD)rb.size(), &w, nullptr); CloseHandle(f); }
+                }
+            }
             if (sub.Type == D3D12_STATE_SUBOBJECT_TYPE_DXIL_LIBRARY && so <= 16) {
                 auto* lib = static_cast<const D3D12_DXIL_LIBRARY_DESC*>(sub.pDesc);
                 char path[MAX_PATH + 48];

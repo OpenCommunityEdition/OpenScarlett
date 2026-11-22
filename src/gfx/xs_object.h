@@ -194,6 +194,12 @@ void desc_rtv_dsv_heap_free(uint64_t base);
 uint32_t desc_increment(D3D12_DESCRIPTOR_HEAP_TYPE type, uint32_t pcInc);
 uint64_t desc_begin_write(uint64_t h, D3D12_DESCRIPTOR_HEAP_TYPE type, DescTag* tag);  // PC handle to write, or 0
 void desc_commit(uint64_t h, D3D12_DESCRIPTOR_HEAP_TYPE type, const DescTag& tag);
+// View slots hold a console-style payload in bytes 0..15 (what translated ray-tracing code reads
+// from descriptor memory) and the layer's tag in bytes 16..31. The view creator sets the payload
+// for the next desc_commit on this thread: buffers a buffer descriptor (base, stride, records,
+// format), acceleration structures their address, textures {heap index, kDescTexture | kind}.
+constexpr uint32_t kDescTexture = 0x80000000u;   // payload dword 1 flag: dword 0 is the slot's heap index
+void desc_set_payload(const uint32_t words[4]);
 bool desc_copy(uint32_t n, uint64_t dst, uint64_t src, D3D12_DESCRIPTOR_HEAP_TYPE type);
 uint64_t desc_pc_cpu(uint64_t h, D3D12_DESCRIPTOR_HEAP_TYPE type);
 void desc_publish(uint64_t h);   // after writing a PC descriptor to desc_pc_cpu(h) of a view slot
