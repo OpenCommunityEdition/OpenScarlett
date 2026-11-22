@@ -8,6 +8,8 @@ output directory then holds run.cmd, which runs every test on a Windows PC with 
 
 Expectations, in the .s header: ';! lanes <expr>' gives words 0..63 (the expression may use L,
 the lane), ';! lanes+<n> <expr>' words n..n+63, ';! word <index> <value>' one word.
+';! gmtest' translates with global memory reading the t1 buffer; ';! mem <byte offset> <word>...' puts
+words (hex/int, or floats when they contain '.', 'inf') into that buffer.
 Usage: tools/gpucode/asmtests <outdir>   (needs build/ and build-native/ built, sdk/ linked)"""
 import os, re, shutil, struct, subprocess, sys
 from pathlib import Path
@@ -41,6 +43,16 @@ for src in sorted(asm.glob("*.s")):
             words[base + L] = eval(m.group(2), {"L": L, "struct": struct}) & 0xffffffff
     for m in re.finditer(r"^;!\s*word\s+(\S+)\s+(\S+)", text, re.M):
         words[int(m.group(1), 0)] = int(m.group(2), 0) & 0xffffffff
+    gmtest = re.search(r"^;!\s*gmtest\s*$", text, re.M) is not None
+    mem = bytearray()
+    for m in re.finditer(r"^;!\s*mem\s+(\S+)\s+(.+)$", text, re.M):
+        off = int(m.group(1), 0)
+        for k, tok in enumerate(m.group(2).split()):
+            b = struct.pack("<f", float(tok)) if ("." in tok or "inf" in tok) else struct.pack("<I", int(tok, 0) & 0xffffffff)
+            end = off + 4 * k + 4
+            if len(mem) < end: mem.extend(b"\0" * (end - len(mem)))
+            mem[off + 4 * k:end] = b
+    if mem: (out / f"{n}.in").write_bytes(bytes(mem))
     body = "\n".join(l for l in text.splitlines() if not l.startswith("//") and not l.startswith(";")) + "\n"
     (out / f"{n}.asm").write_text(body)
     attrs = ["-mattr=+wavefrontsize64"] if wave64 else ["-mattr=-wavefrontsize64,+wavefrontsize32"]
@@ -48,7 +60,7 @@ for src in sorted(asm.glob("*.s")):
     if r.returncode:
         print(f"{n}: does not assemble:\n{r.stderr}"); continue
     run(["llvm-objcopy", "-O", "binary", "-j", ".text", str(out / f"{n}.o"), str(out / f"{n}.bin")])
-    r = run([str(tool), "translate", str(tmpl), "--code", str(out / f"{n}.bin")])
+    r = run([str(tool), "translate", str(tmpl), "--code", str(out / f"{n}.bin")] + (["--global-memory-test"] if gmtest else []))
     if r.returncode:
         print(f"{n}: not translated: {r.stderr.strip()}"); continue
     (out / f"{n}.hlsl").write_text(r.stdout)
@@ -57,7 +69,8 @@ for src in sorted(asm.glob("*.s")):
     if r.returncode:
         print(f"{n}: translation does not compile: {(r.stdout + r.stderr)[:300]}"); continue
     (out / f"{n}.expect").write_text("".join(f"{k} {v:#x}\n" for k, v in sorted(words.items())))
-    lines += [f"echo == {n}", f"dispatch_check.exe {n}.dxil template.cso {n}.hlsl -g 1 1 --expect {n}.expect || set /a fails+=1"]
+    extra = f" --input {n}.in" if mem else ""
+    lines += [f"echo == {n}", f"dispatch_check.exe {n}.dxil template.cso {n}.hlsl -g 1 1 --expect {n}.expect{extra} || set /a fails+=1"]
     print(f"{n}: built ({len(words)} expected words)")
 lines += ["echo failures: %fails%", "exit /b %fails%"]
 (out / "run.cmd").write_text("\r\n".join(lines) + "\r\n")

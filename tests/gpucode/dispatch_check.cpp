@@ -5,6 +5,7 @@
 //   --ref R.dxil  also run a reference shader (the same kernel compiled for PC) and compare the
 //                 memory both leave behind
 //   --show        print the first dwords of every UAV window
+//   --input F     bytes of file F at the start of the t1 window (global-memory tests)
 //   --expect F    check words of the u0 window against F (lines "<dword index> <value>", values
 //                 decimal or 0x hex; '#' starts a comment): hand-assembled ISA tests
 //
@@ -108,12 +109,14 @@ int main(int argc, char** argv) {
     std::string fill = "ramp";
     bool show = false;
     const char* expect = nullptr;
+    const char* input = nullptr;
     for (int i = 4; i < argc; i++) {
         if (!strcmp(argv[i], "-g") && i + 2 < argc) gx = atoi(argv[++i]), gy = atoi(argv[++i]);
         else if (!strcmp(argv[i], "-f") && i + 1 < argc) fill = argv[++i];
         else if (!strcmp(argv[i], "--ref") && i + 1 < argc) ref = read(argv[++i]);
         else if (!strcmp(argv[i], "--show")) show = true;
         else if (!strcmp(argv[i], "--expect") && i + 1 < argc) expect = argv[++i];
+        else if (!strcmp(argv[i], "--input") && i + 1 < argc) input = argv[++i];
     }
     if (dxil.empty() || cso.empty()) { printf("cannot read inputs\n"); return 1; }
     hlsl.push_back(0);
@@ -263,6 +266,16 @@ int main(int argc, char** argv) {
                 std::string key = std::string(uav ? "u" : "t") + std::to_string(reg) + "/" + std::to_string(r.space);
                 if (kind == 10 || kind == 11 || kind == 12 || kind == 0) {
                     if (uav) uav_windows.push_back({reg, off});
+                    if (input && !uav && reg == 1 && r.space == 0) {   // --input: the t1 window's first bytes
+                        FILE* f = fopen(input, "rb");
+                        if (f) {
+                            uint8_t* um = nullptr;
+                            up->Map(0, nullptr, (void**)&um);
+                            fread(um + off, 1, 1u << 20, f);
+                            up->Unmap(0, nullptr);
+                            fclose(f);
+                        }
+                    }
                     unsigned stride = kind == 12 ? (stride_of.count(key) ? stride_of[key] : 4) : 4;
                     UINT n = (UINT)((1u << 20) / stride);
                     bool raw = kind == 11 || kind == 0;

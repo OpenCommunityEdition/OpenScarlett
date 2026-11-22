@@ -129,6 +129,7 @@ struct Translator {
     bool vs_pos = false;
     bool uses_codedata = false;
     bool uses_gm = false;   // global loads/stores through the layer's address table
+    bool uses_bvh = false;  // image_bvh*_intersect_ray in HLSL over global memory
     unsigned ms_max_verts = 256, ms_max_prims = 256, ms_lds = 0;
     bool merged_vs = false;
     bool uses_clipcull = false;
@@ -2124,11 +2125,29 @@ bool Translator::emit_mubuf(const Instr& in, size_t idx) {
 bool Translator::emit_mimg(const Instr& in, size_t idx) {
     std::string n = in.name;
     if (has(n, "bvh")) {
-        // Acceleration structures are not translated yet (the layer keeps them inert): every node
-        // test misses. Box nodes return no children (~0 in all four slots), triangle nodes no hit, so
-        // traversal ends at the root and ray queries report a miss.
-        for (unsigned k = 0; k < 4; k++) write_v(in.vdata + k, "0xffffffffu");
-        uses_inert_bvh = true;
+        if (!opt.global_memory && !opt.global_memory_test) {
+            // Without global memory every node test misses: box nodes return no children, so
+            // traversal ends at the root and ray queries report a miss.
+            for (unsigned k = 0; k < 4; k++) write_v(in.vdata + k, "0xffffffffu");
+            uses_inert_bvh = true;
+            return true;
+        }
+        if (in.a16) return fail(n + " with 16-bit ray directions not supported yet");
+        // Address operands: node pointer (1 or 2 VGPRs), ray extent, origin xyz, direction xyz,
+        // inverse direction xyz. Descriptor: base address [39:0] in 256-byte units, box sorting [63].
+        auto ar = [&](unsigned k) { return in.nsa ? V(k == 0 ? in.vaddr : in.addr_extra[k - 1]) : V(in.vaddr + k); };
+        bool b64 = has(n, "bvh64");
+        unsigned k0 = b64 ? 2 : 1;
+        uses_gm = true;
+        uses_bvh = true;
+        std::string base = fmt("((uint64_t(%s & 0xffu) << 32 | uint64_t(%s)) << 8)", S(in.srsrc + 1).c_str(), S(in.srsrc).c_str());
+        std::string ptr = b64 ? fmt("(uint64_t(%s) << 32 | uint64_t(%s))", ar(1).c_str(), ar(0).c_str()) : fmt("uint64_t(%s)", ar(0).c_str());
+        line(fmt("if (kexec) { uint4 r_ = bvh_isect(%s, %s, asfloat(%s), float3(asfloat(%s), asfloat(%s), asfloat(%s)), float3(asfloat(%s), asfloat(%s), asfloat(%s)), "
+                 "float3(asfloat(%s), asfloat(%s), asfloat(%s)), (%s >> 31) != 0u);",
+                 base.c_str(), ptr.c_str(), ar(k0).c_str(), ar(k0 + 1).c_str(), ar(k0 + 2).c_str(), ar(k0 + 3).c_str(), ar(k0 + 4).c_str(), ar(k0 + 5).c_str(),
+                 ar(k0 + 6).c_str(), ar(k0 + 7).c_str(), ar(k0 + 8).c_str(), ar(k0 + 9).c_str(), S(in.srsrc + 1).c_str()));
+        for (unsigned k = 0; k < 4; k++) line(fmt("  %s = r_[%u];", V(in.vdata + k).c_str(), k));
+        line("}");
         return true;
     }
     int r = res_of.count(idx) ? res_of[idx] : -1;
@@ -2683,9 +2702,9 @@ bool Translator::emit_global(const Instr& in, size_t idx) {
     unsigned cnt = has(n, "x4") ? 4 : has(n, "x3") ? 3 : has(n, "x2") ? 2 : 1;
     if (!dword && (store ? !(ends(n, "byte") || ends(n, "short")) : !(ends(n, "ubyte") || ends(n, "sbyte") || ends(n, "ushort") || ends(n, "sshort"))))
         return fail(fmt("%s at 0x%x not supported", in.name, in.offset));
-    if (store && !opt.global_memory) return fail(fmt("%s at 0x%x: global stores need the layer's global memory", in.name, in.offset));
+    if (store && !opt.global_memory && !opt.global_memory_test) return fail(fmt("%s at 0x%x: global stores need the layer's global memory", in.name, in.offset));
     uses_codedata = true;
-    if (opt.global_memory) uses_gm = true;
+    if (opt.global_memory || opt.global_memory_test) uses_gm = true;
     // 64-bit address: SGPR base pair + 32-bit VGPR offset, or a VGPR pair; plus the signed immediate.
     std::string lo0 = in.saddr != src::kNull ? fmt("(%s + %s)", S(in.saddr).c_str(), V(in.vaddr).c_str()) : V(in.vaddr);
     std::string hi0 = in.saddr != src::kNull ? fmt("(%s + (%s + %s < %s ? 1u : 0u))", S(in.saddr + 1).c_str(), S(in.saddr).c_str(), V(in.vaddr).c_str(), S(in.saddr).c_str())
@@ -2694,7 +2713,7 @@ bool Translator::emit_global(const Instr& in, size_t idx) {
     line(fmt("  hi_ += %s; lo_ = al_;", in.offset_imm < 0 ? "(al_ > lo_ ? 0xffffffffu : 0u)" : "(al_ < lo_ ? 1u : 0u)"));
     auto rdw = [&](const std::string& k) {   // dword at lo_ + k
         std::string cd = fmt("((lo_ + %s) >> 2) < CODEDATA_N ? codedata[(lo_ + %s) >> 2] : 0u", k.c_str(), k.c_str());
-        if (!opt.global_memory) return fmt("(hi_ == 0u ? (%s) : 0u)", cd.c_str());
+        if (!opt.global_memory && !opt.global_memory_test) return fmt("(hi_ == 0u ? (%s) : 0u)", cd.c_str());
         return fmt("(hi_ == 0u && ((lo_ + %s) >> 2) < CODEDATA_N ? codedata[(lo_ + %s) >> 2] : gm_load(lo_ + %s, hi_ + (lo_ + %s < lo_ ? 1u : 0u)))",
                    k.c_str(), k.c_str(), k.c_str(), k.c_str());
     };
@@ -2739,6 +2758,63 @@ std::string Translator::res_decl(const Res& r) const {
     }
     return "";
 }
+
+// image_bvh*_intersect_ray over global memory. Node id: address >> 3 | type (0-3 triangle, 4 box16,
+// 5 box32). Box nodes: four child ids, then per child min xyz, max xyz (box32: floats, box16: f16
+// pairs); a hit child's id is returned, misses 0xFFFFFFFF, sorted by entry distance when asked.
+// Triangle nodes: v0, v1, v2 (floats); returns (t*det, det, u*det, v*det) so that t = x / y, with t =
+// +inf on a miss. Other node types are left to the shader (all 0xFFFFFFFF). Layouts follow AMD's
+// hardware node formats as Mesa (RADV, MIT) documents them.
+const char* kBvhPrelude = R"(
+float gmf(uint64_t a) { return asfloat(gm_load(uint(a), uint(a >> 32))); }
+uint gmu(uint64_t a) { return gm_load(uint(a), uint(a >> 32)); }
+uint4 bvh_isect(uint64_t base, uint64_t ptr, float tmax, float3 o, float3 d, float3 inv, bool sortc) {
+  uint type = uint(ptr) & 7u;
+  uint64_t a = base + ((ptr & ~7ull) << 3);
+  if (type == 4u || type == 5u) {
+    uint ch[4]; float tn[4];
+    [unroll] for (uint i = 0u; i < 4u; i++) {
+      ch[i] = gmu(a + 4u * i);
+      float3 mn, mx;
+      if (type == 5u) {
+        uint64_t c = a + 16u + 24u * i;
+        mn = float3(gmf(c), gmf(c + 4u), gmf(c + 8u));
+        mx = float3(gmf(c + 12u), gmf(c + 16u), gmf(c + 20u));
+      } else {
+        uint64_t c = a + 16u + 12u * i;
+        uint p0 = gmu(c), p1 = gmu(c + 4u), p2 = gmu(c + 8u);
+        mn = float3(f16tof32(p0), f16tof32(p0 >> 16), f16tof32(p1));
+        mx = float3(f16tof32(p1 >> 16), f16tof32(p2), f16tof32(p2 >> 16));
+      }
+      float3 t1 = (mn - o) * inv, t2 = (mx - o) * inv;
+      float lo = max(max(min(t1.x, t2.x), min(t1.y, t2.y)), min(t1.z, t2.z));
+      float hi = min(min(max(t1.x, t2.x), max(t1.y, t2.y)), max(t1.z, t2.z));
+      bool hit = ch[i] != 0xffffffffu && lo <= hi && hi >= 0.0f && lo <= tmax;
+      tn[i] = hit ? lo : 3.0e38f;
+      if (!hit) ch[i] = 0xffffffffu;
+    }
+    if (sortc) {
+      [unroll] for (uint p = 0u; p < 3u; p++)
+        [unroll] for (uint q = 0u; q < 3u - p; q++)
+          if (tn[q + 1u] < tn[q]) { float tt = tn[q]; tn[q] = tn[q + 1u]; tn[q + 1u] = tt; uint cc = ch[q]; ch[q] = ch[q + 1u]; ch[q + 1u] = cc; }
+    }
+    return uint4(ch[0], ch[1], ch[2], ch[3]);
+  }
+  if (type <= 3u) {
+    float3 v0 = float3(gmf(a), gmf(a + 4u), gmf(a + 8u));
+    float3 v1 = float3(gmf(a + 12u), gmf(a + 16u), gmf(a + 20u));
+    float3 v2 = float3(gmf(a + 24u), gmf(a + 28u), gmf(a + 32u));
+    float3 e1 = v1 - v0, e2 = v2 - v0, p = cross(d, e2);
+    float det = dot(e1, p);
+    float3 tv = o - v0, q = cross(tv, e1);
+    float u = dot(tv, p), v = dot(d, q), t = dot(e2, q);
+    float s = det < 0.0f ? -1.0f : 1.0f;
+    bool ok = det != 0.0f && u * s >= 0.0f && v * s >= 0.0f && (u + v) * s <= det * s;
+    return ok ? uint4(asuint(t), asuint(det), asuint(u), asuint(v)) : uint4(0x7f800000u, 0x3f800000u, 0u, 0u);
+  }
+  return uint4(0xffffffffu, 0xffffffffu, 0xffffffffu, 0xffffffffu);
+}
+)";
 
 const char* kPrelude = R"(
 static uint L, LG;
@@ -2991,7 +3067,12 @@ std::string Translator::generate() {
     }
     h << kPrelude;
     if (uses_quad) h << kQuadPrelude;
-    if (uses_gm) {
+    if (uses_gm && opt.global_memory_test) {
+        h << "ByteAddressBuffer GMTEST : register(t1, space0);   // tests: global memory = this buffer\n"
+             "uint gm_load(uint lo, uint hi) { uint n_; GMTEST.GetDimensions(n_); return hi == 0u && lo + 4u <= n_ ? GMTEST.Load(lo & ~3u) : 0u; }\n"
+             "void gm_store(uint lo, uint hi, uint v) {}\n"
+             "void gm_store_bits(uint lo, uint hi, uint v, uint mask) {}\n";
+    } else if (uses_gm) {
         h << "StructuredBuffer<uint4> GMT : register(t0, space901);\n"
              "ByteAddressBuffer GMS[8191] : register(t0, space900);\n"
              "RWByteAddressBuffer GMU[8192] : register(u0, space900);\n"
@@ -3023,6 +3104,7 @@ std::string Translator::generate() {
              "  GMU[NonUniformResourceIndex((f.y >> 14) & 0x3fffu)].InterlockedOr(f.z & ~3u, v << s, o);\n"
              "}\n";
     }
+    if (uses_bvh) h << kBvhPrelude;
     if (uses_codedata) {
         size_t n = (c.precompiled.size() - c.body_begin) / 4;
         h << "static const uint codedata[" << n << "] = {";

@@ -33,6 +33,8 @@ struct TranslateOptions {
     // Global memory (title GPU addresses) through the layer's address table: t0 space901 = table,
     // t0.. / u0.. space900 = raw views (docs/gpucode.md). False: only code-embedded data is readable.
     bool global_memory = false;
+    // Tests: global memory is the raw buffer at t1 space0 (address = byte offset, high half 0).
+    bool global_memory_test = false;
     bool barrier_sync = true;        // false: s_barrier without the group sync (debugging hangs) // the PC runtime takes shader model 6.6 ([WaveSize] on compute)
 };
 
