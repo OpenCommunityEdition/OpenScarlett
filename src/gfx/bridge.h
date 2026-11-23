@@ -111,10 +111,14 @@ struct RtRaysArgs {
     uint64_t raygen, miss, hit, callable;
     uint32_t missStride, hitStride;
     PcObj samplerHeap;         // the title's sampler heap (bound for samplers read from descriptor memory)
+    uint32_t discRegion;       // discovery bitmap region of the pipeline
 };
+struct RtRun { PcObj pso; uint32_t round; };   // one program run of a ray dispatch (round 0 starts the rays)
+const uint8_t* rt_discovery(uint32_t region);   // CPU view of a discovery bitmap (bit per 256 bytes of code)
 uint64_t sampler_memory_address(PcObj samplerHeap, uint64_t gpuHandle);
-bool list_rays(PcObj l, PcObj pso, const RtRaysArgs& args);
+bool list_rays(PcObj l, const std::vector<RtRun>& runs, const RtRaysArgs& args);
 bool is_rays_signature(PcObj sig);
+void note_rays_skipped();   // counted in the frame-rate log
 uint64_t tlas_scratch_size(uint32_t instances);
 // Bottom-level triangle build in the console layout (into the destination's shadow); false: not built.
 struct BlasGeometry { uint64_t vb, ib, transform; uint32_t vbStride, vbFormat, ibFormat, triangles, flags; };

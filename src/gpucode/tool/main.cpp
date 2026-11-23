@@ -195,6 +195,14 @@ static int rtlink_cmd(const char* tmpl, int n, char** blobs) {
     for (auto& [name, off] : l.exports) fprintf(stderr, "  export %s @0x%x\n", name.c_str(), off);
     for (auto& [g, s] : l.hitgroups) fprintf(stderr, "  hit group %s: closest %s, any %s, intersection %s\n", g.c_str(), s[0].c_str(), s[1].c_str(), s[2].c_str());
     for (auto& p : l.parts) fprintf(stderr, "  part 0x%x..0x%x main 0x%x%s\n", p.begin, p.end, p.main, p.raygen ? " (ray generation)" : "");
+    if (const char* k = getenv("RT_PARK")) {   // one collection (index into the blobs) as a parking program
+        RtSpace sp;
+        std::vector<int> ids;
+        for (auto& b : bs) ids.push_back(sp.add(b));
+        std::string e2;
+        if (!sp.program(ids.at((size_t)atoi(k)), l, &e2)) return fprintf(stderr, "program: %s\n", e2.c_str()), 1;
+        fprintf(stderr, "park: pointer v%u, resume at 0x%x, main 0x%x\n", l.park_ptr_vgpr, l.resume_at, l.main);
+    }
     if (const char* k = getenv("RT_PROGRAM")) {   // translate one per-raygen program instead of the full link
         auto progs = rt_programs(l);
         size_t i = (size_t)atoi(k);
@@ -213,6 +221,39 @@ static int rtlink_cmd(const char* tmpl, int n, char** blobs) {
     TranslateResult r = translate(c, rs, rt_translate_options(l));
     if (!r.ok) return fprintf(stderr, "%s\n", r.error.c_str()), 1;
     printf("// profile %s, wave%u\n%s", r.profile.c_str(), r.wave_size, r.hlsl.c_str());
+    return 0;
+}
+
+// rtcache <outdir> <salt> <blob>...: every collection (blobs in the title's deserialization order)
+// as a parking program: <outdir>/rt_<key>.hlsl, keyed like the layer's cache (salt = translator
+// version + compiler option, e.g. gpucode-35-Od). Compile each to rt_<key>.dxil for the cache.
+static int rtcache_cmd(const char* outdir, const char* salt, int n, char** blobs) {
+    RtSpace sp;
+    std::vector<int> ids;
+    for (int i = 0; i < n; i++) ids.push_back(sp.add(read_file(blobs[i])));
+    int written = 0;
+    for (size_t c = 0; c < sp.collections(); c++) {
+        RtLinked l;
+        std::string err;
+        if (!sp.program(int(c), l, &err)) { fprintf(stderr, "collection %zu: %s\n", c, err.c_str()); continue; }
+        Container k;
+        k.kind = ProgramKind::CS;
+        RootSig rs;
+        RsParam p;
+        p.type = ParamType::Constants;
+        p.num32 = kRtRootConstants;
+        rs.params.push_back(p);
+        TranslateResult r = translate(k, rs, rt_translate_options(l));
+        if (!r.ok) { fprintf(stderr, "collection %zu: %s\n", c, r.error.c_str()); continue; }
+        char path[1024];
+        snprintf(path, sizeof path, "%s/rt_%016llx.hlsl", outdir, (unsigned long long)rt_cache_key(l, salt));
+        FILE* f = fopen(path, "wb");
+        if (!f) return fprintf(stderr, "cannot write %s\n", path), 1;
+        fwrite(r.hlsl.data(), 1, r.hlsl.size(), f);
+        fclose(f);
+        written++;
+    }
+    fprintf(stderr, "%zu collections, %d programs written\n", sp.collections(), written);
     return 0;
 }
 
@@ -247,6 +288,7 @@ int main(int argc, char** argv) {
     }
     if (argc >= 3 && !strcmp(argv[1], "meta")) return meta_cmd(argv[2]);
     if (argc >= 4 && !strcmp(argv[1], "rtlink")) return rtlink_cmd(argv[2], argc - 3, argv + 3);
+    if (argc >= 5 && !strcmp(argv[1], "rtcache")) return rtcache_cmd(argv[2], argv[3], argc - 4, argv + 4);
     if (argc >= 4 && !strcmp(argv[1], "cso2elf")) return cso2elf(argv[2], argc - 3, argv + 3);
     if (argc >= 3 && !strcmp(argv[1], "dis")) {
         auto d = read_file(argv[2]);

@@ -221,11 +221,18 @@ struct Translator {
         code = opt.raw_code.empty() ? c.code() : opt.raw_code;
         ins = decode_all(code.data(), code.size());
         if (!opt.raw_skip.empty()) {
+            std::vector<std::pair<uint32_t, uint32_t>> sk = opt.raw_skip;
+            std::sort(sk.begin(), sk.end());
             std::vector<Instr> kept;
             kept.reserve(ins.size());
             for (auto& in : ins) {
+                auto it = std::upper_bound(sk.begin(), sk.end(), std::make_pair(in.offset, 0xffffffffu));
                 bool skip = false;
-                for (auto& [b, e] : opt.raw_skip) skip |= in.offset >= b && in.offset < e;
+                for (auto k = it; k != sk.begin() && !skip;) {   // ranges may overlap: check those starting at or before the offset
+                    --k;
+                    skip = in.offset < k->second;
+                    if (it - k > 8) break;
+                }
                 if (!skip) kept.push_back(in);
             }
             ins.swap(kept);
@@ -320,7 +327,8 @@ struct Translator {
     std::set<size_t> dyn_mimg;             // image loads/stores on descriptors from descriptor memory
     std::set<size_t> dyn_samp;             // samplers read from descriptor memory (layer payload: sampler-heap index)
     bool uses_heap_sampler = false;
-    bool uses_heap_cube = false;   // cube textures sampled through descriptor memory (space 919)
+    bool uses_heap_cube = false;
+    bool uses_park = false;   // ray-tracing program parking (TranslateOptions::raw_park)   // cube textures sampled through descriptor memory (space 919)
     bool uses_gm_atomic = false;
     // 32-bit buffer atomics global memory supports: operation code for gm_atomic(), 0 = none.
     // Byte/short buffer accesses: 1 store_byte 2 store_short 3 load_ubyte 4 load_sbyte 5 load_ushort 6 load_sshort.
@@ -907,7 +915,7 @@ struct Translator {
             bool bvh = has(n, "bvh");   // inert acceleration structures (emit_mimg): no resource
             // Image loads/stores may take a descriptor read from descriptor memory at run time: the
             // layer stamps its global-heap index and view kind into descriptor dwords 0 and 1.
-            bool dynSample = n == "image_sample" || n == "image_sample_l" || n == "image_sample_lz" || n == "image_gather4_lz" || n == "image_gather4";
+            bool dynSample = n == "image_sample" || n == "image_sample_l" || n == "image_sample_lz" || n == "image_sample_d" || n == "image_gather4_lz" || n == "image_gather4";
             bool dynOk = !bvh && (n == "image_load" || n == "image_store" || n == "image_load_mip" || dynSample) && (opt.global_memory || opt.global_memory_test);
             soft_trace = dynOk;
             int r = bvh ? -2 : resource(st, in.srsrc, 8, in, false);
@@ -1149,6 +1157,34 @@ struct Translator {
             return false;
         }
     }
+    std::string park_lane() const {
+        return "((((gid_.z * RC0_d[0].w + gid_.y) * RC0_d[0].z + gid_.x) * WAVE) + LG)";
+    }
+    void emit_park() {
+        const unsigned nv = opt.raw_park_vgprs, stride = 8 + 4 * nv;
+        line("    uint p_ = (tlo_ >> 8) | (thi_ << 24);");
+        line(fmt("    if (kexec && %s < RC0_d[1].w) { uint b_ = %s * %uu;", park_lane().c_str(), park_lane().c_str(), stride));
+        line("      RTST.Store2(b_, uint2(p_, RC0_d[1].z + 1u));");
+        for (unsigned k = 0; k < nv; k += 4) line(fmt("      RTST.Store4(b_ + %uu, uint4(v%u, v%u, v%u, v%u));", 8 + 4 * k, k, k + 1, k + 2, k + 3));
+        line(fmt("      uint u_ = p_ - 0x%xu; if (u_ < (1u << 20)) RTDISC.InterlockedOr((u_ >> 5) * 4u, 1u << (u_ & 31u)); }", uint32_t(opt.code_base >> 8)));
+        line(fmt("    if (kexec) v%u = 0u;", opt.raw_park_ptr_vgpr));
+        max_v = std::max(max_v, nv);
+        uses_park = true;
+    }
+    void emit_resume() {
+        const unsigned nv = opt.raw_park_vgprs, stride = 8 + 4 * nv;
+        line("  if ((RC0_d[1].z & 0xffu) != 0u) {   // resume lanes parked in the previous round on code of this program");
+        line(fmt("    uint l_ = %s, p_ = 0u; bool r_ = false;", park_lane().c_str()));
+        line(fmt("    if (l_ < RC0_d[1].w) { uint2 h_ = RTST.Load2(l_ * %uu); p_ = h_.x; r_ = h_.y == RC0_d[1].z && jump_case(p_ << 8, p_ >> 24) != 0xffffffffu; }", stride));
+        line(fmt("    if (r_) { uint b_ = l_ * %uu; uint4 q_;", stride));
+        for (unsigned k = 0; k < nv; k += 4)
+            line(fmt("      q_ = RTST.Load4(b_ + %uu); v%u = q_.x; v%u = q_.y; v%u = q_.z; v%u = q_.w;", 8 + 4 * k, k, k + 1, k + 2, k + 3));
+        line(fmt("      v%u = p_; } else v%u = 0u;", opt.raw_park_ptr_vgpr, opt.raw_park_ptr_vgpr));
+        line(fmt("    kvcc = kexec && int(v%u) > 0;", opt.raw_park_ptr_vgpr));
+        line("  }");
+        max_v = std::max(max_v, nv);
+        uses_park = true;
+    }
     bool emit(const Instr& in, size_t idx) {
         // Section markers in linked code: v_nop in its VOP3 encoding (opcode 384, absent from the
         // generated table) and v_illegal; they are never reached by execution.
@@ -1176,6 +1212,7 @@ struct Translator {
     }
     bool emit1(const Instr& in, size_t idx) {
         lane_pred.clear();
+        if (opt.raw_park && in.offset == opt.raw_resume_at && cp <= 0) emit_resume();
         if (opt.comments && cp <= 0) out << "  // " << fmt("%04x", in.offset) << ": " << disasm(in) << "\n";
         switch (in.fmt) {
         case Fmt::SOP1: case Fmt::SOP2: case Fmt::SOPC: case Fmt::SOPK: case Fmt::SOPP: return emit_salu(in, idx);
@@ -1420,7 +1457,13 @@ bool Translator::emit_salu(const Instr& in, size_t idx) {
                 uint64_t ret = opt.code_base + in.offset + 4;
                 line(fmt("  %s = 0x%xu; %s = 0x%xu;", S(in.dst).c_str(), uint32_t(ret), S(in.dst + 1).c_str(), uint32_t(ret >> 32)));
             }
-            line("  pc = jump_case(tlo_, thi_); }");
+            if (opt.raw_park && n == "s_swappc_b64" && block_of.count(in.offset + 4) && in.offset >= opt.raw_park_from && in.offset < opt.raw_park_to) {
+                line("  uint t_ = jump_case(tlo_, thi_);");
+                line("  if (t_ == 0xffffffffu) {   // outside this program: park the lanes");
+                emit_park();
+                line(fmt("    pc = %zuu;", block_of[in.offset + 4]));
+                line("  } else pc = t_; }");
+            } else line("  pc = jump_case(tlo_, thi_); }");
             jumped = true;
             return true;
         }
@@ -2448,7 +2491,10 @@ bool Translator::emit_heap_sample(const Instr& in, size_t idx) {
     if (dim != 1 && dim != 5 && dim != 2 && dim != 3) return fail(fmt("%s at 0x%x: dim %u through descriptor memory not supported", in.name, in.offset, dim));
     if (dim == 3) uses_heap_cube = true;
     else heap_dims.insert(dim);
-    auto areg = [&](unsigned k) { return V(in.nsa && k ? in.addr_extra[k - 1] : in.vaddr + k); };
+    auto areg0 = [&](unsigned k) { return V(in.nsa && k ? in.addr_extra[k - 1] : in.vaddr + k); };
+    // image_sample_d: gradients first (dx, dy: 2 components for 2D/arrays/cubes, 3 for 3D), then coordinates
+    const unsigned ng = n == "image_sample_d" ? (dim == 2 ? 3 : 2) : 0;
+    auto areg = [&](unsigned k) { return areg0(k + 2 * ng); };
     const char* tag = dim == 1 ? "2" : dim == 5 ? "2A" : dim == 3 ? "C" : "3";
     unsigned nc = dim == 1 ? 2 : 3;
     std::string tc = nc == 2 ? fmt("float2(asfloat(%s), asfloat(%s))", areg(0).c_str(), areg(1).c_str())
@@ -2472,7 +2518,14 @@ bool Translator::emit_heap_sample(const Instr& in, size_t idx) {
         line("}");
         return true;
     }
-    line(fmt("if (kexec) { float4 t_ = %s.SampleLevel(%s, %s, %s);", T.c_str(), SS.c_str(), tc.c_str(), lod.c_str()));
+    if (ng) {
+        if (dim == 3) return fail(n + " on a cube through descriptor memory");
+        auto g = [&](unsigned b) {
+            return ng == 2 ? fmt("float2(asfloat(%s), asfloat(%s))", areg0(b).c_str(), areg0(b + 1).c_str())
+                           : fmt("float3(asfloat(%s), asfloat(%s), asfloat(%s))", areg0(b).c_str(), areg0(b + 1).c_str(), areg0(b + 2).c_str());
+        };
+        line(fmt("if (kexec) { float4 t_ = %s.SampleGrad(%s, %s, %s, %s);", T.c_str(), SS.c_str(), tc.c_str(), g(0).c_str(), g(ng).c_str()));
+    } else line(fmt("if (kexec) { float4 t_ = %s.SampleLevel(%s, %s, %s);", T.c_str(), SS.c_str(), tc.c_str(), lod.c_str()));
     unsigned o = 0;
     for (int b = 0; b < 4; b++)
         if (in.dmask >> b & 1) line(fmt("  %s = asuint(t_[%d]);", V(in.vdata + o++).c_str(), b));
@@ -3638,6 +3691,7 @@ std::string Translator::generate() {
         }
         if (uses_heap_cube) h << "TextureCube<float4> HSCF[] : register(t0, space919);\n";
         if (uses_heap_sampler) h << "SamplerState HSMP[] : register(s0, space920);\n";
+        if (uses_park) h << "RWByteAddressBuffer RTST : register(u0, space930);\nRWByteAddressBuffer RTDISC : register(u0, space931);\n";
     }
     if (indirect) {   // code address -> dispatcher case (block start); unknown addresses end the invocation
         h << "uint jump_case(uint lo, uint hi) {\n";

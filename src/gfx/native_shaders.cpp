@@ -27,6 +27,7 @@
 #include "bridge.h"
 #include "container.h"
 #include "meta.h"
+#include <algorithm>
 #include "translate.h"
 #include "rtso.h"
 #include "xsl/log.h"
@@ -342,10 +343,7 @@ bool rt_build_pipeline(const gpucode::RtLinked& l, std::vector<uint8_t>& dxil, s
         if (GetEnvironmentVariableA("XSL_RT_DXC_OPT", b, sizeof b) && b[0] == 'O') { w = L"-"; for (char* c = b; *c; c++) w += wchar_t(*c); }
         return w;
     }();
-    uint64_t key = fnv(kVersion, strlen(kVersion), fnv(l.image.data(), l.image.size() * 4, fnv("rt", 2)));
-    key = fnv(&l.main, sizeof l.main, key);
-    for (auto& [b, e] : l.skip) { key = fnv(&b, 4, key); key = fnv(&e, 4, key); }
-    key = fnv(opt.data(), opt.size() * sizeof(wchar_t), key);
+    uint64_t key = gpucode::rt_cache_key(l, std::string(kVersion) + std::string(opt.begin(), opt.end()));   // same key as `xsl-gpucode rtcache`
     wchar_t name[64];
     swprintf(name, 64, L"\\rt_%016llx.dxil", (unsigned long long)key);
     std::wstring path = cache_dir() + name;

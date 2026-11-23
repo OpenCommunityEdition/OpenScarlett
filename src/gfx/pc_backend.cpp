@@ -18,6 +18,7 @@
 #include <vector>
 
 #include "bridge.h"
+#include "rtso.h"
 #include "xsl/log.h"
 
 #define CH "gfx.pc"
@@ -1257,6 +1258,13 @@ static ID3D12RootSignature* rt_root_signature(ID3D12Device* dev) {
         params.push_back(p);
         p.DescriptorTable = {1, &smp};
         params.push_back(p);
+        // parameters 22, 23: parked-lane state (u0 space930) and the discovery bitmap (u0 space931)
+        for (UINT sp : {930u, 931u}) {
+            p = {};
+            p.ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+            p.Descriptor = {0, sp, D3D12_ROOT_DESCRIPTOR_FLAG_DATA_VOLATILE};
+            params.push_back(p);
+        }
         D3D12_VERSIONED_ROOT_SIGNATURE_DESC d{D3D_ROOT_SIGNATURE_VERSION_1_1};
         d.Desc_1_1 = {(UINT)params.size(), params.data(), 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_NONE};
         ID3DBlob *b = nullptr, *e = nullptr;
@@ -1329,7 +1337,10 @@ cbuffer C : register(b0) {
   T.Store2(0x18, uint2(trav, tableHi + (trav < tableLo ? 1u : 0u)));
   T.Store3(0x20, uint3(W, H, D));
   T.Store(0x2C, ((HS / 32u) & 0xffu) << 21 | ((MS / 32u) & 0xffu) << 5);
-  T.Store(0x30, 0u);
+  // Launch index packing (read by the scheduler and, through s13 >> 16, the shaders): x in the low
+  // bits, y from bit ysh, z from bit zsh; s18 = ysh << 8 | (32 - zsh) & 31.
+  uint ysh = W > 1u ? firstbithigh(W - 1u) + 1u : 0u, zsh = ysh + (H > 1u ? firstbithigh(H - 1u) + 1u : 0u);
+  T.Store(0x30, (ysh << 8) | ((32u - zsh) & 31u));
   T.Store4(0x34, uint4((M0 >> 6) | (M1 << 26), (H0 >> 6) | (H1 << 26), (RG0 >> 6) | (RG1 << 26), (C0 >> 6) | (C1 << 26)));
   T.Store(0x44, 0u);
   T.Store4(0x48, uint4(perLane, 0u, 0u, 0u));
@@ -1338,6 +1349,7 @@ cbuffer C : register(b0) {
   uint gx, gy, gz = max(D, 1u);
   if (H < 2u) { gx = (W + 31u) / 32u; gy = max(H, 1u); } else { gx = (W + 7u) / 8u; gy = (H + 3u) / 4u; }
   if (W == 0u || gx > 65535u || gy > 65535u || gz > 65535u) gx = gy = gz = 0u;   // garbage arguments: no work (no GPU hang)
+  T.Store2(0x1B8, uint2(gx, gy));   // root constants 2..3 of the programs (indirect signature)
   T.Store3(0x1C0, uint3(gx, gy, gz));
 }
 )";
@@ -1374,9 +1386,12 @@ static bool rtrt_init() {
     pd.pRootSignature = g_rtrt.prepRs;
     pd.CS = {cs.data(), cs.size()};
     if (FAILED(dev->CreateComputePipelineState(&pd, IID_PPV_ARGS(&g_rtrt.prep)))) return false;
-    D3D12_INDIRECT_ARGUMENT_DESC ad{D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH};
-    D3D12_COMMAND_SIGNATURE_DESC sd{12, 1, &ad, 0};
-    if (FAILED(dev->CreateCommandSignature(&sd, nullptr, IID_PPV_ARGS(&g_rtrt.dispatchSig)))) return false;
+    D3D12_INDIRECT_ARGUMENT_DESC ad[2] = {};
+    ad[0].Type = D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT;
+    ad[0].Constant = {0, 2, 2};   // groups x, y -> root constants 2..3 (lane and stack-slot indices)
+    ad[1].Type = D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH;
+    D3D12_COMMAND_SIGNATURE_DESC sd{20, 2, ad, 0};
+    if (FAILED(dev->CreateCommandSignature(&sd, rt_root_signature(dev), IID_PPV_ARGS(&g_rtrt.dispatchSig)))) return false;
     D3D12_HEAP_PROPERTIES hp{D3D12_HEAP_TYPE_DEFAULT};
     D3D12_RESOURCE_DESC bd{};
     bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
@@ -1390,6 +1405,13 @@ static bool rtrt_init() {
     gm_register((PcObj)g_rtrt.ring, g_rtrt.ringGm, kRtRing, 0);
     g_rtrt.failed = false;
     return true;
+}
+volatile long g_rays_run = 0, g_rays_skipped = 0;   // ray dispatches per frame-rate period
+void note_rays_skipped() { InterlockedIncrement(&g_rays_skipped); }
+static std::string fmt_rays(long run, long skipped) {
+    char b[96];
+    snprintf(b, sizeof b, "; ray dispatches: %ld run, %ld skipped", run, skipped);
+    return b;
 }
 // Sampler descriptor memory for translated ray-tracing code: samplers are not shadowed, so a table
 // handle maps to an identity array (entry k = {k, 0, 0, 0}, 16 bytes) at the heap index of the handle.
@@ -1410,8 +1432,48 @@ uint64_t sampler_memory_address(PcObj heap, uint64_t gpuHandle) {
     uint64_t i = (gpuHandle - start) / inc;
     return i < kN ? base + i * 16 : 0;
 }
-bool list_rays(PcObj l, PcObj pso, const RtRaysArgs& a) {
-    if (!gm_enabled() || !g_gv || !pso || !g_main_device) return false;
+// Lane state of parked rays (TranslateOptions::raw_park) and per-pipeline discovery bitmaps.
+constexpr uint32_t kRtDiscRegions = 64, kRtDiscBytes = 128u << 10;
+struct RtPark {
+    ID3D12Resource* state = nullptr;
+    ID3D12Resource* disc = nullptr;
+    uint8_t* discCpu = nullptr;
+    uint32_t lanes = 0;
+    bool failed = false;
+} g_rtpark;
+static bool rtpark_init() {
+    if (g_rtpark.state) return true;
+    if (g_rtpark.failed || !g_main_device) return false;
+    g_rtpark.failed = true;
+    char b[16];
+    g_rtpark.lanes = GetEnvironmentVariableA("XSL_RT_LANES", b, sizeof b) ? (uint32_t)atoi(b) : (1u << 20);
+    D3D12_RESOURCE_DESC bd{};
+    bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    bd.Width = (uint64_t)g_rtpark.lanes * gpucode::kRtParkStride;
+    bd.Height = bd.DepthOrArraySize = bd.MipLevels = 1;
+    bd.SampleDesc.Count = 1;
+    bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    bd.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+    D3D12_HEAP_PROPERTIES hp{D3D12_HEAP_TYPE_DEFAULT};
+    if (FAILED(g_main_device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&g_rtpark.state)))) return false;
+    D3D12_HEAP_PROPERTIES cp{D3D12_HEAP_TYPE_CUSTOM, D3D12_CPU_PAGE_PROPERTY_WRITE_BACK, D3D12_MEMORY_POOL_L0};
+    bd.Width = (uint64_t)kRtDiscRegions * kRtDiscBytes;
+    if (FAILED(g_main_device->CreateCommittedResource(&cp, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&g_rtpark.disc)))) return false;
+    void* m = nullptr;
+    if (FAILED(g_rtpark.disc->Map(0, nullptr, &m))) return false;
+    g_rtpark.discCpu = (uint8_t*)m;
+    memset(m, 0, (size_t)bd.Width);
+    g_rtpark.failed = false;
+    XSL_INFO(CH, "parked-ray state: %u lanes (%llu MiB)", g_rtpark.lanes, (unsigned long long)((uint64_t)g_rtpark.lanes * gpucode::kRtParkStride >> 20));
+    return true;
+}
+const uint8_t* rt_discovery(uint32_t region) {
+    std::lock_guard<std::mutex> g(g_rtrt.mu);
+    if (!rtpark_init() || region >= kRtDiscRegions) return nullptr;
+    return g_rtpark.discCpu + (size_t)region * kRtDiscBytes;
+}
+bool list_rays(PcObj l, const std::vector<RtRun>& runs, const RtRaysArgs& a) {
+    if (!gm_enabled() || !g_gv || runs.empty() || !g_main_device) return false;
     {
         std::lock_guard<std::mutex> g(g_gm_mu);
         auto h = g_list_global_heap.find(l);
@@ -1421,7 +1483,7 @@ bool list_rays(PcObj l, PcObj pso, const RtRaysArgs& a) {
     uint64_t slice;
     {
         std::lock_guard<std::mutex> g(g_rtrt.mu);
-        if (!rs || !rtrt_init()) return false;
+        if (!rs || !rtrt_init() || !rtpark_init()) return false;
         if (g_rtrt.head + kRtSlice > kRtRing) g_rtrt.head = 0;
         slice = g_rtrt.head;
         g_rtrt.head += kRtSlice;
@@ -1430,6 +1492,8 @@ bool list_rays(PcObj l, PcObj pso, const RtRaysArgs& a) {
         std::lock_guard<std::mutex> g(g_gm_mu);
         if (!gm_in_table(g_rtrt.ringGm, 64) || !gm_in_table(a.stack, 64)) { g_gm_force = true; g_gm_dirty = true; }
     }
+    static volatile long serial = 0;
+    uint32_t ser = (uint32_t)InterlockedIncrement(&serial) & 0xffffff;
     uint64_t table = g_rtrt.ringGm + slice;
     auto* L2 = as<ID3D12GraphicsCommandList>(l);
     auto tr = [&](D3D12_RESOURCE_STATES x, D3D12_RESOURCE_STATES y) {
@@ -1443,7 +1507,7 @@ bool list_rays(PcObj l, PcObj pso, const RtRaysArgs& a) {
     D3D12_RESOURCE_BARRIER ub{};
     ub.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
     L2->ResourceBarrier(1, &ub);
-    // prep: the runtime table and group counts
+    // prep: the runtime table, the group counts and (for the indirect signature) groups x/y as root constants
     L2->SetPipelineState(g_rtrt.prep);
     L2->SetComputeRootSignature(g_rtrt.prepRs);
     uint32_t c[28] = {a.argsVa ? 1u : 0u, a.tables[0], a.tables[1], a.tables[2], a.tables[3], (uint32_t)a.stack, (uint32_t)(a.stack >> 32), a.stackPerLane,
@@ -1456,16 +1520,23 @@ bool list_rays(PcObj l, PcObj pso, const RtRaysArgs& a) {
     L2->Dispatch(1, 1, 1);
     L2->ResourceBarrier(1, &ub);
     tr(D3D12_RESOURCE_STATE_UNORDERED_ACCESS, (D3D12_RESOURCE_STATES)(D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE));
-    // the translated program
-    L2->SetPipelineState(as<ID3D12PipelineState>(pso));
+    // the translated programs, in rounds (parked lanes continue in the program holding their target)
     L2->SetComputeRootSignature(rs);
-    uint32_t rc[8] = {(uint32_t)table, (uint32_t)(table >> 32), 4096, 4096, a.stackPerLane * 32 + 0x200, 0, 0, 0};
-    L2->SetComputeRoot32BitConstants(0, 8, rc, 0);
     uint64_t gpu0 = g_gv->GetGPUDescriptorHandleForHeapStart().ptr;
     L2->SetComputeRootDescriptorTable(1, D3D12_GPU_DESCRIPTOR_HANDLE{gpu0 + (uint64_t)gm_reserved_start() * g_gv_inc});
     for (UINT k = 2; k < 21; k++) L2->SetComputeRootDescriptorTable(k, D3D12_GPU_DESCRIPTOR_HANDLE{gpu0});
     if (a.samplerHeap) L2->SetComputeRootDescriptorTable(21, as<ID3D12DescriptorHeap>(a.samplerHeap)->GetGPUDescriptorHandleForHeapStart());
-    L2->ExecuteIndirect(g_rtrt.dispatchSig, 1, g_rtrt.ring, slice + 0x1C0, nullptr, 0);
+    L2->SetComputeRootUnorderedAccessView(22, g_rtpark.state->GetGPUVirtualAddress());
+    L2->SetComputeRootUnorderedAccessView(23, g_rtpark.disc->GetGPUVirtualAddress() + (uint64_t)std::min(a.discRegion, kRtDiscRegions - 1) * kRtDiscBytes);
+    for (auto& r : runs) {
+        if (!r.pso) continue;
+        L2->SetPipelineState(as<ID3D12PipelineState>(r.pso));
+        uint32_t rc[8] = {(uint32_t)table, (uint32_t)(table >> 32), 0, 0, a.stackPerLane * 32 + 0x200, 0, (ser << 8) | (r.round & 0xff), g_rtpark.lanes};
+        L2->SetComputeRoot32BitConstants(0, 8, rc, 0);
+        L2->ExecuteIndirect(g_rtrt.dispatchSig, 1, g_rtrt.ring, slice + 0x1B8, nullptr, 0);   // root constants 2..3 = groups x, y; then the dispatch
+        L2->ResourceBarrier(1, &ub);
+        InterlockedIncrement(&g_rays_run);
+    }
     tr((D3D12_RESOURCE_STATES)(D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE), D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     L2->ResourceBarrier(1, &ub);
     restore_compute_state(l);
@@ -3162,8 +3233,9 @@ static void prof_slow_check(uint64_t present) {
     if (!period.QuadPart) { period = now; periodStart = present; }
     double ps = double(now.QuadPart - period.QuadPart) / double(f.QuadPart);
     if (ps >= 10.0) {
-        XSL_INFO(CH, "frame rate: %.1f presents/s (presents %llu..%llu, slowest %.0f ms)", double(present - periodStart) / ps, (unsigned long long)periodStart,
-                 (unsigned long long)present, worst);
+        long rr = InterlockedExchange(&g_rays_run, 0), rs = InterlockedExchange(&g_rays_skipped, 0);
+        XSL_INFO(CH, "frame rate: %.1f presents/s (presents %llu..%llu, slowest %.0f ms)%s", double(present - periodStart) / ps, (unsigned long long)periodStart,
+                 (unsigned long long)present, worst, (rr || rs) ? fmt_rays(rr, rs).c_str() : "");
         period = now;
         periodStart = present;
         worst = 0;
@@ -3540,6 +3612,7 @@ void list_execute_indirect(PcObj l, PcObj sig, uint32_t max, PcObj args, uint64_
         if (g_rays_sigs.count(sig)) {
             static volatile long n = 0;
             if (InterlockedIncrement(&n) <= 2) XSL_WARN(CH, "indirect ray dispatch skipped (no translated pipeline ready)");
+            note_rays_skipped();
             return;
         }
     }

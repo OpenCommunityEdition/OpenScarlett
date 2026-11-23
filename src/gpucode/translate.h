@@ -49,6 +49,17 @@ struct TranslateOptions {
     uint32_t raw_rsrc2 = 0, raw_numthreads = 32, raw_entry = 0, raw_root_constants = 0;
     std::string raw_scratch_offset;
     std::vector<std::pair<uint32_t, uint32_t>> raw_skip;   // byte ranges of raw_code left out (not translated)
+    // Parking (ray-tracing programs that each hold part of a pipeline's code): an s_swappc_b64 to an
+    // address outside the program saves the active lanes' target (address >> 8) and VGPRs
+    // v0..raw_park_vgprs-1 to RTST (u0, space930; lane record: target, tag, VGPRs), marks the target
+    // in the RTDISC bitmap (u0, space931; bit per 256 bytes from code_base), sets the scheduler's
+    // pointer VGPR to 0 (lane done here) and continues at the return address. Root constants [6]
+    // = tag (serial << 8 | round), [7] = lane capacity. In rounds > 0, before the instruction at
+    // raw_resume_at, lanes parked in the previous round on a target of this program get their VGPRs
+    // and pointer back; others get pointer 0; vcc = pointer > 0 (the scheduler's test is redone).
+    bool raw_park = false;
+    uint32_t raw_park_ptr_vgpr = 0, raw_resume_at = 0, raw_park_vgprs = 64;
+    uint32_t raw_park_from = 0, raw_park_to = 0;   // the scheduler's code: only its calls park
     bool barrier_sync = true;        // false: s_barrier without the group sync (debugging hangs) // the PC runtime takes shader model 6.6 ([WaveSize] on compute)
 };
 
