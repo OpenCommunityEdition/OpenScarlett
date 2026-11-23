@@ -264,7 +264,7 @@ DWORD WINAPI raw_thread(void*) {
 // Mouse position: the host pointer's position in the focused window's client area, plus the raw
 // motion the pointer could not follow because it was pinned at an edge of that area.
 // Titles take deltas of positionX/Y and integrate them into their own cursor, clamped to their
-// screen and starting at (0, 0) (Minecraft Preview: +0x2e2a8c0). Reporting client coordinates
+// screen and starting at (0, 0). Reporting client coordinates
 // puts that cursor exactly under the host pointer and keeps it there (no drift from pointer
 // acceleration or edges); the edge excess keeps relative motion (camera turning) unbounded, and a
 // title's own clamping absorbs it in menus.
