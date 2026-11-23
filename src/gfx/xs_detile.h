@@ -8,5 +8,7 @@ namespace xs {
 void detile_register(PcObj pcRes, uint64_t va, const void* consoleDesc, uint32_t initialState);
 void detile_view_created(PcObj pcRes);
 void detile_flush(PcObj pcDevice, PcObj pcQueue);
+// Bytes and base alignment the console gives a resource (xg_xs.dll for textures); false without xg.
+bool console_resource_size(const D3D12_RESOURCE_DESC* desc, uint64_t* size, uint64_t* align);
 void detile_forget(PcObj pcRes);                     // the resource is being destroyed   // before each submission
 }

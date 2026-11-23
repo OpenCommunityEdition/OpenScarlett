@@ -133,6 +133,7 @@ uint64_t blas_console_size(uint64_t triangles);
 uint64_t blas_scratch_size(uint64_t triangles);
 void list_dump_memory(PcObj l, uint64_t va, const char* what);   // XSL_AS_DUMP diagnostics              // before each submission: views and address table
 uint32_t gm_reserved_start();
+uint32_t global_view_virtual_size();   // view slots numbered for title heaps (the PC heap holds a prefix of them)
 bool gm_active();                      // translated shaders may use global memory          // first global-heap slot reserved for it (UINT32_MAX: none)   // console D3D12_RESOURCE_STATES -> PC
 using FillSubresource = bool (*)(void* ctx, uint32_t sub, void* dst, uint32_t rowPitch, uint32_t rows, uint32_t depth);
 HRESULT_T upload_texture(PcObj dev, PcObj q, PcObj dst, uint32_t state, FillSubresource fill, void* ctx);
@@ -259,6 +260,7 @@ HRESULT_T device_removed_reason(PcObj dev);
 bool sanitize_container(const void* in, size_t inSize, void** out, size_t* outSize);
 // Console machine code -> HLSL -> DXIL for shaders without (usable) DXIL; see native_shaders.cpp.
 bool native_translate(const void* in, size_t inSize, void** out, size_t* outSize);
+void set_fallback_root_signature(const void* blob, size_t n);   // pipeline's root signature for containers without one (0: none)
 // Whether a shader without DXIL failed translation on this thread since reset_untranslated().
 void reset_untranslated();
 const char* translated_keys();   // keys of shaders translated since reset_untranslated()

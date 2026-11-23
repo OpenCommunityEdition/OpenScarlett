@@ -63,6 +63,28 @@ bool is_graphics(ULONGLONG flags, DWORD protect) {
 
 // Placeholder reservations created by XMemVirtualAlloc (start -> size).
 std::map<uintptr_t, SIZE_T> g_placeholders;
+// GPU-visible ranges of placeholders the title turned into physical-page reservations
+// (MEM_REPLACE_PLACEHOLDER): backed at once by one private, write-watched allocation each, because
+// the GPU can import such memory (OpenExistingHeapFromAddress) but not a run of mapped section
+// views. Pages the title maps there later are taken as already in place; a page mapped at a second
+// address does not alias (logged).
+std::map<uintptr_t, SIZE_T> g_private_graphics;
+std::map<ULONG_PTR, uintptr_t> g_page_home;   // physical page -> where it was first mapped (aliasing check)
+bool in_private_graphics(uintptr_t va) {
+    auto it = g_private_graphics.upper_bound(va);
+    if (it == g_private_graphics.begin()) return false;
+    --it;
+    return va < it->first + it->second;
+}
+// Note that `page` is mapped at va inside private graphics memory; warns when it is mapped twice.
+void note_private_page(uintptr_t va, ULONG_PTR page) {
+    auto [it, fresh] = g_page_home.emplace(page, va);
+    if (!fresh && it->second != va) {
+        static volatile long n = 0;
+        if (InterlockedIncrement(&n) <= 5)
+            XSL_WARN(CH, "physical page %llu mapped at %p and %p: GPU-visible memory here does not alias", (unsigned long long)page, (void*)it->second, (void*)va);
+    }
+}
 
 bool in_placeholder(uintptr_t va) {
     auto it = g_placeholders.upper_bound(va);
@@ -94,6 +116,29 @@ bool map_one(uintptr_t va, ULONG_PTR page) {
     return true;
 }
 
+// XMEM_GRAPHICS_32BIT_ADDRESS asks for GPU memory whose address fits in 32 bits. Such memory is
+// placed between 2 GB (the lowest graphics address D3D12ConfigureVirtualMemoryX reports) and
+// 0xF0000000, where d3d12_xs.dll keeps a range of its own.
+constexpr ULONGLONG kXmem32 = 0x7;
+void* reserve_va(void* base, SIZE_T size, ULONG type, ULONG protect, ULONGLONG flags) {
+    MEM_ADDRESS_REQUIREMENTS req{};
+    MEM_EXTENDED_PARAMETER ep{};
+    ULONG n = 0;
+    if (!base && (flags & kXmem32) == kXmem32) {
+        req.LowestStartingAddress = (void*)0x80000000ull;
+        req.HighestEndingAddress = (void*)0xEFFFFFFFull;
+        ep.Type = MemExtendedParameterAddressRequirements;
+        ep.Pointer = &req;
+        n = 1;
+    }
+    void* p = VirtualAlloc2(GetCurrentProcess(), base, size, type, protect, n ? &ep : nullptr, n);
+    if (!p && n) {
+        XSL_WARN(CH, "no room below 4 GB for %zu bytes of 32-bit graphics memory (%lu); placing it anywhere", size, GetLastError());
+        p = VirtualAlloc2(GetCurrentProcess(), base, size, type, protect, nullptr, 0);
+    }
+    return p;
+}
+
 // ---- Allocation hooks ------------------------------------------------------------------------
 XMEM_ALLOCATION_HOOKS* title_hooks() {
     static XMEM_ALLOCATION_HOOKS* h = [] {
@@ -110,23 +155,69 @@ extern "C" {
 
 PVOID WINAPI XMemVirtualAlloc(PVOID base, SIZE_T size, DWORD type, ULONGLONG flags, DWORD protect) {
     bool large = (type & (MEM_2MB_PAGES | MEM_PHYSICAL)) != 0;  // MEM_64K_PAGES = MEM_2MB_PAGES | MEM_PHYSICAL
-    if ((type & MEM_RESERVE) && !(type & MEM_COMMIT) && large) {
-        // Reservation meant for XMemMapPhysicalPages: a placeholder.
+    // MEM_REPLACE_PLACEHOLDER (with MEM_RESERVE, without a commit): the console turns (part of) a
+    // placeholder into a reservation for physical pages. Here the placeholder already is one; XMemMapPhysicalPages maps
+    // into it. The range is recorded as GPU-visible when the title says so.
+    if ((type & MEM_REPLACE_PLACEHOLDER) && !(type & MEM_COMMIT) && base) {
+        std::lock_guard<std::mutex> g(g_mu);
+        if (in_placeholder((uintptr_t)base)) {
+            SIZE_T sz = (size + kPage - 1) & ~(kPage - 1);
+            if (in_private_graphics((uintptr_t)base)) return base;   // backed with the rest of its reservation
+            if (is_graphics(flags, protect)) {
+                // The whole reservation becomes one private allocation (titles carve one reservation
+                // into several ranges and place one buffer across them; a PC buffer cannot span
+                // allocations). Its placeholders are coalesced first; nothing is mapped there yet.
+                auto it = std::prev(g_placeholders.upper_bound((uintptr_t)base));
+                uintptr_t ps = it->first;
+                SIZE_T psz = it->second;
+                bool whole = VirtualFree((void*)ps, psz, MEM_RELEASE | MEM_COALESCE_PLACEHOLDERS) != 0;
+                if (!whole) {   // already one placeholder, or parts in use: try it as it is, else just this range
+                    MEMORY_BASIC_INFORMATION mbi{};
+                    VirtualQuery((void*)ps, &mbi, sizeof mbi);
+                    whole = mbi.State == MEM_RESERVE && mbi.RegionSize >= psz;
+                }
+                uintptr_t start = whole ? ps : (uintptr_t)base;
+                SIZE_T len = whole ? psz : sz;
+                if (!whole) {
+                    MEMORY_BASIC_INFORMATION mbi{};
+                    VirtualQuery(base, &mbi, sizeof mbi);
+                    if ((uintptr_t)mbi.BaseAddress < (uintptr_t)base)
+                        VirtualFree(mbi.BaseAddress, (uintptr_t)base - (uintptr_t)mbi.BaseAddress, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER);
+                    VirtualQuery(base, &mbi, sizeof mbi);
+                    if (mbi.RegionSize > sz) VirtualFree(base, sz, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER);
+                }
+                void* p = VirtualAlloc2(GetCurrentProcess(), (void*)start, len, MEM_RESERVE | MEM_COMMIT | MEM_REPLACE_PLACEHOLDER | MEM_WRITE_WATCH, PAGE_READWRITE, nullptr, 0);
+                if (p == (void*)start) {
+                    g_private_graphics[start] = len;
+                    g_graphics[start] = len;
+                    XSL_INFO(CH, "GPU-visible physical-page memory %p+%zu: one private allocation", (void*)start, (size_t)len);
+                } else {
+                    XSL_WARN(CH, "GPU-visible physical-page range %p+%zu kept as mapped pages (%lu): the GPU cannot import it", base, sz, GetLastError());
+                    g_graphics[(uintptr_t)base] = sz;
+                }
+            }
+            return base;
+        }
+    }
+    if ((type & MEM_RESERVE) && !(type & MEM_COMMIT) && (large || (type & MEM_RESERVE_PLACEHOLDER))) {
+        // Reservation meant for XMemMapPhysicalPages, or a placeholder the title splits itself
+        // (VirtualFree with MEM_PRESERVE_PLACEHOLDER): a placeholder either way.
         SIZE_T sz = (size + kPage - 1) & ~(kPage - 1);
-        void* p = VirtualAlloc2(GetCurrentProcess(), base, sz, MEM_RESERVE | MEM_RESERVE_PLACEHOLDER, PAGE_NOACCESS, nullptr, 0);
+        void* p = reserve_va(base, sz, MEM_RESERVE | MEM_RESERVE_PLACEHOLDER, PAGE_NOACCESS, flags);
         if (p) {
             std::lock_guard<std::mutex> g(g_mu);
             g_placeholders[(uintptr_t)p] = sz;
         } else {
-            XSL_ERR(CH, "placeholder reservation of %zu bytes failed (%lu)", sz, GetLastError());
+            XSL_ERR(CH, "placeholder reservation of %zu bytes at %p failed (%lu; type %lx, flags %llx, protect %lx)", sz, base, GetLastError(), type, flags, protect);
         }
         return p;
     }
     // Commit inside a 64 KB-page reservation (the console's reserve-then-commit pattern): the
     // reservation is a placeholder, which VirtualAlloc cannot commit, so fresh zeroed pages are
     // mapped into each 64 KB unit not mapped yet.
-    if ((type & MEM_COMMIT) && !(type & MEM_RESERVE) && base) {
+    if ((type & MEM_COMMIT) && !(type & MEM_RESERVE) && base) {   // (MEM_REPLACE_PLACEHOLDER | MEM_COMMIT too)
         std::lock_guard<std::mutex> g(g_mu);
+        if (in_private_graphics((uintptr_t)base)) return base;   // committed already
         if (in_placeholder((uintptr_t)base)) {
             uintptr_t start = (uintptr_t)base & ~(uintptr_t)(kPage - 1);
             uintptr_t end = ((uintptr_t)base + size + kPage - 1) & ~(uintptr_t)(kPage - 1);
@@ -146,7 +237,8 @@ PVOID WINAPI XMemVirtualAlloc(PVOID base, SIZE_T size, DWORD type, ULONGLONG fla
     }
     // GPU-visible memory is imported into the GPU with 64 KB granularity; keep it 64 KB aligned/sized.
     if (is_graphics(flags, protect) && (type & MEM_COMMIT)) size = (size + kPage - 1) & ~(kPage - 1);
-    void* p = VirtualAlloc(base, size, pc_alloc_type(type), pc_protect(protect));
+    void* p = (type & MEM_RESERVE) && !base ? reserve_va(nullptr, size, pc_alloc_type(type), pc_protect(protect), flags)
+                                           : VirtualAlloc(base, size, pc_alloc_type(type), pc_protect(protect));
     if (p && is_graphics(flags, protect) && (type & MEM_COMMIT)) {
         std::lock_guard<std::mutex> g(g_mu);
         g_graphics[(uintptr_t)p] = size;
@@ -171,6 +263,10 @@ BOOL WINAPI XMemFreePhysicalPages(ULONG_PTR count, PULONG_PTR pages) {
 
 PVOID WINAPI XMemMapPhysicalPages(PVOID va, ULONG_PTR count, PULONG_PTR pages) {
     std::lock_guard<std::mutex> g(g_mu);
+    if (in_private_graphics((uintptr_t)va)) {   // memory already there (see g_private_graphics)
+        for (ULONG_PTR i = 0; pages && i < count; i++) note_private_page((uintptr_t)va + i * kPage, pages[i]);
+        return va;
+    }
     if (!in_placeholder((uintptr_t)va)) {
         XSL_ERR(CH, "XMemMapPhysicalPages at %p: not inside an XMem placeholder reservation", va);
         SetLastError(ERROR_INVALID_ADDRESS);
@@ -183,8 +279,13 @@ PVOID WINAPI XMemMapPhysicalPages(PVOID va, ULONG_PTR count, PULONG_PTR pages) {
 
 BOOL WINAPI XMemMapPhysicalPagesScatter(PVOID* vas, ULONG_PTR count, PULONG_PTR pages) {
     std::lock_guard<std::mutex> g(g_mu);
-    for (ULONG_PTR i = 0; i < count; i++)
+    for (ULONG_PTR i = 0; i < count; i++) {
+        if (in_private_graphics((uintptr_t)vas[i])) {
+            if (pages) note_private_page((uintptr_t)vas[i], pages[i]);
+            continue;
+        }
         if (!map_one((uintptr_t)vas[i], pages ? pages[i] : (ULONG_PTR)-1)) return FALSE;
+    }
     return TRUE;
 }
 
@@ -248,6 +349,11 @@ VOID WINAPI XMemFree(PVOID p, ULONGLONG attributes) {
 }
 
 VOID WINAPI XMemSetAllocationHooks(PXMEMALLOC_ROUTINE a, PXMEMFREE_ROUTINE f) { g_setHooks = {a, f}; }
+// Layer-private export: whether the title answers XMemAlloc itself (exported hooks or XMemSetAllocationHooks).
+BOOL WINAPI xsl_xmem_title_hooks() {
+    auto* h = title_hooks();
+    return (h && h->AllocRoutine) || g_setHooks.AllocRoutine;
+}
 
 HANDLE WINAPI XMemGetTitleHeap() { return GetProcessHeap(); }
 HANDLE WINAPI XMemCreateWin32Heap(ULONGLONG, PVOID) { return HeapCreate(0, 0, 0); }
@@ -297,6 +403,52 @@ void* WINAPI xsl_xmem_page_view(ULONG_PTR page) {
     return MapViewOfFile(g_chunks[page / kPagesPerChunk], FILE_MAP_READ | FILE_MAP_WRITE, (DWORD)(off >> 32), (DWORD)off, kPage);
 }
 void WINAPI xsl_xmem_page_unview(void* view) { if (view) UnmapViewOfFile(view); }
+
+// Layer-private export: turn [base, base + size) of a placeholder reservation (pages mapped with
+// XMemMapPhysicalPages or committed later) into one write-watched private allocation with the same
+// contents. d3d12_xs.dll uses it for descriptor memory a title supplies through its XMem hooks: the
+// layer must see which descriptors the title writes. The physical pages that were mapped there stay
+// allocated to the title (it never learns they are gone; titles do not remap descriptor memory).
+BOOL WINAPI xsl_xmem_write_watch(void* base, SIZE_T size) {
+    std::lock_guard<std::mutex> g(g_mu);
+    uintptr_t b = (uintptr_t)base;
+    if (in_private_graphics(b) && in_private_graphics(b + size - 1)) {   // write-watched from the start
+        ResetWriteWatch(base, size);
+        return TRUE;
+    }
+    if ((b & (kPage - 1)) || !size || !in_placeholder(b)) return FALSE;
+    size = (size + kPage - 1) & ~(kPage - 1);
+    std::vector<uint8_t> keep(size);
+    for (uintptr_t va = b; va < b + size; va += kPage) {
+        MEMORY_BASIC_INFORMATION mbi{};
+        VirtualQuery((void*)va, &mbi, sizeof mbi);
+        if (mbi.Type == MEM_MAPPED) {
+            memcpy(&keep[va - b], (void*)va, kPage);
+            UnmapViewOfFile2(GetCurrentProcess(), (void*)va, MEM_PRESERVE_PLACEHOLDER);
+        } else if (mbi.State != MEM_RESERVE) {
+            XSL_WARN(CH, "write watch for %p+%zu: %p is neither mapped nor a placeholder", base, size, (void*)va);
+            return FALSE;
+        }
+    }
+    // One placeholder over exactly the range (the title split it; map_one split it per page).
+    MEMORY_BASIC_INFORMATION mbi{};
+    VirtualQuery(base, &mbi, sizeof mbi);
+    if (mbi.RegionSize < size && !VirtualFree(base, size, MEM_RELEASE | MEM_COALESCE_PLACEHOLDERS)) {
+        XSL_WARN(CH, "write watch for %p+%zu: placeholders not coalesced (%lu)", base, size, GetLastError());
+        return FALSE;
+    }
+    VirtualQuery(base, &mbi, sizeof mbi);
+    if (mbi.RegionSize > size) VirtualFree(base, size, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER);   // split off the rest
+    void* p = VirtualAlloc2(GetCurrentProcess(), base, size, MEM_RESERVE | MEM_COMMIT | MEM_REPLACE_PLACEHOLDER | MEM_WRITE_WATCH, PAGE_READWRITE, nullptr, 0);
+    if (p != base) {
+        XSL_WARN(CH, "write watch for %p+%zu: write-watched memory not placed (%lu)", base, size, GetLastError());
+        return FALSE;
+    }
+    memcpy(base, keep.data(), size);
+    ResetWriteWatch(base, size);
+    XSL_INFO(CH, "%p+%zu: now write-watched memory (descriptor heap memory from the title)", base, size);
+    return TRUE;
+}
 
 // Layer-private export: the GPU-visible allocation containing `address`, if any.
 BOOL WINAPI xsl_xmem_find_graphics(const void* address, void** base, SIZE_T* size) {

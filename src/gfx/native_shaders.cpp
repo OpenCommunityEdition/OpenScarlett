@@ -222,6 +222,30 @@ void set_host_waves(unsigned min_lanes, unsigned max_lanes, bool sm66) {
 }
 const char* translated_keys() { return t_keys.c_str(); }
 
+// The root signature of the pipeline being created, for shaders whose container carries none (the
+// translator rebuilds bindings from it). Set by pipeline creation for the duration of the call.
+thread_local std::vector<uint8_t> t_fallback_rs;
+void set_fallback_root_signature(const void* blob, size_t n) {
+    t_fallback_rs.clear();
+    if (!blob || !n) return;
+    const uint8_t* d = (const uint8_t*)blob;
+    // A serialized root signature is either the RTS0 data itself or a DXBC container holding it.
+    if (n >= 32 && !memcmp(d, "DXBC", 4)) {
+        uint32_t count, total;
+        memcpy(&total, d + 24, 4);
+        memcpy(&count, d + 28, 4);
+        for (uint32_t i = 0; i < count && 32 + 4ull * (i + 1) <= n; i++) {
+            uint32_t off, cc, sz;
+            memcpy(&off, d + 32 + 4 * i, 4);
+            if (off + 8ull > n) break;
+            memcpy(&cc, d + off, 4);
+            memcpy(&sz, d + off + 4, 4);
+            if (!memcmp(&cc, "RTS0", 4) && off + 8ull + sz <= n) { t_fallback_rs.assign(d + off + 8, d + off + 8 + sz); return; }
+        }
+        return;
+    }
+    t_fallback_rs.assign(d, d + n);
+}
 bool native_translate(const void* in, size_t n, void** out, size_t* outSize) {
     if (mode() == 0) return false;
     gpucode::Container c;
@@ -242,6 +266,8 @@ bool native_translate(const void* in, size_t n, void** out, size_t* outSize) {
         return false;
     }
     uint64_t key = fnv(kVersion, strlen(kVersion), fnv(in, n));
+    const bool fallbackRs = !c.part("RTS0") && !t_fallback_rs.empty();
+    if (fallbackRs) key = fnv(t_fallback_rs.data(), t_fallback_rs.size(), key);   // translated against the pipeline's root signature
     if (const char* g = getenv("XSL_LOOP_GUARD"); g && *g) key = fnv(g, strlen(g), key);   // changes the output
     if (getenv("XSL_NO_BARRIER_SYNC")) key = fnv("nb", 2, key);
     if (const char* sk = getenv("XSL_SKIP_SHADERS"); sk && *sk) {   // debugging: these keys become placeholders
@@ -283,8 +309,13 @@ bool native_translate(const void* in, size_t n, void** out, size_t* outSize) {
         const auto* rsp = c.part("RTS0");
         gpucode::RootSig rs;
         std::string err;
-        if (!rsp || !gpucode::parse_root_signature(rsp->data(), rsp->size(), rs, &err)) {
-            XSL_WARN(CH, "shader %016llx: no usable root signature in the container (%s)", (unsigned long long)key, err.c_str());
+        const uint8_t* rsData = rsp ? (const uint8_t*)rsp->data() : fallbackRs ? t_fallback_rs.data() : nullptr;
+        size_t rsSize = rsp ? rsp->size() : fallbackRs ? t_fallback_rs.size() : 0;
+        if (!rsData || !gpucode::parse_root_signature(rsData, rsSize, rs, &err)) {
+            char head[100] = "";
+            for (size_t k = 0; rsData && k < std::min<size_t>(rsSize, 40); k += 4) snprintf(head + strlen(head), sizeof head - strlen(head), "%08x ", *(const uint32_t*)(rsData + k));
+            XSL_WARN(CH, "shader %016llx: no usable root signature in the container (%s; %s, %zu bytes: %s)", (unsigned long long)key, err.c_str(),
+                     rsp ? "own" : fallbackRs ? "pipeline's" : "none", rsSize, head);
             std::lock_guard<std::mutex> g(g_lock);
             g_failed.insert(key);
             t_untranslated = !c.has_bitcode;

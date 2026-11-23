@@ -214,8 +214,68 @@ HRESULT_T device_removed_reason(PcObj dev) {
 
 // Diagnostics: unusual exceptions (codes outside the usual debugger/C++ ones) with the module and
 // offset of each stack frame, logged when DRED or the debug layer is on.
+// XSL_CRASH_DUMP=<file> (diagnostics): on the first access violation or breakpoint in the title's
+// executable (XSL_CRASH_DUMP_AT=<rva hex>: only at that address), a minidump with the modules' data
+// segments and the memory the stacks point at; titles' own crash dumps leave their globals out.
+static void crash_dump(EXCEPTION_POINTERS* e) {
+    static char path[MAX_PATH] = "";
+    static bool init = false;
+    static volatile long done = 0;
+    if (!init) { init = true; GetEnvironmentVariableA("XSL_CRASH_DUMP", path, sizeof path); }
+    DWORD c = e->ExceptionRecord->ExceptionCode;
+    if (!path[0] || (c != 0xC0000005 && c != 0x80000003)) return;
+    auto* exe = (const uint8_t*)GetModuleHandleW(nullptr);
+    auto* nt = (const IMAGE_NT_HEADERS*)(exe + ((const IMAGE_DOS_HEADER*)exe)->e_lfanew);
+    uintptr_t a = (uintptr_t)e->ExceptionRecord->ExceptionAddress, b = (uintptr_t)exe;
+    if (a < b || a >= b + nt->OptionalHeader.SizeOfImage) return;
+    char at[32];
+    if (GetEnvironmentVariableA("XSL_CRASH_DUMP_AT", at, sizeof at) && _strtoui64(at, nullptr, 16) != a - b) return;
+    if (InterlockedExchange(&done, 1)) return;
+    // XSL_CRASH_PEEK=<item>,...: bytes of the title's memory at that moment, logged. An item is
+    // rva:len (address in the executable) or *rva:off:len (the pointer stored at rva, plus off).
+    char peek[1024];
+    if (GetEnvironmentVariableA("XSL_CRASH_PEEK", peek, sizeof peek)) {
+        for (char* it = strtok(peek, ","); it; it = strtok(nullptr, ",")) {
+            // leading '*'s: pointers followed; then rva, one offset per pointer, and the length
+            int levels = 0;
+            char* q = it;
+            while (*q == '*') { levels++; q++; }
+            uint64_t vals[8] = {};
+            int nv = 0;
+            vals[nv++] = _strtoui64(q, &q, 16);
+            while (*q == ':' && nv < 8) vals[nv++] = _strtoui64(q + 1, &q, 16);
+            uint64_t len = nv > levels + 1 ? vals[levels + 1] : 8;
+            uintptr_t at = b + vals[0];
+            bool bad = false;
+            for (int l = 0; l < levels && !bad; l++) {
+                uintptr_t ptr = 0;
+                if (IsBadReadPtr((void*)at, 8)) { bad = true; break; }
+                memcpy(&ptr, (void*)at, 8);
+                at = ptr + (l + 1 < nv ? vals[l + 1] : 0);
+            }
+            if (bad) at = 0;
+            len = std::min<uint64_t>(len ? len : 8, 64);
+            std::string hex;
+            if (!at || IsBadReadPtr((void*)at, (UINT_PTR)len)) hex = "(unreadable)";
+            else for (uint64_t k = 0; k < len; k++) { char h[4]; snprintf(h, sizeof h, "%02x", ((const uint8_t*)at)[k]); hex += h; }
+            XSL_ERR(CH, "peek %s -> %llx: %s", it, (unsigned long long)at, hex.c_str());
+        }
+    }
+    typedef BOOL(WINAPI * Write)(HANDLE, DWORD, HANDLE, int, void*, void*, void*);
+    HMODULE dh = LoadLibraryW(L"dbghelp.dll");
+    auto write = dh ? (Write)GetProcAddress(dh, "MiniDumpWriteDump") : nullptr;
+    if (!strcmp(path, "peek")) return;   // XSL_CRASH_DUMP=peek: the peeks only
+    HANDLE f = CreateFileA(path, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, 0, nullptr);
+    if (!write || f == INVALID_HANDLE_VALUE) return;
+    struct { DWORD ThreadId; EXCEPTION_POINTERS* ExceptionPointers; BOOL ClientPointers; } xi{GetCurrentThreadId(), e, FALSE};
+    // MiniDumpWithDataSegs | MiniDumpWithIndirectlyReferencedMemory | MiniDumpWithThreadInfo | MiniDumpWithUnloadedModules
+    BOOL ok = write(GetCurrentProcess(), GetCurrentProcessId(), f, 0x1 | 0x40 | 0x1000 | 0x20, &xi, nullptr, nullptr);
+    CloseHandle(f);
+    XSL_ERR(CH, "exception %08lx at exe+%llx: dump %s %s", c, (unsigned long long)(a - b), path, ok ? "written" : "failed");
+}
 static LONG CALLBACK note_exception(EXCEPTION_POINTERS* e) {
     DWORD c = e->ExceptionRecord->ExceptionCode;
+    crash_dump(e);
     if (c == 0xC00000FD) return EXCEPTION_CONTINUE_SEARCH;   // stack overflow: no stack left to log with
     static bool log_av = env_on("XSL_LOG_AV");   // access violations too (titles probe memory; noisy)
     if (c == 0xC0000005 && !log_av) return EXCEPTION_CONTINUE_SEARCH;
@@ -244,7 +304,41 @@ static LONG CALLBACK note_exception(EXCEPTION_POINTERS* e) {
     return EXCEPTION_CONTINUE_SEARCH;
 }
 void rt_warm_start();
+// D3D12 Agility SDK runtime: when xsl-run placed one in D3D12\ next to the layer
+// (tools/get-agility.sh), select it before the first device. Titles compile shader model 6.6+ DXIL
+// at run time, which the Windows 10 system runtime rejects. XSL_AGILITY=0 keeps the system runtime.
+static void select_agility_runtime() {
+    static bool done = false;
+    if (done) return;
+    done = true;
+    { char b[4]; if (GetEnvironmentVariableA("XSL_AGILITY", b, 4) && b[0] == '0') return; }
+    wchar_t dir[MAX_PATH];
+    HMODULE self = nullptr;
+    GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCWSTR)&select_agility_runtime, &self);
+    DWORD n = GetModuleFileNameW(self, dir, MAX_PATH);
+    while (n && dir[n - 1] != L'\\') n--;
+    dir[n] = 0;
+    std::wstring sdk = std::wstring(dir) + L"D3D12\\";
+    FILE* vf = _wfopen((sdk + L"VERSION").c_str(), L"r");
+    if (!vf) return;
+    unsigned major = 0, minor = 0, patch = 0;
+    int got = fscanf(vf, "%u.%u.%u", &major, &minor, &patch);
+    fclose(vf);
+    if (got < 2) return;
+    ID3D12SDKConfiguration* cfg = nullptr;
+    // CLSID_D3D12SDKConfiguration (d3d12.h; defined here, the import library does not carry it)
+    static const GUID kSdkConfig = {0x7cda6aca, 0xa03e, 0x49c8, {0x94, 0x58, 0x03, 0x34, 0xd2, 0x0e, 0x07, 0xce}};
+    HRESULT hr = D3D12GetInterface(kSdkConfig, IID_PPV_ARGS(&cfg));
+    if (FAILED(hr)) { XSL_WARN(CH, "D3D12 Agility SDK: no SDK configuration interface (%08lx); system runtime in use", hr); return; }
+    // The path is taken relative to the executable (the layer sits in the executable's directory).
+    const char* path = ".\\D3D12\\";
+    hr = cfg->SetSDKVersion(minor, path);
+    cfg->Release();
+    if (FAILED(hr)) XSL_WARN(CH, "D3D12 Agility SDK %u.%u.%u at %s not selected (%08lx; needs Windows Developer Mode); system runtime in use", major, minor, patch, path, hr);
+    else XSL_INFO(CH, "D3D12 Agility SDK %u.%u.%u selected (%s)", major, minor, patch, path);
+}
 HRESULT_T create_device(PcObj* out) {
+    select_agility_runtime();
     if (env_on("XSL_D3D12_DRED") || env_on("XSL_D3D12_DEBUG")) {
         static bool once = false;
         if (!once) { once = true; AddVectoredExceptionHandler(1, note_exception); }
@@ -350,6 +444,7 @@ std::mutex g_gv_mu;
 ID3D12DescriptorHeap* g_gv = nullptr;
 bool g_gv_failed = false;
 uint32_t g_gv_size = 0, g_gv_inc = 0;
+uint32_t g_gv_virtual = 0;   // view slots handed to title heaps (>= g_gv_size; see global_view_virtual_size)
 std::map<uint32_t, uint32_t> g_gv_free;  // free ranges: offset -> count
 constexpr uint32_t kGmSlots = 16384, kGmHalf = 8192;   // global-memory view range (end of the global heap)
 }  // namespace
@@ -371,12 +466,19 @@ PcObj global_view_heap(PcObj dev) {
         g_gv_failed = true;
         return nullptr;
     }
-    g_gv_free[0] = g_gv_size;
+    // Title heaps may together need more view slots than a PC heap can hold (one title asks for
+    // 1,245,184 in one heap; the PC limit is about 1,000,000). Slots are numbered up to
+    // XSL_VIEW_SLOTS (default 2,097,152): the console-layout memory holds all of them, the PC heap
+    // the first g_gv_size; later ones are kept but not visible to PC shaders.
+    g_gv_virtual = GetEnvironmentVariableA("XSL_VIEW_SLOTS", b, sizeof b) ? (uint32_t)atoi(b) : 2097152u;
+    g_gv_virtual = std::max(g_gv_virtual, g_gv_size);
+    g_gv_free[0] = g_gv_virtual;
     XSL_INFO(CH, "descriptor heaps: %u-entry shader-visible CBV/SRV/UAV heap shared by all title heaps (%u-byte descriptors; console 32)",
              g_gv_size, g_gv_inc);
     return g_gv;
 }
 PcObj global_view_heap_if_created() { return g_gv; }
+uint32_t global_view_virtual_size() { return g_gv_virtual; }
 bool global_view_alloc(PcObj dev, uint32_t count, uint32_t* offset, uint64_t* cpu, uint64_t* gpu) {
     if (!global_view_heap(dev) || count == 0) return false;
     std::lock_guard<std::mutex> g(g_gv_mu);

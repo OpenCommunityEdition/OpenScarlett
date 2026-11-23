@@ -5,7 +5,20 @@
 
 #define XSL_EXPORT_STUB(name) \
     extern "C" HRESULT xsl_exp_##name() { XSL_WARN(CH, "unimplemented export %s", #name); return E_NOTIMPL; }
-XSL_EXPORT_STUB(D3D12ConfigureVirtualMemoryX)
+// D3D12ConfigureVirtualMemoryX (d3d12_xs.h): sizes the console GPU page tables before any graphics
+// memory exists, and reports the graphics virtual-address window. Graphics memory here is ordinary
+// process memory at CPU addresses, so there is nothing to configure; the window reported is the
+// console's (lower bound 2 GB, 1 GB with the legacy flag; 1 TB upper bound).
+struct XslVmConfig { UINT Flags, PageTableMemory4MBPageCount, FrameBufferPreserveMemorySizeBytes; uint64_t MinimumValidGraphicsAddress, MaximumValidGraphicsAddress; };
+extern "C" HRESULT WINAPI xsl_exp_D3D12ConfigureVirtualMemoryX(XslVmConfig* c) {
+    if (!c) return E_INVALIDARG;
+    c->MinimumValidGraphicsAddress = (c->Flags & 1) ? 0x40000000ull : 0x80000000ull;
+    c->MaximumValidGraphicsAddress = 0x10000000000ull;
+    XSL_INFO(CH, "D3D12ConfigureVirtualMemoryX(flags %#x, page tables %u x 4 MB, frame-buffer preserve %u bytes): window %llx..%llx", c->Flags,
+             c->PageTableMemory4MBPageCount, c->FrameBufferPreserveMemorySizeBytes, (unsigned long long)c->MinimumValidGraphicsAddress,
+             (unsigned long long)c->MaximumValidGraphicsAddress);
+    return S_OK;
+}
 XSL_EXPORT_STUB(D3D12CreateDevice)
 XSL_EXPORT_STUB(D3D12GetDebugInterface)
 XSL_EXPORT_STUB(D3D12UploadCustomMicrocodeX)

@@ -100,6 +100,31 @@ HRESULT D3DAPI D_CheckFeatureSupport(ID3D12Device* d, D3D12_FEATURE f, void* dat
     }
     return hr;
 }
+// Descriptor-heap memory the title supplies. The console runtime allocates a heap's descriptor memory
+// with XMemAlloc (D3D allocator, object type 4); titles may answer that from their XMem hooks with
+// memory of their own and check that the heap's CPU handles point there. Asked the same way here;
+// memory that comes back is made write-watched (xmem) and holds the heap's console-layout slots.
+// XSL_TITLE_DESCRIPTOR_MEMORY=0 turns this off.
+static void* title_descriptor_memory(SIZE_T bytes) {
+    static bool on = [] { char b[4]; return !(GetEnvironmentVariableA("XSL_TITLE_DESCRIPTOR_MEMORY", b, 4) && b[0] == '0'); }();
+    typedef PVOID(WINAPI * Alloc)(SIZE_T, ULONGLONG);
+    typedef VOID(WINAPI * Free)(PVOID, ULONGLONG);
+    typedef BOOL(WINAPI * Watch)(void*, SIZE_T);
+    static HMODULE m = GetModuleHandleW(L"xmem.dll");
+    static auto alloc = m ? (Alloc)GetProcAddress(m, "XMemAlloc") : nullptr;
+    static auto release = m ? (Free)GetProcAddress(m, "XMemFree") : nullptr;
+    static auto watch = m ? (Watch)GetProcAddress(m, "xsl_xmem_write_watch") : nullptr;
+    if (!on || !alloc || !release || !watch) return nullptr;
+    // MAKE_XALLOC_ATTRIBUTES(eXALLOCAllocatorId_D3D, object type 4, GRAPHICS_WRITECOMBINE, 64 KB pages, 64 KB alignment, 0)
+    const ULONGLONG attrs = 4ull | (1ull << 14) | (128ull << 16) | (0x10ull << 24) | (1ull << 29);
+    void* p = alloc(bytes, attrs);
+    if (!p) return nullptr;
+    if (!watch(p, bytes)) {   // ordinary memory (no hook, or a hook that allocates): the layer's own shadow serves
+        release(p, attrs);
+        return nullptr;
+    }
+    return p;
+}
 HRESULT D3DAPI D_CreateDescriptorHeap(ID3D12Device* d, const D3D12_DESCRIPTOR_HEAP_DESC* desc, REFIID riid, void** out) {
     XSL_TRACE("gfx.cmd", "CreateDescriptorHeap type %d n %u", (int)desc->Type, desc->NumDescriptors);
     static bool unified = [] { char b[4]; return !(GetEnvironmentVariableA("XSL_UNIFIED_DESCRIPTORS", b, 4) && b[0] == '0'); }();
@@ -118,7 +143,16 @@ HRESULT D3DAPI D_CreateDescriptorHeap(ID3D12Device* d, const D3D12_DESCRIPTOR_HE
         if (pc::global_view_alloc(DPC(d), want, &off, &cpu, &gpu)) {
             XSL_INFO(CH, "shader-visible view heap: %u entries (%u backed) at %u", desc->NumDescriptors, want, off);
             // Console layout: CPU handles in the layer's descriptor memory (see xs_descriptors.cpp).
-            if (uint64_t shadow = desc_view_cpu_start(DEV(d), off)) { cpu = shadow; gpu = desc_view_gpu_start(off); }
+            if (uint64_t shadow = desc_view_cpu_start(DEV(d), off)) {
+                cpu = shadow;
+                gpu = desc_view_gpu_start(off);
+                if (void* mem = title_descriptor_memory((SIZE_T)desc->NumDescriptors * 32)) {
+                    if (desc_view_attach(off, desc->NumDescriptors, mem)) {
+                        cpu = (uint64_t)mem;
+                        XSL_INFO(CH, "view heap of %u entries: descriptor memory supplied by the title at %p", desc->NumDescriptors, mem);
+                    }
+                }
+            }
             return make_descriptor_heap_range(DEV(d), desc, off, cpu, gpu, riid, out);
         }
         XSL_WARN(CH, "global descriptor heap full; %u-entry heap gets its own PC heap (raise XSL_DESCRIPTOR_HEAP_SIZE)", desc->NumDescriptors);
@@ -151,6 +185,8 @@ HRESULT D3DAPI D_CreateRootSignature(ID3D12Device* d, UINT, const void* blob, SI
     XSL_TRACE("gfx.cmd", "CreateRootSignature %zu bytes", (size_t)n);
     PcObj rs = nullptr;
     HRESULT hr = pc::create_root_signature(DPC(d), blob, n, &rs);
+    static volatile long logged = 0;
+    if (InterlockedIncrement(&logged) <= 6) XSL_INFO(CH, "CreateRootSignature(%zu bytes, riid %08lx) -> %08lx", (size_t)n, riid.Data1, hr);
     if (FAILED(hr)) return hr;
     if (blob && n) {
         std::lock_guard<std::mutex> g(g_rs_blob_mu);
@@ -188,7 +224,10 @@ HRESULT D3DAPI D_CreateGraphicsPipelineState(ID3D12Device* d, const D3D12_GRAPHI
         x.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
     PcObj pso = nullptr;
     pc::reset_untranslated();
+    std::vector<uint8_t> rsb;
+    if (x.pRootSignature && root_signature_blob((PcObj)x.pRootSignature, &rsb)) pc::set_fallback_root_signature(rsb.data(), rsb.size());
     HRESULT hr = pc::create_graphics_pso(DPC(d), &x, &pso);
+    pc::set_fallback_root_signature(nullptr, 0);
     if (SUCCEEDED(hr)) pc::note_pso_rs(pso, x.pRootSignature, false);
     return pso_result(DEV(d), hr, pso, riid, out);
 }
@@ -237,7 +276,10 @@ HRESULT D3DAPI D_CreateComputePipelineStateX(ID3D12Device* d, const D3D12_COMPUT
     if (!waitMs) {
         PcObj pso = nullptr;
         pc::reset_untranslated();
+        std::vector<uint8_t> rsb;
+        if (x.pRootSignature && root_signature_blob((PcObj)x.pRootSignature, &rsb)) pc::set_fallback_root_signature(rsb.data(), rsb.size());
         HRESULT hr = pc::create_compute_pso(DPC(d), &x, &pso);
+        pc::set_fallback_root_signature(nullptr, 0);
         if (SUCCEEDED(hr)) pc::note_pso_rs(pso, x.pRootSignature, true);
         return pso_result(DEV(d), hr, pso, riid, out);
     }
@@ -250,7 +292,10 @@ HRESULT D3DAPI D_CreateComputePipelineStateX(ID3D12Device* d, const D3D12_COMPUT
         x.CS = {code->data(), code->size()};
         pc::reset_untranslated();
         PcObj pso = nullptr;
+        std::vector<uint8_t> rsb;
+        if (x.pRootSignature && root_signature_blob((PcObj)x.pRootSignature, &rsb)) pc::set_fallback_root_signature(rsb.data(), rsb.size());
         HRESULT hr = pc::create_compute_pso(dev, &x, &pso);
+        pc::set_fallback_root_signature(nullptr, 0);
         if (SUCCEEDED(hr)) pc::note_pso_rs(pso, x.pRootSignature, true);
         std::unique_lock<std::mutex> g(job->mu);
         job->hr = hr; job->pso = pso; job->untranslated = pc::had_untranslated(); job->keys = pc::translated_keys(); job->done = true;
@@ -340,7 +385,7 @@ HRESULT D3DAPI D_CreatePipelineState(ID3D12Device2* d, const D3D12_PIPELINE_STAT
             case D3D12XBOX_PIPELINE_STATE_SUBOBJECT_TYPE_COMPUTE_SHADER_LIMITS: len = sizeof(D3D12XBOX_COMPUTE_SHADER_LIMITS_DESC); al = alignof(D3D12XBOX_COMPUTE_SHADER_LIMITS_DESC); break;
             default:
                 XSL_ERR(CH, "CreatePipelineState: unknown subobject type %u at offset %zu", type, off);
-                for (void* o : owned) pc::free_container(o);
+                pc::set_fallback_root_signature(nullptr, 0); for (void* o : owned) pc::free_container(o);
                 return E_INVALIDARG;
         }
         size_t pay = align(off + 4, al);
@@ -354,6 +399,8 @@ HRESULT D3DAPI D_CreatePipelineState(ID3D12Device2* d, const D3D12_PIPELINE_STAT
             saw_rs = rs != nullptr;
             stream_rs = P(rs);
             PcObj prs = P(rs);
+            std::vector<uint8_t> rsb;   // for shaders without a root signature of their own (cleared below)
+            if (prs && root_signature_blob(prs, &rsb)) pc::set_fallback_root_signature(rsb.data(), rsb.size());
             emit(0, &prs, sizeof prs);
         } else if (type <= D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CS || type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS ||
                    type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS) {
@@ -365,7 +412,7 @@ HRESULT D3DAPI D_CreatePipelineState(ID3D12Device2* d, const D3D12_PIPELINE_STAT
                 static volatile long warned = 0;
                 if (InterlockedIncrement(&warned) <= 3)
                     XSL_ERR(CH, "title uses mesh shaders; the host GPU has none (DirectX 12 Ultimate needed)");
-                for (void* o : owned) pc::free_container(o);
+                pc::set_fallback_root_signature(nullptr, 0); for (void* o : owned) pc::free_container(o);
                 return E_NOTIMPL;
             }
             void* o; size_t n;
@@ -405,7 +452,7 @@ HRESULT D3DAPI D_CreatePipelineState(ID3D12Device2* d, const D3D12_PIPELINE_STAT
     PcObj pso = nullptr;
     HRESULT hr = pc::create_pso_stream(DPC(d), pcs.data(), pcs.size(), &pso);
     if (SUCCEEDED(hr)) pc::note_pso_rs(pso, stream_rs, stream_cs);
-    for (void* o : owned) pc::free_container(o);
+    pc::set_fallback_root_signature(nullptr, 0); for (void* o : owned) pc::free_container(o);
     return pso_result(DEV(d), hr, pso, riid, out);
 }
 HRESULT D3DAPI D_CreateCommandSignature(ID3D12Device* d, const D3D12_COMMAND_SIGNATURE_DESC* desc, ID3D12RootSignature* rs, REFIID riid, void** out) {
@@ -459,6 +506,53 @@ HRESULT D3DAPI D_CreateCommandQueueX(ID3D12Device* d, const D3D12XBOX_COMMAND_QU
     return D_CreateCommandQueue(d, &qd, riid, out);
 }
 
+// Console memory of committed resources. The console runtime takes a committed resource's memory
+// from XMemAlloc (D3D allocator; 2 MB pages for 2 MB and more), so titles that answer XMemAlloc
+// themselves see those allocations and some check them (one sub-allocates its render targets from
+// a block and verifies the block was used up). When the title has XMem hooks, each committed
+// resource allocates its console size the same way and holds it until it is destroyed; the PC
+// resource is what the GPU uses. XSL_CONSOLE_RESOURCE_MEMORY=0 turns this off.
+namespace {
+std::mutex g_cm_mu;
+std::map<PcObj, std::pair<void*, ULONGLONG>> g_cm;   // PC resource -> (XMemAlloc memory, attributes)
+}  // namespace
+static void console_memory_take(PcObj r, const D3D12_RESOURCE_DESC* rd) {
+    typedef PVOID(WINAPI * Alloc)(SIZE_T, ULONGLONG);
+    typedef BOOL(WINAPI * Hooks)();
+    static HMODULE m = GetModuleHandleW(L"xmem.dll");
+    static auto alloc = m ? (Alloc)GetProcAddress(m, "XMemAlloc") : nullptr;
+    static auto hooks = m ? (Hooks)GetProcAddress(m, "xsl_xmem_title_hooks") : nullptr;
+    static bool on = [] { char b[4]; return !(GetEnvironmentVariableA("XSL_CONSOLE_RESOURCE_MEMORY", b, 4) && b[0] == '0'); }();
+    if (!on || !alloc || !hooks || !hooks()) return;
+    uint64_t size = 0, align = 0;
+    if (!console_resource_size(rd, &size, &align)) return;
+    const bool large = size >= (2u << 20);
+    const ULONGLONG alignCode = align > 0x10000 ? 0x12 /* 256 KB */ : 0x10;   // XALLOC_ALIGNMENT_*
+    // MAKE_XALLOC_ATTRIBUTES(eXALLOCAllocatorId_D3D, object type 2, GRAPHICS_WRITECOMBINE, 64 KB or 2 MB pages, alignment, 0)
+    const ULONGLONG attrs = 2ull | ((large ? 2ull : 1ull) << 14) | (128ull << 16) | (alignCode << 24) | (1ull << 29);
+    void* p = alloc((SIZE_T)size, attrs);
+    static volatile long n = 0;
+    if (InterlockedIncrement(&n) <= 6)
+        XSL_INFO(CH, "committed %s %llux%u (format %d): %llu console bytes from the title's XMemAlloc at %p", rd->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER ? "buffer" : "texture",
+                 (unsigned long long)rd->Width, rd->Height, (int)rd->Format, (unsigned long long)size, p);
+    if (!p) return;
+    std::lock_guard<std::mutex> g(g_cm_mu);
+    g_cm[r] = {p, attrs};
+}
+void console_memory_release_impl(PcObj r) {
+    std::pair<void*, ULONGLONG> e{};
+    {
+        std::lock_guard<std::mutex> g(g_cm_mu);
+        auto it = g_cm.find(r);
+        if (it == g_cm.end()) return;
+        e = it->second;
+        g_cm.erase(it);
+    }
+    typedef VOID(WINAPI * Free)(PVOID, ULONGLONG);
+    static HMODULE m = GetModuleHandleW(L"xmem.dll");
+    static auto release = m ? (Free)GetProcAddress(m, "XMemFree") : nullptr;
+    if (release) release(e.first, e.second);
+}
 HRESULT D3DAPI D_CreateCommittedResource(ID3D12Device* d, const D3D12_HEAP_PROPERTIES* hp, D3D12_HEAP_FLAGS hf, const D3D12_RESOURCE_DESC* rd,
                                          D3D12_RESOURCE_STATES st, const D3D12_CLEAR_VALUE* cv, REFIID riid, void** out) {
     PcObj r = nullptr;
@@ -466,6 +560,7 @@ HRESULT D3DAPI D_CreateCommittedResource(ID3D12Device* d, const D3D12_HEAP_PROPE
     HRESULT hr = pc::create_committed_resource(DPC(d), hp, hf, rd, st, cv, &r);
     if (FAILED(hr)) return hr;
     if (!out) { pc::release(r); return S_FALSE; }
+    console_memory_take(r, rd);
     return make_resource(DEV(d), r, riid, out, hp->Type == D3D12_HEAP_TYPE_UPLOAD);
 }
 // The console resource description is the PC one plus DCC options (no PC meaning).
@@ -485,6 +580,56 @@ HRESULT D3DAPI D_CreateHeap(ID3D12Device* d, const D3D12_HEAP_DESC* desc, REFIID
     HRESULT hr = pc::create_heap(DPC(d), desc, &h);
     if (FAILED(hr)) return hr;
     return make_heap(DEV(d), h, desc, riid, out);
+}
+// Enhanced-barrier creation (D3D12_RESOURCE_DESC1 + initial layout): the layer tracks legacy states,
+// so the layout becomes the equivalent state and the descriptor's sampler-feedback field is dropped.
+static D3D12_RESOURCE_STATES state_of_layout(D3D12_BARRIER_LAYOUT l, const D3D12_RESOURCE_DESC1* d) {
+    switch ((int)l) {
+    case D3D12_BARRIER_LAYOUT_GENERIC_READ: case D3D12_BARRIER_LAYOUT_DIRECT_QUEUE_GENERIC_READ: case D3D12_BARRIER_LAYOUT_COMPUTE_QUEUE_GENERIC_READ:
+        return D3D12_RESOURCE_STATE_GENERIC_READ;
+    case D3D12_BARRIER_LAYOUT_RENDER_TARGET: return D3D12_RESOURCE_STATE_RENDER_TARGET;
+    case D3D12_BARRIER_LAYOUT_UNORDERED_ACCESS: case D3D12_BARRIER_LAYOUT_DIRECT_QUEUE_UNORDERED_ACCESS: case D3D12_BARRIER_LAYOUT_COMPUTE_QUEUE_UNORDERED_ACCESS:
+        return D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    case D3D12_BARRIER_LAYOUT_DEPTH_STENCIL_WRITE: return D3D12_RESOURCE_STATE_DEPTH_WRITE;
+    case D3D12_BARRIER_LAYOUT_DEPTH_STENCIL_READ: return D3D12_RESOURCE_STATE_DEPTH_READ;
+    case D3D12_BARRIER_LAYOUT_SHADER_RESOURCE: case D3D12_BARRIER_LAYOUT_DIRECT_QUEUE_SHADER_RESOURCE: case D3D12_BARRIER_LAYOUT_COMPUTE_QUEUE_SHADER_RESOURCE:
+        return D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+    case D3D12_BARRIER_LAYOUT_COPY_SOURCE: case D3D12_BARRIER_LAYOUT_DIRECT_QUEUE_COPY_SOURCE: case D3D12_BARRIER_LAYOUT_COMPUTE_QUEUE_COPY_SOURCE:
+        return D3D12_RESOURCE_STATE_COPY_SOURCE;
+    case D3D12_BARRIER_LAYOUT_COPY_DEST: case D3D12_BARRIER_LAYOUT_DIRECT_QUEUE_COPY_DEST: case D3D12_BARRIER_LAYOUT_COMPUTE_QUEUE_COPY_DEST:
+        return D3D12_RESOURCE_STATE_COPY_DEST;
+    case D3D12_BARRIER_LAYOUT_RESOLVE_SOURCE: return D3D12_RESOURCE_STATE_RESOLVE_SOURCE;
+    case D3D12_BARRIER_LAYOUT_RESOLVE_DEST: return D3D12_RESOURCE_STATE_RESOLVE_DEST;
+    default: break;   // UNDEFINED, COMMON and the queue-specific COMMON layouts
+    }
+    (void)d;
+    return D3D12_RESOURCE_STATE_COMMON;
+}
+static D3D12_RESOURCE_DESC desc_of(const D3D12_RESOURCE_DESC1* d1) {
+    D3D12_RESOURCE_DESC d{};
+    memcpy(&d, d1, sizeof d);   // DESC1 is DESC followed by the sampler-feedback mip region
+    return d;
+}
+HRESULT D3DAPI D_CreatePlacedResource(ID3D12Device* d, ID3D12Heap* heap, UINT64 off, const D3D12_RESOURCE_DESC* rd, D3D12_RESOURCE_STATES st,
+                                      const D3D12_CLEAR_VALUE* cv, REFIID riid, void** out);
+HRESULT D3DAPI D_CreateCommittedResource3(ID3D12Device10* d, const D3D12_HEAP_PROPERTIES* hp, D3D12_HEAP_FLAGS hf, const D3D12_RESOURCE_DESC1* d1,
+                                          D3D12_BARRIER_LAYOUT layout, const D3D12_CLEAR_VALUE* cv, ID3D12ProtectedResourceSession*, UINT32, DXGI_FORMAT*,
+                                          REFIID riid, void** out) {
+    if (!d1) return E_INVALIDARG;
+    D3D12_RESOURCE_DESC rd = desc_of(d1);
+    return D_CreateCommittedResource((ID3D12Device*)d, hp, hf, &rd, state_of_layout(layout, d1), cv, riid, out);
+}
+HRESULT D3DAPI D_CreatePlacedResource2(ID3D12Device10* d, ID3D12Heap* heap, UINT64 off, const D3D12_RESOURCE_DESC1* d1, D3D12_BARRIER_LAYOUT layout,
+                                       const D3D12_CLEAR_VALUE* cv, UINT32, DXGI_FORMAT*, REFIID riid, void** out) {
+    if (!d1) return E_INVALIDARG;
+    D3D12_RESOURCE_DESC rd = desc_of(d1);
+    return D_CreatePlacedResource((ID3D12Device*)d, heap, off, &rd, state_of_layout(layout, d1), cv, riid, out);
+}
+HRESULT D3DAPI D_CreatePlacedResourceX1(ID3D12Device11* d, D3D12_GPU_VIRTUAL_ADDRESS va, const D3D12_RESOURCE_DESC1* d1, D3D12_BARRIER_LAYOUT layout,
+                                        const D3D12_CLEAR_VALUE* cv, REFIID riid, void** out) {
+    if (!d1) return E_INVALIDARG;
+    D3D12_RESOURCE_DESC rd = desc_of(d1);
+    return D_CreatePlacedResourceX((ID3D12Device*)d, va, &rd, state_of_layout(layout, d1), cv, riid, out);
 }
 HRESULT D3DAPI D_CreatePlacedResource(ID3D12Device* d, ID3D12Heap* heap, UINT64 off, const D3D12_RESOURCE_DESC* rd, D3D12_RESOURCE_STATES st,
                                       const D3D12_CLEAR_VALUE* cv, REFIID riid, void** out) {
@@ -595,6 +740,147 @@ void D3DAPI D_CreateUAV(ID3D12Device* d, ID3D12Resource* r, ID3D12Resource* c, c
     }
     write_view(h.ptr, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, [&](uint64_t ph) { pc::create_uav(DPC(d), P(r), P(c), v, ph); });
 }
+// ---- Placed views (CreatePlaced*ViewX): views of memory at a GPU address --------------------------
+// Buffers: the PC buffer already holding that address (unified title memory or a registered buffer),
+// with the payload naming the title address. Textures: a placed resource at the address (cached per
+// address and description) and the ordinary view of it.
+namespace {
+D3D12_SHADER_RESOURCE_VIEW_DESC pc_srv_desc(const D3D12XBOX_SHADER_RESOURCE_VIEW_DESC* x) {
+    D3D12_SHADER_RESOURCE_VIEW_DESC v{};
+    memcpy(&v, x, offsetof(D3D12XBOX_SHADER_RESOURCE_VIEW_DESC, ResourceLocation));   // same fields up to the address
+    if (!v.Shader4ComponentMapping) v.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    return v;
+}
+D3D12_UNORDERED_ACCESS_VIEW_DESC pc_uav_desc(const D3D12XBOX_UNORDERED_ACCESS_VIEW_DESC* x) {
+    D3D12_UNORDERED_ACCESS_VIEW_DESC v{};
+    memcpy(&v, x, offsetof(D3D12XBOX_UNORDERED_ACCESS_VIEW_DESC, ResourceLocation));
+    if (v.ViewDimension == D3D12_UAV_DIMENSION_BUFFER) v.Buffer.CounterOffsetInBytes = 0;
+    return v;
+}
+// PC buffer and byte offset holding title address va (0: none).
+PcObj placed_buffer(ID3D12Device* d, uint64_t va, uint64_t* off) {
+    UnifiedRef u;
+    if (unified_lookup(DEV(d), va, &u)) { *off = u.offset; return u.res; }
+    PcObj r;
+    uint64_t avail;
+    if (pc::gm_resolve(va, &r, off, &avail)) return r;
+    return nullptr;
+}
+std::mutex g_pv_mu;
+std::map<std::array<uint64_t, 6>, ID3D12Resource*> g_pv_tex;   // (address, description) -> placed console resource
+ID3D12Resource* placed_texture(ID3D12Device* d, const D3D12_RESOURCE_DESC* rd, uint64_t va) {
+    std::array<uint64_t, 6> key{va, rd->Width, (uint64_t)rd->Height << 32 | rd->DepthOrArraySize, (uint64_t)rd->MipLevels << 32 | (uint32_t)rd->Format,
+                                (uint64_t)rd->Dimension << 32 | (uint32_t)rd->Flags, (uint64_t)rd->Layout << 32 | rd->SampleDesc.Count};
+    std::lock_guard<std::mutex> g(g_pv_mu);
+    auto it = g_pv_tex.find(key);
+    if (it != g_pv_tex.end()) return it->second;
+    void* o = nullptr;
+    if (FAILED(D_CreatePlacedResourceX(d, va, rd, D3D12_RESOURCE_STATE_COMMON, nullptr, __uuidof(ID3D12Resource), &o))) {
+        static volatile long n = 0;
+        if (InterlockedIncrement(&n) <= 5)
+            XSL_WARN(CH, "placed view of a %llux%u texture (format %d) at %llx: no resource", (unsigned long long)rd->Width, rd->Height, (int)rd->Format, (unsigned long long)va);
+        return nullptr;
+    }
+    static volatile long made = 0;
+    if (InterlockedIncrement(&made) % 1000 == 1) XSL_INFO(CH, "placed views: %ld texture resources made so far", made);
+    return g_pv_tex[key] = (ID3D12Resource*)o;
+}
+void placed_buffer_view(ID3D12Device* d, uint64_t va, DXGI_FORMAT f, uint64_t first, uint32_t count, uint32_t stride, bool raw, bool uav,
+                        uint64_t h, const void* viewDesc) {
+    uint64_t off = 0;
+    PcObj r = placed_buffer(d, va, &off);
+    uint32_t eb = 4;
+    uint32_t fmt = raw || stride ? 20u : gfx10_buffer_format(f, &eb);
+    if (stride) eb = stride;
+    uint64_t base = va + first * eb;   // payload: the title address (translated code reads it through global memory)
+    uint32_t w[4] = {(uint32_t)base, (uint32_t)((base >> 32) & 0xffff) | ((stride & 0x3fff) << 16), raw ? count * 4 : count, fmt << 12};
+    desc_set_payload(w);
+    if (!r || off % eb) {
+        if (!r) {
+            static volatile long n = 0;
+            if (InterlockedIncrement(&n) <= 5) XSL_WARN(CH, "placed buffer view at %llx: no memory known there", (unsigned long long)va);
+        }
+        write_view(h, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, [&](uint64_t ph) {
+            if (uav) pc::create_uav(DPC(d), nullptr, nullptr, (const D3D12_UNORDERED_ACCESS_VIEW_DESC*)viewDesc, ph);
+            else pc::create_srv(DPC(d), nullptr, (const D3D12_SHADER_RESOURCE_VIEW_DESC*)viewDesc, ph);
+        });
+        return;
+    }
+    // PC rules: raw views are R32_TYPELESS with 4-byte elements; a view with neither format nor stride
+    // becomes raw; the elements must lie inside the PC buffer.
+    D3D12_RESOURCE_DESC prd;
+    pc::res_desc(r, &prd);
+    DXGI_FORMAT vf = raw ? DXGI_FORMAT_R32_TYPELESS : stride ? DXGI_FORMAT_UNKNOWN : f;
+    if (!raw && !stride && f == DXGI_FORMAT_UNKNOWN) { raw = true; vf = DXGI_FORMAT_R32_TYPELESS; eb = 4; }
+    uint64_t firstPc = first + off / eb;
+    uint64_t room = prd.Width / eb > firstPc ? prd.Width / eb - firstPc : 0;
+    uint32_t n = (uint32_t)std::min<uint64_t>(count, room);
+    static volatile long logged = 0;
+    if (InterlockedIncrement(&logged) <= 4)
+        XSL_INFO(CH, "placed %s buffer view at %llx: format %d stride %u raw %d, elements %llu+%u (PC buffer of %llu bytes, offset %llu)", uav ? "UA" : "SR",
+                 (unsigned long long)va, (int)f, stride, raw ? 1 : 0, (unsigned long long)first, count, (unsigned long long)prd.Width, (unsigned long long)off);
+    if (uav) {
+        D3D12_UNORDERED_ACCESS_VIEW_DESC v{};
+        v.Format = vf;
+        v.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+        v.Buffer = {firstPc, n, raw ? 0u : stride, 0, raw ? D3D12_BUFFER_UAV_FLAG_RAW : D3D12_BUFFER_UAV_FLAG_NONE};
+        write_view(h, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, [&](uint64_t ph) { pc::create_uav(DPC(d), r, nullptr, &v, ph); });
+    } else {
+        D3D12_SHADER_RESOURCE_VIEW_DESC v{};
+        v.Format = vf;
+        v.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+        v.Shader4ComponentMapping = ((const D3D12_SHADER_RESOURCE_VIEW_DESC*)viewDesc)->Shader4ComponentMapping;
+        v.Buffer = {firstPc, n, raw ? 0u : stride, raw ? D3D12_BUFFER_SRV_FLAG_RAW : D3D12_BUFFER_SRV_FLAG_NONE};
+        write_view(h, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, [&](uint64_t ph) { pc::create_srv(DPC(d), r, &v, ph); });
+    }
+}
+}  // namespace
+void D3DAPI D_CreatePlacedRawSRV(ID3D12Device* d, const D3D12_RESOURCE_DESC* rd, const D3D12XBOX_SHADER_RESOURCE_VIEW_DESC* x, D3D12_CPU_DESCRIPTOR_HANDLE h) {
+    if (!rd || !x) return;
+    D3D12_SHADER_RESOURCE_VIEW_DESC v = pc_srv_desc(x);
+    if (v.ViewDimension == D3D12_SRV_DIMENSION_BUFFER || rd->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
+        DXGI_FORMAT f = v.Format != DXGI_FORMAT_UNKNOWN ? v.Format : rd->Format;
+        uint32_t count = v.ViewDimension == D3D12_SRV_DIMENSION_BUFFER ? v.Buffer.NumElements : (uint32_t)(rd->Width / 4);
+        if (v.ViewDimension != D3D12_SRV_DIMENSION_BUFFER) {
+            v.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+            v.Format = DXGI_FORMAT_R32_TYPELESS;
+            v.Buffer = {0, count, 0, D3D12_BUFFER_SRV_FLAG_RAW};
+        }
+        placed_buffer_view(d, x->ResourceLocation, f, v.Buffer.FirstElement, v.Buffer.NumElements, v.Buffer.StructureByteStride,
+                           (v.Buffer.Flags & D3D12_BUFFER_SRV_FLAG_RAW) != 0, false, h.ptr, &v);
+        return;
+    }
+    if (ID3D12Resource* r = placed_texture(d, rd, x->ResourceLocation)) D_CreateSRV(d, r, &v, h);
+}
+void D3DAPI D_CreatePlacedRawUAV(ID3D12Device* d, const D3D12_RESOURCE_DESC* rd, const D3D12XBOX_UNORDERED_ACCESS_VIEW_DESC* x, D3D12_CPU_DESCRIPTOR_HANDLE h) {
+    if (!rd || !x) return;
+    D3D12_UNORDERED_ACCESS_VIEW_DESC v = pc_uav_desc(x);
+    if (v.ViewDimension == D3D12_UAV_DIMENSION_BUFFER || rd->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
+        DXGI_FORMAT f = v.Format != DXGI_FORMAT_UNKNOWN ? v.Format : rd->Format;
+        uint32_t count = v.ViewDimension == D3D12_UAV_DIMENSION_BUFFER ? v.Buffer.NumElements : (uint32_t)(rd->Width / 4);
+        if (v.ViewDimension != D3D12_UAV_DIMENSION_BUFFER) {
+            v.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+            v.Format = DXGI_FORMAT_R32_TYPELESS;
+            v.Buffer = {0, count, 0, 0, D3D12_BUFFER_UAV_FLAG_RAW};
+        }
+        placed_buffer_view(d, x->ResourceLocation, f, v.Buffer.FirstElement, v.Buffer.NumElements, v.Buffer.StructureByteStride,
+                           (v.Buffer.Flags & D3D12_BUFFER_UAV_FLAG_RAW) != 0, true, h.ptr, &v);
+        return;
+    }
+    if (ID3D12Resource* r = placed_texture(d, rd, x->ResourceLocation)) D_CreateUAV(d, r, nullptr, &v, h);
+}
+// With a resource object: its own views (the address names a place inside it, which views of the
+// resource cover).
+void D3DAPI D_CreatePlacedSRV(ID3D12Device* d, ID3D12Resource* r, const D3D12XBOX_SHADER_RESOURCE_VIEW_DESC* x, D3D12_CPU_DESCRIPTOR_HANDLE h) {
+    if (!x) { D_CreateSRV(d, r, nullptr, h); return; }
+    D3D12_SHADER_RESOURCE_VIEW_DESC v = pc_srv_desc(x);
+    D_CreateSRV(d, r, &v, h);
+}
+void D3DAPI D_CreatePlacedUAV(ID3D12Device* d, ID3D12Resource* r, const D3D12XBOX_UNORDERED_ACCESS_VIEW_DESC* x, D3D12_CPU_DESCRIPTOR_HANDLE h) {
+    if (!x) { D_CreateUAV(d, r, nullptr, nullptr, h); return; }
+    D3D12_UNORDERED_ACCESS_VIEW_DESC v = pc_uav_desc(x);
+    D_CreateUAV(d, r, nullptr, &v, h);
+}
 void D3DAPI D_CreateCBV(ID3D12Device* d, const D3D12_CONSTANT_BUFFER_VIEW_DESC* v, D3D12_CPU_DESCRIPTOR_HANDLE h) {
     // Console CBVs need 16-byte alignment, PC ones 256: unaligned views point at an aligned copy.
     D3D12_CONSTANT_BUFFER_VIEW_DESC x;
@@ -610,6 +896,32 @@ void D3DAPI D_CreateCBV(ID3D12Device* d, const D3D12_CONSTANT_BUFFER_VIEW_DESC* 
     write_view(h.ptr, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, [&](uint64_t ph) { pc::create_cbv(DPC(d), v, ph); });
 }
 void D3DAPI D_CreateSampler(ID3D12Device* d, const D3D12_SAMPLER_DESC* v, D3D12_CPU_DESCRIPTOR_HANDLE h) { pc::create_sampler(DPC(d), v, h.ptr); }
+// CreateSamplerX: the console sampler description (separate min/mag/mip/aniso filters, filter mode)
+// reduced to a PC filter; console-only refinements (min-mip slopes, LOD bias split, truncation) are dropped.
+void D3DAPI D_CreateSamplerX(ID3D12Device* d, const D3D12XBOX_SAMPLER_DESC* x, D3D12_CPU_DESCRIPTOR_HANDLE h) {
+    if (!x) return;
+    D3D12_SAMPLER_DESC v{};
+    const bool aniso = x->FilterMag >= D3D12XBOX_TEXTURE_XY_FILTER_ANISO_POINT || x->FilterMin >= D3D12XBOX_TEXTURE_XY_FILTER_ANISO_POINT;
+    const bool magLinear = x->FilterMag == D3D12XBOX_TEXTURE_XY_FILTER_BILINEAR || x->FilterMag == D3D12XBOX_TEXTURE_XY_FILTER_ANISO_BILINEAR;
+    const bool minLinear = x->FilterMin == D3D12XBOX_TEXTURE_XY_FILTER_BILINEAR || x->FilterMin == D3D12XBOX_TEXTURE_XY_FILTER_ANISO_BILINEAR;
+    const bool mipLinear = x->FilterMip == D3D12XBOX_TEXTURE_MIP_FILTER_LINEAR;
+    D3D12_FILTER_REDUCTION_TYPE red = x->FilterMode == D3D12XBOX_TEXTURE_FILTER_MODE_MIN ? D3D12_FILTER_REDUCTION_TYPE_MINIMUM
+                                      : x->FilterMode == D3D12XBOX_TEXTURE_FILTER_MODE_MAX ? D3D12_FILTER_REDUCTION_TYPE_MAXIMUM
+                                                                                          : D3D12_FILTER_REDUCTION_TYPE_STANDARD;
+    if (x->ComparisonFunc != D3D12_COMPARISON_FUNC_NEVER && x->ComparisonFunc != 0 && red == D3D12_FILTER_REDUCTION_TYPE_STANDARD)
+        red = D3D12_FILTER_REDUCTION_TYPE_COMPARISON;
+    v.Filter = aniso ? D3D12_ENCODE_ANISOTROPIC_FILTER(red)
+                     : D3D12_ENCODE_BASIC_FILTER(minLinear ? D3D12_FILTER_TYPE_LINEAR : D3D12_FILTER_TYPE_POINT, magLinear ? D3D12_FILTER_TYPE_LINEAR : D3D12_FILTER_TYPE_POINT,
+                                                 mipLinear ? D3D12_FILTER_TYPE_LINEAR : D3D12_FILTER_TYPE_POINT, red);
+    v.AddressU = x->AddressU; v.AddressV = x->AddressV; v.AddressW = x->AddressW;
+    v.MipLODBias = x->MipLODBias;
+    v.MaxAnisotropy = aniso ? std::max(1u, std::min(16u, x->MaxAnisotropy)) : 1;
+    v.ComparisonFunc = x->ComparisonFunc ? x->ComparisonFunc : D3D12_COMPARISON_FUNC_NEVER;
+    memcpy(v.BorderColor, x->BorderColor, sizeof v.BorderColor);
+    v.MinLOD = x->MinLOD;
+    v.MaxLOD = x->MaxLOD;
+    pc::create_sampler(DPC(d), &v, h.ptr);
+}
 void D3DAPI D_CopyDescriptorsSimple(ID3D12Device* d, UINT n, D3D12_CPU_DESCRIPTOR_HANDLE dst, D3D12_CPU_DESCRIPTOR_HANDLE src, D3D12_DESCRIPTOR_HEAP_TYPE t) {
     if (!n || desc_copy(n, dst.ptr, src.ptr, t)) return;  // console-layout slots
     // One side in console-layout slots and the other in a PC heap: translate each descriptor
@@ -650,10 +962,56 @@ void D3DAPI D_GetCopyableFootprints(ID3D12Device* d, const D3D12_RESOURCE_DESC* 
                                     D3D12_PLACED_SUBRESOURCE_FOOTPRINT* layouts, UINT* rows, UINT64* rowSizes, UINT64* total) {
     pc::get_copyable_footprints(DPC(d), rd, first, num, base, layouts, rows, rowSizes, total);
 }
+// Sizes and alignments as the console gives them (xg_xs.dll), which is what titles lay their memory
+// out by; the PC runtime's answer where xg cannot describe a resource. (The PC answers differ, and
+// are UINT64_MAX for descriptions only the console accepts.) XSL_PC_ALLOCATION_INFO=1: PC answers.
+static void allocation_info_one(ID3D12Device* d, UINT mask, const D3D12_RESOURCE_DESC* rd, D3D12_RESOURCE_ALLOCATION_INFO* out) {
+    static bool pcOnly = [] { char b[4]; return GetEnvironmentVariableA("XSL_PC_ALLOCATION_INFO", b, 4) && b[0] == '1'; }();
+    uint64_t size = 0, align = 0;
+    if (!pcOnly && console_resource_size(rd, &size, &align)) {
+        if (rd->Alignment && rd->Alignment >= align && (rd->Alignment & (rd->Alignment - 1)) == 0) align = rd->Alignment;
+        *out = {(size + align - 1) / align * align, align};
+        return;
+    }
+    pc::get_resource_allocation_info(DPC(d), mask, 1, rd, out);
+}
 D3D12_RESOURCE_ALLOCATION_INFO D3DAPI D_GetResourceAllocationInfo(ID3D12Device* d, UINT mask, UINT n, const D3D12_RESOURCE_DESC* rd) {
-    D3D12_RESOURCE_ALLOCATION_INFO i{};
-    pc::get_resource_allocation_info(DPC(d), mask, n, rd, &i);
-    return i;
+    D3D12_RESOURCE_ALLOCATION_INFO all{0, 0};
+    for (UINT k = 0; k < n; k++) {
+        D3D12_RESOURCE_ALLOCATION_INFO i{};
+        allocation_info_one(d, mask, &rd[k], &i);
+        if (i.SizeInBytes == UINT64_MAX) return i;
+        uint64_t a = std::max<uint64_t>(i.Alignment, 1);
+        all.SizeInBytes = (all.SizeInBytes + a - 1) / a * a + i.SizeInBytes;
+        all.Alignment = std::max(all.Alignment, i.Alignment);
+    }
+    return all;
+}
+// The per-resource forms: each resource's size and alignment, laid out one after another.
+static D3D12_RESOURCE_ALLOCATION_INFO allocation_info_each(ID3D12Device* d, UINT mask, UINT n, const D3D12_RESOURCE_DESC* descs,
+                                                          D3D12_RESOURCE_ALLOCATION_INFO1* each) {
+    D3D12_RESOURCE_ALLOCATION_INFO all{0, 0};
+    for (UINT k = 0; k < n; k++) {
+        D3D12_RESOURCE_ALLOCATION_INFO i{};
+        allocation_info_one(d, mask, &descs[k], &i);
+        if (i.SizeInBytes == UINT64_MAX) return i;
+        uint64_t a = std::max<uint64_t>(i.Alignment, 1);
+        uint64_t off = (all.SizeInBytes + a - 1) / a * a;
+        if (each) each[k] = {off, i.Alignment, i.SizeInBytes};
+        all.SizeInBytes = off + i.SizeInBytes;
+        all.Alignment = std::max(all.Alignment, i.Alignment);
+    }
+    return all;
+}
+D3D12_RESOURCE_ALLOCATION_INFO D3DAPI D_GetResourceAllocationInfo1(ID3D12Device4* d, UINT mask, UINT n, const D3D12_RESOURCE_DESC* rd,
+                                                                    D3D12_RESOURCE_ALLOCATION_INFO1* each) {
+    return allocation_info_each((ID3D12Device*)d, mask, n, rd, each);
+}
+D3D12_RESOURCE_ALLOCATION_INFO D3DAPI D_GetResourceAllocationInfo2(ID3D12Device8* d, UINT mask, UINT n, const D3D12_RESOURCE_DESC1* rd1,
+                                                                    D3D12_RESOURCE_ALLOCATION_INFO1* each) {
+    std::vector<D3D12_RESOURCE_DESC> rd(n);
+    for (UINT k = 0; k < n; k++) memcpy(&rd[k], &rd1[k], sizeof rd[k]);
+    return allocation_info_each((ID3D12Device*)d, mask, n, rd.data(), each);
 }
 HRESULT D3DAPI D_CreateFence(ID3D12Device* d, UINT64 init, D3D12_FENCE_FLAGS f, REFIID riid, void** out) {
     PcObj fence = nullptr;
@@ -1391,6 +1749,10 @@ void init_device_table() {
         t->CreateDepthStencilView = D_CreateDSV;
         t->CreateShaderResourceView = D_CreateSRV;
         t->CreateUnorderedAccessView = D_CreateUAV;
+        t->CreatePlacedShaderResourceViewX = D_CreatePlacedSRV;
+        t->CreatePlacedUnorderedAccessViewX = D_CreatePlacedUAV;
+        t->CreatePlacedRawShaderResourceViewX = D_CreatePlacedRawSRV;
+        t->CreatePlacedRawUnorderedAccessViewX = D_CreatePlacedRawUAV;
         t->CreateConstantBufferView = D_CreateCBV;
         t->CreateSampler = D_CreateSampler;
         t->CopyDescriptorsSimple = D_CopyDescriptorsSimple;
@@ -1420,6 +1782,12 @@ void init_device_table() {
         ((D3D12Device7_Function_Table*)&g_dev_tbl)->AddToStateObject = D_AddToStateObject;
         ((D3D12Device5_Function_Table*)&g_dev_tbl)->GetRaytracingAccelerationStructurePrebuildInfo = D_GetRaytracingAccelerationStructurePrebuildInfo;
         ((D3D12Device8_Function_Table*)&g_dev_tbl)->GetRaytracingAccelerationStructurePrebuildInfoX = D_GetRaytracingAccelerationStructurePrebuildInfoX;
+        g_dev_tbl.Device10.CreateCommittedResource3 = D_CreateCommittedResource3;
+        g_dev_tbl.Device10.CreatePlacedResource2 = D_CreatePlacedResource2;
+        g_dev_tbl.CreatePlacedResourceX1 = D_CreatePlacedResourceX1;
+        ((D3D12Device4_Function_Table*)&g_dev_tbl)->GetResourceAllocationInfo1 = D_GetResourceAllocationInfo1;
+        ((D3D12Device8_Function_Table*)&g_dev_tbl)->GetResourceAllocationInfo2 = D_GetResourceAllocationInfo2;
+        t->CreateSamplerX = D_CreateSamplerX;
     });
 }
 }  // namespace
@@ -1604,6 +1972,7 @@ void init_dxgi() {
 bool rt_dispatch(PcObj list, const void* so, const uint64_t* tables, const D3D12_DISPATCH_RAYS_DESC* d, uint64_t argsVa, PcObj samplerHeap) {
     return rt_dispatch_impl(list, so, tables, d, argsVa, samplerHeap);
 }
+void console_memory_release(PcObj r) { console_memory_release_impl(r); }
 
 HRESULT create_dxgi_device(Device* dev, void** out) {
     init_dxgi();

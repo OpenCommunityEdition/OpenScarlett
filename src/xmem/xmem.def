@@ -37,5 +37,7 @@ EXPORTS
     XMemSetWinHttpHooks=xsl_xmem_true
     XMemTransferMemory=xsl_xmem_unsupported
     xsl_xmem_find_graphics
+    xsl_xmem_write_watch
+    xsl_xmem_title_hooks
     xsl_xmem_page_view
     xsl_xmem_page_unview

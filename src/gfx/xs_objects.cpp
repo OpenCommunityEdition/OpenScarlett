@@ -84,7 +84,7 @@ void free_object(IGraphicsUnknown* self) {
     // Resources: the PC object outlives the console one by a few frames. Titles free resources once
     // their own fences say the GPU is done, but other components given the PC object (Media
     // Foundation's decoder) may still have work referencing it.
-    if (h->pc && h->kind == Kind::Resource) { keep_foreign(h->pc); pc::release(h->pc); }
+    if (h->pc && h->kind == Kind::Resource) { console_memory_release(h->pc); keep_foreign(h->pc); pc::release(h->pc); }
     else if (h->pc) pc::release(h->pc);
     h->magic = 0;
     _aligned_free(h);
@@ -250,7 +250,90 @@ HRESULT D3DAPI Fence_SetEventOnCompletion(ID3D12Fence* f, UINT64 v, HANDLE e) {
     if (hang_watch()) { std::lock_guard<std::mutex> g(g_fw_mu); g_fw[f].lastWait = v; }
     return pc::fence_set_event(pc_of(f), v, e);
 }
-HRESULT D3DAPI Fence_Signal(ID3D12Fence* f, UINT64 v) { return pc::fence_signal(pc_of(f), v); }
+// Fence value memory. Console fences live in memory the title can read: GetGpuAddressX returns the
+// address of the 64-bit completed value, and titles wait by polling it (monitorx/mwaitx). Here each
+// fence that is asked for its address gets an 8-byte slot in GPU-visible XMem memory; CPU signals
+// write it at once, and a watcher thread copies GPU completions into it (an event per fence, armed
+// for the next value).
+namespace fmem {
+struct Entry { PcObj pc; volatile uint64_t* slot; HANDLE ev; uint64_t armed; };
+std::mutex g_mu;
+std::map<void*, Entry> g_fences;
+std::vector<volatile uint64_t*> g_free;
+HANDLE g_wake = nullptr;
+volatile uint64_t* take_slot() {
+    if (g_free.empty()) {
+        typedef PVOID(WINAPI * VAlloc)(PVOID, SIZE_T, DWORD, ULONGLONG, DWORD);
+        static auto va = [] { HMODULE m = GetModuleHandleW(L"xmem.dll"); return m ? (VAlloc)GetProcAddress(m, "XMemVirtualAlloc") : nullptr; }();
+        const SIZE_T bytes = 64 << 10;
+        // XMEM_GRAPHICS: GPU commands may name the address too (unified memory)
+        void* p = va ? va(nullptr, bytes, MEM_COMMIT | MEM_RESERVE, 0x3ull, PAGE_READWRITE) : nullptr;
+        if (!p) p = VirtualAlloc(nullptr, bytes, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+        if (!p) return nullptr;
+        for (size_t k = bytes / 8; k-- > 0;) g_free.push_back((volatile uint64_t*)p + k);
+    }
+    auto* s = g_free.back();
+    g_free.pop_back();
+    return s;
+}
+void watcher() {
+    std::vector<HANDLE> evs;
+    std::vector<void*> keys;
+    for (;;) {
+        evs.assign(1, g_wake);
+        keys.assign(1, nullptr);
+        {
+            std::lock_guard<std::mutex> g(g_mu);
+            for (auto& [k, e] : g_fences) {
+                uint64_t v = pc::fence_completed(e.pc);
+                if (v != *e.slot && v != UINT64_MAX) *e.slot = v;
+                if (v != UINT64_MAX && v >= e.armed) { e.armed = v + 1; pc::fence_set_event(e.pc, e.armed, e.ev); }
+                if (evs.size() < MAXIMUM_WAIT_OBJECTS) { evs.push_back(e.ev); keys.push_back(k); }
+            }
+        }
+        // More fences than one wait can name: those are polled every millisecond.
+        WaitForMultipleObjects((DWORD)evs.size(), evs.data(), FALSE, evs.size() < (size_t)MAXIMUM_WAIT_OBJECTS ? 50 : 1);
+    }
+}
+void destroy(IGraphicsUnknown* self) {
+    std::lock_guard<std::mutex> g(g_mu);
+    auto it = g_fences.find(self);
+    if (it == g_fences.end()) return;
+    CloseHandle(it->second.ev);
+    g_free.push_back(it->second.slot);
+    g_fences.erase(it);
+}
+uint64_t address(ID3D12Fence* f) {
+    std::lock_guard<std::mutex> g(g_mu);
+    auto it = g_fences.find(f);
+    if (it != g_fences.end()) return (uint64_t)(uintptr_t)it->second.slot;
+    if (!g_wake) {
+        g_wake = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        std::thread(watcher).detach();
+    }
+    volatile uint64_t* slot = take_slot();
+    if (!slot) return 0;
+    uint64_t v = pc::fence_completed(pc_of(f));
+    *slot = v == UINT64_MAX ? 0 : v;
+    Entry e{pc_of(f), slot, CreateEventW(nullptr, FALSE, FALSE, nullptr), *slot + 1};
+    pc::fence_set_event(e.pc, e.armed, e.ev);
+    g_fences[f] = e;
+    hdr(f)->destroy = destroy;
+    SetEvent(g_wake);
+    return (uint64_t)(uintptr_t)slot;
+}
+void cpu_signal(ID3D12Fence* f, uint64_t v) {
+    std::lock_guard<std::mutex> g(g_mu);
+    auto it = g_fences.find(f);
+    if (it != g_fences.end()) *it->second.slot = v;
+}
+}  // namespace fmem
+HRESULT D3DAPI Fence_Signal(ID3D12Fence* f, UINT64 v) {
+    HRESULT hr = pc::fence_signal(pc_of(f), v);
+    if (SUCCEEDED(hr)) fmem::cpu_signal(f, v);
+    return hr;
+}
+D3D12_GPU_VIRTUAL_ADDRESS D3DAPI Fence_GetGpuAddressX(ID3D12Fence1* f) { return fmem::address((ID3D12Fence*)f); }
 
 D3D12Fence1_Function_Table g_fence_tbl;
 D3D12RootSignature_Function_Table g_rs_tbl;
@@ -298,6 +381,7 @@ void init_simple_tables() {
         f->GetCompletedValue = Fence_GetCompletedValue;
         f->SetEventOnCompletion = Fence_SetEventOnCompletion;
         f->Signal = Fence_Signal;
+        g_fence_tbl.GetGpuAddressX = Fence_GetGpuAddressX;
         xsl_fill_default(&g_rs_tbl);
         install_device_child_base(&g_rs_tbl);
         xsl_fill_default(&g_pso_tbl);
@@ -439,6 +523,7 @@ ID3D12DescriptorHeap* new_descriptor_heap(Device* dev, PcObj pch, const D3D12_DE
 }
 void DH_DestroyRange(IGraphicsUnknown* self) {
     auto* e = ex<ID3D12DescriptorHeap, HeapExtra>((ID3D12DescriptorHeap*)self);
+    desc_view_detach(e->offset);
     pc::global_view_free(e->offset, e->desc.NumDescriptors);
 }
 }  // namespace
@@ -553,6 +638,11 @@ D3D12_INDEX_BUFFER_VIEW quad_ib(Device* dev) {
 #define LPC(l) pc_of(l)
 
 HRESULT D3DAPI L_Close(ID3D12GraphicsCommandList* l) { XSL_TRACE("gfx.cmd", "list %p Close", (void*)l); return pc::list_close(LPC(l)); }
+HRESULT D3DAPI L_Reset(ID3D12GraphicsCommandList* l, ID3D12CommandAllocator* a, ID3D12PipelineState* p);
+// ResetX: Reset with console flags (minimal state, no sync around clears/copies): the PC list needs none.
+HRESULT D3DAPI L_ResetX(ID3D12GraphicsCommandList* l, ID3D12CommandAllocator* a, ID3D12PipelineState* p, D3D12XBOX_COMMAND_LIST_RESET_FLAGS) {
+    return L_Reset(l, a, p);
+}
 HRESULT D3DAPI L_Reset(ID3D12GraphicsCommandList* l, ID3D12CommandAllocator* a, ID3D12PipelineState* p) {
     lx(l)->topology = 0;
     lx(l)->ibValid = false;
@@ -1303,6 +1393,7 @@ HRESULT make_list(Device* dev, PcObj pcl, D3D12_COMMAND_LIST_TYPE t, REFIID riid
         g->ClearUnorderedAccessViewFloat = L_ClearUAVFloat;
         g->DiscardResource = L_DiscardResource;
         ((D3D12GraphicsCommandList6_Function_Table*)&g_list_tbl)->DispatchMesh = L_DispatchMesh;
+        ((D3D12GraphicsCommandList6_Function_Table*)&g_list_tbl)->ResetX = L_ResetX;
         {
             auto* t4 = (D3D12GraphicsCommandList4_Function_Table*)&g_list_tbl;
             t4->BuildRaytracingAccelerationStructure = L_BuildRtAs;
@@ -1376,6 +1467,13 @@ HRESULT D3DAPI Q_Signal(ID3D12CommandQueue* q, ID3D12Fence* f, UINT64 v) { retur
 // work, caches included.
 HRESULT D3DAPI Q_SignalX(ID3D12CommandQueue* q, ID3D12Fence* f, UINT64 v, D3D12XBOX_FLUSH) { return pc::queue_signal(pc_of(q), P_or_pc(f), v); }
 HRESULT D3DAPI Q_Wait(ID3D12CommandQueue* q, ID3D12Fence* f, UINT64 v) { return pc::queue_wait(pc_of(q), P_or_pc(f), v); }
+// The X forms add a frame-pipeline token and console sync parameters (cache flushes at the signal
+// or wait point); on PC a queue signal/wait already orders all prior work.
+void D3DAPI Q_Execute2X(ID3D12CommandQueue* q, UINT n, ID3D12CommandList* const* lists, D3D12XBOX_FRAME_PIPELINE_TOKEN, D3D12XBOX_EXECUTE_COMMAND_LIST_FLAGS) {
+    Q_Execute(q, n, lists);
+}
+HRESULT D3DAPI Q_Signal2X(ID3D12CommandQueue* q, ID3D12Fence* f, UINT64 v, D3D12XBOX_SYNC_PARAMS*, D3D12XBOX_SYNC_PARAMS*) { return Q_Signal(q, f, v); }
+HRESULT D3DAPI Q_WaitX(ID3D12CommandQueue* q, ID3D12Fence* f, UINT64 v, D3D12XBOX_SYNC_PARAMS*) { return Q_Wait(q, f, v); }
 void D3DAPI Q_GetDesc(ID3D12CommandQueue* q, D3D12_COMMAND_QUEUE_DESC* d) { *d = ex<ID3D12CommandQueue, QueueExtra>(q)->desc; }
 HRESULT D3DAPI Q_SuspendX(ID3D12CommandQueue*, UINT) { return S_OK; }
 HRESULT D3DAPI Q_ResumeX(ID3D12CommandQueue*) { return S_OK; }
@@ -1489,6 +1587,9 @@ HRESULT make_queue(Device* dev, PcObj pcq, const D3D12_COMMAND_QUEUE_DESC* d, RE
         xsl_fill_default(&g_queue_tbl);
         install_device_child_base(&g_queue_tbl);
         g_queue_tbl.ExecuteCommandLists = Q_Execute;
+        g_queue_tbl.ExecuteCommandLists2X = Q_Execute2X;
+        g_queue_tbl.Signal2X = Q_Signal2X;
+        g_queue_tbl.WaitX = Q_WaitX;
         g_queue_tbl.Signal = Q_Signal;
         g_queue_tbl.SignalX = Q_SignalX;
         g_queue_tbl.Wait = Q_Wait;

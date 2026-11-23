@@ -83,6 +83,22 @@ bool fill(void* ctx, uint32_t sub, void* dst, uint32_t rowPitch, uint32_t rows, 
 }
 }  // namespace
 
+bool console_resource_size(const D3D12_RESOURCE_DESC* d, uint64_t* size, uint64_t* align) {
+    if (!d) return false;
+    if (d->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
+        *size = (d->Width + 0xFFFF) & ~0xFFFFull;
+        *align = 0x10000;
+        return true;
+    }
+    CreateComputer f = xg();
+    XgComputer* c = nullptr;
+    if (!f || FAILED(f(d, &c)) || !c) return false;
+    *size = c->GetResourceSizeBytes();
+    *align = c->GetResourceBaseAlignmentBytes();
+    c->Release();
+    return *size != 0;
+}
+
 void detile_register(PcObj pcRes, uint64_t va, const void* consoleDesc, uint32_t initialState) {
     auto* d = static_cast<const D3D12_RESOURCE_DESC*>(consoleDesc);
     if (!d || d->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER || d->Dimension == D3D12_RESOURCE_DIMENSION_UNKNOWN) return;

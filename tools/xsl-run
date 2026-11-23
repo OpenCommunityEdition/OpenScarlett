@@ -258,6 +258,13 @@ def build_run_dir(title_dir, build_dir, run_dir, backend, exe_rel=Path()):
             if dst.exists() or dst.is_symlink():
                 dst.unlink()
             shutil.copy2(src, dst)
+    # The D3D12 Agility SDK runtime (tools/get-agility.sh), selected by the layer at start (Windows).
+    agility = build_dir / "deps/agility"
+    if WINDOWS and (agility / "x64/D3D12Core.dll").exists():
+        (exe_dir / "D3D12").mkdir(exist_ok=True)
+        for name in ("D3D12Core.dll", "d3d12SDKLayers.dll"):
+            copy_sync(agility / "x64" / name, exe_dir / "D3D12" / name)
+        shutil.copy2(agility / "VERSION", exe_dir / "D3D12" / "VERSION")
     sdk = REPO / "sdk"
     for name, rel in SDK_DLLS.items():
         if (sdk / rel).exists() and not (exe_dir / name).exists():

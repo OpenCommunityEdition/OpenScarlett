@@ -82,7 +82,8 @@ Records g_rec[4];  // by D3D12_DESCRIPTOR_HEAP_TYPE (sampler unused)
 // Global CBV/SRV/UAV shadow, parallel to the global shader-visible heap.
 uint8_t* g_view = nullptr;
 std::vector<uint8_t> g_snapshot;
-uint32_t g_viewCount = 0;
+uint32_t g_viewCount = 0;   // console-layout view slots (title heaps are numbered within these)
+uint32_t g_pcCount = 0;     // of which the PC shader-visible heap holds the first g_pcCount
 uint64_t g_pcCpu = 0, g_pcGpu = 0;
 uint32_t g_pcInc = 0;
 // CPU-only mirror of the global view heap: slot i's current PC descriptor, the source for
@@ -98,6 +99,16 @@ bool enabled() {
 }
 
 uint8_t* g_viewGpu = nullptr;   // GPU-readable copy of g_view (global memory at g_viewGpuAddr)
+// Slot ranges whose bytes live in memory the title supplied (its XMem hooks answer the runtime's
+// descriptor-heap allocation, and it checks that the heap's CPU handles point there). That memory
+// is write-watched like g_view (xmem's xsl_xmem_write_watch); g_view is unused for those slots.
+struct Seg { uint32_t first, count; uint8_t* base; };
+std::vector<Seg> g_segs;
+uint8_t* slot_ptr(uint32_t i) {
+    for (auto& g : g_segs)
+        if (i - g.first < g.count) return g.base + (size_t)(i - g.first) * kViewSlot;
+    return g_view + (size_t)i * kViewSlot;
+}
 uint64_t g_viewGpuAddr = 0;
 bool ensure(Device* dev) {
     if (g_ready) return true;
@@ -107,7 +118,8 @@ bool ensure(Device* dev) {
     g_dev = dev;
     D3D12_DESCRIPTOR_HEAP_DESC d;
     pc::heap_desc(gh, &d);
-    g_viewCount = d.NumDescriptors;
+    g_pcCount = d.NumDescriptors;
+    g_viewCount = std::max(pc::global_view_virtual_size(), g_pcCount);
     g_pcCpu = pc::heap_cpu_start(gh);
     g_pcGpu = pc::heap_gpu_start(gh);
     g_pcInc = pc::descriptor_increment(pcdev, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
@@ -115,7 +127,7 @@ bool ensure(Device* dev) {
     g_view = (uint8_t*)VirtualAlloc(nullptr, bytes, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE);
     if (!g_view) { XSL_ERR(CH, "descriptor shadow: VirtualAlloc(MEM_WRITE_WATCH) failed (%lu)", GetLastError()); return false; }
     g_snapshot.assign(bytes, 0);
-    D3D12_DESCRIPTOR_HEAP_DESC md{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, g_viewCount, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
+    D3D12_DESCRIPTOR_HEAP_DESC md{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, g_viewCount, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};   // CPU-only: may exceed the PC limit
     if (FAILED(pc::create_descriptor_heap(pcdev, &md, &g_mirror))) { XSL_ERR(CH, "descriptor mirror heap (%u) failed", g_viewCount); return false; }
     g_mirrorCpu = pc::heap_cpu_start(g_mirror);
     if (!g_rec[D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV].init(pcdev, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 1u << 18) ||
@@ -134,9 +146,15 @@ bool ensure(Device* dev) {
 uint64_t pc_view_cpu(uint32_t i) { return g_pcCpu + (uint64_t)i * g_pcInc; }
 uint64_t mirror_cpu(uint32_t i) { return g_mirrorCpu + (uint64_t)i * g_pcInc; }
 // Slot i's PC descriptor is in the mirror: publish it to the shader-visible heap.
-uint32_t g_hi[8] = {};   // highest slot published per 125k-slot band (usage diagnostics)
+uint32_t g_hi[17] = {};   // highest slot published per 125k-slot band (usage diagnostics)
+uint64_t g_unbacked = 0;  // writes to slots past the PC heap
 void publish(uint32_t i) {
-    if (i / 125000 < 8 && i > g_hi[i / 125000]) g_hi[i / 125000] = i;
+    if (i / 125000 < 17 && i > g_hi[i / 125000]) g_hi[i / 125000] = i;
+    if (i >= g_pcCount) {   // past the PC heap: kept in descriptor memory only
+        if (g_unbacked++ == 0)
+            XSL_WARN(CH, "title view slot %u is past the PC heap (%u slots): kept in descriptor memory, not visible to PC descriptor tables", i, g_pcCount);
+        return;
+    }
     if (i >= pc::gm_reserved_start()) {   // the title writes into the range reserved for global memory
         static volatile long n = 0;
         if (InterlockedIncrement(&n) == 1)
@@ -150,9 +168,16 @@ void set_slot(uint32_t i, uint64_t src) {   // src: a CPU-only PC descriptor
     publish(i);
 }
 bool view_slot(uint64_t h, uint32_t* i) {
-    if (!g_view || h < (uint64_t)g_view || h >= (uint64_t)g_view + (uint64_t)g_viewCount * kViewSlot) return false;
-    *i = (uint32_t)((h - (uint64_t)g_view) / kViewSlot);
-    return true;
+    if (g_view && h >= (uint64_t)g_view && h < (uint64_t)g_view + (uint64_t)g_viewCount * kViewSlot) {
+        *i = (uint32_t)((h - (uint64_t)g_view) / kViewSlot);
+        return true;
+    }
+    for (auto& g : g_segs)
+        if (h >= (uint64_t)g.base && h < (uint64_t)g.base + (uint64_t)g.count * kViewSlot) {
+            *i = g.first + (uint32_t)((h - (uint64_t)g.base) / kViewSlot);
+            return true;
+        }
+    return false;
 }
 const ShadowHeap* rtv_dsv_heap(uint64_t h) {
     for (auto& s : g_rtvDsv)
@@ -191,7 +216,7 @@ thread_local uint32_t t_payload[4];
 thread_local bool t_has_payload = false;
 // Make global slot i match its shadow bytes. Caller holds g_mu.
 void materialize(uint32_t i) {
-    const uint8_t* s = g_view + (size_t)i * kViewSlot;
+    const uint8_t* s = slot_ptr(i);
     Tag t;
     memcpy(&t, s + kTagOffset, sizeof t);
     uint64_t rec;
@@ -229,12 +254,12 @@ bool desc_peek(uint64_t h, uint32_t slot, uint32_t out[8]) {
     if (!g_ready || h < g_pcGpu || h >= g_pcGpu + (uint64_t)g_viewCount * kViewSlot) return false;
     size_t off = (size_t)(h - g_pcGpu) + (size_t)slot * kViewSlot;
     if (off + kViewSlot > (size_t)g_viewCount * kViewSlot) return false;
-    memcpy(out, g_view + off, kViewSlot);
+    memcpy(out, slot_ptr((uint32_t)(off / kViewSlot)), kViewSlot);
     static volatile long once = 0;
     if (InterlockedIncrement(&once) == 200) {   // diagnostics: how much of the shadow memory holds anything
         uint64_t nz = 0, tagged = 0, first = 0, last = 0;
         for (uint32_t i = 0; i < g_viewCount; i++) {
-            const uint32_t* w = (const uint32_t*)(g_view + (size_t)i * kViewSlot);
+            const uint32_t* w = (const uint32_t*)slot_ptr(i);
             bool any = false;
             for (int k = 0; k < 8; k++) any |= w[k] != 0;
             if (!any) continue;
@@ -323,7 +348,7 @@ void desc_staging_store(uint64_t h) {
 // The payload follows a descriptor copied from src to dst (each a view slot or a staging handle).
 void desc_payload_copy(uint64_t dst, uint64_t src) {
     uint32_t w[4] = {}, i;
-    if (view_slot(src, &i)) memcpy(w, g_view + (size_t)i * kViewSlot, sizeof w);
+    if (view_slot(src, &i)) memcpy(w, slot_ptr(i), sizeof w);
     else {
         std::shared_lock<std::shared_mutex> g(g_stage_mu);
         if (const uint32_t* p = stage_at(src)) memcpy(w, p, sizeof w);
@@ -331,7 +356,7 @@ void desc_payload_copy(uint64_t dst, uint64_t src) {
     if (view_slot(dst, &i)) {
         if (w[1] & kDescTexture) w[0] = i;   // texture payloads name their own slot
         std::lock_guard<std::mutex> g(g_mu);
-        uint8_t* s = g_view + (size_t)i * kViewSlot;
+        uint8_t* s = slot_ptr(i);
         if (!memcmp(s, w, sizeof w)) return;
         memcpy(s, w, sizeof w);
         memcpy(&g_snapshot[(size_t)i * kViewSlot], w, sizeof w);   // not a title write: nothing to decode
@@ -357,7 +382,7 @@ void desc_commit(uint64_t h, D3D12_DESCRIPTOR_HEAP_TYPE type, const Tag& tag) {
     if (type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) {
         uint32_t i;
         if (!view_slot(h, &i)) return;
-        uint8_t* s = g_view + (size_t)i * kViewSlot;
+        uint8_t* s = slot_ptr(i);
         memset(s, 0, kViewSlot);
         if (t_has_payload) {
             uint32_t w[4] = {t_payload[0], t_payload[1], t_payload[2], t_payload[3]};
@@ -398,9 +423,9 @@ bool desc_copy(uint32_t n, uint64_t dst, uint64_t src, D3D12_DESCRIPTOR_HEAP_TYP
             uint32_t k = di > si ? n - 1 - q : q;
             if (di + k == si + k) continue;
             set_slot(di + k, mirror_cpu(si + k));
-            uint32_t* w = (uint32_t*)(g_view + (size_t)(di + k) * kViewSlot);
+            uint32_t* w = (uint32_t*)slot_ptr(di + k);
             if (w[1] & kDescTexture) w[0] = di + k;   // texture payloads name their own slot
-            memcpy(&g_snapshot[(size_t)(di + k) * kViewSlot], g_view + (size_t)(di + k) * kViewSlot, kViewSlot);
+            memcpy(&g_snapshot[(size_t)(di + k) * kViewSlot], w, kViewSlot);
         }
         return true;
     }
@@ -433,7 +458,13 @@ void desc_publish(uint64_t h) {
 }
 uint64_t desc_pc_gpu(uint64_t h) {
     if (!g_ready || h < g_pcGpu || h >= g_pcGpu + (uint64_t)g_viewCount * kViewSlot) return h;
-    return g_pcGpu + (h - g_pcGpu) / kViewSlot * g_pcInc;
+    uint64_t i = (h - g_pcGpu) / kViewSlot;
+    if (i >= g_pcCount) {   // a table past the PC heap: the heap's start instead (wrong contents, but no GPU fault)
+        static volatile long n = 0;
+        if (InterlockedIncrement(&n) <= 3) XSL_WARN(CH, "descriptor table at view slot %llu is past the PC heap (%u slots)", (unsigned long long)i, g_pcCount);
+        i = 0;
+    }
+    return g_pcGpu + i * g_pcInc;
 }
 
 // ---- Sync before submission ---------------------------------------------------------------------
@@ -442,7 +473,8 @@ void desc_sync() {
     std::lock_guard<std::mutex> g(g_mu);
     static uint64_t syncs = 0;
     if (++syncs % 2000 == 0)
-        XSL_INFO(CH, "view slots written, highest per 125k band: %u %u %u %u %u %u %u %u", g_hi[0], g_hi[1], g_hi[2], g_hi[3], g_hi[4], g_hi[5], g_hi[6], g_hi[7]);
+        XSL_INFO(CH, "view slots written, highest per 125k band: %u %u %u %u %u %u %u %u %u %u %u %u %u %u %u %u %u; %llu writes past the PC heap", g_hi[0], g_hi[1], g_hi[2], g_hi[3], g_hi[4],
+                 g_hi[5], g_hi[6], g_hi[7], g_hi[8], g_hi[9], g_hi[10], g_hi[11], g_hi[12], g_hi[13], g_hi[14], g_hi[15], g_hi[16], (unsigned long long)g_unbacked);
     size_t bytes = (size_t)g_viewCount * kViewSlot;
     static std::vector<void*> pages;
     pages.resize(bytes / 4096 + 1);
@@ -457,6 +489,36 @@ void desc_sync() {
             if (memcmp(g_view + (size_t)i * kViewSlot, &g_snapshot[(size_t)i * kViewSlot], kViewSlot) != 0) materialize(i);
         if (g_viewGpu) memcpy(g_viewGpu + off, g_view + off, std::min<size_t>(gran, bytes - off));
     }
+    for (auto& sg : g_segs) {   // title-supplied slot memory
+        size_t sb = (size_t)sg.count * kViewSlot;
+        pages.resize(sb / 4096 + 1);
+        count = pages.size();
+        if (GetWriteWatch(WRITE_WATCH_FLAG_RESET, sg.base, sb, pages.data(), &count, &gran) != 0) continue;
+        for (ULONG_PTR p = 0; p < count; p++) {
+            size_t off = (uint8_t*)pages[p] - sg.base;
+            uint32_t first = sg.first + (uint32_t)(off / kViewSlot), last = sg.first + (uint32_t)((off + gran) / kViewSlot);
+            if (last > sg.first + sg.count) last = sg.first + sg.count;
+            for (uint32_t i = first; i < last; i++)
+                if (memcmp(slot_ptr(i), &g_snapshot[(size_t)i * kViewSlot], kViewSlot) != 0) materialize(i);
+            if (g_viewGpu) memcpy(g_viewGpu + (size_t)sg.first * kViewSlot + off, sg.base + off, std::min<size_t>(gran, sb - off));
+        }
+    }
+}
+
+// Slots [first, first + count) of a heap now live in title memory `mem` (write-watched already).
+// Its current bytes become the slots' snapshot, so nothing is decoded until the title writes.
+bool desc_view_attach(uint32_t first, uint32_t count, void* mem) {
+    std::lock_guard<std::mutex> g(g_mu);
+    if (!g_ready || (uint64_t)first + count > g_viewCount) return false;
+    g_segs.push_back({first, count, (uint8_t*)mem});
+    memcpy(&g_snapshot[(size_t)first * kViewSlot], mem, (size_t)count * kViewSlot);
+    if (g_viewGpu) memcpy(g_viewGpu + (size_t)first * kViewSlot, mem, (size_t)count * kViewSlot);
+    return true;
+}
+void desc_view_detach(uint32_t first) {
+    std::lock_guard<std::mutex> g(g_mu);
+    for (auto it = g_segs.begin(); it != g_segs.end(); ++it)
+        if (it->first == first) { g_segs.erase(it); return; }
 }
 
 }  // namespace xs
