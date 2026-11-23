@@ -110,4 +110,46 @@ functions, per-ray stacks). R1 translates that code as it is. It needs, in order
 4. **Ray-tracing pipelines:** `DeserializeStateObjectX` blobs carry the compiled program; translate it
    as a compute shader and run `DispatchRays` as a dispatch with the shader tables in global memory.
 
-Until then ray queries are translated as misses and ray dispatches are skipped (step R0).
+### Step 4 as implemented
+
+Observed in the console runtime's code (the scheduler `main` and traversal sections of the
+collections; offsets from The Matrix Awakens demo, layouts from disassembly):
+
+- **Collections** (`DeserializeStateObjectX` blobs, `tools/gpucode/rtso`) hold sections: three to
+  five `XDXR_TraceRay` traversal variants, then one section per export. Continuation segments
+  (`<export>.ss_N`) end with `s_setpc_b64 s[30:31]`; pointers are code addresses >> 8. The dword 16
+  bytes before an export's name record is 0 for ray-generation shaders and the payload size for hit
+  and miss shaders. Hit groups are records {u32 length, UTF-16 name} x 4 (group, closest hit, any
+  hit, intersection).
+- **Identifiers are code addresses.** Titles ask collections (not pipelines) for identifiers and mix
+  them in shader tables; pipelines of hit groups only are dispatched with ray-generation shaders of
+  other collections. `gpucode::RtSpace` places every collection once (from `0x100000000`);
+  identifiers are entry >> 8 (hit groups: closest hit, any hit, intersection in dwords 0..2). The
+  traversal reads dword 0 of a hit record as the closest-hit pointer (0: none).
+- **Runtime table** (scheduler argument `s[0:1]`): +0x0..0xc descriptor-table bases of the global
+  root signature (SRV, CBV, sampler, UAV); +0x18 the scheduler's s12..s27: traversal-pointer table
+  (one per lane, variant chosen by ray flags), width, height, depth, s17 (hit stride / 32 at bit 21,
+  miss stride / 32 at bit 5), s18 (launch-index packing: y shift at bit 8, 32 - z shift in bits
+  0..4), s19..s23 (passed to shaders as s8..s12: miss table, hit table, ray-generation record,
+  callable table, all address >> 6), s24 stack bytes per lane; +0x90 ray-stack buffer descriptor.
+  2-D launches use 8x4 lanes per group, 1-D 32.
+- **Programs.** DXC time grows much faster than linearly with function size (a 49K-line program
+  takes over 10 minutes even at `-Od`), so each collection is its own program (traversal + the
+  collection + its scheduler). A scheduler call to code outside the program parks the active lanes
+  (target and VGPRs v0..v63 to a lane-state buffer; target marked in the pipeline's discovery
+  bitmap). A dispatch runs round 0 in the pipeline's ray-generation collection, then further rounds
+  over the collections rays were seen to reach; a program resumes the lanes parked on its code just
+  before the scheduler's loop (the scheduler's prologue is re-run; it is deterministic per wave).
+- **Cache.** Programs are cached by `rt_cache_key` (included code, scheduler, parking settings,
+  translator version, compiler option). `xsl-gpucode rtcache <dir> gpucode-35-Od <blobs...>` writes
+  every program's HLSL from blobs dumped with `XSL_DUMP_STATE_OBJECTS` (in deserialization order);
+  compiling those to `rt_<key>.dxil` in the cache directory avoids compiling in game.
+
+| Switch | Effect |
+|---|---|
+| `XSL_RT_PIPELINES=0` | Leave ray-tracing pipelines inert (no translation, ray dispatches skipped) |
+| `XSL_RT_ROUNDS=<n>` | Program rounds per ray dispatch (default 6) |
+| `XSL_RT_LANES=<n>` | Capacity of the parked-lane state (default 1M lanes, 264 bytes each) |
+| `XSL_RT_DXC_OPT=Od/O1/O2/O3` | Optimization level of ray-tracing programs (default Od) |
+| `XSL_RT_BUILD_THREADS=<n>` | Worker threads compiling ray-tracing programs (default a quarter of the processors, 1..4) |
+| `XSL_DUMP_STATE_OBJECTS=<dir>` | Save deserialized collections (in order) and state-object descriptions |
