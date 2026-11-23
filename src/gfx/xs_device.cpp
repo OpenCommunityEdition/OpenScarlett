@@ -260,7 +260,8 @@ static void pso_pool_run(std::function<void()> job) {
     static std::once_flag once;
     std::call_once(once, [] {
         char b[8];
-        unsigned n = GetEnvironmentVariableA("XSL_PSO_THREADS", b, sizeof b) ? (unsigned)atoi(b) : 3u;
+        unsigned hw = std::thread::hardware_concurrency();
+        unsigned n = GetEnvironmentVariableA("XSL_PSO_THREADS", b, sizeof b) ? (unsigned)atoi(b) : std::min(8u, std::max(3u, hw / 2));
         for (unsigned t = 0; t < std::max(1u, n); t++)
             std::thread([] {
                 for (;;) {
@@ -345,19 +346,101 @@ HRESULT D3DAPI D_CreateComputePipelineState(ID3D12Device* d, const D3D12_COMPUTE
     return D_CreateComputePipelineStateX(d, desc, 0, nullptr, riid, out);
 }
 // Pipeline-state streams: console subobject numbering and contents -> PC.
+// A pipeline stream turned into its PC form: the stream, where its shaders and root signature sit
+// in it, and (for a creation that runs after the call returns) copies of what the title's stream
+// only pointed to.
+struct StreamPso {
+    std::vector<uint8_t> pcs;
+    const void* code[8];
+    size_t size[8], at[8], stages = 0;
+    size_t rs_at = 0;
+    PcObj rs = nullptr;
+    bool cs = false;
+    std::vector<std::vector<uint8_t>> keepCode;
+    std::vector<D3D12_INPUT_ELEMENT_DESC> keepElems;
+    std::vector<std::string> keepNames;
+};
+// Translation and creation (on any thread).
+static HRESULT stream_pso_create(PcObj dev, StreamPso& s, PcObj* pso) {
+    std::vector<void*> owned;  // sanitized shader containers, freed after creation
+    std::vector<uint8_t> blob;
+    // Shaders that describe their own root signature: the pipeline is created with that one.
+    PcObj own = s.stages ? pc::own_root_signature(dev, s.code, s.size, s.stages, &blob) : nullptr;
+    if (own) {
+        if (!s.rs_at) {   // no root signature in the stream: one is appended
+            size_t start = (s.pcs.size() + 7) & ~(size_t)7;
+            s.rs_at = start + 8;
+            s.pcs.resize(s.rs_at + 8, 0);
+        }
+        memcpy(s.pcs.data() + s.rs_at, &own, sizeof own);
+        s.rs = own;
+        pc::set_fallback_root_signature(blob.data(), blob.size());
+    } else if (s.rs && root_signature_blob(s.rs, &blob)) {
+        pc::set_fallback_root_signature(blob.data(), blob.size());   // for shaders without a root signature of their own
+    }
+    for (size_t i = 0; i < s.stages; i++) {
+        void* o; size_t n;
+        if (!pc::sanitize_container(s.code[i], s.size[i], &o, &n)) continue;
+        owned.push_back(o);
+        D3D12_SHADER_BYTECODE bc{o, n};
+        memcpy(s.pcs.data() + s.at[i], &bc, sizeof bc);
+    }
+    *pso = nullptr;
+    HRESULT hr = pc::create_pso_stream(dev, s.pcs.data(), s.pcs.size(), pso);
+    if (SUCCEEDED(hr)) { pc::note_pso_rs(*pso, s.rs, s.cs); pc::note_pso_own_rs(*pso, own, s.cs); }
+    pc::set_fallback_root_signature(nullptr, 0);
+    for (void* o : owned) pc::free_container(o);
+    return hr;
+}
+// Graphics pipelines are created after the call returns, on the pipeline workers: a title that
+// builds thousands of them while it loads waits for a driver compile each time otherwise (one
+// spent its whole frame on them). The title gets its object at once; a list that selects a pipeline
+// not built yet builds it there and then (or waits for the worker that has it).
+// XSL_GFX_PSO_ASYNC=0 creates them in the call.
+struct PendingPso {
+    std::mutex mu;
+    std::condition_variable cv;
+    std::atomic<int> state{0};   // 0 queued, 1 being built, 2 done
+    std::function<void()> build;
+};
+static std::mutex g_pending_mu;
+static std::unordered_map<void*, std::shared_ptr<PendingPso>> g_pending;
+static void pending_run(const std::shared_ptr<PendingPso>& j) {
+    int queued = 0;
+    if (!j->state.compare_exchange_strong(queued, 1)) return;   // another thread has it
+    j->build();
+    { std::lock_guard<std::mutex> g(j->mu); j->state = 2; }
+    j->cv.notify_all();
+}
+void pso_wait_ready_impl(void* obj) {
+    std::shared_ptr<PendingPso> j;
+    {
+        std::lock_guard<std::mutex> g(g_pending_mu);
+        auto it = g_pending.find(obj);
+        if (it == g_pending.end()) return;
+        j = it->second;
+    }
+    pending_run(j);
+    std::unique_lock<std::mutex> g(j->mu);
+    j->cv.wait(g, [&] { return j->state.load() == 2; });
+}
 HRESULT D3DAPI D_CreatePipelineState(ID3D12Device2* d, const D3D12_PIPELINE_STATE_STREAM_DESC* desc, REFIID riid, void** out) {
     if (null_graphics()) return make_simple(DEV(d), Kind::Pso, nullptr, riid, out);
     pc::reset_untranslated();
     XSL_TRACE("gfx.cmd", "CreatePipelineState stream %zu bytes", (size_t)desc->SizeInBytes);
     auto align = [](size_t v, size_t a) { return (v + a - 1) & ~(a - 1); };
     const uint8_t* in = (const uint8_t*)desc->pPipelineStateSubobjectStream;
-    std::vector<uint8_t> pcs;
-    std::vector<void*> owned;  // sanitized shader containers, freed after creation
-    bool saw_rs = false, stream_cs = false;
-    PcObj stream_rs = nullptr;
-    size_t rs_at = 0;                          // where the root signature sits in the PC stream
-    const void* stage_code[8];
-    size_t stage_size[8], stage_at[8], stages = 0;
+    StreamPso sp;
+    std::vector<uint8_t>& pcs = sp.pcs;
+    bool saw_rs = false;
+    bool& stream_cs = sp.cs;
+    PcObj& stream_rs = sp.rs;
+    size_t& rs_at = sp.rs_at;                  // where the root signature sits in the PC stream
+    const void** stage_code = sp.code;
+    size_t *stage_size = sp.size, *stage_at = sp.at;
+    size_t& stages = sp.stages;
+    size_t il_at = 0;                          // where the input layout sits
+    bool hasStreamOutput = false;
     pcs.reserve(desc->SizeInBytes + 64);
     size_t cur_al = 8;  // alignment of the payload being copied (d3dx12 subobject layout)
     auto emit = [&](uint32_t pcType, const void* payload, size_t len) {
@@ -402,7 +485,6 @@ HRESULT D3DAPI D_CreatePipelineState(ID3D12Device2* d, const D3D12_PIPELINE_STAT
             case D3D12XBOX_PIPELINE_STATE_SUBOBJECT_TYPE_COMPUTE_SHADER_LIMITS: len = sizeof(D3D12XBOX_COMPUTE_SHADER_LIMITS_DESC); al = alignof(D3D12XBOX_COMPUTE_SHADER_LIMITS_DESC); break;
             default:
                 XSL_ERR(CH, "CreatePipelineState: unknown subobject type %u at offset %zu", type, off);
-                pc::set_fallback_root_signature(nullptr, 0); for (void* o : owned) pc::free_container(o);
                 return E_INVALIDARG;
         }
         size_t pay = align(off + 4, al);
@@ -416,8 +498,6 @@ HRESULT D3DAPI D_CreatePipelineState(ID3D12Device2* d, const D3D12_PIPELINE_STAT
             saw_rs = rs != nullptr;
             stream_rs = P(rs);
             PcObj prs = P(rs);
-            std::vector<uint8_t> rsb;   // for shaders without a root signature of their own (cleared below)
-            if (prs && root_signature_blob(prs, &rsb)) pc::set_fallback_root_signature(rsb.data(), rsb.size());
             rs_at = align(align(pcs.size(), 8) + 4, 8);
             emit(0, &prs, sizeof prs);
         } else if (type <= D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CS || type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS ||
@@ -430,7 +510,6 @@ HRESULT D3DAPI D_CreatePipelineState(ID3D12Device2* d, const D3D12_PIPELINE_STAT
                 static volatile long warned = 0;
                 if (InterlockedIncrement(&warned) <= 3)
                     XSL_ERR(CH, "title uses mesh shaders; the host GPU has none (DirectX 12 Ultimate needed)");
-                pc::set_fallback_root_signature(nullptr, 0); for (void* o : owned) pc::free_container(o);
                 return E_NOTIMPL;
             }
             // (Translated after the loop, once the pipeline's root signature is known.)
@@ -451,6 +530,14 @@ HRESULT D3DAPI D_CreatePipelineState(ID3D12Device2* d, const D3D12_PIPELINE_STAT
             for (auto& f : a.RTFormats)
                 if (int sf = pc::format_stand_in(f)) f = (DXGI_FORMAT)sf;
             emit(type, &a, sizeof a);
+        } else if (type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_INPUT_LAYOUT) {
+            il_at = align(align(pcs.size(), 8) + 4, 8);
+            emit(type, p, len);
+        } else if (type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_STREAM_OUTPUT) {
+            D3D12_STREAM_OUTPUT_DESC so;
+            memcpy(&so, p, sizeof so);
+            hasStreamOutput = so.NumEntries || so.NumStrides;
+            emit(type, p, len);
         } else if (type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL_FORMAT) {
             DXGI_FORMAT f;
             memcpy(&f, p, 4);
@@ -472,28 +559,64 @@ HRESULT D3DAPI D_CreatePipelineState(ID3D12Device2* d, const D3D12_PIPELINE_STAT
         static volatile long n = 0;
         if (InterlockedIncrement(&n) <= 5) XSL_INFO(CH, "pipeline stream without a root signature (the shaders' embedded one is used)");
     }
-    // Shaders that describe their own root signature: the pipeline is created with that one.
-    std::vector<uint8_t> ownBlob;
-    PcObj own = stages ? pc::own_root_signature(DPC(d), stage_code, stage_size, stages, &ownBlob) : nullptr;
-    if (own) {
-        cur_al = 8;
-        if (rs_at) memcpy(pcs.data() + rs_at, &own, sizeof own);
-        else emit(0, &own, sizeof own);
-        stream_rs = own;
-        pc::set_fallback_root_signature(ownBlob.data(), ownBlob.size());
+    static const bool async = [] { char b[4]; return !(GetEnvironmentVariableA("XSL_GFX_PSO_ASYNC", b, 4) && b[0] == '0'); }();
+    if (!async || stream_cs || hasStreamOutput || !out) {
+        PcObj pso = nullptr;
+        HRESULT hr = stream_pso_create(DPC(d), sp, &pso);
+        return pso_result(DEV(d), hr, pso, riid, out);
     }
-    for (size_t i = 0; i < stages; i++) {
-        void* o; size_t n;
-        if (!pc::sanitize_container(stage_code[i], stage_size[i], &o, &n)) continue;
-        owned.push_back(o);
-        D3D12_SHADER_BYTECODE bc{o, n};
-        memcpy(pcs.data() + stage_at[i], &bc, sizeof bc);
+    // Deferred: the title's object now, the pipeline from a worker. What the stream pointed to in
+    // the title's memory is copied.
+    auto st = std::make_shared<StreamPso>(std::move(sp));
+    st->keepCode.reserve(st->stages);
+    for (size_t i = 0; i < st->stages; i++) {
+        st->keepCode.emplace_back((const uint8_t*)st->code[i], (const uint8_t*)st->code[i] + st->size[i]);
+        st->code[i] = st->keepCode[i].data();
     }
-    PcObj pso = nullptr;
-    HRESULT hr = pc::create_pso_stream(DPC(d), pcs.data(), pcs.size(), &pso);
-    if (SUCCEEDED(hr)) { pc::note_pso_rs(pso, stream_rs, stream_cs); pc::note_pso_own_rs(pso, own, stream_cs); }
-    pc::set_fallback_root_signature(nullptr, 0); for (void* o : owned) pc::free_container(o);
-    return pso_result(DEV(d), hr, pso, riid, out);
+    if (il_at) {
+        D3D12_INPUT_LAYOUT_DESC il;
+        memcpy(&il, st->pcs.data() + il_at, sizeof il);
+        if (il.NumElements && il.pInputElementDescs) {
+            st->keepElems.assign(il.pInputElementDescs, il.pInputElementDescs + il.NumElements);
+            st->keepNames.reserve(il.NumElements);
+            for (auto& e : st->keepElems) {
+                st->keepNames.emplace_back(e.SemanticName ? e.SemanticName : "");
+                e.SemanticName = st->keepNames.back().c_str();
+            }
+            il.pInputElementDescs = st->keepElems.data();
+            memcpy(st->pcs.data() + il_at, &il, sizeof il);
+        }
+    }
+    HRESULT hr = make_simple(DEV(d), Kind::Pso, nullptr, riid, out);
+    if (FAILED(hr) || !*out) return hr;
+    void* obj = *out;
+    AddRef((IGraphicsUnknown*)obj);
+    if (st->rs) pc::addref(st->rs);
+    PcObj titleRs = st->rs;
+    PcObj dev = DPC(d);
+    auto job = std::make_shared<PendingPso>();
+    job->build = [st, obj, dev, titleRs] {
+        pc::reset_untranslated();
+        PcObj pso = nullptr;
+        HRESULT hr = stream_pso_create(dev, *st, &pso);
+        if (SUCCEEDED(hr)) {
+            hdr(obj)->pc = pso;
+        } else {
+            static volatile long n = 0;
+            const bool translated = *pc::translated_keys() != 0;
+            if (InterlockedIncrement(&n) <= 8) {
+                if (pc::had_untranslated()) XSL_WARN(CH, "pipeline with untranslated console shaders: placeholder PSO (its work is skipped)");
+                else XSL_WARN(CH, "pipeline %s rejected by the PC runtime (%08lx): placeholder PSO (its work is skipped)", translated ? pc::translated_keys() : "", hr);
+            }
+            placeholder_note(obj, pc::had_untranslated() ? pc::untranslated_reason() : "rejected by the PC runtime");
+        }
+        if (titleRs) pc::release(titleRs);
+        { std::lock_guard<std::mutex> g(g_pending_mu); g_pending.erase(obj); }
+        Release((IGraphicsUnknown*)obj);
+    };
+    { std::lock_guard<std::mutex> g(g_pending_mu); g_pending[obj] = job; }
+    pso_pool_run([job] { pending_run(job); });
+    return S_OK;
 }
 HRESULT D3DAPI D_CreateCommandSignature(ID3D12Device* d, const D3D12_COMMAND_SIGNATURE_DESC* desc, ID3D12RootSignature* rs, REFIID riid, void** out) {
     if (desc) {
@@ -623,6 +746,7 @@ HRESULT D3DAPI D_CreateCommittedResource(ID3D12Device* d, const D3D12_HEAP_PROPE
     HRESULT hr = pc::create_committed_resource(DPC(d), hp, hf, rd, st, cv, &r);
     if (FAILED(hr)) return hr;
     if (!out) { pc::release(r); return S_FALSE; }
+    detile_note_desc(r, rd, pc::pc_state_of(st));   // should the title map it
     console_memory_take(r, rd);
     return make_resource(DEV(d), r, riid, out, hp->Type == D3D12_HEAP_TYPE_UPLOAD);
 }
@@ -2036,6 +2160,7 @@ bool rt_dispatch(PcObj list, const void* so, const uint64_t* tables, const D3D12
     return rt_dispatch_impl(list, so, tables, d, argsVa, samplerHeap);
 }
 void console_memory_release(PcObj r) { console_memory_release_impl(r); }
+void pso_wait_ready(void* titlePipeline) { pso_wait_ready_impl(titlePipeline); }
 // The console memory of a resource; a resource without any gets plain memory of its console size
 // (a title asked for the address of a texture: it means to read or write texels there).
 void* console_memory_of(PcObj r) {

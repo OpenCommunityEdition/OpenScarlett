@@ -192,6 +192,7 @@ uint64_t desc_view_gpu_start(uint32_t offset);
 bool desc_view_attach(uint32_t first, uint32_t count, void* mem);
 // Placeholder pipelines (no PC pipeline; their work is skipped): why, for the log of skipped work.
 void placeholder_note(void* titleObject, const char* why);
+void pso_wait_ready(void* titlePipeline);   // a pipeline still being built is built (or awaited) now
 void* console_memory_of(PcObj pcResource);     // the XMemAlloc memory a committed resource holds, if any
 void console_memory_release(PcObj pcResource);   // XMemAlloc memory a committed resource held (see xs_device.cpp)   // slots whose bytes live in title memory
 void desc_view_detach(uint32_t first);

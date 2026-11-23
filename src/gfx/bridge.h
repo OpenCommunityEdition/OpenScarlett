@@ -154,6 +154,7 @@ HRESULT_T res_map(PcObj r, uint32_t sub, const void* range, void** out);
 void res_unmap(PcObj r, uint32_t sub, const void* range);
 void res_desc(PcObj r, void* outDesc);
 uint64_t res_gpu_va(PcObj r);
+void* map_shadow_base(PcObj r);   // the CPU copy a mapped video-memory texture got, if any
 
 // Allocator and command list
 HRESULT_T alloc_reset(PcObj a);
@@ -231,7 +232,8 @@ HRESULT_T queue_wait(PcObj q, PcObj f, uint64_t v);
 
 // Presentation: copy `res` (current state: PRESENT) to the window's swap chain.
 // colorSpace: the plane's DXGI_COLOR_SPACE_TYPE (console values; HDR planes are mapped to SDR scan-out).
-HRESULT_T present(PcObj dev, PcObj queue, PcObj res, void* hwnd, uint32_t syncInterval, uint32_t colorSpace);
+// overlay: a second plane blended over the first by its alpha (nullptr: none)
+HRESULT_T present(PcObj dev, PcObj queue, PcObj res, void* hwnd, uint32_t syncInterval, uint32_t colorSpace, PcObj overlay = nullptr);
 HRESULT_T null_present(void* hwnd);  // null graphics: no scan-out, the FPS title still updates
 
 // Unified memory: wrap a host allocation (VirtualAlloc'd, 64 KB aligned) as a GPU buffer without

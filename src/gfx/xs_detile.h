@@ -7,6 +7,11 @@ namespace xs {
 // the title's own xg_xs.dll) and uploaded before the next submission after a view is made of them.
 void detile_register(PcObj pcRes, uint64_t va, const void* consoleDesc, uint32_t initialState);
 void detile_view_created(PcObj pcRes);
+// Textures the title maps (the console hands out their memory): the console description is noted
+// when the resource is created, the mapped copy when it is first mapped, and each unmap uploads it.
+void detile_note_desc(PcObj pcRes, const void* consoleDesc, uint32_t initialState);
+void detile_mapped(PcObj pcRes, void* copy);
+void detile_unmapped(PcObj pcRes);
 void detile_flush(PcObj pcDevice, PcObj pcQueue);
 void detile_stats(uint64_t out[6]);   // since the last call: checked bytes, changed, uploads, uploaded bytes, first uploads; textures known
 // Bytes and base alignment the console gives a resource (xg_xs.dll for textures); false without xg.

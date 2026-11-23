@@ -188,6 +188,7 @@ HRESULT D3DAPI D_CreatePlacedResourceX(ID3D12Device* d, D3D12_GPU_VIRTUAL_ADDRES
     PcObj r = nullptr;
     HRESULT hr = pc::create_reserved_resource(de->pcDevice, desc, st, cv, &r);
     if (FAILED(hr)) return hr;
+    detile_note_desc(r, desc, pc::pc_state_of(st));   // should the title map it
     auto* p = new Placed{va, reservation_extent(va), r, pc::resource_tiles(de->pcDevice, r)};
     if (!p->extent) p->extent = p->tiles.size() * kPage;
     if (p->tiles.size() * kPage > p->extent) {

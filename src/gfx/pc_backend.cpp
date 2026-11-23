@@ -3427,6 +3427,45 @@ void create_srv(PcObj dev, PcObj res, const void* desc, uint64_t h) {
                          desc ? (int)static_cast<const D3D12_SHADER_RESOURCE_VIEW_DESC*>(desc)->Format : -1);
         }
     }
+    // A mip range past the resource's levels (titles name "all levels" with more than there are,
+    // which the console accepts) is an invalid call that removes a PC device: it is clamped.
+    D3D12_SHADER_RESOURCE_VIEW_DESC clamped;
+    if (vd && res) {
+        const UINT mips = as<ID3D12Resource>(res)->GetDesc().MipLevels;
+        UINT *first = nullptr, *count = nullptr;
+        clamped = *vd;
+        switch (clamped.ViewDimension) {
+        case D3D12_SRV_DIMENSION_TEXTURE1D: first = &clamped.Texture1D.MostDetailedMip; count = &clamped.Texture1D.MipLevels; break;
+        case D3D12_SRV_DIMENSION_TEXTURE1DARRAY: first = &clamped.Texture1DArray.MostDetailedMip; count = &clamped.Texture1DArray.MipLevels; break;
+        case D3D12_SRV_DIMENSION_TEXTURE2D: first = &clamped.Texture2D.MostDetailedMip; count = &clamped.Texture2D.MipLevels; break;
+        case D3D12_SRV_DIMENSION_TEXTURE2DARRAY: first = &clamped.Texture2DArray.MostDetailedMip; count = &clamped.Texture2DArray.MipLevels; break;
+        case D3D12_SRV_DIMENSION_TEXTURE3D: first = &clamped.Texture3D.MostDetailedMip; count = &clamped.Texture3D.MipLevels; break;
+        case D3D12_SRV_DIMENSION_TEXTURECUBE: first = &clamped.TextureCube.MostDetailedMip; count = &clamped.TextureCube.MipLevels; break;
+        case D3D12_SRV_DIMENSION_TEXTURECUBEARRAY: first = &clamped.TextureCubeArray.MostDetailedMip; count = &clamped.TextureCubeArray.MipLevels; break;
+        default: break;
+        }
+        if (first && mips && (*first >= mips || (*count != UINT_MAX && *first + *count > mips))) {
+            if (*first >= mips) *first = mips - 1;
+            *count = UINT_MAX;
+            vd = &clamped;
+        }
+        // The same for array ranges ("all slices" as a count past the array).
+        const UINT slices = as<ID3D12Resource>(res)->GetDesc().DepthOrArraySize;
+        UINT *slice0 = nullptr, *sliceN = nullptr;
+        if (clamped.ViewDimension == D3D12_SRV_DIMENSION_TEXTURE1DARRAY) { slice0 = &clamped.Texture1DArray.FirstArraySlice; sliceN = &clamped.Texture1DArray.ArraySize; }
+        else if (clamped.ViewDimension == D3D12_SRV_DIMENSION_TEXTURE2DARRAY) { slice0 = &clamped.Texture2DArray.FirstArraySlice; sliceN = &clamped.Texture2DArray.ArraySize; }
+        if (slice0 && slices && (*slice0 >= slices || (*sliceN != UINT_MAX && *slice0 + *sliceN > slices))) {
+            if (*slice0 >= slices) *slice0 = slices - 1;
+            *sliceN = UINT_MAX;
+            vd = &clamped;
+        }
+        if (clamped.ViewDimension == D3D12_SRV_DIMENSION_TEXTURECUBEARRAY && slices >= 6) {
+            auto& c = clamped.TextureCubeArray;
+            if (c.First2DArrayFace + 6 > slices) { c.First2DArrayFace = 0; vd = &clamped; }
+            const UINT room = (slices - c.First2DArrayFace) / 6;
+            if (c.NumCubes == 0 || c.NumCubes > room) { c.NumCubes = room; vd = &clamped; }
+        }
+    }
     as<ID3D12Device>(dev)->CreateShaderResourceView(as<ID3D12Resource>(res), vd, cpu(h));
 }
 struct FormatSize;
@@ -3662,9 +3701,21 @@ void drop_map_shadow(PcObj o) {
     g_shadows.erase(it);
 }
 
+void* map_shadow_base(PcObj r) {
+    std::lock_guard<std::mutex> l(g_shadow_lock);
+    auto it = g_shadows.find(r);
+    return it == g_shadows.end() ? nullptr : it->second.base;
+}
 HRESULT_T res_map(PcObj r, uint32_t sub, const void* range, void** out) {
     auto* res = as<ID3D12Resource>(r);
-    HRESULT hr = res->Map(sub, static_cast<const D3D12_RANGE*>(range), out);
+    // A texture in video memory cannot be mapped on a PC, and for a reserved one the attempt alone
+    // removes the device: only textures in a CPU-visible custom heap are mapped for real.
+    bool tryMap = true;
+    if (out && res->GetDesc().Dimension != D3D12_RESOURCE_DIMENSION_BUFFER) {
+        D3D12_HEAP_PROPERTIES hp{};
+        tryMap = SUCCEEDED(res->GetHeapProperties(&hp, nullptr)) && hp.Type == D3D12_HEAP_TYPE_CUSTOM && hp.CPUPageProperty != D3D12_CPU_PAGE_PROPERTY_NOT_AVAILABLE;
+    }
+    HRESULT hr = tryMap ? res->Map(sub, static_cast<const D3D12_RANGE*>(range), out) : E_INVALIDARG;
     if (SUCCEEDED(hr) && out && *out && trace_writers() && res->GetDesc().Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
         std::lock_guard<std::mutex> g(g_wr_mu);
         g_mapped[res->GetGPUVirtualAddress()] = {res->GetDesc().Width, (uint8_t*)*out};
@@ -3695,8 +3746,10 @@ HRESULT_T res_map(PcObj r, uint32_t sub, const void* range, void** out) {
         MapShadow sh{base, size, {}};
         for (auto& f : fp) sh.offsets.push_back(f.Offset * 2);
         it = g_shadows.emplace(r, std::move(sh)).first;
-        XSL_WARN(CH, "Map of a GPU-only texture (%llux%u x%u, %u mips, format %d): CPU shadow of %llu KiB; CPU writes stay on the CPU",
-                 (unsigned long long)d.Width, d.Height, d.DepthOrArraySize, d.MipLevels, d.Format, (unsigned long long)(size >> 10));
+        static volatile long logged = 0;
+        if (InterlockedIncrement(&logged) <= 6)
+            XSL_INFO(CH, "Map of a texture in video memory (%llux%u x%u, %u mips, format %d): CPU copy of %llu KiB (uploaded when the title unmaps it, where the layout is known)",
+                     (unsigned long long)d.Width, d.Height, d.DepthOrArraySize, d.MipLevels, d.Format, (unsigned long long)(size >> 10));
     }
     const MapShadow& sh = it->second;
     *out = (uint8_t*)sh.base + (sub < sh.offsets.size() ? sh.offsets[sub] : 0);
@@ -5371,6 +5424,8 @@ struct Blitter {
     ID3D12DescriptorHeap* rtv = nullptr;
     UINT srvInc = 0, rtvInc = 0, slot = 0;
     bool failed = false;
+    ID3DBlob *vs = nullptr, *psOver = nullptr;        // for the overlay pipelines
+    std::map<int, ID3D12PipelineState*> over;         // swap-chain format -> pipeline that blends a plane over it
 };
 Blitter g_blit;
 typedef HRESULT(WINAPI* PFN_D3DCompile)(const void*, SIZE_T, const char*, const void*, void*, const char*, const char*, UINT, UINT,
@@ -5400,8 +5455,10 @@ bool blit_init(ID3D12Device* dev) {
         "  if (mode == 1) c = rolloff(max(mul(P3to709, c * 10000.0), 0) / white);\n"
         "  else if (mode == 2) c = rolloff(max(mul(BT2020to709, pq_nits(c)), 0) / white);\n"
         "  else if (mode == 3) c = rolloff(max(c * 80.0, 0) / white);\n"
-        "  return float4(saturate(c), 1); }\n";
+        "  return float4(saturate(c), 1); }\n"
+        "float4 ps_over(V i) : SV_Target { return t.Sample(s, i.uv); }\n";
     ID3DBlob *vs = nullptr, *ps = nullptr, *err = nullptr;
+    compile(src, sizeof src - 1, "xsl_blit", nullptr, nullptr, "ps_over", "ps_5_0", 0, 0, &g_blit.psOver, &err);
     if (FAILED(compile(src, sizeof src - 1, "xsl_blit", nullptr, nullptr, "vs", "vs_5_0", 0, 0, &vs, &err)) ||
         FAILED(compile(src, sizeof src - 1, "xsl_blit", nullptr, nullptr, "ps", "ps_5_0", 0, 0, &ps, &err))) {
         XSL_ERR(CH, "blit: shader compile failed: %s", err ? (const char*)err->GetBufferPointer() : "?");
@@ -5438,6 +5495,7 @@ bool blit_init(ID3D12Device* dev) {
     pd.RTVFormats[0] = DXGI_FORMAT_B8G8R8A8_UNORM_SRGB;  // linear plane values -> sRGB scan-out
     pd.SampleDesc.Count = 1;
     if (FAILED(dev->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&g_blit.pso)))) return false;
+    g_blit.vs = vs;
     D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 8, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
     dev->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&g_blit.srv));
     D3D12_DESCRIPTOR_HEAP_DESC rh{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 8, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
@@ -5493,6 +5551,68 @@ void blit(ID3D12Device* dev, ID3D12GraphicsCommandList* l, ID3D12Resource* src, 
     float white = sdr_white_nits();
     uint32_t consts[2] = {mode, 0};
     memcpy(&consts[1], &white, 4);
+    l->SetGraphicsRoot32BitConstants(1, 2, consts, 0);
+    D3D12_VIEWPORT vp{0, 0, (float)w, (float)h, 0, 1};
+    D3D12_RECT sr{0, 0, (LONG)w, (LONG)h};
+    l->RSSetViewports(1, &vp);
+    l->RSSetScissorRects(1, &sr);
+    l->OMSetRenderTargets(1, &rc, FALSE, nullptr);
+    l->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    l->DrawInstanced(3, 1, 0, 0);
+}
+// A second present plane (the console composes it over the first by its alpha: titles draw their
+// interface there) blended over the image already in the swap-chain buffer. The plane's colours
+// are premultiplied by the blending that drew them into a transparent plane.
+void blit_over(ID3D12Device* dev, ID3D12GraphicsCommandList* l, ID3D12Resource* src, ID3D12Resource* dst, UINT w, UINT h, DXGI_FORMAT fmt) {
+    if (!g_blit.vs || !g_blit.psOver) return;
+    ID3D12PipelineState*& pso = g_blit.over[(int)fmt];
+    if (!pso) {
+        D3D12_GRAPHICS_PIPELINE_STATE_DESC pd{};
+        pd.pRootSignature = g_blit.rs;
+        pd.VS = {g_blit.vs->GetBufferPointer(), g_blit.vs->GetBufferSize()};
+        pd.PS = {g_blit.psOver->GetBufferPointer(), g_blit.psOver->GetBufferSize()};
+        auto& rt = pd.BlendState.RenderTarget[0];
+        rt.BlendEnable = TRUE;
+        rt.SrcBlend = D3D12_BLEND_ONE;
+        rt.DestBlend = D3D12_BLEND_INV_SRC_ALPHA;
+        rt.BlendOp = D3D12_BLEND_OP_ADD;
+        rt.SrcBlendAlpha = D3D12_BLEND_ONE;
+        rt.DestBlendAlpha = D3D12_BLEND_INV_SRC_ALPHA;
+        rt.BlendOpAlpha = D3D12_BLEND_OP_ADD;
+        rt.RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+        pd.SampleMask = UINT_MAX;
+        pd.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+        pd.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+        pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+        pd.NumRenderTargets = 1;
+        pd.RTVFormats[0] = fmt;
+        pd.SampleDesc.Count = 1;
+        if (FAILED(dev->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&pso)))) { pso = nullptr; return; }
+        XSL_INFO(CH, "presentation: the second plane is blended over the first");
+    }
+    UINT i = g_blit.slot++ % 8;
+    D3D12_CPU_DESCRIPTOR_HANDLE sc = g_blit.srv->GetCPUDescriptorHandleForHeapStart();
+    sc.ptr += (SIZE_T)i * g_blit.srvInc;
+    D3D12_GPU_DESCRIPTOR_HANDLE sg = g_blit.srv->GetGPUDescriptorHandleForHeapStart();
+    sg.ptr += (UINT64)i * g_blit.srvInc;
+    D3D12_SHADER_RESOURCE_VIEW_DESC sd{};
+    sd.Format = src->GetDesc().Format;
+    sd.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    sd.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    sd.Texture2D.MipLevels = 1;
+    dev->CreateShaderResourceView(src, &sd, sc);
+    D3D12_CPU_DESCRIPTOR_HANDLE rc = g_blit.rtv->GetCPUDescriptorHandleForHeapStart();
+    rc.ptr += (SIZE_T)i * g_blit.rtvInc;
+    D3D12_RENDER_TARGET_VIEW_DESC rv{};
+    rv.Format = fmt;
+    rv.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
+    dev->CreateRenderTargetView(dst, &rv, rc);
+    l->SetGraphicsRootSignature(g_blit.rs);
+    l->SetPipelineState(pso);
+    ID3D12DescriptorHeap* heaps[] = {g_blit.srv};
+    l->SetDescriptorHeaps(1, heaps);
+    l->SetGraphicsRootDescriptorTable(0, sg);
+    uint32_t consts[2] = {0, 0};
     l->SetGraphicsRoot32BitConstants(1, 2, consts, 0);
     D3D12_VIEWPORT vp{0, 0, (float)w, (float)h, 0, 1};
     D3D12_RECT sr{0, 0, (LONG)w, (LONG)h};
@@ -5564,7 +5684,7 @@ HRESULT_T null_present(void* hwnd) {
     update_fps_title(static_cast<HWND>(hwnd));
     return S_OK;
 }
-HRESULT_T present(PcObj devObj, PcObj queueObj, PcObj resObj, void* hwndPtr, uint32_t sync, uint32_t colorSpace) {
+HRESULT_T present(PcObj devObj, PcObj queueObj, PcObj resObj, void* hwndPtr, uint32_t sync, uint32_t colorSpace, PcObj overlayObj) {
     if (trace_writers()) {
         static uint64_t n = 0;
         if (++n % 60 == 0) {
@@ -5655,6 +5775,19 @@ HRESULT_T present(PcObj devObj, PcObj queueObj, PcObj resObj, void* hwndPtr, uin
     D3D12_TEXTURE_COPY_LOCATION src{res, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, {}};
     if (copyable) s.list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
     else blit(dev, s.list, res, bb, s.w, s.h, mode);
+    // XSL_PRESENT_OVERLAY=0 shows the first plane alone.
+    static bool overlayOn = [] { char eb[4]; return !(GetEnvironmentVariableA("XSL_PRESENT_OVERLAY", eb, 4) && eb[0] == '0'); }();
+    if (auto* ov = as<ID3D12Resource>(overlayObj); ov && ov != res && overlayOn && blit_init(dev)) {
+        D3D12_RESOURCE_BARRIER ob[2] = {};
+        ob[0].Type = ob[1].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        ob[0].Transition = {ov, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE};
+        ob[1].Transition = {bb, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_RENDER_TARGET};
+        s.list->ResourceBarrier(copyable ? 2 : 1, ob);
+        blit_over(dev, s.list, ov, bb, s.w, s.h, want);
+        std::swap(ob[0].Transition.StateBefore, ob[0].Transition.StateAfter);
+        std::swap(ob[1].Transition.StateBefore, ob[1].Transition.StateAfter);
+        s.list->ResourceBarrier(copyable ? 2 : 1, ob);
+    }
     std::swap(b[0].Transition.StateBefore, b[0].Transition.StateAfter);
     std::swap(b[1].Transition.StateBefore, b[1].Transition.StateAfter);
     s.list->ResourceBarrier(2, b);

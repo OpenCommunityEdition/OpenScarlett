@@ -44,7 +44,8 @@ struct XgComputer {
 // XG_RESOURCE_DESC has the layout of D3D12_RESOURCE_DESC (xg_xs.h); the console desc is passed as is.
 using CreateComputer = HRESULT(__cdecl*)(const void* desc, XgComputer** out);
 
-struct Entry { uint64_t va; D3D12_RESOURCE_DESC desc; uint32_t state; bool queued = false, done = false; uint64_t size = 0, hash = 0; };
+struct Entry { uint64_t va; D3D12_RESOURCE_DESC desc; uint32_t state; bool queued = false, done = false; uint64_t size = 0, hash = 0; bool mapped = false; };
+std::map<PcObj, std::pair<D3D12_RESOURCE_DESC, uint32_t>> g_descs;   // console descriptions of textures the title may map
 std::mutex g_mu;
 std::map<PcObj, Entry> g_tex;
 std::vector<PcObj> g_queue;
@@ -129,8 +130,32 @@ void detile_stats(uint64_t out[6]) {
     std::lock_guard<std::mutex> g(g_mu);
     out[5] = g_tex.size();
 }
+void detile_note_desc(PcObj pcRes, const void* consoleDesc, uint32_t initialState) {
+    auto* d = static_cast<const D3D12_RESOURCE_DESC*>(consoleDesc);
+    if (!d || d->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER || d->Dimension == D3D12_RESOURCE_DIMENSION_UNKNOWN || d->SampleDesc.Count > 1) return;
+    std::lock_guard<std::mutex> g(g_mu);
+    g_descs[pcRes] = {*d, initialState};
+}
+void detile_mapped(PcObj pcRes, void* copy) {
+    if (!copy) return;
+    std::lock_guard<std::mutex> g(g_mu);
+    auto d = g_descs.find(pcRes);
+    if (d == g_descs.end() || g_tex.count(pcRes)) return;
+    Entry e{(uint64_t)(uintptr_t)copy, d->second.first, d->second.second};
+    e.mapped = true;
+    g_tex[pcRes] = e;
+}
+void detile_unmapped(PcObj pcRes) {
+    std::lock_guard<std::mutex> g(g_mu);
+    auto it = g_tex.find(pcRes);
+    if (it == g_tex.end() || !it->second.mapped || it->second.queued) return;
+    it->second.queued = true;
+    it->second.done = false;
+    g_queue.push_back(pcRes);
+}
 void detile_forget(PcObj pcRes) {
     std::lock_guard<std::mutex> g(g_mu);
+    g_descs.erase(pcRes);
     g_tex.erase(pcRes);
     for (auto& q : g_queue) if (q == pcRes) q = nullptr;
 }
@@ -155,7 +180,7 @@ void detile_flush(PcObj pcDevice, PcObj pcQueue) {
             for (size_t k = 0; k < g_tex.size() && budget; k++, g_scan++) {
                 if (it == g_tex.end()) it = g_tex.begin();
                 Entry& e = it->second;
-                if (e.done && e.size && e.size <= budget) {
+                if (e.done && e.size && e.size <= budget && !e.mapped) {   // (mapped copies upload at their unmap)
                     budget -= e.size;
                     uint64_t now = 0;
                     if (!content_hash_guarded(e.va, e.size, &now)) e.size = 0;   // the title released the memory: stop checking
@@ -171,7 +196,7 @@ void detile_flush(PcObj pcDevice, PcObj pcQueue) {
         for (PcObj r : g_queue) {
             if (!r) continue;
             auto it = g_tex.find(r);
-            if (it != g_tex.end() && !it->second.done) { it->second.done = true; work.push_back(*it); }
+            if (it != g_tex.end() && !it->second.done) { it->second.done = true; it->second.queued = false; work.push_back(*it); }
         }
         g_queue.clear();
     }

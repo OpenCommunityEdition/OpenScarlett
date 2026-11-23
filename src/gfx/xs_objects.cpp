@@ -425,8 +425,15 @@ HRESULT make_simple(Device* dev, Kind kind, PcObj pc, REFIID riid, void** out) {
 // Resource
 // ============================================================================================
 namespace {
-HRESULT D3DAPI Res_Map(ID3D12Resource* r, UINT sub, const D3D12_RANGE* range, void** out) { return pc::res_map(pc_of(r), sub, range, out); }
-void D3DAPI Res_Unmap(ID3D12Resource* r, UINT sub, const D3D12_RANGE* range) { pc::res_unmap(pc_of(r), sub, range); }
+HRESULT D3DAPI Res_Map(ID3D12Resource* r, UINT sub, const D3D12_RANGE* range, void** out) {
+    HRESULT hr = pc::res_map(pc_of(r), sub, range, out);
+    if (SUCCEEDED(hr) && out) detile_mapped(pc_of(r), pc::map_shadow_base(pc_of(r)));   // a texture's CPU copy
+    return hr;
+}
+void D3DAPI Res_Unmap(ID3D12Resource* r, UINT sub, const D3D12_RANGE* range) {
+    pc::res_unmap(pc_of(r), sub, range);
+    detile_unmapped(pc_of(r));
+}
 void D3DAPI Res_GetDesc(ID3D12Resource* r, D3D12_RESOURCE_DESC* d) { pc::res_desc(pc_of(r), d); }
 // On the console every resource has an address, textures too, and it is CPU memory as well: titles
 // write texels through it. A PC texture has none; the address of the console memory the resource
@@ -675,6 +682,7 @@ HRESULT D3DAPI L_Reset(ID3D12GraphicsCommandList* l, ID3D12CommandAllocator* a, 
     lx(l)->ibValid = false;
     lx(l)->nTracked = 0;
     lx(l)->sampler = nullptr;
+    if (p && !P(p)) pso_wait_ready(p);
     lx(l)->placeholderPso = p && !P(p);
     lx(l)->placeholderWhy = lx(l)->placeholderPso ? placeholder_reason(p) : -1;
     HRESULT hr = pc::list_reset(LPC(l), P(a), P(p));
@@ -780,6 +788,12 @@ void D3DAPI L_ClearDSV(ID3D12GraphicsCommandList* l, D3D12_CPU_DESCRIPTOR_HANDLE
 }
 void D3DAPI L_RSSetViewports(ID3D12GraphicsCommandList* l, UINT n, const D3D12_VIEWPORT* v) { pc::list_viewports(LPC(l), n, v); }
 void D3DAPI L_RSSetScissorRects(ID3D12GraphicsCommandList* l, UINT n, const D3D12_RECT* r) { pc::list_scissors(LPC(l), n, r); }
+// XSL_DRAW_DUMP=<present> (diagnostics): the draws of the frame before that present, with the first
+// bytes of the vertex buffers they use.
+static bool draw_dump_now() {
+    static uint64_t at = [] { char b[16]; return GetEnvironmentVariableA("XSL_DRAW_DUMP", b, sizeof b) ? _strtoui64(b, nullptr, 10) : 0ull; }();
+    return at && pc::present_count() + 1 == at;
+}
 void D3DAPI L_SetGfxRootSig(ID3D12GraphicsCommandList* l, ID3D12RootSignature* rs) {
     XSL_TRACE("gfx.cmd", "list %p RootSig %p", (void*)l, (void*)rs);
     pc::list_set_gfx_root_signature(LPC(l), P(rs));
@@ -796,6 +810,7 @@ void D3DAPI L_SetComputeRootSig(ID3D12GraphicsCommandList* l, ID3D12RootSignatur
 }
 void D3DAPI L_SetPipelineState(ID3D12GraphicsCommandList* l, ID3D12PipelineState* p) {
     if (null_graphics()) return;
+    if (p && !P(p)) pso_wait_ready(p);
     lx(l)->placeholderPso = p && !P(p);
     lx(l)->placeholderWhy = lx(l)->placeholderPso ? placeholder_reason(p) : -1;
     if (lx(l)->placeholderPso) return;
@@ -822,6 +837,15 @@ void D3DAPI L_IASetPrimitiveTopology(ID3D12GraphicsCommandList* l, D3D12_PRIMITI
 }
 void D3DAPI L_IASetVertexBuffers(ID3D12GraphicsCommandList* l, UINT s, UINT n, const D3D12_VERTEX_BUFFER_VIEW* v) {
     XSL_TRACE("gfx.cmd", "list %p VB %u n=%u va=%llx size=%u stride=%u", (void*)l, s, n, n ? (unsigned long long)v[0].BufferLocation : 0ull, n ? v[0].SizeInBytes : 0, n ? v[0].StrideInBytes : 0);
+    if (draw_dump_now() && v && n) {   // the first vertices, as the title wrote them
+        std::string t;
+        uint8_t b[96];
+        SIZE_T got = 0;
+        if (ReadProcessMemory(GetCurrentProcess(), (const void*)(uintptr_t)v[0].BufferLocation, b, sizeof b, &got) && got == sizeof b)
+            for (size_t k = 0; k < sizeof b; k++) { char h[4]; snprintf(h, sizeof h, "%02x", b[k]); t += h; if (k % 4 == 3) t += ' '; }
+        XSL_INFO(CH, "draw dump: list %p vertex buffer slot %u: %llx, %u bytes, stride %u: %s", (void*)l, s, (unsigned long long)v[0].BufferLocation, v[0].SizeInBytes,
+                 v[0].StrideInBytes, t.empty() ? "(not CPU memory)" : t.c_str());
+    }
     // The address may be the CPU address of unified memory.
     D3D12_VERTEX_BUFFER_VIEW x[D3D12_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT];
     if (v && n <= D3D12_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT) {
@@ -845,6 +869,7 @@ void D3DAPI L_IASetIndexBuffer(ID3D12GraphicsCommandList* l, const D3D12_INDEX_B
 }
 void D3DAPI L_DrawInstanced(ID3D12GraphicsCommandList* l, UINT a, UINT b, UINT c, UINT d) {
     if (null_graphics()) return;
+    if (draw_dump_now()) XSL_INFO(CH, "draw dump: list %p Draw(%u vertices, %u instances, first %u), topology %d%s", (void*)l, a, b, c, lx(l)->topology, lx(l)->placeholderPso ? " (skipped)" : "");
     if (lx(l)->placeholderPso) { placeholder_skip(lx(l)->placeholderWhy); return; }
     if (lx(l)->topology == D3D_PRIMITIVE_TOPOLOGY_QUADLIST) {
         D3D12_INDEX_BUFFER_VIEW q = quad_ib(hdr(l)->device);
@@ -1606,7 +1631,7 @@ HRESULT D3DAPI Q_PresentX(ID3D12CommandQueue* q, UINT planes, const D3D12XBOX_PR
     if (!de->window || !IsWindow(de->window)) de->window = find_title_window();
     if (!de->window) { XSL_WARN(CH, "PresentX: no title window yet"); return S_OK; }
     XSL_TRACE("gfx.cmd", "PresentX planes=%u res %p", planes, (void*)p->ppResources[0]);
-    if (planes > 1) XSL_TRACE(CH, "PresentX: %u planes, presenting plane 0 only", planes);
+    if (planes > 2) XSL_TRACE(CH, "PresentX: %u planes, presenting the first two", planes);
     {
         static volatile long n = 0;
         if (planes > 1 && InterlockedIncrement(&n) <= 3)
@@ -1632,7 +1657,8 @@ HRESULT D3DAPI Q_PresentX(ID3D12CommandQueue* q, UINT planes, const D3D12XBOX_PR
     }
     HRESULT hr = null_graphics() ? pc::null_present(de->window)
                                  : pc::present(de->pcDevice, presentQ, dbg_present_override() ? dbg_present_override() : P(p->ppResources[0]),
-                                               de->window, 0, (uint32_t)p->ColorSpace);
+                                               de->window, 0, (uint32_t)p->ColorSpace,
+                                               planes > 1 && p[1].ResourceCount && p[1].ppResources ? P(p[1].ppResources[0]) : nullptr);
     // Enforce the console's frame-latency bound: block until the GPU has finished every frame
     // older than maxLatency. Without this a title resets command allocators still in flight.
     if (!de->latencyFence) {

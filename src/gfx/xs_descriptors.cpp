@@ -370,7 +370,10 @@ uint64_t desc_begin_write(uint64_t h, D3D12_DESCRIPTOR_HEAP_TYPE type, Tag* tagO
     std::lock_guard<std::mutex> g(g_mu);
     if (!g_ready) return 0;
     uint32_t i;
-    if (type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV ? view_slot(h, &i) : rtv_dsv_heap(h) != nullptr) {
+    // Render-target and depth views may be created anywhere: on the console a descriptor is plain
+    // data, and titles keep such views in memory of their own (and copy them around).
+    const bool rtvDsv = type == D3D12_DESCRIPTOR_HEAP_TYPE_RTV || type == D3D12_DESCRIPTOR_HEAP_TYPE_DSV;
+    if (type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV ? view_slot(h, &i) : (rtvDsv && h != 0)) {
         uint64_t rec;
         *tagOut = g_rec[type].allocate(type, &rec);
         return rec;
@@ -397,6 +400,8 @@ void desc_commit(uint64_t h, D3D12_DESCRIPTOR_HEAP_TYPE type, const Tag& tag) {
     } else if (const ShadowHeap* sh = rtv_dsv_heap(h)) {
         memset((void*)h, 0, sh->slot);
         memcpy((void*)h, &tag, sizeof tag);
+    } else if (h) {
+        memcpy((void*)h, &tag, sizeof tag);   // a view in the title's own memory: the tag alone
     }
 }
 
@@ -429,9 +434,12 @@ bool desc_copy(uint32_t n, uint64_t dst, uint64_t src, D3D12_DESCRIPTOR_HEAP_TYP
         }
         return true;
     }
+    if (type != D3D12_DESCRIPTOR_HEAP_TYPE_RTV && type != D3D12_DESCRIPTOR_HEAP_TYPE_DSV) return false;
+    // Render-target and depth views: the slots' bytes (their tags), wherever the two ranges lie.
     const ShadowHeap* d = rtv_dsv_heap(dst);
-    if (!d || !rtv_dsv_heap(src)) return false;
-    memmove((void*)dst, (const void*)src, (size_t)n * d->slot);
+    const uint32_t slot = d ? d->slot : type == D3D12_DESCRIPTOR_HEAP_TYPE_RTV ? kRtvSlot : kDsvSlot;
+    if (d && rtv_dsv_heap(src)) { memmove((void*)dst, (const void*)src, (size_t)n * slot); return true; }
+    for (uint32_t k = 0; k < n; k++) memmove((void*)(dst + (uint64_t)k * slot), (const void*)(src + (uint64_t)k * slot), sizeof(Tag));
     return true;
 }
 
@@ -440,13 +448,22 @@ uint64_t desc_pc_cpu(uint64_t h, D3D12_DESCRIPTOR_HEAP_TYPE type) {
     if (!g_ready || !h) return h;
     std::lock_guard<std::mutex> g(g_mu);
     uint32_t i;
-    bool shadow = type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV ? view_slot(h, &i) : rtv_dsv_heap(h) != nullptr;
-    if (!shadow) return h;
+    if (type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) return view_slot(h, &i) ? mirror_cpu(i) : h;   // the slot's current PC descriptor
+    if (type != D3D12_DESCRIPTOR_HEAP_TYPE_RTV && type != D3D12_DESCRIPTOR_HEAP_TYPE_DSV) return h;
+    // A render-target or depth view: its tag, wherever the descriptor lies (the layer's heaps, or a
+    // copy the title keeps in its own memory). Memory that is not readable resolves to nothing.
     Tag t;
-    memcpy(&t, (const void*)h, sizeof t);
+    const bool known = rtv_dsv_heap(h) != nullptr;
+    SIZE_T got = 0;
+    if (known) memcpy(&t, (const void*)h, sizeof t);
+    else if (!ReadProcessMemory(GetCurrentProcess(), (const void*)h, &t, sizeof t, &got) || got != sizeof t) return 0;
     uint64_t rec;
-    if (type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) return mirror_cpu(i);   // the slot's current PC descriptor
     if (g_rec[type].resolve(t, &rec)) return rec;
+    if (!known && t.magic != 0x444C5358u) {
+        static volatile long n = 0;
+        if (InterlockedIncrement(&n) <= 4) XSL_WARN(CH, "%s view handle %llx names no view of the layer (first bytes %08x %08x)", type == D3D12_DESCRIPTOR_HEAP_TYPE_RTV ? "render-target" : "depth",
+                                                    (unsigned long long)h, t.magic, t.type);
+    }
     return 0;
 }
 // After a PC descriptor was written to desc_pc_cpu(h) of a console-layout view slot.
