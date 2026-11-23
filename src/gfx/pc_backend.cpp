@@ -243,6 +243,7 @@ static LONG CALLBACK note_exception(EXCEPTION_POINTERS* e) {
     if (c == 0x87d) dump_debug_messages();   // the debug layer's break: show the message behind it
     return EXCEPTION_CONTINUE_SEARCH;
 }
+void rt_warm_start();
 HRESULT_T create_device(PcObj* out) {
     if (env_on("XSL_D3D12_DRED") || env_on("XSL_D3D12_DEBUG")) {
         static bool once = false;
@@ -330,6 +331,7 @@ HRESULT_T create_device(PcObj* out) {
     }
     *out = dev;
     g_main_device = (ID3D12Device*)dev;
+    rt_warm_start();
     return S_OK;
 }
 
@@ -1275,6 +1277,48 @@ static ID3D12RootSignature* rt_root_signature(ID3D12Device* dev) {
         }
     });
     return rs;
+}
+// XSL_RT_WARM=1: create (and release) a pipeline for every cached ray-tracing program on all
+// processors at device creation, so the driver's own shader cache holds them (the driver takes tens
+// of seconds per unoptimized program the first time).
+std::wstring rt_cache_dir();
+void rt_warm_start() {
+    char b[4];
+    if (!GetEnvironmentVariableA("XSL_RT_WARM", b, sizeof b) || b[0] != '1') return;
+    auto files = std::make_shared<std::vector<std::wstring>>();
+    WIN32_FIND_DATAW fd;
+    std::wstring dir = rt_cache_dir();
+    wchar_t wd[MAX_PATH];
+    if (GetEnvironmentVariableW(L"XSL_RT_WARM_DIR", wd, MAX_PATH)) dir = std::wstring(wd) + L"\\";   // diagnostics: another directory
+    HANDLE h = FindFirstFileW((dir + L"rt_*.dxil").c_str(), &fd);
+    if (h != INVALID_HANDLE_VALUE) {
+        do files->push_back(dir + fd.cFileName);
+        while (FindNextFileW(h, &fd));
+        FindClose(h);
+    }
+    auto next = std::make_shared<std::atomic<size_t>>(0);
+    auto done = std::make_shared<std::atomic<size_t>>(0);
+    DWORD t0 = GetTickCount();
+    unsigned n = std::max(1u, std::thread::hardware_concurrency());
+    XSL_INFO(CH, "ray-tracing warm-up: %zu programs on %u threads", files->size(), n);
+    for (unsigned t = 0; t < n; t++)
+        std::thread([files, next, done, t0] {
+            for (size_t i; (i = (*next)++) < files->size();) {
+                HANDLE f = CreateFileW((*files)[i].c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+                if (f == INVALID_HANDLE_VALUE) continue;
+                std::vector<uint8_t> d(GetFileSize(f, nullptr));
+                DWORD got = 0;
+                ReadFile(f, d.data(), (DWORD)d.size(), &got, nullptr);
+                CloseHandle(f);
+                DWORD s = GetTickCount();
+                if (PcObj p = rt_create_pso((PcObj)g_main_device, d)) as<ID3D12PipelineState>(p)->Release();
+                size_t k = ++*done;
+                if (k % 16 == 0 || k == files->size() || files->size() <= 16)
+                    XSL_INFO(CH, "ray-tracing warm-up: %zu/%zu programs (last %ls: %lu ms, %lu s so far)", k, files->size(),
+                             (*files)[i].substr((*files)[i].find_last_of(L"\\") + 1).c_str(), (unsigned long)(GetTickCount() - s),
+                             (unsigned long)((GetTickCount() - t0) / 1000));
+            }
+        }).detach();
 }
 PcObj rt_create_pso(PcObj devObj, const std::vector<uint8_t>& dxil) {
     auto* dev = as<ID3D12Device>(devObj);

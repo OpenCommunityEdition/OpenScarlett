@@ -1162,6 +1162,15 @@ struct Translator {
             if (offset >= sg.offset && offset < sg.offset + sg.size) return sg.address + (offset - sg.offset);
         return opt.code_base + offset;
     }
+    // dst[k] = dword k at (lo_, hi_) through global memory: one search for all of them (dwords past
+    // the found range read 0).
+    void gm_read_n(const std::vector<std::string>& dst) {
+        if (dst.size() == 1) { line(fmt("  %s = gm_load(lo_, hi_);", dst[0].c_str())); return; }
+        line("  { uint fy_, fz_, fl_; bool fx_ = gm_find(lo_, hi_, fy_, fz_, fl_);");
+        for (size_t k = 0; k < dst.size(); k++)
+            line(fmt("    %s = fx_ && fl_ > %zuu ? gm_vload(fy_, fz_ + %zuu) : 0u;", dst[k].c_str(), 4 * k, 4 * k));
+        line("  }");
+    }
     std::string park_lane() const {
         return "((((gid_.z * RC0_d[0].w + gid_.y) * RC0_d[0].z + gid_.x) * WAVE) + LG)";
     }
@@ -1572,7 +1581,7 @@ bool Translator::emit_smem(const Instr& in, size_t idx) {
             std::string so = in.soffset == src::kNull ? std::string("0u") : rd(in.soffset, in);
             line(fmt("{ uint lo_ = (%s & ~3u) + %uu + %s, hi_ = %s + (lo_ < %s ? 1u : 0u);", S(in.sbase).c_str(), uint32_t(in.offset_imm), so.c_str(),
                      S(in.sbase + 1).c_str(), S(in.sbase).c_str()));
-            for (unsigned k = 0; k < cnt; k++) line(fmt("  %s = gm_load(lo_ + %uu, hi_ + (lo_ + %uu < lo_ ? 1u : 0u));", S(in.sdata + k).c_str(), 4 * k, 4 * k));
+            { std::vector<std::string> d; for (unsigned k = 0; k < cnt; k++) d.push_back(S(in.sdata + k)); gm_read_n(d); }
             line("}");
             return true;
         }
@@ -1587,7 +1596,7 @@ bool Translator::emit_smem(const Instr& in, size_t idx) {
             unsigned cnt = has(n, "x16") ? 16 : has(n, "x8") ? 8 : has(n, "x4") ? 4 : has(n, "x2") ? 2 : 1;
             std::string off = in.soffset == src::kNull ? fmt("%uu", uint32_t(in.offset_imm)) : fmt("(%s + %uu)", rd(in.soffset, in).c_str(), uint32_t(in.offset_imm));
             line(fmt("{ uint lo_ = %s + (%s & ~3u), hi_ = (%s & 0xffffu) + (lo_ < %s ? 1u : 0u);", S(in.sbase).c_str(), off.c_str(), S(in.sbase + 1).c_str(), S(in.sbase).c_str()));
-            for (unsigned k = 0; k < cnt; k++) line(fmt("  %s = gm_load(lo_ + %uu, hi_ + (lo_ + %uu < lo_ ? 1u : 0u));", S(in.sdata + k).c_str(), 4 * k, 4 * k));
+            { std::vector<std::string> d; for (unsigned k = 0; k < cnt; k++) d.push_back(S(in.sdata + k)); gm_read_n(d); }
             line("}");
             return true;
         }
@@ -2305,11 +2314,12 @@ bool Translator::emit_mubuf(const Instr& in, size_t idx) {
         line(fmt("if (kexec) { uint off_ = %s + %s + %uu + %s * ((%s >> 16) & 0x3fffu);", voff.c_str(), so.c_str(), uint32_t(in.offset_imm), vidx.c_str(), d1.c_str()));
         line(fmt("  uint lo_ = %s + off_, hi_ = (%s & 0xffffu) + (lo_ < %s ? 1u : 0u);", d0.c_str(), d1.c_str(), d0.c_str()));
         bool store = has(n, "_store_");
-        for (unsigned k = 0; k < cnt; k++) {
-            std::string a = fmt("lo_ + %uu, hi_ + (lo_ + %uu < lo_ ? 1u : 0u)", 4 * k, 4 * k);
-            if (store) line(fmt("  gm_store(%s, %s);", a.c_str(), V(in.vdata + k).c_str()));
-            else line(fmt("  %s = gm_load(%s);", V(in.vdata + k).c_str(), a.c_str()));
-        }
+        if (!store) { std::vector<std::string> d; for (unsigned k = 0; k < cnt; k++) d.push_back(V(in.vdata + k)); gm_read_n(d); }
+        else
+            for (unsigned k = 0; k < cnt; k++) {
+                std::string a = fmt("lo_ + %uu, hi_ + (lo_ + %uu < lo_ ? 1u : 0u)", 4 * k, 4 * k);
+                line(fmt("  gm_store(%s, %s);", a.c_str(), V(in.vdata + k).c_str()));
+            }
         line("}");
         return true;
     }
@@ -3217,7 +3227,12 @@ bool Translator::emit_global(const Instr& in, size_t idx) {
         return fmt("(hi_ == 0u && ((lo_ + %s) >> 2) < CODEDATA_N ? codedata[(lo_ + %s) >> 2] : gm_load(lo_ + %s, hi_ + (lo_ + %s < lo_ ? 1u : 0u)))",
                    k.c_str(), k.c_str(), k.c_str(), k.c_str());
     };
-    if (load && dword) {
+    if (load && dword && cnt > 1 && (opt.global_memory || opt.global_memory_test)) {
+        line("  uint fy_, fz_, fl_; bool fx_ = gm_find(lo_, hi_, fy_, fz_, fl_);");
+        for (unsigned k = 0; k < cnt; k++)
+            line(fmt("  %s = hi_ == 0u && ((lo_ + %uu) >> 2) < CODEDATA_N ? codedata[(lo_ + %uu) >> 2] : (fx_ && fl_ > %uu ? gm_vload(fy_, fz_ + %uu) : 0u);",
+                     V(in.dst + k).c_str(), 4 * k, 4 * k, 4 * k, 4 * k));
+    } else if (load && dword) {
         for (unsigned k = 0; k < cnt; k++) line(fmt("  %s = %s;", V(in.dst + k).c_str(), rdw(fmt("%uu", 4 * k)).c_str()));
     } else if (load) {
         bool sgn = has(n, "sbyte") || has(n, "sshort");
@@ -3583,7 +3598,7 @@ std::string Translator::generate() {
              "RWByteAddressBuffer GMU[8192] : register(u0, space900);\n"
              "// Entry of the address table holding (lo, hi): found, view word, byte offset. A fixed-step\n"
              "// search (tables up to 32767 entries) without branches or loops (inlined at every access; loops there made DXC superlinear).\n"
-             "bool gm_find(uint lo, uint hi, out uint view, out uint off) {\n"
+             "bool gm_find(uint lo, uint hi, out uint view, out uint off, out uint left) {\n"
              "  uint a = 0u, n = GMT[0].x, t, ex, ey;\n"
              "  t = a + 16384u; ex = GMT[min(t, n)].x; ey = GMT[min(t, n)].y; a = select((t <= n) & ((ey < hi) | ((ey == hi) & (ex <= lo))), t, a);\n"
              "  t = a + 8192u; ex = GMT[min(t, n)].x; ey = GMT[min(t, n)].y; a = select((t <= n) & ((ey < hi) | ((ey == hi) & (ex <= lo))), t, a);\n"
@@ -3602,21 +3617,28 @@ std::string Translator::generate() {
              "  t = a + 1u; ex = GMT[min(t, n)].x; ey = GMT[min(t, n)].y; a = select((t <= n) & ((ey < hi) | ((ey == hi) & (ex <= lo))), t, a);\n"
              "  ex = GMT[a].x; ey = GMT[a].y; uint ez = GMT[a].z; view = GMT[a].w;\n"
              "  off = lo - ex; uint ohi = hi - ey - select(lo < ex, 1u, 0u);\n"
+             "  left = ez - off;\n"
              "  return (a != 0u) & (ohi == 0u) & (off < ez);\n"
              "}\n"
+             "// A dword of a view gm_find returned (several dwords of one access share one search).\n"
+             "uint gm_vload(uint fy, uint off) {\n"
+             "  if (fy & 0x40000000u) return GMS[NonUniformResourceIndex(fy & 0x3fffu)].Load(off & ~3u);\n"
+             "  if (fy & 0x80000000u) return GMU[NonUniformResourceIndex((fy >> 14) & 0x3fffu)].Load(off & ~3u);\n"
+             "  return 0u;\n"
+             "}\n"
              "uint gm_load(uint lo, uint hi) {\n"
-             "  uint fy, fz; bool fx = gm_find(lo, hi, fy, fz);\n"
+             "  uint fy, fz, fl; bool fx = gm_find(lo, hi, fy, fz, fl);\n"
              "  if (!fx) return 0u;\n"
              "  if (fy & 0x40000000u) return GMS[NonUniformResourceIndex(fy & 0x3fffu)].Load(fz & ~3u);\n"
              "  if (fy & 0x80000000u) return GMU[NonUniformResourceIndex((fy >> 14) & 0x3fffu)].Load(fz & ~3u);\n"
              "  return 0u;\n"
              "}\n"
              "void gm_store(uint lo, uint hi, uint v) {\n"
-             "  uint fy, fz; bool fx = gm_find(lo, hi, fy, fz);\n"
+             "  uint fy, fz, fl; bool fx = gm_find(lo, hi, fy, fz, fl);\n"
              "  if (fx && (fy & 0x80000000u)) GMU[NonUniformResourceIndex((fy >> 14) & 0x3fffu)].Store(fz & ~3u, v);\n"
              "}\n"
              "uint gm_atomic(uint lo, uint hi, uint op, uint v) {   // 1 add 2 sub 3 umin 4 umax 5 smin 6 smax 7 and 8 or 9 xor 10 swap\n"
-             "  uint fy, fz; bool fx = gm_find(lo, hi, fy, fz);\n"
+             "  uint fy, fz, fl; bool fx = gm_find(lo, hi, fy, fz, fl);\n"
              "  if (!fx || !(fy & 0x80000000u)) return 0u;\n"
              "  uint i = (fy >> 14) & 0x3fffu, a = fz & ~3u, o = 0u; int so = 0;\n"
              "  switch (op) {\n"
@@ -3632,7 +3654,7 @@ std::string Translator::generate() {
              "  default: GMU[NonUniformResourceIndex(i)].InterlockedExchange(a, v, o); break;\n"
              "  }\n  return o;\n}\n"
              "void gm_store_bits(uint lo, uint hi, uint v, uint mask) {   // byte/short stores: atomic clear and set\n"
-             "  uint fy, fz; bool fx = gm_find(lo, hi, fy, fz);\n"
+             "  uint fy, fz, fl; bool fx = gm_find(lo, hi, fy, fz, fl);\n"
              "  if (!fx || !(fy & 0x80000000u)) return;\n"
              "  uint s = (fz & 3u) * 8u, o;\n"
              "  GMU[NonUniformResourceIndex((fy >> 14) & 0x3fffu)].InterlockedAnd(fz & ~3u, ~(mask << s), o);\n"

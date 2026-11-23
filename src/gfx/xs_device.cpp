@@ -843,7 +843,11 @@ static void rt_start_pipeline(Device* dev, const void* so, std::vector<std::vect
     static std::atomic<uint32_t> regions{0};
     pipe->region = std::min<uint32_t>(regions++, 63);
     { std::lock_guard<std::mutex> g(g_rt_mu); g_rt[so].pipe = pipe; g_rt[so].parts = blobs; g_rt[so].colls = pipe->colls; }
-    rt_program(pipe->start);   // the others are built once rays are seen to reach them
+    rt_program(pipe->start);
+    // The pipeline's other collections are built too (cached DXIL still costs the driver tens of
+    // seconds per program the first time; it keeps its own cache afterwards).
+    for (int c : pipe->colls)
+        if (c >= 0 && c != pipe->start) rt_program(c);
     XSL_INFO(CH, "ray-tracing pipeline %p: %zu collections, rays start in collection %d", so, blobs.size(), pipe->start);
 }
 // Collections the pipeline's rays parked on (discovery bitmap), as program candidates.

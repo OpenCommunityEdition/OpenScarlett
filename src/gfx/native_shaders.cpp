@@ -336,6 +336,7 @@ bool native_translate(const void* in, size_t n, void** out, size_t* outSize) {
 // by the image's hash (compiling one takes minutes: callers run this off the title's threads).
 // XSL_RT_DXC_OPT=Od|O1|O2|O3: optimization level of these programs (default Od: DXC takes about
 // 3x longer at O3 on these huge single-function programs; the driver optimizes either way).
+std::wstring rt_cache_dir() { return cache_dir(); }
 bool rt_build_pipeline(const gpucode::RtLinked& l, std::vector<uint8_t>& dxil, std::string& err) {
     static std::wstring opt = [] {
         char b[8];
