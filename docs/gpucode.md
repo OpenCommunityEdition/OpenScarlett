@@ -62,6 +62,10 @@ Shaders that cannot be translated yet make their pipeline a placeholder (its wor
 | `XSL_MF_GPU=0` | Refuse Media Foundation a D3D12 device (no GPU video decoding) |
 | `XSL_COMPUTE_AS_DIRECT=0` | Keep PC compute queues for console compute queues (default: direct queues) |
 | `XSL_TRACE_VIDEO_PLANES=1` | Log placements of R8/R8G8 textures (video plane aliases) |
+| `XSL_PSO_ASYNC_MS=<ms>`, `XSL_PSO_THREADS=<n>` | Compute pipelines that take longer than this to create (default 300 ms) finish on a pool of n threads (default 3); their dispatches are skipped until then |
+| `XSL_PSO_CACHE=0` | Do not keep the driver's compiled pipelines (`pso_*.bin`, `rtpso_*.bin`) in the cache directory |
+| `XSL_GM_WATCH=<hex address>` | Log registrations, releases and table rows of the global-memory buffer holding that address |
+| `XSL_HANG_WATCH=1` | When a fence wait stalls: queue state and the stacks of the title's threads |
 
 ## Tests
 
@@ -134,6 +138,26 @@ collections; offsets from The Matrix Awakens demo, layouts from disassembly):
   0..4), s19..s23 (passed to shaders as s8..s12: miss table, hit table, ray-generation record,
   callable table, all address >> 6), s24 stack bytes per lane; +0x90 ray-stack buffer descriptor.
   2-D launches use 8x4 lanes per group, 1-D 32.
+- **Wave size.** The code is wave32 but uses 64-bit forms on the EXEC pair (`s_or_saveexec_b64 sN,
+  -1` around sections that run every lane). Any `saveexec_b32`/`wrexec_b32` decides wave32; read as
+  wave64, every compare result also wrote the following register (in the scheduler that was the
+  ray-generation pointer it had just loaded, so those pipelines traced nothing). In wave32 code a
+  64-bit scalar logic or EXEC instruction writes both registers, and EXEC/VCC zero tests look at the
+  low register only.
+- **Ray stack.** The scheduler converts byte offsets with `>> 5` and sizes a wave's stack as
+  `0x200 + 32 * s24`: the stack descriptor is a scratch-style buffer with ADD_TID_ENABLE (dword 3
+  bit 23), i.e. swizzled per lane: dword offset `o` of lane `t` is at `o * 32 + t * 4` after the
+  scalar offset. Functions save registers to frames at the end of the wave's stack (`s32`) with the
+  same addressing (offsets up to 656 bytes seen). `TranslateOptions::raw_tid_buffers` applies that
+  to single-dword accesses through run-time descriptors with the bit set; a wave's slot is
+  `rt_wave_stack_bytes()` and there are `kRtStackSlots` of them (lanes parked between rounds keep
+  their stack, so slots must outnumber the waves of a dispatch).
+- **Traversal per program.** A shader asks for a trace by returning pointer 42; the scheduler picks
+  a variant (0..2 from the ray flags) and reads the traversal pointer from that *lane* of a VGPR it
+  loaded from the runtime table. The table names one traversal for the pipeline, but a program
+  holds only its collection's traversal sections (two sets exist in the demo), so at the resume
+  point every program replaces that VGPR with its own entries (`RtLinked::trav_vgpr`); otherwise
+  lanes parked on traversal code no program of the round contained.
 - **Programs.** DXC time grows much faster than linearly with function size (a 49K-line program
   takes over 10 minutes even at `-Od`), so each collection is its own program (traversal + the
   collection + its scheduler). A scheduler call to code outside the program parks the active lanes
@@ -143,15 +167,24 @@ collections; offsets from The Matrix Awakens demo, layouts from disassembly):
   over the collections rays were seen to reach; a program resumes the lanes parked on its code just
   before the scheduler's loop (the scheduler's prologue is re-run; it is deterministic per wave).
 - **Cache.** Programs are cached by `rt_cache_key` (included code, scheduler, parking settings,
-  translator version, compiler option). `xsl-gpucode rtcache <dir> gpucode-35-Od <blobs...>` writes
+  translator version, compiler option). `xsl-gpucode rtcache <dir> gpucode-35-O3 <blobs...>` writes
   every program's HLSL from blobs dumped with `XSL_DUMP_STATE_OBJECTS` (in deserialization order);
   compiling those to `rt_<key>.dxil` in the cache directory avoids compiling in game.
 
 | Switch | Effect |
 |---|---|
 | `XSL_RT_PIPELINES=0` | Leave ray-tracing pipelines inert (no translation, ray dispatches skipped) |
-| `XSL_RT_ROUNDS=<n>` | Program rounds per ray dispatch (default 6) |
+| `XSL_RT_ROUNDS=<n>` | Program rounds per ray dispatch (default 12; a ray needs one round per change of collection) |
 | `XSL_RT_LANES=<n>` | Capacity of the parked-lane state (default 1M lanes, 264 bytes each) |
-| `XSL_RT_DXC_OPT=Od/O1/O2/O3` | Optimization level of ray-tracing programs (default Od) |
-| `XSL_RT_BUILD_THREADS=<n>` | Worker threads compiling ray-tracing programs (default a quarter of the processors, 1..4) |
+| `XSL_RT_DXC_OPT=Od/O1/O2/O3` | Optimization level of ray-tracing programs (default O3; part of the cache key) |
+| `XSL_RT_BUILD_THREADS=<n>` | Worker threads compiling ray-tracing programs (default 1, at idle priority) |
 | `XSL_DUMP_STATE_OBJECTS=<dir>` | Save deserialized collections (in order) and state-object descriptions |
+| `XSL_RT_DEBUG=1` | Programs with counters (other cache keys): lanes, parked/resumed lanes and targets, BVH tests, global-memory misses, the scheduler's view of the runtime table; logged per pipeline with the frame rate |
+| `XSL_RT_GUARD=<n>` | Dispatcher steps per invocation of a ray-tracing program (default 65536; other cache keys) |
+| `XSL_RT_WARM=1` | Create every cached program's pipeline at start (fills the driver-blob cache `rtpso_*.bin`) |
+
+The GPU driver compiles one pipeline at a time per process and needs 15 s to several minutes for
+each of these programs. `xsl-rtwarm <shard> <shards>` (`tools/rtwarm`, `ninja xsl-rtwarm`) does
+that outside the game for the `rt_*.dxil` files in the cache directory; one process per shard
+(e.g. 12) uses the whole machine. `RT_STATS=1 xsl-gpucode rtcache ...` writes the `XSL_RT_DEBUG`
+variants.

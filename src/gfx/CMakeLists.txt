@@ -16,3 +16,7 @@ target_include_directories(d3d12_xs PRIVATE ${XSL_GEN_DIR} "${GXDK_ROOT}/xbox/in
 target_compile_options(d3d12_xs PRIVATE -Wno-everything)
 target_link_libraries(d3d12_xs PRIVATE xsl_gfx_pc xsl_platform xsl_common)
 set_target_properties(d3d12_xs PROPERTIES OUTPUT_NAME d3d12_xs PREFIX "")
+
+# Offline warm-up of the driver's pipeline cache for translated ray-tracing programs (tools/rtwarm).
+add_executable(xsl-rtwarm EXCLUDE_FROM_ALL ${CMAKE_SOURCE_DIR}/tools/rtwarm/main.cpp)
+target_link_libraries(xsl-rtwarm PRIVATE xsl_gfx_pc xsl_platform xsl_common d3d12 dxgi dxguid)

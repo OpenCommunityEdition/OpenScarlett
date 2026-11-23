@@ -65,9 +65,18 @@ struct TranslateOptions {
     // target (3-4 the last one), 5 loop-guard expiries (19 block, 20 steps), 6 parked lanes (7-8 last
     // target), 9 resumed lanes, 10 BVH tests, 11 BVH tests with a result, 12 global loads that found
     // no memory (13-14 last address), 15 global stores that found none (16-17 last address),
-    // 21 global loads, 22 global stores.
+    // 21 global loads, 22 global stores, 23 lanes with a shader pointer at the scheduler's test (24 all
+    // lanes there, 25-26 last pointer without one and the round tag), 27 lanes entering code of this
+    // program from the scheduler, 56..63 lanes at the test per round.
     bool raw_stats = false;
     uint32_t raw_park_disc_shift = 0;   // discovery bit = (target - code_base >> 8) >> shift
+    // The scheduler's traversal pointers (VGPR, one variant per lane) are replaced with these at the
+    // resume point: traces started in a program run its own traversal code. ~0u: left as loaded.
+    uint32_t raw_trav_vgpr = ~0u, raw_trav[3] = {0, 0, 0};
+    // Buffer accesses through run-time descriptors honour ADD_TID_ENABLE (dword 3 bit 23) as the
+    // console's scratch layout: the lane is added to the index of a swizzled buffer, so dword
+    // offset o of lane t is at o * wave size + t * 4 (the ray stack and the frames above it).
+    bool raw_tid_buffers = false;
     // Code at several addresses: raw_code holds segments back to back; a byte offset inside one
     // has address `address + (offset - offset_of_segment)` (empty: code_base + offset).
     struct RawSegment { uint32_t offset, size; uint64_t address; };

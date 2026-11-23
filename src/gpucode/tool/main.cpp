@@ -229,6 +229,7 @@ static int rtcache_cmd(const char* outdir, const char* salt, int n, char** blobs
         RtLinked l;
         std::string err;
         if (!sp.program(int(c), l, &err)) { fprintf(stderr, "collection %zu: %s\n", c, err.c_str()); continue; }
+        if (getenv("RT_STATS")) l.stats = true;   // the debug-counter variant (XSL_RT_DEBUG=1 in the layer)
         Container k;
         k.kind = ProgramKind::CS;
         RootSig rs;

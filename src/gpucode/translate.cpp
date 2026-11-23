@@ -94,6 +94,7 @@ struct Translator {
     std::vector<Instr> ins;
     std::vector<uint32_t> code;
     unsigned W = 64;
+    bool wave32_sure = false;
     std::string err;
     std::vector<size_t> block_start;       // instruction indices
     std::map<uint32_t, size_t> block_of;   // byte offset -> block
@@ -242,12 +243,17 @@ struct Translator {
             std::string n = in.name;
             if ((n == "s_mov_b32" || starts(n, "s_and_b32") || starts(n, "s_or_b32")) && (in.dst == 126))
                 W = 32;
+            // only wave32 code saves EXEC in one register: that decides it. (Wave32 code may still use
+            // 64-bit forms on the EXEC pair, e.g. s_or_saveexec_b64 around whole-wave sections of the
+            // ray-traversal code; read as wave64, every compare result would clobber a second register.)
             if (n == "s_and_saveexec_b32" || n == "s_or_saveexec_b32" || n == "s_andn2_wrexec_b32" ||
-                n == "s_xor_saveexec_b32" || n == "s_andn2_saveexec_b32")
+                n == "s_xor_saveexec_b32" || n == "s_andn2_saveexec_b32") {
                 W = 32;
+                wave32_sure = true;
+            }
         }
         for (auto& in : ins) {
-            if (!in.name) continue;
+            if (!in.name || wave32_sure) continue;
             std::string n = in.name;
             if (ends(n, "_b64") && (in.dst == 126 || in.src0 == 126 || in.src1 == 126) && in.fmt != Fmt::VOP3) W = 64;
             if (has(n, "saveexec_b64") || has(n, "wrexec_b64")) W = 64;
@@ -1022,8 +1028,9 @@ struct Translator {
         }
         if (e == src::kLiteral) return fmt("0x%xu", in.literal);
         if (e == src::kScc) return "(scc ? 1u : 0u)";
-        if (e == src::kVccz) return "((s106 | s107) == 0u ? 1u : 0u)";
-        if (e == src::kExecz) return "((s126 | s127) == 0u ? 1u : 0u)";
+        // wave32 code: only the low register is the mask (the high one may hold anything)
+        if (e == src::kVccz) return W == 64 ? "((s106 | s107) == 0u ? 1u : 0u)" : "(s106 == 0u ? 1u : 0u)";
+        if (e == src::kExecz) return W == 64 ? "((s126 | s127) == 0u ? 1u : 0u)" : "(s126 == 0u ? 1u : 0u)";
         return "";
     }
     // 32-bit source bits.
@@ -1200,6 +1207,20 @@ struct Translator {
             line(fmt("      q_ = RTST.Load4(b_ + %uu); v%u = q_.x; v%u = q_.y; v%u = q_.z; v%u = q_.w;", 8 + 4 * k, k, k + 1, k + 2, k + 3));
         line(fmt("      v%u = p_; } else v%u = 0u;", opt.raw_park_ptr_vgpr, opt.raw_park_ptr_vgpr));
         if (opt.raw_stats) line("    if (r_) dbg_add(9u);");
+        line("  }");
+        if (opt.raw_stats) {   // at the scheduler's "pointer > 0" test, every round
+            line(fmt("  if (kexec) { dbg_add(24u); if (int(v%u) > 0) dbg_add(23u); else dbg_set2(25u, v%u, RC0_d[1].z); dbg_add(56u + min(RC0_d[1].z & 0xffu, 7u)); }",
+                     opt.raw_park_ptr_vgpr, opt.raw_park_ptr_vgpr));
+            // the scheduler's table values (s12..s27), group ids and launch coordinates of a lane without a pointer in round 0
+            line(fmt("  if (kexec && int(v%u) <= 0 && (RC0_d[1].z & 0xffu) == 0u) { RTDBG.Store4(DBGB + 256u, uint4(s12, s13, s14, s15)); RTDBG.Store4(DBGB + 272u, uint4(s16, s17, s18, s19)); "
+                     "RTDBG.Store4(DBGB + 288u, uint4(s20, s21, s22, s23)); RTDBG.Store4(DBGB + 304u, uint4(s24, s4, s5, s6)); RTDBG.Store4(DBGB + 320u, uint4(v0, v1, v2, v3)); "
+                     "RTDBG.Store4(DBGB + 336u, uint4(s0, s1, s2, s28)); "
+                     "{ uint ky_, kz_, kl_; bool kx_ = gm_find(s21 << 6, s21 >> 26, ky_, kz_, kl_); RTDBG.Store4(DBGB + 352u, uint4(kx_ ? 1u : 0u, ky_, kz_, kl_)); "
+                     "RTDBG.Store4(DBGB + 368u, uint4(gm_vload(ky_, kz_), GMT[0].x, GMT[0].y, v%u)); } }", opt.raw_park_ptr_vgpr, opt.raw_park_ptr_vgpr));
+        }
+        if (opt.raw_trav_vgpr != ~0u)   // every lane, active or not: the scheduler reads lanes 0..2 of the wave
+            line(fmt("  v%u = LG == 0u ? 0x%xu : LG == 1u ? 0x%xu : 0x%xu;", opt.raw_trav_vgpr, opt.raw_trav[0], opt.raw_trav[1], opt.raw_trav[2]));
+        line("  {");
         // the compare is redone: the lane flag and the wave's VCC mask (the scheduler's saveexec and its
         // later exec arithmetic use the mask; a stale one re-activated lanes that were not resumed)
         line(fmt("    kvcc = kexec && int(v%u) > 0; s106 = ballot2(kvcc).x; s107 = 0u;", opt.raw_park_ptr_vgpr));
@@ -1319,8 +1340,9 @@ bool Translator::emit_salu(const Instr& in, size_t idx) {
             sync_mask_from_int(d);
             return;
         }
-        // Integer view and lane bit of a mask result; SCC = result != 0.
-        if (W == 64) line(fmt("{ uint lo_ = %s, hi_ = %s; bool k_ = %s;%s %s = lo_; %s = hi_;%s }",
+        // Integer view and lane bit of a mask result; SCC = result != 0. A 64-bit instruction in
+        // wave32 code writes both registers (it may as well be integer arithmetic on a pair).
+        if (W == 64 || ends(n, "_b64")) line(fmt("{ uint lo_ = %s, hi_ = %s; bool k_ = %s;%s %s = lo_; %s = hi_;%s }",
                               iv_lo.c_str(), iv_hi.c_str(), bv.c_str(), sc, S(d).c_str(), S(d + 1).c_str(),
                               d == src::kExecLo ? " kexec = k_;" : d == 106 ? " kvcc = k_;" : ""));
         else line(fmt("{ uint lo_ = %s; bool k_ = %s;%s %s = lo_;%s }", iv_lo.c_str(), bv.c_str(), set_scc ? " scc = lo_ != 0u;" : "", S(d).c_str(),
@@ -1460,7 +1482,7 @@ bool Translator::emit_salu(const Instr& in, size_t idx) {
                 if (d == 106) sync_mask_from_int(106);
                 return true;
             }
-            if (W == 64)
+            if (W == 64 || ends(n, "_b64"))
                 line(fmt("{ uint ol_ = s126, oh_ = s127; uint lo_ = %s, hi_ = %s; bool k_ = %s; s126 = lo_; s127 = hi_; kexec = k_; scc = (lo_ | hi_) != 0u; %s = %s; %s = %s; }",
                          il.c_str(), ih.c_str(), ib.c_str(), S(d).c_str(), wr ? "lo_" : "ol_", S(d + 1).c_str(), wr ? "hi_" : "oh_"));
             else
@@ -1484,7 +1506,7 @@ bool Translator::emit_salu(const Instr& in, size_t idx) {
                 line("  if (t_ == 0xffffffffu) {   // outside this program: park the lanes");
                 emit_park();
                 line(fmt("    pc = %zuu;", block_of[in.offset + 4]));
-                line("  } else pc = t_; }");
+                line(opt.raw_stats ? "  } else { pc = t_; if (kexec) dbg_add(27u); } }" : "  } else pc = t_; }");
             } else line(opt.raw_stats ? "  pc = jump_case(tlo_, thi_); if (pc == 0xffffffffu) dbg_set2(3u, tlo_, thi_); }" : "  pc = jump_case(tlo_, thi_); }");
             jumped = true;
             return true;
@@ -2324,7 +2346,12 @@ bool Translator::emit_mubuf(const Instr& in, size_t idx) {
         std::string voff = in.offen ? V(in.idxen ? va + 1 : va) : "0u";
         std::string so = rd(in.soffset, in);
         const std::string d0 = S(in.srsrc), d1 = S(in.srsrc + 1);
-        line(fmt("if (kexec) { uint off_ = %s + %s + %uu + %s * ((%s >> 16) & 0x3fffu);", voff.c_str(), so.c_str(), uint32_t(in.offset_imm), vidx.c_str(), d1.c_str()));
+        if (opt.raw_tid_buffers && cnt == 1) {
+            line(fmt("if (kexec) { uint off_ = %s + %uu + %s * ((%s >> 16) & 0x3fffu);", voff.c_str(), uint32_t(in.offset_imm), vidx.c_str(), d1.c_str()));
+            line(fmt("  if ((%s & 0x800000u) != 0u) off_ = (off_ & ~3u) * WAVE + LG * 4u + (off_ & 3u);   // ADD_TID_ENABLE: swizzled per lane", S(in.srsrc + 3).c_str()));
+            line(fmt("  off_ += %s;", so.c_str()));
+        } else
+            line(fmt("if (kexec) { uint off_ = %s + %s + %uu + %s * ((%s >> 16) & 0x3fffu);", voff.c_str(), so.c_str(), uint32_t(in.offset_imm), vidx.c_str(), d1.c_str()));
         line(fmt("  uint lo_ = %s + off_, hi_ = (%s & 0xffffu) + (lo_ < %s ? 1u : 0u);", d0.c_str(), d1.c_str(), d0.c_str()));
         bool store = has(n, "_store_");
         if (!store) { std::vector<std::string> d; for (unsigned k = 0; k < cnt; k++) d.push_back(V(in.vdata + k)); gm_read_n(d); }
@@ -3473,10 +3500,10 @@ std::string Translator::generate() {
         std::string ln = last.name;
         if (ln == "s_cbranch_scc0") return "!scc";
         if (ln == "s_cbranch_scc1") return "scc";
-        if (ln == "s_cbranch_vccz") return "(s106 | s107) == 0u";
-        if (ln == "s_cbranch_vccnz") return "(s106 | s107) != 0u";
-        if (ln == "s_cbranch_execz") return "(s126 | s127) == 0u";
-        if (ln == "s_cbranch_execnz") return "(s126 | s127) != 0u";
+        if (ln == "s_cbranch_vccz") return W == 64 ? "(s106 | s107) == 0u" : "s106 == 0u";
+        if (ln == "s_cbranch_vccnz") return W == 64 ? "(s106 | s107) != 0u" : "s106 != 0u";
+        if (ln == "s_cbranch_execz") return W == 64 ? "(s126 | s127) == 0u" : "s126 == 0u";
+        if (ln == "s_cbranch_execnz") return W == 64 ? "(s126 | s127) != 0u" : "s126 != 0u";
         fail(ln + " not supported");
         return "false";
     };
@@ -3819,6 +3846,11 @@ std::string Translator::generate() {
         if ((meta.rsrc2 & 1) && !opt.raw_scratch_offset.empty())   // SCRATCH_EN: the scratch wave offset follows
             init += fmt("  s%u = %s;   // scratch wave offset\n", s++, opt.raw_scratch_offset.c_str());
         if (opt.raw_stats) init += "  DBGB = RC0_d[1].y; dbg_add(0u);\n";
+        if (opt.raw_park)   // most waves of most programs have nothing to do in the rounds after the first
+            init += fmt("  if ((RC0_d[1].z & 0xffu) != 0u) {   // later rounds: only waves with a lane parked on this program's code run\n"
+                        "    uint l_ = %s; bool r_ = false;\n"
+                        "    if (l_ < RC0_d[1].w) { uint2 h_ = RTST.Load2(l_ * %uu); r_ = h_.y == RC0_d[1].z && jump_case(h_.x << 8, h_.x >> 24) != 0xffffffffu; }\n"
+                        "    if (!WaveActiveAnyTrue(r_)) return;\n  }\n", park_lane().c_str(), 8 + 4 * opt.raw_park_vgprs);
         for (unsigned k = 0; k < meta.tid_comps(); k++) init += fmt("  v%u = tid_.%c;\n", k, "xyz"[k]);
     } else if (c.kind == ProgramKind::PS) {
         h << "struct PSIn {\n";

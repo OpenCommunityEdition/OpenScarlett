@@ -38,6 +38,11 @@ struct RtLinked {
     // Parking (TranslateOptions::raw_park): set by RtSpace::program.
     bool park = false;
     uint32_t park_ptr_vgpr = 0, resume_at = 0, park_from = 0, park_to = 0;
+    // The VGPR holding the scheduler's traversal pointers (-1: not found, or no traversal code in the
+    // program). The runtime table gives one traversal for the pipeline; a program holds only its
+    // collection's traversal sections, so its scheduler is given those instead (any traversal
+    // section serves any shader: they call hit and miss shaders by pointer).
+    int trav_vgpr = -1;
     bool stats = false;   // debug counters (TranslateOptions::raw_stats)
     unsigned loop_guard = 0;   // dispatcher steps per invocation (0: the translator's default)
 };
@@ -90,7 +95,12 @@ bool rt_link(const std::vector<std::vector<uint8_t>>& blobs, RtLinked& out, std:
 // [4] stack bytes per wave (scratch wave offset = flat group index * [4]), [6] parking tag
 // (serial << 8 | round), [7] parked-lane capacity.
 constexpr uint32_t kRtRootConstants = 8;
-constexpr uint32_t kRtStackSlots = 16384;
+constexpr uint32_t kRtStackSlots = 32768;
+// Bytes of one wave's stack slot. The stack descriptor adds the lane to the index of a swizzled
+// buffer (dword offsets interleaved over the 32 lanes), so everything takes 32 times its per-lane
+// size: a 0x200-byte header, the ray stacks, and above them the frames functions save registers
+// to (offsets up to 656 bytes seen).
+constexpr uint32_t rt_wave_stack_bytes(uint32_t perLane) { return 0x200 + 32 * (((perLane + 15) & ~15u) + 704); }
 constexpr uint32_t kRtParkVgprs = 64, kRtParkStride = 8 + 4 * kRtParkVgprs;   // parked-lane record (TranslateOptions::raw_park)   // per-wave stack slots (the scratch offset wraps)
 TranslateOptions rt_translate_options(const RtLinked& l);
 // Shader-cache key of a program (rt_<key>.dxil): the code it includes (offsets and contents),

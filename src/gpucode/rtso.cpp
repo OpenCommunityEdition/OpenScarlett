@@ -232,7 +232,7 @@ bool RtSpace::link(const std::vector<int>& ids, RtLinked& out, std::string* err)
 // The scheduler's resume point for parked rays: the pointer VGPR is the one v_readfirstlane_b32
 // reads before the first s_swappc_b64; the resume point is the s_and_saveexec_b32 after the first
 // "v_cmp_lt_i32 vcc, 0, <pointer>" (lanes with a pointer > 0 enter the loop there).
-static bool park_info(const std::vector<uint32_t>& img, uint32_t main, uint32_t* ptr, uint32_t* resume) {
+static bool park_info(const std::vector<uint32_t>& img, uint32_t main, uint32_t* ptr, uint32_t* resume, int* trav) {
     std::vector<Instr> v;
     for (size_t i = main / 4; i < img.size() && v.size() < 600;) {
         Instr in;
@@ -248,6 +248,11 @@ static bool park_info(const std::vector<uint32_t>& img, uint32_t main, uint32_t*
             if (v[j].name && !strcmp(v[j].name, "v_readfirstlane_b32") && v[j].src0 >= 256) p = v[j].src0 - 256;
     }
     if (p < 0) return false;
+    // The traversal pointers: one per lane in a VGPR the scheduler reads with v_readlane (lane =
+    // traversal variant) when a shader asks for a trace.
+    *trav = -1;
+    for (auto& in : v)
+        if (in.name && !strcmp(in.name, "v_readlane_b32") && in.src0 >= 256) { *trav = in.src0 - 256; break; }
     for (size_t k = 0; k < v.size(); k++) {
         auto& in = v[k];
         if (!in.name || strcmp(in.name, "v_cmp_lt_i32") || in.fmt != Fmt::VOPC || in.src0 != 128 || in.src1 != 256 + p) continue;
@@ -264,8 +269,10 @@ static bool park_info(const std::vector<uint32_t>& img, uint32_t main, uint32_t*
 bool RtSpace::program(int id, RtLinked& out, std::string* err) const {
     if (!link({id}, out, err)) return false;
     uint32_t ptr, resume;
-    if (!park_info(out.image, out.main, &ptr, &resume)) { if (err) *err = "scheduler not understood"; return false; }
+    int trav;
+    if (!park_info(out.image, out.main, &ptr, &resume, &trav)) { if (err) *err = "scheduler not understood"; return false; }
     out.park = true;
+    out.trav_vgpr = out.traversal.empty() ? -1 : trav;
     out.park_ptr_vgpr = ptr;
     out.resume_at = resume;
     out.park_from = out.main;
@@ -282,7 +289,7 @@ bool rt_link(const std::vector<std::vector<uint8_t>>& blobs, RtLinked& out, std:
 }
 
 uint64_t rt_cache_key(const RtLinked& l, const std::string& salt) {
-    uint64_t key = fnv("rt8", 3, 1469598103934665603ull);   // bump when the translation of these programs changes
+    uint64_t key = fnv("rt15", 4, 1469598103934665603ull);   // bump when the translation of these programs changes
     key = fnv(salt.data(), salt.size(), key);
     for (auto& sg : l.segs) {
         key = fnv(&sg.address, 8, key);
@@ -315,12 +322,18 @@ TranslateOptions rt_translate_options(const RtLinked& l) {
     o.raw_park_from = l.park_from;
     o.raw_park_to = l.park_to;
     o.raw_park_vgprs = kRtParkVgprs;
+    if (l.trav_vgpr >= 0 && !l.traversal.empty()) {   // the program's own traversal (see RtLinked::trav_vgpr)
+        o.raw_trav_vgpr = (uint32_t)l.trav_vgpr;
+        for (size_t k = 0; k < 3; k++) o.raw_trav[k] = uint32_t(l.traversal[std::min(k, l.traversal.size() - 1)] >> 8);
+    }
     o.raw_rsrc2 = 1 | (4 << 1) | (7 << 7);   // scratch, 4 user SGPRs (runtime table pointer), group ids x/y/z
     o.raw_root_constants = 4;
     o.raw_numthreads = 32;
     o.raw_entry = l.main;
-    // Stack slots: the flat group index modulo kRtStackSlots (far more slots than waves in flight).
-    o.raw_scratch_offset = "((((gid_.z * RC0_d[0].w + gid_.y) * RC0_d[0].z + gid_.x) % 16384u) * RC0_d[1].x)";
+    // Stack slots: the flat group index modulo kRtStackSlots (lanes parked between rounds keep their
+    // stack: a dispatch of more waves than slots would mix them).
+    o.raw_scratch_offset = "((((gid_.z * RC0_d[0].w + gid_.y) * RC0_d[0].z + gid_.x) % " + std::to_string(kRtStackSlots) + "u) * RC0_d[1].x)";
+    o.raw_tid_buffers = true;
     return o;
 }
 
