@@ -65,6 +65,8 @@ System32 or the registry. Logs go to the console, or to a file with `XSL_LOG_FIL
 
 ### Minecraft Preview
 
+https://github.com/user-attachments/assets/c82c22e9-eafd-4a22-b8ca-fed18cf52263
+
 1. **Edition files.** This version was built with the March 2022 GDK (GXDK 220300). Collect that
    edition's two files from your own GDK installs and point the build at them (see
    [docs/sdk-editions.md](docs/sdk-editions.md)):
@@ -81,6 +83,8 @@ System32 or the registry. Logs go to the console, or to a file with `XSL_LOG_FIL
 Known gaps: no audio, no speech synthesis, no game streaming.
 
 ### The Matrix Awakens: An Unreal Engine 5 Experience
+
+https://github.com/user-attachments/assets/7e01f974-c23e-4f67-9e05-39103014cb84
 
 1. **Windows 10/11 with a recent NVIDIA GPU** (tested on an RTX 5090). Linux is untested for this
    title.
