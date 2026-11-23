@@ -317,9 +317,10 @@ private:
     // XSL_DSTORAGE_TRACE=1: each request (first 400): source, sizes, options, the first output
     // bytes and the result.
     static void trace_request(const Command& c, HRESULT hr) {
-        static bool on = [] { char b[4]; return GetEnvironmentVariableA("XSL_DSTORAGE_TRACE", b, 4) && b[0] == '1'; }();
+        // XSL_DSTORAGE_TRACE=1 (first 400 requests) or =<n> (first n)
+        static long limit = [] { char b[16]; return GetEnvironmentVariableA("XSL_DSTORAGE_TRACE", b, sizeof b) ? std::max(atol(b) == 1 ? 400L : atol(b), 0L) : 0L; }();
         static volatile long n = 0;
-        if (!on || InterlockedIncrement(&n) > 400) return;
+        if (!limit || InterlockedIncrement(&n) > limit) return;
         const DSTORAGE_REQUEST& r = c.request;
         char head[40] = "";
         if (SUCCEEDED(hr) && !r.Options.DestinationIsPhysicalPages && r.Destination && r.DestinationSize)

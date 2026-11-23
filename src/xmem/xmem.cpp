@@ -19,6 +19,7 @@
 #include <cstring>
 
 #include <map>
+#include <set>
 #include <mutex>
 #include <vector>
 
@@ -29,6 +30,10 @@
 namespace {
 constexpr SIZE_T kPage = 64 * 1024;
 constexpr SIZE_T kPagesPerChunk = 4096;  // 256 MB sections
+// Page numbers given to the title are 4 KB frame numbers, as on the console: a 64 KB page's number
+// is a multiple of 16. Titles rely on it (one keeps its page table with the low four bits dropped;
+// with consecutive numbers, sixteen addresses shared one page).
+constexpr ULONG_PTR kFramesPerPage = 16;
 
 DWORD pc_protect(DWORD p) {
     p &= ~(DWORD)(PAGE_GRAPHICS_NOACCESS | PAGE_GRAPHICS_READONLY | PAGE_GRAPHICS_READWRITE | PAGE_GRAPHICS_EXECUTE |
@@ -93,11 +98,32 @@ bool in_placeholder(uintptr_t va) {
     return va < it->first + it->second;
 }
 
+// Which physical page is mapped where. A page must never be handed out while a view of it exists:
+// the new owner's writes would show through the old address (a title's shader blobs were
+// overwritten by file reads into another buffer). Pages the layer took itself for a commit
+// (g_owned) return to the free list when their address is decommitted; pages a title frees while
+// still mapped wait (g_zombie) until the view goes.
+// XSL_XMEM_TRACE=<n>: logs the first n XMem calls of the title, and every page mapped twice.
+long g_trace_left = [] { const char* e = getenv("XSL_XMEM_TRACE"); return e ? atol(e) : 0; }();
+bool trace_on() { return g_trace_left != 0; }
+bool trace_take() { return g_trace_left > 1 && InterlockedDecrement(&g_trace_left) > 0; }
+std::map<uintptr_t, ULONG_PTR> g_va_page;
+std::map<ULONG_PTR, int> g_page_views;
+std::set<ULONG_PTR> g_owned, g_zombie;
+void release_va(uintptr_t va) {
+    auto it = g_va_page.find(va);
+    if (it == g_va_page.end()) return;
+    ULONG_PTR page = it->second;
+    g_va_page.erase(it);
+    if (--g_page_views[page] > 0) return;
+    g_page_views.erase(page);
+    if (g_owned.erase(page) || g_zombie.erase(page)) g_free.push_back(page);
+}
 // Make [va, va+kPage) its own placeholder (splitting the enclosing one) and map `page` there.
 bool map_one(uintptr_t va, ULONG_PTR page) {
     MEMORY_BASIC_INFORMATION mbi{};
     VirtualQuery((void*)va, &mbi, sizeof mbi);
-    if (mbi.Type == MEM_MAPPED) UnmapViewOfFile2(GetCurrentProcess(), (void*)va, MEM_PRESERVE_PLACEHOLDER);
+    if (mbi.Type == MEM_MAPPED) { UnmapViewOfFile2(GetCurrentProcess(), (void*)va, MEM_PRESERVE_PLACEHOLDER); release_va(va); }
     VirtualQuery((void*)va, &mbi, sizeof mbi);
     if (mbi.RegionSize > kPage || (uintptr_t)mbi.BaseAddress != va) {
         // Split the placeholder so this 64 KB unit stands alone.
@@ -112,6 +138,13 @@ bool map_one(uintptr_t va, ULONG_PTR page) {
     if (p != (void*)va) {
         XSL_ERR(CH, "MapViewOfFile3 at %p failed (%lu)", (void*)va, GetLastError());
         return false;
+    }
+    g_va_page[va] = page;
+    if (g_page_views[page]++ > 0 && trace_on()) {
+        uintptr_t other = 0;
+        for (auto& [a, pg] : g_va_page) if (pg == page && a != va) { other = a; break; }
+        XSL_INFO(CH, "trace: page %llu now mapped at %p and %p (owned %d, zombie %d)", (unsigned long long)page, (void*)other, (void*)va,
+                 (int)g_owned.count(page), (int)g_zombie.count(page));
     }
     return true;
 }
@@ -153,7 +186,13 @@ XMEM_ALLOCATION_HOOKS g_setHooks{};
 
 extern "C" {
 
+static PVOID WINAPI XMemVirtualAlloc_(PVOID base, SIZE_T size, DWORD type, ULONGLONG flags, DWORD protect);
 PVOID WINAPI XMemVirtualAlloc(PVOID base, SIZE_T size, DWORD type, ULONGLONG flags, DWORD protect) {
+    PVOID r = XMemVirtualAlloc_(base, size, type, flags, protect);
+    if (trace_take()) XSL_INFO(CH, "trace: XMemVirtualAlloc(%p, %zx, type %lx, flags %llx, protect %lx) = %p", base, size, type, flags, protect, r);
+    return r;
+}
+static PVOID WINAPI XMemVirtualAlloc_(PVOID base, SIZE_T size, DWORD type, ULONGLONG flags, DWORD protect) {
     bool large = (type & (MEM_2MB_PAGES | MEM_PHYSICAL)) != 0;  // MEM_64K_PAGES = MEM_2MB_PAGES | MEM_PHYSICAL
     // MEM_REPLACE_PLACEHOLDER (with MEM_RESERVE, without a commit): the console turns (part of) a
     // placeholder into a reservation for physical pages. Here the placeholder already is one; XMemMapPhysicalPages maps
@@ -228,6 +267,7 @@ PVOID WINAPI XMemVirtualAlloc(PVOID base, SIZE_T size, DWORD type, ULONGLONG fla
                 if (g_free.empty() && !grow()) { SetLastError(ERROR_NOT_ENOUGH_MEMORY); return nullptr; }
                 ULONG_PTR page = g_free.back();
                 g_free.pop_back();
+                g_owned.insert(page);
                 if (!map_one(va, page)) return nullptr;
                 memset((void*)va, 0, kPage);  // committed memory reads as zero
             }
@@ -247,24 +287,31 @@ PVOID WINAPI XMemVirtualAlloc(PVOID base, SIZE_T size, DWORD type, ULONGLONG fla
     return p;
 }
 
-BOOL WINAPI XMemAllocatePhysicalPages(ULONGLONG, PULONG_PTR count, PULONG_PTR pages) {
+BOOL WINAPI XMemAllocatePhysicalPages(ULONGLONG fl, PULONG_PTR count, PULONG_PTR pages) {
+    if (trace_take()) XSL_INFO(CH, "trace: XMemAllocatePhysicalPages(flags %llx, %llu pages)", fl, (unsigned long long)*count);
     std::lock_guard<std::mutex> g(g_mu);
     while (g_free.size() < *count)
         if (!grow()) { *count = 0; SetLastError(ERROR_NOT_ENOUGH_MEMORY); return FALSE; }
-    for (ULONG_PTR i = 0; i < *count; i++) { pages[i] = g_free.back(); g_free.pop_back(); }
+    for (ULONG_PTR i = 0; i < *count; i++) { pages[i] = g_free.back() * kFramesPerPage; g_free.pop_back(); }
     return TRUE;
 }
 
 BOOL WINAPI XMemFreePhysicalPages(ULONG_PTR count, PULONG_PTR pages) {
+    if (trace_take()) XSL_INFO(CH, "trace: XMemFreePhysicalPages(%llu pages, first %llu)", (unsigned long long)count, (unsigned long long)(count ? pages[0] : 0));
     std::lock_guard<std::mutex> g(g_mu);
-    for (ULONG_PTR i = 0; i < count; i++) g_free.push_back(pages[i]);
+    for (ULONG_PTR i = 0; i < count; i++) {
+        ULONG_PTR pg = pages[i] / kFramesPerPage;
+        if (g_page_views.count(pg)) g_zombie.insert(pg);   // still mapped: free once the view goes
+        else g_free.push_back(pg);
+    }
     return TRUE;
 }
 
 PVOID WINAPI XMemMapPhysicalPages(PVOID va, ULONG_PTR count, PULONG_PTR pages) {
+    if (trace_take()) XSL_INFO(CH, "trace: XMemMapPhysicalPages(%p, %llu pages, first %lld)", va, (unsigned long long)count, pages && count ? (long long)pages[0] : -1ll);
     std::lock_guard<std::mutex> g(g_mu);
     if (in_private_graphics((uintptr_t)va)) {   // memory already there (see g_private_graphics)
-        for (ULONG_PTR i = 0; pages && i < count; i++) note_private_page((uintptr_t)va + i * kPage, pages[i]);
+        for (ULONG_PTR i = 0; pages && i < count; i++) note_private_page((uintptr_t)va + i * kPage, pages[i] / kFramesPerPage);
         return va;
     }
     if (!in_placeholder((uintptr_t)va)) {
@@ -273,18 +320,19 @@ PVOID WINAPI XMemMapPhysicalPages(PVOID va, ULONG_PTR count, PULONG_PTR pages) {
         return nullptr;
     }
     for (ULONG_PTR i = 0; i < count; i++)
-        if (!map_one((uintptr_t)va + i * kPage, pages ? pages[i] : (ULONG_PTR)-1)) return nullptr;
+        if (!map_one((uintptr_t)va + i * kPage, pages ? pages[i] / kFramesPerPage : (ULONG_PTR)-1)) return nullptr;
     return va;
 }
 
 BOOL WINAPI XMemMapPhysicalPagesScatter(PVOID* vas, ULONG_PTR count, PULONG_PTR pages) {
+    if (trace_take()) XSL_INFO(CH, "trace: XMemMapPhysicalPagesScatter(%llu pages, first %p <- %lld)", (unsigned long long)count, count ? vas[0] : nullptr, pages && count ? (long long)pages[0] : -1ll);
     std::lock_guard<std::mutex> g(g_mu);
     for (ULONG_PTR i = 0; i < count; i++) {
         if (in_private_graphics((uintptr_t)vas[i])) {
-            if (pages) note_private_page((uintptr_t)vas[i], pages[i]);
+            if (pages) note_private_page((uintptr_t)vas[i], pages[i] / kFramesPerPage);
             continue;
         }
-        if (!map_one((uintptr_t)vas[i], pages ? pages[i] : (ULONG_PTR)-1)) return FALSE;
+        if (!map_one((uintptr_t)vas[i], pages ? pages[i] / kFramesPerPage : (ULONG_PTR)-1)) return FALSE;
     }
     return TRUE;
 }
@@ -425,6 +473,7 @@ BOOL WINAPI xsl_xmem_write_watch(void* base, SIZE_T size) {
         if (mbi.Type == MEM_MAPPED) {
             memcpy(&keep[va - b], (void*)va, kPage);
             UnmapViewOfFile2(GetCurrentProcess(), (void*)va, MEM_PRESERVE_PLACEHOLDER);
+            release_va(va);
         } else if (mbi.State != MEM_RESERVE) {
             XSL_WARN(CH, "write watch for %p+%zu: %p is neither mapped nor a placeholder", base, size, (void*)va);
             return FALSE;
@@ -447,6 +496,36 @@ BOOL WINAPI xsl_xmem_write_watch(void* base, SIZE_T size) {
     memcpy(base, keep.data(), size);
     ResetWriteWatch(base, size);
     XSL_INFO(CH, "%p+%zu: now write-watched memory (descriptor heap memory from the title)", base, size);
+    return TRUE;
+}
+
+// Layer-private export: VirtualFree on memory inside an XMem placeholder reservation (the platform
+// DLL routes the title's VirtualFree here). Decommit unmaps the 64 KB views (VirtualFree cannot) and
+// frees the pages the layer took for them; a release of a whole reservation unmaps everything first.
+// Returns FALSE when the address is not XMem's (the caller then calls the real VirtualFree).
+BOOL WINAPI xsl_xmem_virtual_free(void* base, SIZE_T size, DWORD type, BOOL* result) {
+    if (trace_take()) XSL_INFO(CH, "trace: VirtualFree(%p, %zx, type %lx)", base, size, type);
+    std::lock_guard<std::mutex> g(g_mu);
+    uintptr_t b = (uintptr_t)base;
+    if (!in_placeholder(b) || (type & (MEM_PRESERVE_PLACEHOLDER | MEM_COALESCE_PLACEHOLDERS))) return FALSE;
+    if (in_private_graphics(b)) {   // private memory: stays committed (the GPU imported it)
+        if (type & MEM_DECOMMIT) { *result = TRUE; return TRUE; }
+        return FALSE;
+    }
+    auto it = std::prev(g_placeholders.upper_bound(b));
+    uintptr_t start = b & ~(uintptr_t)(kPage - 1), end;
+    if (type & MEM_DECOMMIT) end = size ? (b + size + kPage - 1) & ~(uintptr_t)(kPage - 1) : it->first + it->second;
+    else { start = it->first; end = it->first + it->second; if (b != it->first) return FALSE; }
+    for (auto v = g_va_page.lower_bound(start); v != g_va_page.end() && v->first < end;) {
+        uintptr_t va = v->first;
+        ++v;
+        UnmapViewOfFile2(GetCurrentProcess(), (void*)va, MEM_PRESERVE_PLACEHOLDER);
+        release_va(va);
+    }
+    if (type & MEM_DECOMMIT) { *result = TRUE; return TRUE; }
+    VirtualFree((void*)start, end - start, MEM_RELEASE | MEM_COALESCE_PLACEHOLDERS);
+    *result = VirtualFree((void*)start, 0, MEM_RELEASE);
+    g_placeholders.erase(it);
     return TRUE;
 }
 

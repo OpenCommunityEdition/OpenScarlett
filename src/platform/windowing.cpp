@@ -62,7 +62,23 @@ ATOM remember(ATOM atom, WNDPROC proc) {
     return atom;
 }
 
+// Console titles have no input method editor. On a PC the text-input framework attaches to the
+// title's window when it gets the focus and can keep the thread in DispatchMessage for a long time
+// (one title's watchdog ended the process after 30 s there): the IME is turned off for the process
+// before its first window class exists. XSL_IME=1 keeps it.
+void disable_ime() {
+    static bool done = false;
+    if (done) return;
+    done = true;
+    char b[4];
+    if (GetEnvironmentVariableA("XSL_IME", b, 4) && b[0] == '1') return;
+    HMODULE imm = LoadLibraryW(L"imm32.dll");
+    auto fn = imm ? (BOOL(WINAPI*)(DWORD))GetProcAddress(imm, "ImmDisableIME") : nullptr;
+    if (fn && fn((DWORD)-1)) XSL_INFO("platform", "input method editor disabled for the title's windows");
+}
+
 ATOM WINAPI Xsl_RegisterClassExW(const WNDCLASSEXW* a) {
+    disable_ime();
     if (!a) return RegisterClassExW(a);
     WNDCLASSEXW w = *a;
     w.lpfnWndProc = close_wrapper;
@@ -70,6 +86,7 @@ ATOM WINAPI Xsl_RegisterClassExW(const WNDCLASSEXW* a) {
 }
 
 ATOM WINAPI Xsl_RegisterClassExA(const WNDCLASSEXA* a) {
+    disable_ime();
     if (!a) return RegisterClassExA(a);
     if (!g_ansi_as_unicode) {
         WNDCLASSEXA c = *a;

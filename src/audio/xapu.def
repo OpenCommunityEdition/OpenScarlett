@@ -1,8 +1,8 @@
 LIBRARY xapu.dll
 EXPORTS
-    XApuConnect=xsl_no_device
-    XApuDisconnect=xsl_ok
-    XApuEnqueueCommand=xsl_no_device
-    XApuDequeueResult=xsl_no_device
-    XApuGetResultCount=xsl_zero
-    XApuGetUtilization=xsl_no_device
+    XApuConnect
+    XApuDisconnect
+    XApuEnqueueCommand
+    XApuDequeueResult
+    XApuGetResultCount
+    XApuGetUtilization

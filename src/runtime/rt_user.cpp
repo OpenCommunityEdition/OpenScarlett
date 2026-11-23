@@ -98,7 +98,10 @@ HRESULT M_XUserGetTokenAndSignatureAsync(void*, XUserHandle, XUserGetTokenAndSig
     if (InterlockedIncrement(&n) <= 8)
         XSL_INFO(CH, "XUserGetTokenAndSignatureAsync(%s %s, options %#x): offline, failing deterministically", method ? method : "?",
                  url ? url : "?", (unsigned)opts);
-    return xsl_async_immediate(async, kTokenIdentity, "XUserGetTokenAndSignatureAsync", E_GAMEUSER_RESOLVE_USER_ISSUE_REQUIRED, nullptr, 0);
+    // A terminal failure. E_GAMEUSER_RESOLVE_USER_ISSUE_REQUIRED would send the title to
+    // XUserResolveIssueWithUiAsync (not implemented) and back here, in a loop; with this code the
+    // sign-in attempt fails once and the title's own retry pacing applies.
+    return xsl_async_immediate(async, kTokenIdentity, "XUserGetTokenAndSignatureAsync", E_GAMEUSER_FAILED_TO_GET_TOKEN, nullptr, 0);
 }
 bool M_XUserIsStoreUser(void*, XUserHandle) { return true; }
 }  // namespace

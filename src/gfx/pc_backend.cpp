@@ -12,6 +12,9 @@
 #include <map>
 #include <unordered_map>
 #include <set>
+#include <thread>
+#include <windows.h>
+#include <tlhelp32.h>
 #include <deque>
 #include <mutex>
 #include <string>
@@ -273,7 +276,145 @@ static void crash_dump(EXCEPTION_POINTERS* e) {
     CloseHandle(f);
     XSL_ERR(CH, "exception %08lx at exe+%llx: dump %s %s", c, (unsigned long long)(a - b), path, ok ? "written" : "failed");
 }
+// XSL_TRAP=<rva>,... (diagnostics, at most four): hardware execution breakpoints (debug registers;
+// the title's code is not modified) on every thread of the process. Each hit logs the registers and
+// the XSL_TRAP_PEEK items, [*]reg+off:len (a leading * reads the pointer stored there first);
+// XSL_TRAP_MAX hits per address (default 20) are logged, after which the trap stays silent.
+static uintptr_t g_trap[4];
+static int g_ntrap = 0;
+// XSL_TRAP_WATCH=<reg>[+off]: at the first hit of the first trap, the page of that address becomes
+// read-only; each later write by code to the first 64 bytes there logs the writer and a stack
+// (first 16), and file reads into the page fail.
+static volatile uintptr_t g_watch = 0;
+static volatile long g_watch_gen = 0;
+static volatile long g_trap_hits[4];
+static void trap_arm(HANDLE th) {
+    CONTEXT c{};
+    c.ContextFlags = CONTEXT_DEBUG_REGISTERS;
+    if (!GetThreadContext(th, &c)) return;
+    DWORD64* dr[4] = {&c.Dr0, &c.Dr1, &c.Dr2, &c.Dr3};
+    for (int i = 0; i < g_ntrap; i++) { *dr[i] = g_trap[i]; c.Dr7 |= 1ull << (2 * i); c.Dr7 &= ~(0xFull << (16 + 4 * i)); }
+    SetThreadContext(th, &c);
+}
+static void trap_watch() {
+    std::set<DWORD> armed;
+    long gen = 0;
+    for (;;) {
+        if (gen != g_watch_gen) { gen = g_watch_gen; armed.clear(); }   // a watch was set: every thread again
+        HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+        if (snap != INVALID_HANDLE_VALUE) {
+            THREADENTRY32 te{sizeof te};
+            for (BOOL ok = Thread32First(snap, &te); ok; ok = Thread32Next(snap, &te)) {
+                if (te.th32OwnerProcessID != GetCurrentProcessId() || te.th32ThreadID == GetCurrentThreadId() || armed.count(te.th32ThreadID)) continue;
+                HANDLE th = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_SET_CONTEXT, FALSE, te.th32ThreadID);
+                if (!th) continue;
+                if (SuspendThread(th) != (DWORD)-1) { trap_arm(th); ResumeThread(th); }
+                CloseHandle(th);
+                armed.insert(te.th32ThreadID);
+            }
+            CloseHandle(snap);
+        }
+        Sleep(20);
+    }
+}
+static void trap_start() {
+    char b[256];
+    if (!GetEnvironmentVariableA("XSL_TRAP", b, sizeof b)) return;
+    uintptr_t base = (uintptr_t)GetModuleHandleW(nullptr);
+    for (char* it = strtok(b, ","); it && g_ntrap < 3; it = strtok(nullptr, ",")) g_trap[g_ntrap++] = base + _strtoui64(it, nullptr, 16);
+    if (g_ntrap) std::thread(trap_watch).detach();
+    XSL_INFO(CH, "%d hardware trap(s) armed on the title's threads", g_ntrap);
+}
+static bool trap_hit(EXCEPTION_POINTERS* e) {
+    static thread_local bool stepping = false;
+    if (g_watch && e->ExceptionRecord->ExceptionCode == 0xC0000005 && e->ExceptionRecord->NumberParameters >= 2 && e->ExceptionRecord->ExceptionInformation[0] == 1 &&
+        (e->ExceptionRecord->ExceptionInformation[1] & ~0xFFFull) == (g_watch & ~0xFFFull)) {
+        uintptr_t wa = (uintptr_t)e->ExceptionRecord->ExceptionInformation[1];
+        static volatile long n = 0;
+        if (wa >= g_watch && wa < g_watch + 64 && InterlockedIncrement(&n) <= 16) {
+            void* frames[24];
+            USHORT k = RtlCaptureStackBackTrace(0, 24, frames, nullptr);
+            std::string t;
+            for (USHORT f = 0; f < k; f++) {
+                HMODULE m = nullptr;
+                char name[MAX_PATH] = "?", buf[MAX_PATH + 32];
+                if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCSTR)frames[f], &m)) {
+                    GetModuleFileNameA(m, name, MAX_PATH);
+                    const char* bn = strrchr(name, '\\');
+                    snprintf(buf, sizeof buf, " %s+%llx", bn ? bn + 1 : name, (unsigned long long)((uint8_t*)frames[f] - (uint8_t*)m));
+                    t += buf;
+                }
+            }
+            XSL_ERR(CH, "watch: write to %llx (thread %lu), rip %llx, rcx %llx rdx %llx r8 %llx; stack:%s", (unsigned long long)wa, GetCurrentThreadId(),
+                    (unsigned long long)e->ContextRecord->Rip, e->ContextRecord->Rcx, e->ContextRecord->Rdx, e->ContextRecord->R8, t.c_str());
+        }
+        DWORD old;
+        VirtualProtect((void*)(g_watch & ~0xFFFull), 4096, PAGE_READWRITE, &old);
+        e->ContextRecord->EFlags |= 0x100;   // one instruction, then read-only again
+        stepping = true;
+        return true;
+    }
+    if (stepping && e->ExceptionRecord->ExceptionCode == 0x80000004) {
+        stepping = false;
+        DWORD old;
+        VirtualProtect((void*)(g_watch & ~0xFFFull), 4096, PAGE_READONLY, &old);
+        return true;
+    }
+    if (e->ExceptionRecord->ExceptionCode != 0x80000004 || !g_ntrap) return false;
+    CONTEXT* c = e->ContextRecord;
+    uintptr_t at = (uintptr_t)e->ExceptionRecord->ExceptionAddress;
+    int i = 0;
+    while (i < g_ntrap && g_trap[i] != at) i++;
+    if (i == g_ntrap) return false;
+    if (i == 0 && !g_watch) {
+        char w[32];
+        if (GetEnvironmentVariableA("XSL_TRAP_WATCH", w, sizeof w)) {
+            const char* names[] = {"rax", "rcx", "rdx", "rbx", "rsp", "rbp", "rsi", "rdi", "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15"};
+            DWORD64 vals[] = {c->Rax, c->Rcx, c->Rdx, c->Rbx, c->Rsp, c->Rbp, c->Rsi, c->Rdi, c->R8, c->R9, c->R10, c->R11, c->R12, c->R13, c->R14, c->R15};
+            for (int k = 15; k >= 0; k--) {
+                size_t L = strlen(names[k]);
+                if (_strnicmp(w, names[k], L) || isalnum((unsigned char)w[L])) continue;
+                g_watch = (uintptr_t)(vals[k] + (w[L] == '+' ? _strtoui64(w + L + 1, nullptr, 16) : 0));
+                // The page becomes read-only: writes by code fault (logged below, then allowed for
+                // one instruction), writes by the kernel (file reads) fail with ERROR_NOACCESS.
+                DWORD old;
+                VirtualProtect((void*)(g_watch & ~0xFFFull), 4096, PAGE_READONLY, &old);
+                XSL_ERR(CH, "write watch set on %llx (page read-only; first bytes %016llx)", (unsigned long long)g_watch, *(unsigned long long*)g_watch);
+                break;
+            }
+        }
+    }
+    c->EFlags |= 0x10000;   // RF: resume without hitting the breakpoint again
+    static long maxHits = [] { char b[16]; return GetEnvironmentVariableA("XSL_TRAP_MAX", b, sizeof b) ? atol(b) : 20L; }();
+    if (InterlockedIncrement(&g_trap_hits[i]) > maxHits) return true;
+    uintptr_t base = (uintptr_t)GetModuleHandleW(nullptr);
+    XSL_ERR(CH, "trap exe+%llx (thread %lu): rax %llx rcx %llx rdx %llx rbx %llx rsp %llx rbp %llx rsi %llx rdi %llx r8 %llx r9 %llx r10 %llx r11 %llx r12 %llx r13 %llx r14 %llx r15 %llx",
+            (unsigned long long)(at - base), GetCurrentThreadId(), c->Rax, c->Rcx, c->Rdx, c->Rbx, c->Rsp, c->Rbp, c->Rsi, c->Rdi, c->R8, c->R9, c->R10, c->R11, c->R12, c->R13, c->R14, c->R15);
+    char pk[512];
+    if (GetEnvironmentVariableA("XSL_TRAP_PEEK", pk, sizeof pk)) {
+        const char* names[] = {"rax", "rcx", "rdx", "rbx", "rsp", "rbp", "rsi", "rdi", "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15"};
+        DWORD64 vals[] = {c->Rax, c->Rcx, c->Rdx, c->Rbx, c->Rsp, c->Rbp, c->Rsi, c->Rdi, c->R8, c->R9, c->R10, c->R11, c->R12, c->R13, c->R14, c->R15};
+        char* save = nullptr;
+        for (char* it = strtok_s(pk, ",", &save); it; it = strtok_s(nullptr, ",", &save)) {
+            bool deref = *it == '*';
+            char* q = it + (deref ? 1 : 0);
+            int r = -1;
+            for (int k = 0; k < 16; k++) if (!_strnicmp(q, names[k], strlen(names[k])) && !isalnum((unsigned char)q[strlen(names[k])])) { r = k; q += strlen(names[k]); break; }
+            if (r < 0) continue;
+            uint64_t off = *q == '+' ? _strtoui64(q + 1, &q, 16) : 0, len = *q == ':' ? _strtoui64(q + 1, &q, 16) : 16;
+            uintptr_t a = vals[r] + off;
+            if (deref) { if (IsBadReadPtr((void*)a, 8)) continue; a = *(uintptr_t*)a; }
+            len = std::min<uint64_t>(len, 64);
+            std::string hex;
+            if (!a || IsBadReadPtr((void*)a, (UINT_PTR)len)) hex = "(unreadable)";
+            else for (uint64_t k = 0; k < len; k++) { char h[4]; snprintf(h, sizeof h, "%02x", ((const uint8_t*)a)[k]); hex += h; }
+            XSL_ERR(CH, "  %s -> %llx: %s", it, (unsigned long long)a, hex.c_str());
+        }
+    }
+    return true;
+}
 static LONG CALLBACK note_exception(EXCEPTION_POINTERS* e) {
+    if (trap_hit(e)) return EXCEPTION_CONTINUE_EXECUTION;
     DWORD c = e->ExceptionRecord->ExceptionCode;
     crash_dump(e);
     if (c == 0xC00000FD) return EXCEPTION_CONTINUE_SEARCH;   // stack overflow: no stack left to log with
@@ -341,7 +482,7 @@ HRESULT_T create_device(PcObj* out) {
     select_agility_runtime();
     if (env_on("XSL_D3D12_DRED") || env_on("XSL_D3D12_DEBUG")) {
         static bool once = false;
-        if (!once) { once = true; AddVectoredExceptionHandler(1, note_exception); }
+        if (!once) { once = true; AddVectoredExceptionHandler(1, note_exception); trap_start(); }
     }
     HRESULT hr;
     if (env_on("XSL_D3D12_DRED")) {

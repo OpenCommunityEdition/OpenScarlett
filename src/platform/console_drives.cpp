@@ -247,21 +247,30 @@ BOOL WINAPI D_SetFileInformationByHandle(HANDLE h, FILE_INFO_BY_HANDLE_CLASS c, 
     }
     return SetFileInformationByHandle(h, c, info, size);
 }
-// XSL_FILE_TRACE=3: reads from .pak files (offset, size, how they completed), first 300.
+// XSL_FILE_TRACE=3: reads from .pak/.rpf archives (offset, size, how they completed), first 20000.
 bool pak_handle(HANDLE h) {
     wchar_t p[MAX_PATH * 2];
     DWORD n = GetFinalPathNameByHandleW(h, p, MAX_PATH * 2, 0);
-    return n > 4 && n < MAX_PATH * 2 && _wcsicmp(p + n - 4, L".pak") == 0;
+    return n > 4 && n < MAX_PATH * 2 && (_wcsicmp(p + n - 4, L".pak") == 0 || _wcsicmp(p + n - 4, L".rpf") == 0);
 }
 BOOL WINAPI D_ReadFile(HANDLE h, LPVOID buf, DWORD size, LPDWORD got, LPOVERLAPPED ov) {
     BOOL r = ReadFile(h, buf, size, got, ov);
     DWORD e = GetLastError();
+    if (!r && (e == ERROR_NOACCESS || e == ERROR_INVALID_USER_BUFFER)) {   // the destination is not writable (diagnostics: XSL_TRAP_WATCH)
+        static volatile long n = 0;
+        if (InterlockedIncrement(&n) <= 8)
+            XSL_INFO(CH, "ReadFile into %p (+%lu) at offset %llu failed: destination not writable (error %lu)", buf, size,
+                     ov ? ((unsigned long long)ov->OffsetHigh << 32 | ov->Offset) : ~0ull, e);
+    }
     if (trace_level() >= 3 && pak_handle(h)) {
         static volatile long n = 0;
-        if (InterlockedIncrement(&n) <= 300) {
+        if (InterlockedIncrement(&n) <= 20000) {
             unsigned long long off = ov ? ((unsigned long long)ov->OffsetHigh << 32 | ov->Offset) : ~0ull;
-            XSL_INFO(CH, "pak read @%llu size %lu: %s (error %lu, got %lu)", off, size, r ? "ok" : "pending/failed", r ? 0ul : e,
-                     got ? *got : 0ul);
+            wchar_t fp[MAX_PATH];
+            DWORD fn = GetFinalPathNameByHandleW(h, fp, MAX_PATH, 0);
+            const wchar_t* base = fn ? wcsrchr(fp, L'\\') : nullptr;
+            XSL_INFO(CH, "archive read %ls @%llu size %lu (%s): %s (error %lu, got %lu)", base ? base + 1 : L"?", off, size, ov ? "overlapped" : "file pointer",
+                     r ? "ok" : "pending/failed", r ? 0ul : e, got ? *got : 0ul);
         }
     }
     SetLastError(e);
@@ -272,12 +281,21 @@ BOOL WINAPI D_GetOverlappedResult(HANDLE h, LPOVERLAPPED ov, LPDWORD got, BOOL w
     DWORD e = GetLastError();
     if (trace_level() >= 3 && pak_handle(h)) {
         static volatile long n = 0;
-        if (InterlockedIncrement(&n) <= 300)
+        if (InterlockedIncrement(&n) <= 20000)
             XSL_INFO(CH, "pak read @%llu completed: %s, %lu bytes (error %lu)", ((unsigned long long)ov->OffsetHigh << 32 | ov->Offset),
                      r ? "ok" : "FAILED", got ? *got : 0ul, r ? 0ul : e);
     }
     SetLastError(e);
     return r;
+}
+// VirtualFree on XMem memory (64 KB-page reservations are placeholders with mapped views, which
+// VirtualFree cannot decommit): xmem.dll does it. Everything else goes to the system.
+BOOL WINAPI D_VirtualFree(LPVOID base, SIZE_T size, DWORD type) {
+    typedef BOOL(WINAPI * Fn)(void*, SIZE_T, DWORD, BOOL*);
+    static Fn fn = [] { HMODULE m = GetModuleHandleW(L"xmem.dll"); return m ? (Fn)GetProcAddress(m, "xsl_xmem_virtual_free") : nullptr; }();
+    BOOL r;
+    if (fn && fn(base, size, type, &r)) return r;
+    return VirtualFree(base, size, type);
 }
 // CRT: the title's own CRT (ucrtbase) is called, so FILE objects and errno stay in the CRT
 // instance the title uses.
@@ -371,6 +389,7 @@ void patch_module(HMODULE m) {
         {"GetDiskFreeSpaceW", (void*)D_GetDiskFreeSpaceW},
         {"SetFileInformationByHandle", (void*)D_SetFileInformationByHandle},
         {"ReadFile", (void*)D_ReadFile},
+        {"VirtualFree", (void*)D_VirtualFree},
         {"GetOverlappedResult", (void*)D_GetOverlappedResult},
         {"_wfopen", (void*)D__wfopen},
         {"_wfopen_s", (void*)D__wfopen_s},

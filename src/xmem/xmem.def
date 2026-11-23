@@ -39,5 +39,6 @@ EXPORTS
     xsl_xmem_find_graphics
     xsl_xmem_write_watch
     xsl_xmem_title_hooks
+    xsl_xmem_virtual_free
     xsl_xmem_page_view
     xsl_xmem_page_unview

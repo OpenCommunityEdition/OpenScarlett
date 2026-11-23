@@ -1,11 +1,18 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Console-only DLLs with no host hardware: audio (AcpHal, xapu, chad), PIXEvt, XFrontPanelDisplay.
+# Console-only DLLs with no host hardware: audio (AcpHal, xapu, chad: software stand-ins), PIXEvt, XFrontPanelDisplay.
 add_library(AcpHal SHARED acphal.cpp AcpHal.def)
 target_compile_options(AcpHal PRIVATE -Wno-everything)
 target_link_libraries(AcpHal PRIVATE xsl_common)
 target_include_directories(AcpHal PRIVATE "${XSL_CASE_DIR}" "${GXDK_ROOT}/xbox/include")
 set_target_properties(AcpHal PROPERTIES OUTPUT_NAME AcpHal PREFIX "")
-foreach(dll xapu chad PIXEvt XFrontPanelDisplay)
+foreach(dll xapu chad)
+  add_library(${dll} SHARED ${dll}.cpp ${dll}.def)
+  target_compile_options(${dll} PRIVATE -Wno-everything)
+  target_link_libraries(${dll} PRIVATE xsl_common)
+  target_include_directories(${dll} PRIVATE "${XSL_CASE_DIR}" "${GXDK_ROOT}/xbox/include")
+  set_target_properties(${dll} PROPERTIES OUTPUT_NAME ${dll} PREFIX "")
+endforeach()
+foreach(dll PIXEvt XFrontPanelDisplay)
   add_library(${dll} SHARED console_stubs.cpp ${dll}.def)
   target_compile_options(${dll} PRIVATE -Wno-everything)
   target_link_libraries(${dll} PRIVATE xsl_common)
