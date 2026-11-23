@@ -30,7 +30,7 @@ vkd3d-proton. "Scarlett" is the codename of the hardware platform the project ta
 | Gaming Runtime (task queues, users, saves, local storage, package/system APIs) | ⚠ Core APIs work; online services stay offline |
 | Direct3D 12.X → PC Direct3D 12 (devices, queues, resources, pipelines, `PresentX`, console descriptor model, page mapping) | ✅ Works for the tested games |
 | Console GPU machine code → HLSL (compute, pixel, vertex, mesh, geometry shaders) | ✅ Works; every shader of the tested games translates |
-| Ray tracing (acceleration structures, ray queries, `DispatchRays`) | ⚠ In progress: structures build and pipelines translate, but programs are slow to prepare and results are not yet verified |
+| Ray tracing (acceleration structures, ray queries, `DispatchRays`) | ⚠ In progress: structures build, pipelines translate and light most of the scenes tested; programs are slow to prepare and some results are still wrong |
 | GameInput (gamepads incl. DualSense, keyboard, mouse) | ✅ Works |
 | DirectStorage (`XCRDAPI.dll`) | ✅ Works (zlib; BCPack through the SDK's own DLL) |
 | Audio | ❌ Not yet (a silent audio processor keeps games running) |
@@ -41,7 +41,7 @@ vkd3d-proton. "Scarlett" is the codename of the hardware platform the project ta
 | Game | Version / GDK edition | Tested on | Status |
 |---|---|---|---|
 | Minecraft Preview | 1.18.3064.0, GXDK 220300 | Windows 10 (RTX 5090), Linux (Wine) | ✅ **Playable**: worlds are created, saved and played at ~60 FPS; no audio |
-| The Matrix Awakens: An Unreal Engine 5 Experience | GXDK 200800 | Windows 10 (RTX 5090) | ⚠ **In progress**: menus, videos and the opening chase run at ~20 FPS; in some real-time scenes people and objects render black (Lumen hardware ray tracing is incomplete); the first run spends minutes compiling shaders and has lag spikes |
+| The Matrix Awakens: An Unreal Engine 5 Experience | GXDK 200800 | Windows 10 (RTX 5090) | ⚠ **In progress**: menus, videos and the opening chase run at ~20 FPS; real-time scenes are lit once their ray-tracing programs are prepared, with some objects still black (Lumen hardware ray tracing is incomplete); the first run spends minutes compiling shaders and has lag spikes |
 | Microsoft's Xbox GDK samples (25, built as Series X\|S executables) | GDKX April 2026 | Linux (Intel Iris Xe) | ✅ 22 of 25 present frames with their intended image; the other 3 need a mesh-shader GPU |
 
 Per-title details, known issues and what was fixed on the way are in
@@ -99,9 +99,13 @@ https://github.com/user-attachments/assets/7e01f974-c23e-4f67-9e05-39103014cb84
    or `XSL_SHADER_CACHE=dir`), so later runs start much faster. Expect stalls the first time each
    scene appears.
 
-Known issues: people and objects render black in some real-time scenes (Lumen's hardware ray
-tracing does not produce results yet); occasional lag spikes and repeated audio while pipelines
-compile. `XSL_RT_PIPELINES=0` turns ray-tracing pipelines off.
+Known issues: Lumen's hardware ray tracing runs on translated programs, each of which the GPU
+driver needs 15 s to minutes to prepare the first time. Until a scene's programs are ready its
+people and objects are black; `xsl-rtwarm` ([docs/gpucode.md](docs/gpucode.md)) prepares cached
+programs outside the game on all cores. With the programs ready, most of the white-room scenes are
+lit, but some figures and furniture still render black and the rooftop shot can show wrongly
+coloured lighting. Occasional lag spikes and repeated audio while pipelines compile.
+`XSL_RT_PIPELINES=0` turns ray-tracing pipelines off.
 
 ### Microsoft's Xbox GDK samples
 

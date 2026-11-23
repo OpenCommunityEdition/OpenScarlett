@@ -856,34 +856,45 @@ static std::shared_ptr<RtPipe> rt_pipe_of(const void* so) {
     return it == g_rt.end() ? nullptr : it->second.pipe;
 }
 // Builds run on a few worker threads (each compile takes seconds to minutes and much memory),
-// smallest program first. XSL_RT_BUILD_THREADS=<n> (default 1, idle priority; at most 4).
-static void rt_queue_build(size_t size, std::function<void()> job) {
-    static std::mutex mu;
-    static std::condition_variable cv;
-    static std::multimap<size_t, std::function<void()>> q;
-    static bool started = false;
-    std::lock_guard<std::mutex> g(mu);
-    q.emplace(size, std::move(job));
-    if (!started) {
-        started = true;
-        char b[8];
-        unsigned n = GetEnvironmentVariableA("XSL_RT_BUILD_THREADS", b, sizeof b) ? (unsigned)atoi(b) : 1u;
-        n = std::max(1u, std::min(n, 12u));
-        for (unsigned t = 0; t < n; t++) std::thread([] {
-            SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_IDLE);   // behind the title's own pipeline compiles
-            for (;;) {
-                std::function<void()> j;
-                {
-                    std::unique_lock<std::mutex> u(mu);
-                    cv.wait(u, [] { return !q.empty(); });
-                    j = std::move(q.begin()->second);
-                    q.erase(q.begin());
+// smallest program first. XSL_RT_BUILD_THREADS=<n> (default 1, idle priority; at most 12).
+// Programs already in the cache have a queue and a thread of their own: they load in moments and
+// must not wait behind compiles that take minutes.
+static void rt_queue_build(size_t size, std::function<void()> job, bool cached) {
+    struct Queue {
+        std::mutex mu;
+        std::condition_variable cv;
+        std::multimap<size_t, std::function<void()>> q;
+        bool started = false;
+        void run(unsigned threads, int priority) {
+            for (unsigned t = 0; t < threads; t++) std::thread([this, priority] {
+                SetThreadPriority(GetCurrentThread(), priority);
+                for (;;) {
+                    std::function<void()> j;
+                    {
+                        std::unique_lock<std::mutex> u(mu);
+                        cv.wait(u, [this] { return !q.empty(); });
+                        j = std::move(q.begin()->second);
+                        q.erase(q.begin());
+                    }
+                    j();
                 }
-                j();
-            }
-        }).detach();
+            }).detach();
+        }
+    };
+    static Queue compile, load;
+    Queue& Q = cached ? load : compile;
+    std::lock_guard<std::mutex> g(Q.mu);
+    Q.q.emplace(size, std::move(job));
+    if (!Q.started) {
+        Q.started = true;
+        if (cached) Q.run(1, THREAD_PRIORITY_NORMAL);
+        else {
+            char b[8];
+            unsigned n = GetEnvironmentVariableA("XSL_RT_BUILD_THREADS", b, sizeof b) ? (unsigned)atoi(b) : 1u;
+            Q.run(std::max(1u, std::min(n, 12u)), THREAD_PRIORITY_IDLE);   // behind the title's own pipeline compiles
+        }
     }
-    cv.notify_one();
+    Q.cv.notify_one();
 }
 // Program of a collection: built once (worker threads, cached on disk), shared by all pipelines.
 std::mutex g_prog_mu;
@@ -923,12 +934,12 @@ static std::shared_ptr<RtProg> rt_program(int coll, bool first = false) {
         prog->pso = pso;
         prog->state = 1;
         XSL_INFO(CH, "ray-tracing collection %d ready (%zu KiB code) after %lu s", coll, size / 1024, (unsigned long)((GetTickCount() - t0) / 1000));
-    });
+    }, pc::rt_program_cached(*link));
     return prog;
 }
 static void rt_start_pipeline(Device* dev, const void* so, std::vector<std::vector<uint8_t>> blobs) {
     auto pipe = std::make_shared<RtPipe>();
-    g_rt_pcdev = dev_extra(dev)->pcDevice;
+    if (dev) g_rt_pcdev = dev_extra(dev)->pcDevice;
     for (auto& b : blobs) pipe->colls.push_back(space_add(b));
     {
         std::lock_guard<std::mutex> g(g_space_mu);
@@ -948,13 +959,16 @@ static void rt_start_pipeline(Device* dev, const void* so, std::vector<std::vect
     if (pipe->start >= 0) rt_program(pipe->start, true);   // the others once rays are seen to reach them (the driver takes 15 s to 2 min per program the first time)
     XSL_INFO(CH, "ray-tracing pipeline %p: %zu collections, rays start in collection %d", so, blobs.size(), pipe->start);
 }
-// A start for a pipeline without collections of its own: a collection whose program is ready
-// (any scheduler will do), else the first collection there is.
+// A start for a pipeline without collections of its own: a collection whose program is ready (any
+// scheduler will do). While other programs are still building, none (-1: the dispatch is skipped
+// and asks again); when no program was ever asked for, the first collection there is.
 static int rt_any_start() {
     {
         std::lock_guard<std::mutex> g(g_prog_mu);
         for (auto& [c, p] : g_progs)
             if (p && p->state.load() == 1) return c;
+        for (auto& [c, p] : g_progs)
+            if (p && p->state.load() == 0) return -1;
     }
     std::lock_guard<std::mutex> g(g_space_mu);
     return g_space.collections() ? 0 : -1;
@@ -988,6 +1002,15 @@ static void rt_scan(RtPipe& p) {
 // over the collections rays were seen to reach. Returns false when nothing ran.
 bool rt_dispatch_impl(PcObj list, const void* so, const uint64_t* tables, const D3D12_DISPATCH_RAYS_DESC* d, uint64_t argsVa, PcObj samplerHeap) {
     auto pipe = rt_pipe_of(so);
+    if (!pipe && so) {   // dispatched with a deserialized state object itself: a pipeline of that one collection
+        std::vector<std::vector<uint8_t>> one;
+        {
+            std::lock_guard<std::mutex> g(g_rt_mu);
+            auto it = g_rt.find(so);
+            if (it != g_rt.end() && !it->second.blob.empty()) one.push_back(it->second.blob);
+        }
+        if (!one.empty()) { rt_start_pipeline(nullptr, so, std::move(one)); pipe = rt_pipe_of(so); }
+    }
     if (pipe && pipe->start < 0) {
         int c = rt_any_start();
         if (c >= 0) {
@@ -999,7 +1022,7 @@ bool rt_dispatch_impl(PcObj list, const void* so, const uint64_t* tables, const 
     }
     std::shared_ptr<RtProg> start = pipe && pipe->start >= 0 ? rt_program(pipe->start) : nullptr;
     if (!pipe || !start || start->state.load() != 1 || (!d && !argsVa)) {
-        if (d) pc::note_rays_skipped();   // indirect ones are counted where they are skipped
+        pc::note_rays_skipped(!pipe || !start ? 0 : start->state.load() == 0 ? 1 : 2);
         if (pipe && start && !pipe->skipLogged) {   // once per pipeline: which program it waits for
             pipe->skipLogged = true;
             XSL_INFO(CH, "ray dispatches of pipeline (region %u) wait for collection %d (program %s)", pipe->region, pipe->start,
@@ -1045,13 +1068,19 @@ bool rt_dispatch_impl(PcObj list, const void* so, const uint64_t* tables, const 
     static uint32_t rounds = [] { char b[8]; return GetEnvironmentVariableA("XSL_RT_ROUNDS", b, sizeof b) ? std::max(1u, (uint32_t)atoi(b)) : 12u; }();
     std::vector<pc::RtRun> runs{{start->pso.load(), 0}};
     std::vector<PcObj> others;
+    bool building = false;
     {
         std::lock_guard<std::mutex> g(pipe->mu);
         for (int c : pipe->active) {
             auto pr = rt_program(c);
             if (pr->state.load() == 1) others.push_back(pr->pso.load());
+            else if (pr->state.load() == 0) building = true;
         }
     }
+    // Rays that reach a collection whose program is not there yet never finish, and what their
+    // shaders would have written stays as it was (noise from other uses of the target): until the
+    // program is ready the dispatch is left out, as it is while the start program builds.
+    if (building) { pc::note_rays_skipped(3); return false; }
     for (uint32_t r = 1; r < rounds && !others.empty(); r++)
         for (PcObj p : others) runs.push_back({p, r});
     static volatile long n = 0;

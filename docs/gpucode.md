@@ -183,6 +183,20 @@ collections; offsets from The Matrix Awakens demo, layouts from disassembly):
 | `XSL_RT_GUARD=<n>` | Dispatcher steps per invocation of a ray-tracing program (default 65536; other cache keys) |
 | `XSL_RT_WARM=1` | Create every cached program's pipeline at start (fills the driver-blob cache `rtpso_*.bin`) |
 
+Dispatches of a pipeline are left out while its start program or the program of a collection its
+rays were seen to reach is still being built (rays that cannot finish leave their outputs
+unwritten); the frame-rate log counts them by reason. Cached programs load on a thread of their
+own, ahead of compiles. A pipeline made without collections (configuration only; the title
+dispatches it with identifiers of collections it loaded on its own) starts through any ready
+collection's scheduler, and one dispatched as a deserialized state object is a pipeline of that
+collection.
+
+Open: one traversal variant set calls any-hit and intersection shaders directly (`s_swappc`
+inside the traversal, pointer from the hit record). When that shader is in another collection the
+jump target is not in the program and the wave ends; this is the suspected cause of the objects
+that are still black. The traversal presets the shader's answer to "accept", so letting such calls
+fall through would count the hit as opaque (not tried yet).
+
 The GPU driver compiles one pipeline at a time per process and needs 15 s to several minutes for
 each of these programs. `xsl-rtwarm <shard> <shards>` (`tools/rtwarm`, `ninja xsl-rtwarm`) does
 that outside the game for the `rt_*.dxil` files in the cache directory; one process per shard

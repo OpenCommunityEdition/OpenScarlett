@@ -1601,7 +1601,8 @@ static bool rtrt_init() {
     return true;
 }
 volatile long g_rays_run = 0, g_rays_skipped = 0;   // ray dispatches per frame-rate period
-void note_rays_skipped() { InterlockedIncrement(&g_rays_skipped); }
+volatile long g_rays_why[5] = {};   // per reason: no pipeline, start program building, failed, a reached program building, indirect path
+void note_rays_skipped(int why) { InterlockedIncrement(&g_rays_skipped); InterlockedIncrement(&g_rays_why[why >= 0 && why < 5 ? why : 0]); }
 static std::string fmt_rays(long run, long skipped) {
     char b[96];
     snprintf(b, sizeof b, "; ray dispatches: %ld run, %ld skipped", run, skipped);
@@ -3634,8 +3635,12 @@ static void prof_slow_check(uint64_t present) {
     if (ps >= 10.0) {
         long rr = InterlockedExchange(&g_rays_run, 0), rs = InterlockedExchange(&g_rays_skipped, 0);
         rt_debug_dump();
-        XSL_INFO(CH, "frame rate: %.1f presents/s (presents %llu..%llu, slowest %.0f ms)%s", double(present - periodStart) / ps, (unsigned long long)periodStart,
-                 (unsigned long long)present, worst, (rr || rs) ? fmt_rays(rr, rs).c_str() : "");
+        long why[5];
+        for (int k = 0; k < 5; k++) why[k] = InterlockedExchange(&g_rays_why[k], 0);
+        char wb[160] = "";
+        if (rs) snprintf(wb, sizeof wb, " (no pipeline %ld, start program building %ld, failed %ld, reached program building %ld, indirect %ld)", why[0], why[1], why[2], why[3], why[4]);
+        XSL_INFO(CH, "frame rate: %.1f presents/s (presents %llu..%llu, slowest %.0f ms)%s%s", double(present - periodStart) / ps, (unsigned long long)periodStart,
+                 (unsigned long long)present, worst, (rr || rs) ? fmt_rays(rr, rs).c_str() : "", wb);
         period = now;
         periodStart = present;
         worst = 0;
@@ -3873,7 +3878,7 @@ void list_rt_copy(PcObj l, uint64_t dst, uint64_t src, uint32_t mode) {
 }
 // Indirect-argument guard: every ExecuteIndirect that dispatches or draws runs from a copy of its
 // arguments in which a dispatch with a group count above the D3D12 limit (65535), or a draw with a
-// vertex/index/instance count of 2^28 or more, becomes empty. Arguments like that are never valid;
+// vertex/index/instance count (or their product) of 2^28 or more, becomes empty. Arguments like that are never valid;
 // they come from work that did not run as on the console, and executing them hangs the GPU.
 // XSL_INDIRECT_GUARD=0 turns it off.
 static void restore_compute_state(PcObj l);
@@ -3895,7 +3900,7 @@ static bool guard_init(ID3D12Device* dev) {
         "  if (i >= count) return;\n"
         "  uint o = off + i * stride;\n"
         "  if (kind == 0u) { uint3 g = a.Load3(o); if (any(g > 65535u)) a.Store3(o, uint3(0, 0, 0)); }\n"
-        "  else { uint2 c = a.Load2(o); if (any(c >= 0x10000000u)) a.Store2(o, uint2(0, 0)); }\n"
+        "  else { uint2 c = a.Load2(o); if (any(c >= 0x10000000u) || (c.x != 0u && c.y >= 0x10000000u / c.x)) a.Store2(o, uint2(0, 0)); }\n"
         "}\n";
     ID3DBlob *cs = nullptr, *err = nullptr;
     if (FAILED(compile(src, sizeof src - 1, "xsl_arg_guard", nullptr, nullptr, "main", "cs_5_0", 0, 0, &cs, &err))) {
@@ -4012,7 +4017,7 @@ void list_execute_indirect(PcObj l, PcObj sig, uint32_t max, PcObj args, uint64_
         if (g_rays_sigs.count(sig)) {
             static volatile long n = 0;
             if (InterlockedIncrement(&n) <= 2) XSL_WARN(CH, "indirect ray dispatch skipped (no translated pipeline ready)");
-            note_rays_skipped();
+            note_rays_skipped(4);
             return;
         }
     }

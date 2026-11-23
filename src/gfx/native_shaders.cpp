@@ -340,17 +340,30 @@ bool native_translate(const void* in, size_t n, void** out, size_t* outSize) {
 // XSL_RT_DXC_OPT=Od|O1|O2|O3: optimization level of these programs (default O3: slower in DXC,
 // but the driver, which compiles each program again on every new machine, is faster with it).
 std::wstring rt_cache_dir() { return cache_dir(); }
-bool rt_build_pipeline(const gpucode::RtLinked& l, std::vector<uint8_t>& dxil, std::string& err) {
+static const std::wstring& rt_opt() {
     static std::wstring opt = [] {
         char b[8];
         std::wstring w = L"-O3";   // the driver compiles O3 DXIL of these programs about 30% faster
         if (GetEnvironmentVariableA("XSL_RT_DXC_OPT", b, sizeof b) && b[0] == 'O') { w = L"-"; for (char* c = b; *c; c++) w += wchar_t(*c); }
         return w;
     }();
+    return opt;
+}
+static std::wstring rt_cache_path(const gpucode::RtLinked& l, const std::wstring& opt) {
     uint64_t key = gpucode::rt_cache_key(l, std::string(kRtVersion) + std::string(opt.begin(), opt.end()));   // same key as `xsl-gpucode rtcache`
     wchar_t name[64];
     swprintf(name, 64, L"\\rt_%016llx.dxil", (unsigned long long)key);
-    std::wstring path = cache_dir() + name;
+    return cache_dir() + name;
+}
+// Whether the program's DXIL is in the cache (its pipeline is then quick to create, or at least
+// needs no translation and DXC run).
+bool rt_program_cached(const gpucode::RtLinked& l) {
+    return GetFileAttributesW(rt_cache_path(l, rt_opt()).c_str()) != INVALID_FILE_ATTRIBUTES;
+}
+bool rt_build_pipeline(const gpucode::RtLinked& l, std::vector<uint8_t>& dxil, std::string& err) {
+    const std::wstring& opt = rt_opt();
+    std::wstring path = rt_cache_path(l, opt);
+    uint64_t key = gpucode::rt_cache_key(l, std::string(kRtVersion) + std::string(opt.begin(), opt.end()));
     if (read_file(path, dxil) && !dxil.empty()) return true;
     XSL_INFO(CH, "ray-tracing program rt_%016llx: not cached, compiling (image %zu bytes, %zu segments, main 0x%x, %zu entries)", (unsigned long long)key,
              l.image.size() * 4, l.segs.size(), l.main, l.entries.size());

@@ -951,7 +951,7 @@ void D3DAPI L_ExecuteIndirect(ID3D12GraphicsCommandList* l, ID3D12CommandSignatu
         if (va && lx(l)->rtPipeline) {
             bool ran = false;
             for (UINT k = 0; k < (max ? std::min(max, 1u) : 0u); k++) ran |= rt_dispatch(LPC(l), lx(l)->rtPipeline, lx(l)->csTables, nullptr, va + ao, lx(l)->sampler);
-            if (ran) return;
+            if (ran || max) return;   // run, or skipped and counted with its reason
         }
     }
     static bool diag = [] { char b[4]; return GetEnvironmentVariableA("XSL_D3D12_DEBUG", b, 4) && b[0] != '0'; }();

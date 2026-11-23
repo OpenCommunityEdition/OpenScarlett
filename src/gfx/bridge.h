@@ -99,6 +99,7 @@ void* gm_low_buffer(PcObj dev, uint64_t offset, uint64_t bytes, uint64_t* addres
 namespace gpucode { struct RtLinked; }
 namespace pc {
 bool rt_build_pipeline(const gpucode::RtLinked& linked, std::vector<uint8_t>& dxil, std::string& err);
+bool rt_program_cached(const gpucode::RtLinked& linked);
 PcObj rt_create_pso(PcObj dev, const std::vector<uint8_t>& dxil);
 uint64_t rt_stack_buffer(uint64_t bytes);
 struct RtRaysArgs {
@@ -119,7 +120,7 @@ const uint8_t* rt_discovery(uint32_t region);   // CPU view of a discovery bitma
 uint64_t sampler_memory_address(PcObj samplerHeap, uint64_t gpuHandle);
 bool list_rays(PcObj l, const std::vector<RtRun>& runs, const RtRaysArgs& args);
 bool is_rays_signature(PcObj sig);
-void note_rays_skipped();   // counted in the frame-rate log
+void note_rays_skipped(int why);   // counted in the frame-rate log (0 no pipeline, 1 start program building, 2 failed, 3 a reached program building, 4 indirect)
 uint64_t present_count();
 std::string gm_describe_address(uint64_t address);   // diagnostics: registered buffers around and over an address
 int rt_warm_shard(void* pcDevice, unsigned shard, unsigned shards);   // tools/rtwarm
