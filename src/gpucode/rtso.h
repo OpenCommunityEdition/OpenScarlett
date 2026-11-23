@@ -38,6 +38,8 @@ struct RtLinked {
     // Parking (TranslateOptions::raw_park): set by RtSpace::program.
     bool park = false;
     uint32_t park_ptr_vgpr = 0, resume_at = 0, park_from = 0, park_to = 0;
+    bool stats = false;   // debug counters (TranslateOptions::raw_stats)
+    unsigned loop_guard = 0;   // dispatcher steps per invocation (0: the translator's default)
 };
 
 // The code space of a process: console shader identifiers are code addresses, requested on
@@ -48,7 +50,9 @@ struct RtLinked {
 class RtSpace {
 public:
     static constexpr uint64_t kBase = 0x100000000ull;
-    static constexpr uint32_t kSlotShift = 20, kSlots = 1u << 20;   // up to kBase + 1 TiB
+    // Slots end at 2^39: identifiers (address >> 8) must stay positive as signed 32-bit values (the
+    // console code tests "pointer > 0" to tell a shader from none).
+    static constexpr uint32_t kSlotShift = 20, kSlots = 1u << 19;
     int add(const std::vector<uint8_t>& blob);   // collection id (the same for the same blob), -1: not a collection
     bool identifier(int id, const std::string& name, uint32_t words[3]) const;   // export or hit group of a collection
     // Several collections (and their traversal sections) as one program.

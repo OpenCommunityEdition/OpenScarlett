@@ -666,7 +666,16 @@ void D3DAPI L_SetGfxRootSig(ID3D12GraphicsCommandList* l, ID3D12RootSignature* r
     XSL_TRACE("gfx.cmd", "list %p RootSig %p", (void*)l, (void*)rs);
     pc::list_set_gfx_root_signature(LPC(l), P(rs));
 }
-void D3DAPI L_SetComputeRootSig(ID3D12GraphicsCommandList* l, ID3D12RootSignature* rs) { pc::list_set_compute_root_signature(LPC(l), P(rs)); }
+// XSL_RT_DEBUG=1: the compute bindings a list makes while a ray-tracing pipeline is selected.
+static bool rt_bind_trace(ID3D12GraphicsCommandList* l) {
+    static bool on = [] { char b[4]; return GetEnvironmentVariableA("XSL_RT_DEBUG", b, 4) && b[0] == '1'; }();
+    static volatile long n = 0;
+    return on && lx(l)->rtPipeline && InterlockedIncrement(&n) <= 400;
+}
+void D3DAPI L_SetComputeRootSig(ID3D12GraphicsCommandList* l, ID3D12RootSignature* rs) {
+    if (rt_bind_trace(l)) XSL_INFO(CH, "rt bind: list %p SetComputeRootSignature %p", (void*)l, (void*)rs);
+    pc::list_set_compute_root_signature(LPC(l), P(rs));
+}
 void D3DAPI L_SetPipelineState(ID3D12GraphicsCommandList* l, ID3D12PipelineState* p) {
     if (null_graphics()) return;
     lx(l)->placeholderPso = p && !P(p);
@@ -722,7 +731,20 @@ void D3DAPI L_DrawIndexedInstanced(ID3D12GraphicsCommandList* l, UINT a, UINT b,
     XSL_TRACE("gfx.cmd", "list %p DrawIndexed %u x%u", (void*)l, a, b);
     pc::list_draw_indexed(LPC(l), a, b, c, d, e);
 }
+static void rt_peek_tables(ID3D12GraphicsCommandList* l, const char* what) {
+    std::string s;
+    for (int k : {0, 1, 3}) {
+        uint32_t w[8] = {};
+        char b[160];
+        bool ok = desc_peek(lx(l)->csTables[k], 0, w);
+        snprintf(b, sizeof b, " table %d index %llu%s: %x %x %x %x tag %x %x;", k, (unsigned long long)((lx(l)->csTables[k] - desc_view_gpu_start(0)) / 32), ok ? "" : " (not view memory)",
+                 w[0], w[1], w[2], w[3], w[4], w[5]);
+        s += b;
+    }
+    XSL_INFO(CH, "rt bind: list %p %s:%s", (void*)l, what, s.c_str());
+}
 void D3DAPI L_Dispatch(ID3D12GraphicsCommandList* l, UINT x, UINT y, UINT z) {
+    if (rt_bind_trace(l)) rt_peek_tables(l, "Dispatch");
     static bool diag = [] { char b[4]; return GetEnvironmentVariableA("XSL_D3D12_DEBUG", b, 4) && b[0] != '0'; }();
     if (diag && (uint64_t)x * y * z > (1u << 18)) {
         static volatile long n = 0;
@@ -755,10 +777,19 @@ void D3DAPI L_SetGfxRootTable(ID3D12GraphicsCommandList* l, UINT i, D3D12_GPU_DE
     pc::list_gfx_root_table(LPC(l), i, desc_pc_gpu(h.ptr));
 }
 void D3DAPI L_SetComputeRootTable(ID3D12GraphicsCommandList* l, UINT i, D3D12_GPU_DESCRIPTOR_HANDLE h) {
+    if (rt_bind_trace(l)) {
+        uint32_t w[8] = {};
+        bool ok = desc_peek(h.ptr, 0, w);
+        XSL_INFO(CH, "rt bind: list %p SetComputeRootDescriptorTable(%u, %llx)%s index %llu slot 0: %x %x %x %x tag %x %x", (void*)l, i, (unsigned long long)h.ptr,
+                 ok ? "" : " (not view memory)", (unsigned long long)((h.ptr - desc_view_gpu_start(0)) / 32), w[0], w[1], w[2], w[3], w[4], w[5]);
+    }
     if (i < 16) lx(l)->csTables[i] = h.ptr;
     pc::list_compute_root_table(LPC(l), i, desc_pc_gpu(h.ptr));
 }
-void D3DAPI L_SetPipelineState1(ID3D12GraphicsCommandList4* l4, ID3D12StateObject* so) { lx((ID3D12GraphicsCommandList*)l4)->rtPipeline = so; }
+void D3DAPI L_SetPipelineState1(ID3D12GraphicsCommandList4* l4, ID3D12StateObject* so) {
+    lx((ID3D12GraphicsCommandList*)l4)->rtPipeline = so;
+    if (rt_bind_trace((ID3D12GraphicsCommandList*)l4)) XSL_INFO(CH, "rt bind: list %p SetPipelineState1 %p", (void*)l4, (void*)so);
+}
 void D3DAPI L_DispatchRays(ID3D12GraphicsCommandList4* l4, const D3D12_DISPATCH_RAYS_DESC* d) {
     auto* l = (ID3D12GraphicsCommandList*)l4;
     if (null_graphics()) return;
@@ -772,6 +803,7 @@ void D3DAPI L_SetGfxRootCbv(ID3D12GraphicsCommandList* l, UINT i, D3D12_GPU_VIRT
     pc::list_gfx_root_cbv(LPC(l), i, cbv_fix_root(hdr(l)->device, a));
 }
 void D3DAPI L_SetComputeRootCbv(ID3D12GraphicsCommandList* l, UINT i, D3D12_GPU_VIRTUAL_ADDRESS a) {
+    if (rt_bind_trace(l)) XSL_INFO(CH, "rt bind: list %p SetComputeRootConstantBufferView(%u, %llx)", (void*)l, i, (unsigned long long)a);
     pc::list_compute_root_cbv(LPC(l), i, cbv_fix_root(hdr(l)->device, a));
 }
 // Root SRVs/UAVs may address GPU-visible title memory (XMem graphics allocations).
@@ -891,8 +923,31 @@ void D3DAPI L_ExecuteIndirect(ID3D12GraphicsCommandList* l, ID3D12CommandSignatu
                               ID3D12Resource* cnt, UINT64 co) {
     if (lx(l)->placeholderPso) InterlockedIncrement(&g_skipped_work);
     if (null_graphics() || lx(l)->placeholderPso) return;   // placeholder PSO: its work is skipped
+    if (sig && args && pc::is_rays_signature(P(sig)) && rt_bind_trace(l)) rt_peek_tables(l, "ExecuteIndirect (rays)");
     if (sig && args && pc::is_rays_signature(P(sig))) {   // indirect rays on a translated pipeline (count buffer ignored)
         uint64_t va = pc::res_gpu_va(P(args));
+        {   // diagnostics: the indirect arguments as the CPU sees them now (dimensions may be copied in later on the GPU)
+            static volatile long shown = 0;
+            if (va && InterlockedIncrement(&shown) <= 6) {
+                const uint8_t* m = (const uint8_t*)pc::buffer_try_map(P(args));
+                if (m) {
+                    D3D12_DISPATCH_RAYS_DESC d;
+                    memcpy(&d, m + ao, sizeof d);
+                    uint64_t probe[4] = {d.RayGenerationShaderRecord.StartAddress, d.MissShaderTable.StartAddress, d.HitGroupTable.StartAddress, d.CallableShaderTable.StartAddress};
+                    char res[4][24];
+                    for (int k = 0; k < 4; k++) {
+                        PcObj r; uint64_t off, avail;
+                        if (probe[k] && pc::gm_resolve(probe[k], &r, &off, &avail)) snprintf(res[k], sizeof res[k], "ok +%llx", (unsigned long long)off);
+                        else snprintf(res[k], sizeof res[k], probe[k] ? "NOT in memory" : "-");
+                    }
+                    XSL_INFO(CH, "indirect rays args (buffer VA %llx+%llu): raygen %llx/%llu (%s) miss %llx/%llu stride %llu (%s) hit %llx/%llu stride %llu (%s) callable %llx (%s) %ux%ux%u",
+                             (unsigned long long)va, (unsigned long long)ao, (unsigned long long)probe[0], (unsigned long long)d.RayGenerationShaderRecord.SizeInBytes, res[0],
+                             (unsigned long long)probe[1], (unsigned long long)d.MissShaderTable.SizeInBytes, (unsigned long long)d.MissShaderTable.StrideInBytes, res[1],
+                             (unsigned long long)probe[2], (unsigned long long)d.HitGroupTable.SizeInBytes, (unsigned long long)d.HitGroupTable.StrideInBytes, res[2],
+                             (unsigned long long)probe[3], res[3], d.Width, d.Height, d.Depth);
+                } else XSL_INFO(CH, "indirect rays args (buffer VA %llx+%llu): not CPU-readable", (unsigned long long)va, (unsigned long long)ao);
+            }
+        }
         if (va && lx(l)->rtPipeline) {
             bool ran = false;
             for (UINT k = 0; k < (max ? std::min(max, 1u) : 0u); k++) ran |= rt_dispatch(LPC(l), lx(l)->rtPipeline, lx(l)->csTables, nullptr, va + ao, lx(l)->sampler);

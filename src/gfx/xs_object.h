@@ -200,6 +200,11 @@ void desc_commit(uint64_t h, D3D12_DESCRIPTOR_HEAP_TYPE type, const DescTag& tag
 // format), acceleration structures their address, textures {heap index, kDescTexture | kind}.
 constexpr uint32_t kDescTexture = 0x80000000u;   // payload dword 1 flag: dword 0 is the slot's heap index
 void desc_set_payload(const uint32_t words[4]);
+bool desc_peek(uint64_t gpuHandle, uint32_t slot, uint32_t out[8]);   // diagnostics: the slot's 32 bytes
+// Payloads of views in CPU-only (staging) heaps (xs_descriptors.cpp).
+void desc_staging_heap(uint64_t cpuStart, uint32_t count, uint32_t inc, bool add);
+void desc_staging_store(uint64_t pcHandle);
+void desc_payload_copy(uint64_t dst, uint64_t src);
 uint64_t desc_memory_address(uint64_t gpuHandle);   // global-memory address of descriptor memory (0: none)
 // DispatchRays on a translated ray-tracing pipeline (xs_device.cpp); tables = console compute root tables.
 // argsVa: PC address of an indirect D3D12_DISPATCH_RAYS_DESC (then d may be null). False: no pipeline ready.

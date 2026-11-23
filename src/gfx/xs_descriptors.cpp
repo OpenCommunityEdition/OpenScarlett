@@ -22,6 +22,7 @@
 #include <cstring>
 #include <algorithm>
 #include <mutex>
+#include <shared_mutex>
 #include <vector>
 
 #include "xs_cbv.h"
@@ -185,6 +186,7 @@ bool materialize_xbox_cbv(uint32_t i, const uint64_t* q) {
 }
 
 constexpr size_t kTagOffset = 16;   // view slots: payload in bytes 0..15, tag in 16..31
+bool g_payload_dirty = false;       // payloads written by copies since the last sync
 thread_local uint32_t t_payload[4];
 thread_local bool t_has_payload = false;
 // Make global slot i match its shadow bytes. Caller holds g_mu.
@@ -221,6 +223,33 @@ uint64_t desc_view_cpu_start(Device* dev, uint32_t offset) {
 }
 uint64_t desc_view_gpu_start(uint32_t offset) { return g_pcGpu + (uint64_t)offset * kViewSlot; }
 // Global-memory address of the descriptor memory at console GPU handle h (0 if none).
+// Diagnostics: the first 16 bytes (payload) of the view slot `slot` entries after a GPU handle.
+bool desc_peek(uint64_t h, uint32_t slot, uint32_t out[8]) {
+    std::lock_guard<std::mutex> g(g_mu);
+    if (!g_ready || h < g_pcGpu || h >= g_pcGpu + (uint64_t)g_viewCount * kViewSlot) return false;
+    size_t off = (size_t)(h - g_pcGpu) + (size_t)slot * kViewSlot;
+    if (off + kViewSlot > (size_t)g_viewCount * kViewSlot) return false;
+    memcpy(out, g_view + off, kViewSlot);
+    static volatile long once = 0;
+    if (InterlockedIncrement(&once) == 200) {   // diagnostics: how much of the shadow memory holds anything
+        uint64_t nz = 0, tagged = 0, first = 0, last = 0;
+        for (uint32_t i = 0; i < g_viewCount; i++) {
+            const uint32_t* w = (const uint32_t*)(g_view + (size_t)i * kViewSlot);
+            bool any = false;
+            for (int k = 0; k < 8; k++) any |= w[k] != 0;
+            if (!any) continue;
+            if (!nz) first = i;
+            last = i;
+            nz++;
+            Tag t;
+            memcpy(&t, (const uint8_t*)w + kTagOffset, sizeof t);
+            tagged += t.magic == 0x444C5358u;
+        }
+        XSL_INFO(CH, "descriptor memory: %llu of %u slots hold data (%llu tagged), first %llu, last %llu; g_view %p, GPU start %llx", (unsigned long long)nz, g_viewCount,
+                 (unsigned long long)tagged, (unsigned long long)first, (unsigned long long)last, (void*)g_view, (unsigned long long)g_pcGpu);
+    }
+    return true;
+}
 uint64_t desc_memory_address(uint64_t h) {
     if (!g_viewGpu || h < g_pcGpu || h >= g_pcGpu + (uint64_t)g_viewCount * kViewSlot) return 0;
     return g_viewGpuAddr + (h - g_pcGpu);
@@ -258,6 +287,59 @@ uint32_t desc_increment(D3D12_DESCRIPTOR_HEAP_TYPE t, uint32_t pcInc) {
 void desc_set_payload(const uint32_t words[4]) {
     memcpy(t_payload, words, sizeof t_payload);
     t_has_payload = true;
+}
+// ---- Payloads of descriptors in CPU-only (staging) heaps ----------------------------------------
+// Staging heaps are PC heaps (their handles are PC handles), so a view created there has no slot
+// to carry its console-style payload. Titles that create every view in staging heaps and copy them
+// into shader-visible tables through CopyDescriptors would leave the descriptor memory translated
+// code reads empty. Each staging heap therefore gets a payload array (16 bytes per descriptor),
+// and copies carry payloads between staging heaps and view slots.
+struct Stage { uint64_t start, end; uint32_t inc; uint32_t* pay; };
+std::shared_mutex g_stage_mu;
+std::vector<Stage> g_stages;   // sorted by start
+static uint32_t* stage_at(uint64_t h) {   // caller holds g_stage_mu (shared)
+    auto it = std::upper_bound(g_stages.begin(), g_stages.end(), h, [](uint64_t v, const Stage& s) { return v < s.start; });
+    if (it == g_stages.begin()) return nullptr;
+    --it;
+    return h < it->end ? it->pay + (h - it->start) / it->inc * 4 : nullptr;
+}
+void desc_staging_heap(uint64_t cpuStart, uint32_t count, uint32_t inc, bool add) {
+    if (!cpuStart || !count || !inc) return;
+    std::unique_lock<std::shared_mutex> g(g_stage_mu);
+    for (auto it = g_stages.begin(); it != g_stages.end(); ++it)
+        if (it->start == cpuStart) { free(it->pay); g_stages.erase(it); break; }
+    if (!add) return;
+    Stage s{cpuStart, cpuStart + (uint64_t)count * inc, inc, (uint32_t*)calloc((size_t)count * 4, 4)};
+    if (!s.pay) return;
+    g_stages.insert(std::upper_bound(g_stages.begin(), g_stages.end(), s.start, [](uint64_t v, const Stage& x) { return v < x.start; }), s);
+}
+// A view was created at PC handle h (not a view slot): its payload, or none.
+void desc_staging_store(uint64_t h) {
+    uint32_t w[4] = {};
+    if (t_has_payload) { memcpy(w, t_payload, sizeof w); t_has_payload = false; }
+    std::shared_lock<std::shared_mutex> g(g_stage_mu);
+    if (uint32_t* p = stage_at(h)) memcpy(p, w, sizeof w);
+}
+// The payload follows a descriptor copied from src to dst (each a view slot or a staging handle).
+void desc_payload_copy(uint64_t dst, uint64_t src) {
+    uint32_t w[4] = {}, i;
+    if (view_slot(src, &i)) memcpy(w, g_view + (size_t)i * kViewSlot, sizeof w);
+    else {
+        std::shared_lock<std::shared_mutex> g(g_stage_mu);
+        if (const uint32_t* p = stage_at(src)) memcpy(w, p, sizeof w);
+    }
+    if (view_slot(dst, &i)) {
+        if (w[1] & kDescTexture) w[0] = i;   // texture payloads name their own slot
+        std::lock_guard<std::mutex> g(g_mu);
+        uint8_t* s = g_view + (size_t)i * kViewSlot;
+        if (!memcmp(s, w, sizeof w)) return;
+        memcpy(s, w, sizeof w);
+        memcpy(&g_snapshot[(size_t)i * kViewSlot], w, sizeof w);   // not a title write: nothing to decode
+        g_payload_dirty = true;
+    } else {
+        std::shared_lock<std::shared_mutex> g(g_stage_mu);
+        if (uint32_t* p = stage_at(dst)) memcpy(p, w, sizeof w);
+    }
 }
 uint64_t desc_begin_write(uint64_t h, D3D12_DESCRIPTOR_HEAP_TYPE type, Tag* tagOut) {
     std::lock_guard<std::mutex> g(g_mu);
@@ -301,6 +383,14 @@ bool desc_copy(uint32_t n, uint64_t dst, uint64_t src, D3D12_DESCRIPTOR_HEAP_TYP
     if (type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) {
         uint32_t di, si;
         if (!view_slot(dst, &di) || !view_slot(src, &si)) return false;
+        {
+            static bool on = [] { char b[4]; return GetEnvironmentVariableA("XSL_RT_DEBUG", b, 4) && b[0] == '1'; }();
+            static volatile long cn = 0;
+            if (on && InterlockedIncrement(&cn) % 5000 < 12) {
+                const uint32_t* w = (const uint32_t*)src;
+                XSL_INFO(CH, "desc copy: %u slots %u -> %u; source slot: %x %x %x %x tag %x %x", n, si, di, w[0], w[1], w[2], w[3], w[4], w[5]);
+            }
+        }
         memmove((void*)dst, (const void*)src, (size_t)n * kViewSlot);
         // PC descriptors follow from the source slots' mirror entries (in an order that is safe
         // for overlapping ranges); the copied bytes become the destinations' snapshots.

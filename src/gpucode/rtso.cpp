@@ -282,7 +282,7 @@ bool rt_link(const std::vector<std::vector<uint8_t>>& blobs, RtLinked& out, std:
 }
 
 uint64_t rt_cache_key(const RtLinked& l, const std::string& salt) {
-    uint64_t key = fnv("rt6", 3, 1469598103934665603ull);   // bump when the translation of these programs changes
+    uint64_t key = fnv("rt8", 3, 1469598103934665603ull);   // bump when the translation of these programs changes
     key = fnv(salt.data(), salt.size(), key);
     for (auto& sg : l.segs) {
         key = fnv(&sg.address, 8, key);
@@ -290,6 +290,10 @@ uint64_t rt_cache_key(const RtLinked& l, const std::string& salt) {
     }
     uint32_t v[6] = {l.main, l.park ? 1u : 0u, l.park_ptr_vgpr, l.resume_at, l.park_from, l.park_to};
     key = fnv(v, sizeof v, key);
+    if (l.stats || l.loop_guard) {   // debug variants (keys of normal programs unchanged)
+        uint32_t x[2] = {l.stats ? 1u : 0u, l.loop_guard};
+        key = fnv(x, sizeof x, key);
+    }
     return fnv(l.entries.data(), l.entries.size() * 4, key);
 }
 
@@ -300,6 +304,10 @@ TranslateOptions rt_translate_options(const RtLinked& l) {
     o.global_memory = true;
     o.raw_code = l.image;
     o.raw_segments = l.segs;
+    o.raw_stats = l.stats;
+    // Traversal of one ray takes thousands of dispatcher steps; the translator's default guard (4096,
+    // sized for raster and compute shaders) cut rays off mid-traversal.
+    o.loop_guard = o.loop_guard_barrier = l.loop_guard ? l.loop_guard : 1u << 16;
     o.raw_park_disc_shift = RtSpace::kSlotShift - 8;
     o.raw_park = l.park;
     o.raw_park_ptr_vgpr = l.park_ptr_vgpr;

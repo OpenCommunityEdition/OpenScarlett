@@ -60,6 +60,13 @@ struct TranslateOptions {
     bool raw_park = false;
     uint32_t raw_park_ptr_vgpr = 0, raw_resume_at = 0, raw_park_vgprs = 64;
     uint32_t raw_park_from = 0, raw_park_to = 0;   // the scheduler's code: only its calls park
+    // Debug counters (ray-tracing programs): RTDBG (u0, space932) at byte offset root constant [5];
+    // dword slots: 0 lanes started, 1 lanes ended by s_endpgm, 2 lanes ended by an unknown jump
+    // target (3-4 the last one), 5 loop-guard expiries (19 block, 20 steps), 6 parked lanes (7-8 last
+    // target), 9 resumed lanes, 10 BVH tests, 11 BVH tests with a result, 12 global loads that found
+    // no memory (13-14 last address), 15 global stores that found none (16-17 last address),
+    // 21 global loads, 22 global stores.
+    bool raw_stats = false;
     uint32_t raw_park_disc_shift = 0;   // discovery bit = (target - code_base >> 8) >> shift
     // Code at several addresses: raw_code holds segments back to back; a byte offset inside one
     // has address `address + (offset - offset_of_segment)` (empty: code_base + offset).

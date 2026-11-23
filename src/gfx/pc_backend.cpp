@@ -520,6 +520,7 @@ uint32_t g_gm_next_srv = 1, g_gm_next_uav = kGmHalf;
 std::vector<ID3D12Resource*> g_gm_tables;       // table buffers (recent ones kept alive)
 std::map<ID3D12Resource*, ID3D12Resource*> g_as_shadow;   // acceleration-structure buffer -> shadow
 std::vector<uint32_t> g_gm_free_srv, g_gm_free_uav;   // view slots of destroyed buffers
+std::map<std::tuple<ID3D12Resource*, uint64_t, uint64_t>, std::pair<uint32_t, uint32_t>> g_gm_synth;   // views of segments inside buffers (resource, first byte, bytes)
 uint64_t g_gm_built_at = UINT64_MAX;            // present count of the last table rebuild
 bool g_gm_force = false;                         // rebuild at the next submission even if one ran this frame
 std::vector<std::pair<uint64_t, uint64_t>> g_gm_built;   // address ranges in the current GPU table (sorted)
@@ -539,7 +540,23 @@ uint32_t gm_reserved_start() { return gm_enabled() && g_gv_size > kGmSlots ? g_g
 // Layer memory at fixed low addresses (translated ray-tracing code holds some pointers in 32 bits):
 // 0xF0000000 upward. A title buffer registered in that range would be ambiguous: warned.
 constexpr uint64_t kLowBase = 0xF0000000ull, kLowEnd = 0x100000000ull;
+uint64_t present_count();
+// XSL_GM_WATCH=<hex address> (diagnostics): log buffers created, registered or forgotten that cover it.
+static uint64_t gm_watch() { static uint64_t v = [] { char b[32]; return GetEnvironmentVariableA("XSL_GM_WATCH", b, sizeof b) ? _strtoui64(b, nullptr, 16) : 0ull; }(); return v; }
+static void gm_watch_note(const char* what, PcObj res, uint64_t va, uint64_t size) {
+    uint64_t w = gm_watch();
+    if (!w || w < va || w >= va + size) return;
+    static volatile long n = 0;
+    if (InterlockedIncrement(&n) > 40) return;
+    D3D12_HEAP_PROPERTIES hp{};
+    D3D12_HEAP_FLAGS hf{};
+    D3D12_RESOURCE_DESC d = as<ID3D12Resource>(res)->GetDesc();
+    bool heap = SUCCEEDED(as<ID3D12Resource>(res)->GetHeapProperties(&hp, &hf));
+    XSL_INFO(CH, "gm watch: %s %p at %llx+%llx (width %llx, flags %#x, heap type %d%s, present %llu)", what, res, (unsigned long long)va, (unsigned long long)size,
+             (unsigned long long)d.Width, (unsigned)d.Flags, heap ? (int)hp.Type : -1, heap ? "" : " (reserved)", (unsigned long long)present_count());
+}
 void gm_register(PcObj res, uint64_t titleVa, uint64_t size, uint64_t resOff) {
+    if (res && size) gm_watch_note("register", res, titleVa, size);
     if (!gm_enabled() || !res || !size) return;
     if (titleVa < kLowEnd && titleVa + size > kLowBase && titleVa < kLowBase) {
         static volatile long w = 0;
@@ -566,8 +583,16 @@ void gm_forget(PcObj res) {
     }
     if (shadow) { gm_forget((PcObj)shadow); shadow->Release(); }
     std::lock_guard<std::mutex> g(g_gm_mu);
+    for (auto it = g_gm_synth.begin(); it != g_gm_synth.end();) {
+        if (std::get<0>(it->first) != as<ID3D12Resource>(res)) { ++it; continue; }
+        if (it->second.first) g_gm_free_srv.push_back(it->second.first);
+        if (it->second.second) g_gm_free_uav.push_back(it->second.second);
+        it = g_gm_synth.erase(it);
+        g_gm_dirty = true;
+    }
     for (auto it = g_gm.begin(); it != g_gm.end();) {
         if (it->second.res != as<ID3D12Resource>(res)) { ++it; continue; }
+        gm_watch_note("forget", res, it->first, it->second.size);
         for (auto& v : it->second.views) {
             if (v.first) g_gm_free_srv.push_back(v.first);
             if (v.second) g_gm_free_uav.push_back(v.second);
@@ -1260,8 +1285,9 @@ static ID3D12RootSignature* rt_root_signature(ID3D12Device* dev) {
         params.push_back(p);
         p.DescriptorTable = {1, &smp};
         params.push_back(p);
-        // parameters 22, 23: parked-lane state (u0 space930) and the discovery bitmap (u0 space931)
-        for (UINT sp : {930u, 931u}) {
+        // parameters 22..24: parked-lane state (u0 space930), the discovery bitmap (u0 space931),
+        // debug counters (u0 space932)
+        for (UINT sp : {930u, 931u, 932u}) {
             p = {};
             p.ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
             p.Descriptor = {0, sp, D3D12_ROOT_DESCRIPTOR_FLAG_DATA_VOLATILE};
@@ -1407,6 +1433,7 @@ uint64_t rt_stack_buffer(uint64_t bytes) {
 static const char kRtPrep[] = R"(
 RWByteAddressBuffer T : register(u0);   // table slice
 ByteAddressBuffer A : register(t0);     // indirect arguments (D3D12_DISPATCH_RAYS_DESC)
+RWByteAddressBuffer DBG : register(u1); // debug counters (slots 32..: the raw arguments of the last dispatch)
 cbuffer C : register(b0) {
   uint indirect, srv, cbv, smp, uav, stackLo, stackHi, perLane;
   uint trav0, trav1, trav2, tableLo, tableHi, w, h, d;
@@ -1420,6 +1447,9 @@ cbuffer C : register(b0) {
     H0 = A.Load(40); H1 = A.Load(44); HS = A.Load(56); C0 = A.Load(64); C1 = A.Load(68);
     W = A.Load(88); H = A.Load(92); D = A.Load(96);
   }
+  DBG.Store4(pad0 + 128u, uint4(RG0, RG1, M0, M1));
+  DBG.Store4(pad0 + 144u, uint4(H0, H1, MS, HS));
+  DBG.Store4(pad0 + 160u, uint4(W, H, D, indirect));
   T.Store4(0, uint4(srv, cbv, smp, uav));
   uint trav = tableLo + 0xC0u;
   T.Store2(0x18, uint2(trav, tableHi + (trav < tableLo ? 1u : 0u)));
@@ -1460,12 +1490,14 @@ static bool rtrt_init() {
     std::vector<uint8_t> cs;
     std::string log;
     if (!compile_layer_shader(std::string(kRtPrep, sizeof kRtPrep - 1), "cs_6_0", cs, log)) { XSL_ERR(CH, "ray prep: %s", log.c_str()); return false; }
-    D3D12_ROOT_PARAMETER params[3] = {};
+    D3D12_ROOT_PARAMETER params[4] = {};
     params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
     params[0].Constants.Num32BitValues = 28;
     params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
     params[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
-    D3D12_ROOT_SIGNATURE_DESC rsd{3, params, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_NONE};
+    params[3].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+    params[3].Descriptor.ShaderRegister = 1;
+    D3D12_ROOT_SIGNATURE_DESC rsd{4, params, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_NONE};
     ID3DBlob *b = nullptr, *e = nullptr;
     if (FAILED(D3D12SerializeRootSignature(&rsd, D3D_ROOT_SIGNATURE_VERSION_1, &b, &e)) ||
         FAILED(dev->CreateRootSignature(0, b->GetBufferPointer(), b->GetBufferSize(), IID_PPV_ARGS(&g_rtrt.prepRs))))
@@ -1526,6 +1558,8 @@ struct RtPark {
     ID3D12Resource* state = nullptr;
     ID3D12Resource* disc = nullptr;
     uint8_t* discCpu = nullptr;
+    ID3D12Resource* dbg = nullptr;   // debug counters: 256 bytes per pipeline region
+    uint32_t* dbgCpu = nullptr;
     uint32_t lanes = 0;
     bool failed = false;
 } g_rtpark;
@@ -1551,9 +1585,54 @@ static bool rtpark_init() {
     if (FAILED(g_rtpark.disc->Map(0, nullptr, &m))) return false;
     g_rtpark.discCpu = (uint8_t*)m;
     memset(m, 0, (size_t)bd.Width);
+    bd.Width = (uint64_t)kRtDiscRegions * 256;
+    if (FAILED(g_main_device->CreateCommittedResource(&cp, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&g_rtpark.dbg)))) return false;
+    if (FAILED(g_rtpark.dbg->Map(0, nullptr, &m))) return false;
+    g_rtpark.dbgCpu = (uint32_t*)m;
+    memset(m, 0, (size_t)bd.Width);
     g_rtpark.failed = false;
     XSL_INFO(CH, "parked-ray state: %u lanes (%llu MiB)", g_rtpark.lanes, (unsigned long long)((uint64_t)g_rtpark.lanes * gpucode::kRtParkStride >> 20));
     return true;
+}
+// XSL_RT_DEBUG=1: the counters translated ray-tracing programs keep (TranslateOptions::raw_stats),
+// logged per pipeline region with the frame-rate line and cleared.
+// Where an address stands among the buffers registered in global memory (diagnostics).
+static std::string gm_describe(uint64_t a) {
+    std::lock_guard<std::mutex> g(g_gm_mu);
+    char b[256];
+    auto it = g_gm.upper_bound(a);
+    uint64_t pv = 0, ps = 0, nv = 0;
+    if (it != g_gm.end()) nv = it->first;
+    if (it != g_gm.begin()) { auto p = std::prev(it); pv = p->first; ps = p->second.size; }
+    bool in = ps && a < pv + ps;
+    snprintf(b, sizeof b, "%llx %s (before: %llx+%llx, after: %llx; %zu buffers)", (unsigned long long)a, in ? "registered" : "NOT registered", (unsigned long long)pv,
+             (unsigned long long)ps, (unsigned long long)nv, g_gm.size());
+    std::string out = b;
+    int shown = 0;
+    for (auto& [va, e] : g_gm)   // every buffer holding the address (buffers may overlap)
+        if (a >= va && a < va + e.size && shown++ < 4) {
+            D3D12_RESOURCE_DESC d = e.res->GetDesc();
+            snprintf(b, sizeof b, "; inside %llx+%llx (flags %#x)", (unsigned long long)va, (unsigned long long)e.size, (unsigned)d.Flags);
+            out += b;
+        }
+    if (!shown) out += "; inside no buffer";
+    return out;
+}
+void rt_debug_dump() {
+    if (!g_rtpark.dbgCpu) return;
+    for (uint32_t r = 0; r < kRtDiscRegions; r++) {
+        uint32_t c[64];
+        memcpy(c, g_rtpark.dbgCpu + r * 64, sizeof c);
+        if (!c[0] && !c[9]) continue;
+        memset(g_rtpark.dbgCpu + r * 64, 0, 256);
+        XSL_INFO(CH, "rt debug region %u: last dispatch%s raygen %08x'%08x miss %08x'%08x (stride %u) hit %08x'%08x (stride %u) size %ux%ux%u", r, c[43] ? " (indirect)" : "",
+                 c[33], c[32], c[35], c[34], c[38], c[37], c[36], c[39], c[40], c[41], c[42]);
+        XSL_INFO(CH, "rt debug region %u: raygen record %s; hit table %s", r, gm_describe((uint64_t)c[33] << 32 | c[32]).c_str(), gm_describe((uint64_t)c[37] << 32 | c[36]).c_str());
+        if (c[12]) XSL_INFO(CH, "rt debug region %u: last missed load %s", r, gm_describe((uint64_t)c[14] << 32 | c[13]).c_str());
+        XSL_INFO(CH, "rt debug region %u: lanes %u, endpgm %u, unknown jump %u (last %08x'%08x), guard %u (block %u), parked %u (last %08x'%08x), resumed %u, bvh %u (results %u), "
+                 "loads %u (missed %u, last %08x'%08x), stores %u (missed %u, last %08x'%08x)", r, c[0], c[1], c[2], c[4], c[3], c[5], c[19], c[6], c[8], c[7], c[9], c[10], c[11],
+                 c[21], c[12], c[14], c[13], c[22], c[15], c[17], c[16]);
+    }
 }
 const uint8_t* rt_discovery(uint32_t region) {
     std::lock_guard<std::mutex> g(g_rtrt.mu);
@@ -1579,6 +1658,9 @@ bool list_rays(PcObj l, const std::vector<RtRun>& runs, const RtRaysArgs& a) {
     {
         std::lock_guard<std::mutex> g(g_gm_mu);
         if (!gm_in_table(g_rtrt.ringGm, 64) || !gm_in_table(a.stack, 64)) { g_gm_force = true; g_gm_dirty = true; }
+        // Shader tables are often made just before the dispatch (a new buffer every frame): any
+        // buffer registered since the last table build must be in the table this list runs with.
+        if (g_gm_dirty) g_gm_force = true;
     }
     static volatile long serial = 0;
     uint32_t ser = (uint32_t)InterlockedIncrement(&serial) & 0xffffff;
@@ -1601,10 +1683,12 @@ bool list_rays(PcObj l, const std::vector<RtRun>& runs, const RtRaysArgs& a) {
     uint32_t c[28] = {a.argsVa ? 1u : 0u, a.tables[0], a.tables[1], a.tables[2], a.tables[3], (uint32_t)a.stack, (uint32_t)(a.stack >> 32), a.stackPerLane,
                       a.traversal[0], a.traversal[1], a.traversal[2], (uint32_t)table, (uint32_t)(table >> 32), a.width, a.height, a.depth,
                       (uint32_t)a.raygen, (uint32_t)(a.raygen >> 32), (uint32_t)a.miss, (uint32_t)(a.miss >> 32), a.missStride,
-                      (uint32_t)a.hit, (uint32_t)(a.hit >> 32), a.hitStride, (uint32_t)a.callable, (uint32_t)(a.callable >> 32), 0, 0};
+                      (uint32_t)a.hit, (uint32_t)(a.hit >> 32), a.hitStride, (uint32_t)a.callable, (uint32_t)(a.callable >> 32),
+                      std::min(a.discRegion, kRtDiscRegions - 1) * 256, 0};
     L2->SetComputeRoot32BitConstants(0, 28, c, 0);
     L2->SetComputeRootUnorderedAccessView(1, g_rtrt.ring->GetGPUVirtualAddress() + slice);
     L2->SetComputeRootShaderResourceView(2, a.argsVa ? a.argsVa : g_rtrt.ring->GetGPUVirtualAddress());
+    L2->SetComputeRootUnorderedAccessView(3, g_rtpark.dbg->GetGPUVirtualAddress());
     L2->Dispatch(1, 1, 1);
     L2->ResourceBarrier(1, &ub);
     tr(D3D12_RESOURCE_STATE_UNORDERED_ACCESS, (D3D12_RESOURCE_STATES)(D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE));
@@ -1616,10 +1700,12 @@ bool list_rays(PcObj l, const std::vector<RtRun>& runs, const RtRaysArgs& a) {
     if (a.samplerHeap) L2->SetComputeRootDescriptorTable(21, as<ID3D12DescriptorHeap>(a.samplerHeap)->GetGPUDescriptorHandleForHeapStart());
     L2->SetComputeRootUnorderedAccessView(22, g_rtpark.state->GetGPUVirtualAddress());
     L2->SetComputeRootUnorderedAccessView(23, g_rtpark.disc->GetGPUVirtualAddress() + (uint64_t)std::min(a.discRegion, kRtDiscRegions - 1) * kRtDiscBytes);
+    L2->SetComputeRootUnorderedAccessView(24, g_rtpark.dbg->GetGPUVirtualAddress());
     for (auto& r : runs) {
         if (!r.pso) continue;
         L2->SetPipelineState(as<ID3D12PipelineState>(r.pso));
-        uint32_t rc[8] = {(uint32_t)table, (uint32_t)(table >> 32), 0, 0, a.stackPerLane * 32 + 0x200, 0, (ser << 8) | (r.round & 0xff), g_rtpark.lanes};
+        uint32_t rc[8] = {(uint32_t)table, (uint32_t)(table >> 32), 0, 0, a.stackPerLane * 32 + 0x200, std::min(a.discRegion, kRtDiscRegions - 1) * 256,
+                          (ser << 8) | (r.round & 0xff), g_rtpark.lanes};
         L2->SetComputeRoot32BitConstants(0, 8, rc, 0);
         L2->ExecuteIndirect(g_rtrt.dispatchSig, 1, g_rtrt.ring, slice + 0x1B8, nullptr, 0);   // root constants 2..3 = groups x, y; then the dispatch
         L2->ResourceBarrier(1, &ub);
@@ -1651,9 +1737,11 @@ void list_rt_deserialize(PcObj l, uint64_t dst, uint64_t src) {
 bool gm_resolve(uint64_t va, PcObj* res, uint64_t* off, uint64_t* avail) {
     std::lock_guard<std::mutex> g(g_gm_mu);
     auto it = g_gm.upper_bound(va);
-    if (it == g_gm.begin()) return false;
-    --it;
-    if (va >= it->first + it->second.size) return false;
+    for (int back = 0;; back++) {   // buffers may overlap: the nearest ones below, until one holds the address
+        if (it == g_gm.begin() || back >= 64) return false;
+        --it;
+        if (va < it->first + it->second.size) break;
+    }
     *res = (PcObj)it->second.res;
     *off = it->second.resOff + (va - it->first);
     if (avail) *avail = it->first + it->second.size - va;
@@ -1786,59 +1874,109 @@ void gm_flush(PcObj devObj) {
     // A buffer view holds at most 2^27 elements (512 MB raw): larger buffers become several chunks,
     // each with its own views and table entry.
     constexpr uint64_t kChunk = 512ull << 20;
+    auto take = [](std::vector<uint32_t>& fr, uint32_t& next, uint32_t end) -> uint32_t {
+        if (!fr.empty()) { uint32_t k = fr.back(); fr.pop_back(); return k; }
+        return next < end ? next++ : 0u;
+    };
+    // Views of `len` bytes of a buffer from byte `first`; false when the view range is full or the
+    // buffer allows neither kind of view.
+    auto make_views = [&](ID3D12Resource* res, const D3D12_RESOURCE_DESC& rd, uint64_t first, uint64_t len, std::pair<uint32_t, uint32_t>& v) -> bool {
+        const bool srvOk = !(rd.Flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE);
+        const bool uavOk = (rd.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) != 0;
+        if (!srvOk && !uavOk) return false;
+        if (v.first || v.second) return true;
+        uint32_t sSlot = srvOk ? take(g_gm_free_srv, g_gm_next_srv, kGmHalf) : 0u;
+        uint32_t uSlot = uavOk ? take(g_gm_free_uav, g_gm_next_uav, kGmSlots - 1) : 0u;   // last slot: XSL_PROBE
+        if ((srvOk && !sSlot) || (uavOk && !uSlot)) {
+            if (sSlot) g_gm_free_srv.push_back(sSlot);
+            if (uSlot) g_gm_free_uav.push_back(uSlot);
+            if (InterlockedIncrement(&full) == 1) XSL_WARN(CH, "global memory: view range full");
+            return false;
+        }
+        D3D12_SHADER_RESOURCE_VIEW_DESC sv{};
+        sv.Format = DXGI_FORMAT_R32_TYPELESS;
+        sv.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+        sv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        sv.Buffer.FirstElement = first / 4;
+        sv.Buffer.NumElements = (UINT)(len / 4);
+        sv.Buffer.Flags = D3D12_BUFFER_SRV_FLAG_RAW;
+        if (srvOk) { v.first = sSlot; dev->CreateShaderResourceView(res, &sv, cpu_at(v.first)); }
+        if (uavOk) {
+            v.second = uSlot;
+            D3D12_UNORDERED_ACCESS_VIEW_DESC uv{};
+            uv.Format = DXGI_FORMAT_R32_TYPELESS;
+            uv.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+            uv.Buffer.FirstElement = sv.Buffer.FirstElement;
+            uv.Buffer.NumElements = sv.Buffer.NumElements;
+            uv.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
+            dev->CreateUnorderedAccessView(res, nullptr, &uv, cpu_at(v.second));
+        }
+        return true;
+    };
+    struct Row { uint64_t start; uint32_t len, view; };
+    std::vector<Row> rows;
+    auto add_row = [&](uint64_t start, uint64_t len, const std::pair<uint32_t, uint32_t>& v) {
+        // [13:0] SRV index, [27:14] UAV index, [30] has SRV, [31] has UAV
+        rows.push_back({start, (uint32_t)len, (v.first ? (v.first - 1) | 0x40000000u : 0u) | (v.second ? ((v.second - kGmHalf) << 14) | 0x80000000u : 0u)});
+    };
+    // Titles place buffers at overlapping addresses (placed resources sharing heap memory). The
+    // table is searched for the last start at or below an address, so the part of an enclosing
+    // buffer that follows the end of a buffer inside it gets a segment of its own (with views that
+    // start at that offset; kept in g_gm_synth while used).
+    struct Open { uint64_t start, end; GmBuf* e; };
+    std::vector<Open> open;
+    std::set<std::tuple<ID3D12Resource*, uint64_t, uint64_t>> used;
+    auto synth = [&](const Open& t, uint64_t from, uint64_t to) {   // [from, to) of buffer t
+        D3D12_RESOURCE_DESC rd = t.e->res->GetDesc();
+        // raw views start at multiples of 16 bytes of the buffer: the segment starts at the next one
+        from = t.start + ((t.e->resOff + (from - t.start) + 15) & ~15ull) - t.e->resOff;
+        for (uint64_t at = from; at < to;) {
+            uint64_t len = std::min(kChunk, to - at) & ~3ull;
+            if (!len) break;
+            auto key = std::make_tuple(t.e->res, t.e->resOff + (at - t.start), len);
+            auto& v = g_gm_synth[key];
+            if (make_views(t.e->res, rd, std::get<1>(key), len, v)) { add_row(at, len, v); used.insert(key); }
+            at += len;
+        }
+    };
+    auto close_until = [&](uint64_t s) {   // buffers ending at or before s; s = UINT64_MAX closes all
+        while (!open.empty() && open.back().end <= s) {
+            uint64_t e = open.back().end;
+            open.pop_back();
+            while (!open.empty() && open.back().end <= e) open.pop_back();   // ended inside the one just closed
+            if (!open.empty() && e < s) synth(open.back(), e, std::min(open.back().end, s));
+        }
+    };
     for (auto& [va, e] : g_gm) {
         D3D12_RESOURCE_DESC rd = e.res->GetDesc();
         uint64_t bytes = std::min<uint64_t>(e.size, rd.Width - e.resOff) & ~3ull;
         if (!bytes) continue;
+        close_until(va);
         uint32_t chunks = (uint32_t)((bytes + kChunk - 1) / kChunk);
         if (e.views.size() != chunks) e.views.assign(chunks, {0, 0});
+        bool any = false;
         for (uint32_t c = 0; c < chunks; c++) {
             uint64_t off = (uint64_t)c * kChunk, len = std::min(kChunk, bytes - off);
-            auto& v = e.views[c];
-            const bool srvOk = !(rd.Flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE);
-            const bool uavOk = (rd.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) != 0;
-            if (!srvOk && !uavOk) continue;
-            if (!v.first && !v.second) {
-                auto take = [](std::vector<uint32_t>& fr, uint32_t& next, uint32_t end) -> uint32_t {
-                    if (!fr.empty()) { uint32_t k = fr.back(); fr.pop_back(); return k; }
-                    return next < end ? next++ : 0u;
-                };
-                uint32_t sSlot = srvOk ? take(g_gm_free_srv, g_gm_next_srv, kGmHalf) : 0u;
-                uint32_t uSlot = uavOk ? take(g_gm_free_uav, g_gm_next_uav, kGmSlots - 1) : 0u;   // last slot: XSL_PROBE
-                if ((srvOk && !sSlot) || (uavOk && !uSlot)) {
-                    if (sSlot) g_gm_free_srv.push_back(sSlot);
-                    if (uSlot) g_gm_free_uav.push_back(uSlot);
-                    if (InterlockedIncrement(&full) == 1) XSL_WARN(CH, "global memory: view range full");
-                    continue;
-                }
-                D3D12_SHADER_RESOURCE_VIEW_DESC sv{};
-                sv.Format = DXGI_FORMAT_R32_TYPELESS;
-                sv.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
-                sv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-                sv.Buffer.FirstElement = (e.resOff + off) / 4;
-                sv.Buffer.NumElements = (UINT)(len / 4);
-                sv.Buffer.Flags = D3D12_BUFFER_SRV_FLAG_RAW;
-                if (srvOk) { v.first = sSlot; dev->CreateShaderResourceView(e.res, &sv, cpu_at(v.first)); }
-                if (uavOk) {
-                    v.second = uSlot;
-                    D3D12_UNORDERED_ACCESS_VIEW_DESC uv{};
-                    uv.Format = DXGI_FORMAT_R32_TYPELESS;
-                    uv.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
-                    uv.Buffer.FirstElement = sv.Buffer.FirstElement;
-                    uv.Buffer.NumElements = sv.Buffer.NumElements;
-                    uv.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
-                    dev->CreateUnorderedAccessView(e.res, nullptr, &uv, cpu_at(v.second));
-                }
-            }
-            // {start lo, start hi, size, SRV index [13:0] | UAV index [27:14] | has UAV [31]}
-            uint64_t start = va + off;
-            table.push_back(uint32_t(start));
-            table.push_back(uint32_t(start >> 32));
-            table.push_back((uint32_t)len);
-            // [13:0] SRV index, [27:14] UAV index, [30] has SRV, [31] has UAV
-            table.push_back((v.first ? (v.first - 1) | 0x40000000u : 0u) | (v.second ? ((v.second - kGmHalf) << 14) | 0x80000000u : 0u));
-            count++;
+            if (!make_views(e.res, rd, e.resOff + off, len, e.views[c])) continue;
+            add_row(va + off, len, e.views[c]);
+            any = true;
         }
+        if (any) open.push_back({va, va + bytes, &e});
+    }
+    close_until(UINT64_MAX);
+    for (auto it = g_gm_synth.begin(); it != g_gm_synth.end();) {   // segments no longer needed
+        if (used.count(it->first)) { ++it; continue; }
+        if (it->second.first) g_gm_free_srv.push_back(it->second.first);
+        if (it->second.second) g_gm_free_uav.push_back(it->second.second);
+        it = g_gm_synth.erase(it);
+    }
+    std::stable_sort(rows.begin(), rows.end(), [](const Row& x, const Row& y) { return x.start < y.start; });
+    for (auto& r : rows) {   // {start lo, start hi, size, views}
+        table.push_back(uint32_t(r.start));
+        table.push_back(uint32_t(r.start >> 32));
+        table.push_back(r.len);
+        table.push_back(r.view);
+        count++;
     }
     table[0] = count;
     D3D12_HEAP_PROPERTIES hp{D3D12_HEAP_TYPE_UPLOAD};
@@ -2538,6 +2676,14 @@ HRESULT_T create_reserved_resource(PcObj dev, const void* desc, uint32_t state, 
         std::lock_guard<std::mutex> g(g_remap_mu);
         g_remapped.insert(*reinterpret_cast<ID3D12Resource**>(out));
     }
+    if (SUCCEEDED(hr) && d.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {   // buffers the title places itself: addressable by translated code too
+        note_buffer_fwd(*out);
+        static volatile long n = 0;
+        if (InterlockedIncrement(&n) <= 5)
+            XSL_INFO(CH, "reserved buffer %p: %llu bytes at %llx (registered in global memory)", *out, (unsigned long long)d.Width,
+                     (unsigned long long)as<ID3D12Resource>(*out)->GetGPUVirtualAddress());
+        gm_register(*out, as<ID3D12Resource>(*out)->GetGPUVirtualAddress(), d.Width, 0);
+    }
     return hr;
 }
 std::vector<TileCoord> resource_tiles(PcObj dev, PcObj res) {
@@ -2618,6 +2764,10 @@ HRESULT_T create_heap(PcObj dev, const void* desc, PcObj* out) {
 std::map<uint64_t, std::pair<PcObj, uint64_t>> g_buf_va;   // writer tracing: buffer GPU VA -> (resource, size)
 std::mutex g_buf_va_mu;
 static void note_buffer(PcObj r) {
+    if (r && gm_watch()) {
+        D3D12_RESOURCE_DESC wd = as<ID3D12Resource>(r)->GetDesc();
+        if (wd.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) gm_watch_note("created", r, as<ID3D12Resource>(r)->GetGPUVirtualAddress(), wd.Width);
+    }
     if (false) return;
     if (!r || !getenv("XSL_TRACE_BUFFER")) return;
     D3D12_RESOURCE_DESC d = as<ID3D12Resource>(r)->GetDesc();
@@ -3383,6 +3533,7 @@ static void prof_slow_check(uint64_t present) {
     double ps = double(now.QuadPart - period.QuadPart) / double(f.QuadPart);
     if (ps >= 10.0) {
         long rr = InterlockedExchange(&g_rays_run, 0), rs = InterlockedExchange(&g_rays_skipped, 0);
+        rt_debug_dump();
         XSL_INFO(CH, "frame rate: %.1f presents/s (presents %llu..%llu, slowest %.0f ms)%s", double(present - periodStart) / ps, (unsigned long long)periodStart,
                  (unsigned long long)present, worst, (rr || rs) ? fmt_rays(rr, rs).c_str() : "");
         period = now;

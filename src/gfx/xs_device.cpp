@@ -126,6 +126,8 @@ HRESULT D3DAPI D_CreateDescriptorHeap(ID3D12Device* d, const D3D12_DESCRIPTOR_HE
     PcObj h = nullptr;
     HRESULT hr = pc::create_descriptor_heap(DPC(d), desc, &h);
     if (FAILED(hr)) return hr;
+    if (desc->Type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV)   // staging heap: payloads of its views (never freed: small)
+        desc_staging_heap(pc::heap_cpu_start(h), desc->NumDescriptors, pc::descriptor_increment(DPC(d), desc->Type), true);
     if (desc->Type == D3D12_DESCRIPTOR_HEAP_TYPE_RTV || desc->Type == D3D12_DESCRIPTOR_HEAP_TYPE_DSV)
         if (uint64_t shadow = desc_rtv_dsv_heap(DEV(d), desc->Type, desc->NumDescriptors))
             return make_rtv_dsv_shadow_heap(DEV(d), h, desc, shadow, riid, out);
@@ -551,6 +553,7 @@ template <class F> void write_view(uint64_t h, D3D12_DESCRIPTOR_HEAP_TYPE type, 
         desc_commit(h, type, tag);
     } else {
         create(h);
+        if (type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) desc_staging_store(h);   // staging heap: keep the payload
     }
 }
 void D3DAPI D_CreateRTV(ID3D12Device* d, ID3D12Resource* r, const D3D12_RENDER_TARGET_VIEW_DESC* v, D3D12_CPU_DESCRIPTOR_HANDLE h) {
@@ -612,13 +615,19 @@ void D3DAPI D_CopyDescriptorsSimple(ID3D12Device* d, UINT n, D3D12_CPU_DESCRIPTO
     // One side in console-layout slots and the other in a PC heap: translate each descriptor
     // (the title steps both handles by its increment).
     uint64_t pd = desc_pc_cpu(dst.ptr, t), ps = desc_pc_cpu(src.ptr, t);
-    if (pd == dst.ptr && ps == src.ptr) { pc::copy_descriptors_simple(DPC(d), n, dst.ptr, src.ptr, t); return; }
     const uint64_t inc = D_GetDescriptorHandleIncrementSize(d, t);
+    const bool views = t == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+    if (pd == dst.ptr && ps == src.ptr) {
+        pc::copy_descriptors_simple(DPC(d), n, dst.ptr, src.ptr, t);
+        if (views) for (UINT k = 0; k < n; k++) desc_payload_copy(dst.ptr + k * inc, src.ptr + k * inc);
+        return;
+    }
     for (UINT k = 0; k < n; k++) {
         uint64_t a = desc_pc_cpu(dst.ptr + k * inc, t), b = desc_pc_cpu(src.ptr + k * inc, t);
         if (a && b) {
             pc::copy_descriptors_simple(DPC(d), 1, a, b, t);
-            if (t == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV && a != dst.ptr + k * inc) desc_publish(dst.ptr + k * inc);
+            if (views && a != dst.ptr + k * inc) desc_publish(dst.ptr + k * inc);
+            if (views) desc_payload_copy(dst.ptr + k * inc, src.ptr + k * inc);
         }
     }
 }
@@ -820,7 +829,7 @@ struct RtPipe {
     std::mutex mu;
     std::set<int> active;           // collections reached (discovery bitmap), run in rounds >= 1
     uint32_t scans = 0;
-    bool skipLogged = false;
+    bool skipLogged = false, peekLogged = false;
     std::vector<gpucode::RtLinked::Part> parts;   // diagnostics
 };
 // Every collection's code in one space (gpucode::RtSpace): identifiers are global code addresses.
@@ -859,7 +868,7 @@ static void rt_queue_build(size_t size, std::function<void()> job) {
         started = true;
         char b[8];
         unsigned n = GetEnvironmentVariableA("XSL_RT_BUILD_THREADS", b, sizeof b) ? (unsigned)atoi(b) : 1u;
-        n = std::max(1u, std::min(n, 4u));
+        n = std::max(1u, std::min(n, 12u));
         for (unsigned t = 0; t < n; t++) std::thread([] {
             SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_IDLE);   // behind the title's own pipeline compiles
             for (;;) {
@@ -895,6 +904,12 @@ static std::shared_ptr<RtProg> rt_program(int coll, bool first = false) {
     bool ok;
     { std::lock_guard<std::mutex> g(g_space_mu); ok = g_space.program(coll, *link, &err); }
     if (!ok) { XSL_WARN(CH, "ray-tracing collection %d: no program (%s)", coll, err.c_str()); prog->state = -1; return prog; }
+    {   // XSL_RT_DEBUG=1: debug counters; XSL_RT_GUARD=<n>: dispatcher steps per invocation (other cache keys)
+        static bool dbg = [] { char b[4]; return GetEnvironmentVariableA("XSL_RT_DEBUG", b, 4) && b[0] == '1'; }();
+        static unsigned guard = [] { char b[16]; return GetEnvironmentVariableA("XSL_RT_GUARD", b, sizeof b) ? (unsigned)strtoul(b, nullptr, 0) : 0u; }();
+        link->stats = dbg;
+        link->loop_guard = guard;
+    }
     size_t size = link->image.size() * 4;
     XSL_INFO(CH, "ray-tracing collection %d: program rt_%016llx queued (%zu KiB code)", coll,
              (unsigned long long)gpucode::rt_cache_key(*link, "gpucode-35-O3"), size / 1024);
@@ -1016,6 +1031,23 @@ bool rt_dispatch_impl(PcObj list, const void* so, const uint64_t* tables, const 
     if (InterlockedIncrement(&n) <= 5)
         XSL_INFO(CH, "DispatchRays %s%ux%ux%u: %zu program runs (tables %x %x %x %x)", argsVa ? "(indirect) " : "", a.width, a.height, a.depth, runs.size(),
                  a.tables[0], a.tables[1], a.tables[2], a.tables[3]);
+    if (!pipe->peekLogged) {   // diagnostics, once per pipeline: the descriptor words the programs will read
+        pipe->peekLogged = true;
+        std::string s;
+        const char* nm[4] = {"SRV", "CBV", "sampler", "UAV"};
+        for (int k = 0; k < 4; k++) {
+            char b[200];
+            snprintf(b, sizeof b, " | %s handle %llx -> %x:", nm[k], (unsigned long long)tables[k], a.tables[k]);
+            s += b;
+            for (uint32_t j = 0; j < 6; j++) {
+                uint32_t w[8] = {};
+                if (!desc_peek(tables[k], j, w)) { s += " (not view memory)"; break; }
+                snprintf(b, sizeof b, " [%u] %x %x %x %x tag %x %x %x %x", j, w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7]);
+                s += b;
+            }
+        }
+        XSL_INFO(CH, "ray pipeline (region %u) tables:%s", pipe->region, s.c_str());
+    }
     return pc::list_rays(list, runs, a);
 }
 namespace {

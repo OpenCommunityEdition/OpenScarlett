@@ -1169,6 +1169,7 @@ struct Translator {
     void gm_read_n(const std::vector<std::string>& dst) {
         if (dst.size() == 1) { line(fmt("  %s = gm_load(lo_, hi_);", dst[0].c_str())); return; }
         line("  { uint fy_, fz_, fl_; bool fx_ = gm_find(lo_, hi_, fy_, fz_, fl_);");
+        if (opt.raw_stats) line("    dbg_add(21u); if (!fx_) { dbg_add(12u); dbg_set2(13u, lo_, hi_); }");
         for (size_t k = 0; k < dst.size(); k++)
             line(fmt("    %s = fx_ && fl_ > %zuu ? gm_vload(fy_, fz_ + %zuu) : 0u;", dst[k].c_str(), 4 * k, 4 * k));
         line("  }");
@@ -1184,6 +1185,7 @@ struct Translator {
         for (unsigned k = 0; k < nv; k += 4) line(fmt("      RTST.Store4(b_ + %uu, uint4(v%u, v%u, v%u, v%u));", 8 + 4 * k, k, k + 1, k + 2, k + 3));
         line(fmt("      uint u_ = (p_ - 0x%xu) >> %uu; if (u_ < (1u << 20)) RTDISC.InterlockedOr((u_ >> 5) * 4u, 1u << (u_ & 31u)); }", uint32_t(opt.code_base >> 8),
                  opt.raw_park_disc_shift));
+        if (opt.raw_stats) line("    if (kexec) { dbg_add(6u); dbg_set2(7u, tlo_, thi_); }");
         line(fmt("    if (kexec) v%u = 0u;", opt.raw_park_ptr_vgpr));
         max_v = std::max(max_v, nv);
         uses_park = true;
@@ -1197,7 +1199,10 @@ struct Translator {
         for (unsigned k = 0; k < nv; k += 4)
             line(fmt("      q_ = RTST.Load4(b_ + %uu); v%u = q_.x; v%u = q_.y; v%u = q_.z; v%u = q_.w;", 8 + 4 * k, k, k + 1, k + 2, k + 3));
         line(fmt("      v%u = p_; } else v%u = 0u;", opt.raw_park_ptr_vgpr, opt.raw_park_ptr_vgpr));
-        line(fmt("    kvcc = kexec && int(v%u) > 0;", opt.raw_park_ptr_vgpr));
+        if (opt.raw_stats) line("    if (r_) dbg_add(9u);");
+        // the compare is redone: the lane flag and the wave's VCC mask (the scheduler's saveexec and its
+        // later exec arithmetic use the mask; a stale one re-activated lanes that were not resumed)
+        line(fmt("    kvcc = kexec && int(v%u) > 0; s106 = ballot2(kvcc).x; s107 = 0u;", opt.raw_park_ptr_vgpr));
         line("  }");
         max_v = std::max(max_v, nv);
         uses_park = true;
@@ -1480,7 +1485,7 @@ bool Translator::emit_salu(const Instr& in, size_t idx) {
                 emit_park();
                 line(fmt("    pc = %zuu;", block_of[in.offset + 4]));
                 line("  } else pc = t_; }");
-            } else line("  pc = jump_case(tlo_, thi_); }");
+            } else line(opt.raw_stats ? "  pc = jump_case(tlo_, thi_); if (pc == 0xffffffffu) dbg_set2(3u, tlo_, thi_); }" : "  pc = jump_case(tlo_, thi_); }");
             jumped = true;
             return true;
         }
@@ -2635,6 +2640,7 @@ bool Translator::emit_mimg(const Instr& in, size_t idx) {
                  base.c_str(), ptr.c_str(), ar(k0).c_str(), ar(k0 + 1).c_str(), ar(k0 + 2).c_str(), ar(k0 + 3).c_str(), ar(k0 + 4).c_str(), ar(k0 + 5).c_str(),
                  ar(k0 + 6).c_str(), ar(k0 + 7).c_str(), ar(k0 + 8).c_str(), ar(k0 + 9).c_str(), S(in.srsrc + 1).c_str()));
         for (unsigned k = 0; k < 4; k++) line(fmt("  %s = r_[%u];", V(in.vdata + k).c_str(), k));
+        if (opt.raw_stats) line("  dbg_add(10u); if (r_[0] != 0xffffffffu) dbg_add(11u);");
         line("}");
         return true;
     }
@@ -3491,8 +3497,8 @@ std::string Translator::generate() {
         bool barriers = false;
         for (auto& i : ins) barriers |= i.name && !strcmp(i.name, "s_barrier") && i.offset >= first_head;
         size_t start = opt.raw_code.empty() || !block_of.count(opt.raw_entry) ? 0 : block_of[opt.raw_entry];
-        line(fmt("uint pc = %zuu, guard_ = 0u;\n  [loop] for (;;) {\n  if (++guard_ > %uu) RETURN;\n  [forcecase] switch (pc) {", start,
-                 barriers ? opt.loop_guard_barrier : opt.loop_guard));
+        line(fmt("uint pc = %zuu, guard_ = 0u;\n  [loop] for (;;) {\n  if (++guard_ > %uu) %s\n  [forcecase] switch (pc) {", start,
+                 barriers ? opt.loop_guard_barrier : opt.loop_guard, opt.raw_stats ? "{ dbg_add(5u); dbg_set2(19u, pc, guard_); RETURN; }" : "RETURN;"));
     }
     // Blocks not reachable from the entry (data after the last instruction) are not emitted.
     std::vector<bool> live(nb, indirect);
@@ -3528,7 +3534,7 @@ std::string Translator::generate() {
         std::string ln = last.name;
         size_t next = b + 1;
         if (jumped) line("break;");   // s_setpc / s_swappc set pc
-        else if (last.fmt == Fmt::SOPP && ln == "s_endpgm") line("RETURN;");
+        else if (last.fmt == Fmt::SOPP && ln == "s_endpgm") line(opt.raw_stats ? "{ dbg_add(1u); RETURN; }" : "RETURN;");
         else if (last.fmt == Fmt::SOPP && (starts(ln, "s_branch") || starts(ln, "s_cbranch"))) {
             size_t t = block_of.count(uint32_t(int32_t(last.offset) + 4 + last.simm16 * 4)) ? block_of[uint32_t(int32_t(last.offset) + 4 + last.simm16 * 4)] : nb;
             if (starts(ln, "s_branch")) line(loops ? fmt("pc = %zuu; break;", t) : fmt("reach[%zu] = true;", t));
@@ -3542,7 +3548,7 @@ std::string Translator::generate() {
         }
         line("}");
     }
-    if (loops) line(fmt("default: RETURN;\n  }\n  }"));
+    if (loops) line(opt.raw_stats ? "default: { dbg_add(2u); RETURN; }\n  }\n  }" : "default: RETURN;\n  }\n  }");
     else line("RETURN;");
     std::swap(out, body);
     if (!err.empty()) return "";
@@ -3812,6 +3818,7 @@ std::string Translator::generate() {
         }
         if ((meta.rsrc2 & 1) && !opt.raw_scratch_offset.empty())   // SCRATCH_EN: the scratch wave offset follows
             init += fmt("  s%u = %s;   // scratch wave offset\n", s++, opt.raw_scratch_offset.c_str());
+        if (opt.raw_stats) init += "  DBGB = RC0_d[1].y; dbg_add(0u);\n";
         for (unsigned k = 0; k < meta.tid_comps(); k++) init += fmt("  v%u = tid_.%c;\n", k, "xyz"[k]);
     } else if (c.kind == ProgramKind::PS) {
         h << "struct PSIn {\n";
@@ -4288,6 +4295,23 @@ TranslateResult translate(const Container& c, const RootSig& rs, const Translate
     }
     r.hlsl = t.generate();
     r.wave_size = t.W;
+    if (opt.raw_stats) {   // counters in the global-memory helpers (see TranslateOptions::raw_stats)
+        auto rep = [&](const std::string& a, const std::string& b) {
+            size_t at = r.hlsl.find(a);
+            if (at != std::string::npos) r.hlsl.replace(at, a.size(), b);
+        };
+        rep("StructuredBuffer<uint4> GMT : register(t0, space901);\n",
+            "RWByteAddressBuffer RTDBG : register(u0, space932);\nstatic uint DBGB = 0u;\n"
+            "void dbg_add(uint slot) { uint o_; RTDBG.InterlockedAdd(DBGB + slot * 4u, 1u, o_); }\n"
+            "void dbg_set2(uint slot, uint a, uint b) { RTDBG.Store2(DBGB + slot * 4u, uint2(a, b)); }\n"
+            "StructuredBuffer<uint4> GMT : register(t0, space901);\n");
+        rep("uint gm_load(uint lo, uint hi) {\n  uint fy, fz, fl; bool fx = gm_find(lo, hi, fy, fz, fl);\n  if (!fx) return 0u;\n",
+            "uint gm_load(uint lo, uint hi) {\n  uint fy, fz, fl; bool fx = gm_find(lo, hi, fy, fz, fl);\n  dbg_add(21u);\n"
+            "  if (!fx) { dbg_add(12u); dbg_set2(13u, lo, hi); return 0u; }\n");
+        rep("void gm_store(uint lo, uint hi, uint v) {\n  uint fy, fz, fl; bool fx = gm_find(lo, hi, fy, fz, fl);\n",
+            "void gm_store(uint lo, uint hi, uint v) {\n  uint fy, fz, fl; bool fx = gm_find(lo, hi, fy, fz, fl);\n  dbg_add(22u);\n"
+            "  if (!fx || !(fy & 0x80000000u)) { dbg_add(15u); dbg_set2(16u, lo, hi); }\n");
+    }
     // Conservative depth outputs need the position input interpolated noperspective centroid (DXIL
     // validation; the console hardware has no such rule).
     if (c.kind == ProgramKind::PS && (r.hlsl.find("SV_DepthLessEqual") != std::string::npos || r.hlsl.find("SV_DepthGreaterEqual") != std::string::npos)) {
