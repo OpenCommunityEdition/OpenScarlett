@@ -3533,15 +3533,16 @@ void create_cbv(PcObj dev, const void* desc, uint64_t h) {
     if (p) {
         d = *p;
         d.SizeInBytes = (d.SizeInBytes + 255) & ~255u;
-        if ((d.BufferLocation & 255) && getenv("XSL_CBV_ALIGN_DOWN")) {   // experiment: legal view, shifted contents
-            d.SizeInBytes = UINT((d.SizeInBytes + (d.BufferLocation & 255) + 255) & ~255ull);
-            d.BufferLocation &= ~255ull;
-        }
         if (d.BufferLocation & 255) {
+            // An unaligned view is an invalid call that removes the device: the view starts at the
+            // 256-byte boundary below (legal, but the shader reads its constants shifted).
             static volatile long n = 0;
             if (InterlockedIncrement(&n) <= 3)
-                XSL_WARN(CH, "constant buffer view at %llx is not 256-byte aligned (PC requirement); the shader may read shifted constants",
+                XSL_WARN(CH, "constant buffer view at %llx is not 256-byte aligned (PC requirement); the shader reads shifted constants",
                          (unsigned long long)d.BufferLocation);
+            d.SizeInBytes = UINT((d.SizeInBytes + (d.BufferLocation & 255) + 255) & ~255ull);
+            if (d.SizeInBytes > 65536) d.SizeInBytes = 65536;
+            d.BufferLocation &= ~255ull;
         }
         p = &d;
     }

@@ -174,14 +174,17 @@ void detile_flush(PcObj pcDevice, PcObj pcQueue) {
         // Content check: up to 8 MB of uploaded textures per submission.
         static bool check = [] { char b[4]; return !(GetEnvironmentVariableA("XSL_DETILE_RECHECK", b, 4) && b[0] == '0'); }();
         if (check && !g_tex.empty()) {
-            uint64_t budget = 8ull << 20;
+            const uint64_t kCheckBudget = 8ull << 20;
+            uint64_t budget = kCheckBudget;
             auto it = g_tex.begin();
             std::advance(it, g_scan % g_tex.size());
             for (size_t k = 0; k < g_tex.size() && budget; k++, g_scan++) {
                 if (it == g_tex.end()) it = g_tex.begin();
                 Entry& e = it->second;
-                if (e.done && e.size && e.size <= budget && !e.mapped) {   // (mapped copies upload at their unmap)
-                    budget -= e.size;
+                // (Mapped copies upload at their unmap. A texture larger than the whole budget is
+                // checked when nothing else was this time, else it would never be: font atlases.)
+                if (e.done && e.size && (e.size <= budget || budget == kCheckBudget) && !e.mapped) {
+                    budget -= std::min(budget, e.size);
                     uint64_t now = 0;
                     if (!content_hash_guarded(e.va, e.size, &now)) e.size = 0;   // the title released the memory: stop checking
                     else {

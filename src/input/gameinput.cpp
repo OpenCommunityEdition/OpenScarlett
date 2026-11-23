@@ -60,11 +60,12 @@ float stick(SHORT v) { return v < 0 ? v / 32768.0f : v / 32767.0f; }
 
 std::atomic<bool> g_title_reads_keyboard{false};
 
-// XSL_INPUT_SCRIPT="<seconds>:<button>[,<seconds>:<button>...]" (testing without a person at the
-// machine): from that many seconds after start the button is held for 300 ms, on the first gamepad
-// and as the matching key. Buttons: A B X Y Menu View Up Down Left Right (keys Enter Escape and arrows
-// for A/Menu, B/View and the D-pad).
-struct ScriptedPress { uint64_t at_ms; uint32_t pad; int vk; };
+// XSL_INPUT_SCRIPT="<seconds>:<button>[:<hold ms>][,...]" (testing without a person at the
+// machine): from that many seconds after start the button is held for 300 ms (or the given time), on
+// the first gamepad and as the matching key. Buttons: A B X Y Menu View Up Down Left Right (keys Enter
+// Escape and arrows for A/Menu, B/View and the D-pad); RUp RDown LUp LDown push the right or left
+// stick fully up or down.
+struct ScriptedPress { uint64_t at_ms; uint32_t pad; int vk; uint64_t hold_ms; int stick; };
 const std::vector<ScriptedPress>& input_script() {
     static std::vector<ScriptedPress> v = [] {
         std::vector<ScriptedPress> r;
@@ -74,12 +75,16 @@ const std::vector<ScriptedPress>& input_script() {
             {"A", GameInputGamepadA, VK_RETURN}, {"B", GameInputGamepadB, VK_ESCAPE}, {"X", GameInputGamepadX, 'C'}, {"Y", GameInputGamepadY, 'V'},
             {"Menu", GameInputGamepadMenu, VK_RETURN}, {"View", GameInputGamepadView, VK_ESCAPE}, {"Up", GameInputGamepadDPadUp, VK_UP},
             {"Down", GameInputGamepadDPadDown, VK_DOWN}, {"Left", GameInputGamepadDPadLeft, VK_LEFT}, {"Right", GameInputGamepadDPadRight, VK_RIGHT}};
+        static const struct { const char* n; int stick; } sticks[] = {{"RUp", 1}, {"RDown", 2}, {"LUp", 3}, {"LDown", 4}};
         for (char* t = strtok(b, ","); t; t = strtok(nullptr, ",")) {
             double sec = 0;
             char btn[16] = {};
-            if (sscanf(t, "%lf:%15s", &sec, btn) != 2) continue;
+            unsigned hold = 300;
+            if (sscanf(t, "%lf:%15[^:]:%u", &sec, btn, &hold) < 2) continue;
             for (auto& n : names)
-                if (!_stricmp(n.n, btn)) r.push_back({(uint64_t)(sec * 1000), n.pad, n.vk});
+                if (!_stricmp(n.n, btn)) r.push_back({(uint64_t)(sec * 1000), n.pad, n.vk, hold, 0});
+            for (auto& n : sticks)
+                if (!_stricmp(n.n, btn)) r.push_back({(uint64_t)(sec * 1000), 0, 0, hold, n.stick});
         }
         XSL_INFO(CH, "input script: %zu scripted presses", r.size());
         return r;
@@ -90,9 +95,19 @@ uint64_t g_start_ms = GetTickCount64();
 void scripted(uint32_t* pad, std::vector<int>* vks) {
     uint64_t now = GetTickCount64() - g_start_ms;
     for (auto& p : input_script())
-        if (now >= p.at_ms && now < p.at_ms + 300) {
+        if (!p.stick && now >= p.at_ms && now < p.at_ms + p.hold_ms) {
             if (pad) *pad |= p.pad;
             if (vks) vks->push_back(p.vk);
+        }
+}
+// Scripted stick pushes: the vertical deflection of the right and of the left stick, if any.
+void scripted_sticks(float* ry, float* ly) {
+    uint64_t now = GetTickCount64() - g_start_ms;
+    for (auto& p : input_script())
+        if (p.stick && now >= p.at_ms && now < p.at_ms + p.hold_ms) {
+            float v = (p.stick & 1) ? 1.0f : -1.0f;
+            if (p.stick <= 2) *ry = v;
+            else *ly = v;
         }
 }
 
@@ -105,6 +120,7 @@ bool pad_state(DWORD slot, GameInputGamepadState* s) {
             uint32_t o = 0;
             scripted(&o, nullptr);
             s->buttons = (GameInputGamepadButtons)o;
+            scripted_sticks(&s->rightThumbstickY, &s->leftThumbstickY);
             return true;
         }
         return false;
@@ -133,6 +149,7 @@ bool pad_state(DWORD slot, GameInputGamepadState* s) {
     s->leftThumbstickY = stick(x.Gamepad.sThumbLY);
     s->rightThumbstickX = stick(x.Gamepad.sThumbRX);
     s->rightThumbstickY = stick(x.Gamepad.sThumbRY);
+    if (slot == 0) scripted_sticks(&s->rightThumbstickY, &s->leftThumbstickY);
     return true;
 }
 
