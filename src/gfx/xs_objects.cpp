@@ -428,7 +428,18 @@ namespace {
 HRESULT D3DAPI Res_Map(ID3D12Resource* r, UINT sub, const D3D12_RANGE* range, void** out) { return pc::res_map(pc_of(r), sub, range, out); }
 void D3DAPI Res_Unmap(ID3D12Resource* r, UINT sub, const D3D12_RANGE* range) { pc::res_unmap(pc_of(r), sub, range); }
 void D3DAPI Res_GetDesc(ID3D12Resource* r, D3D12_RESOURCE_DESC* d) { pc::res_desc(pc_of(r), d); }
-D3D12_GPU_VIRTUAL_ADDRESS D3DAPI Res_GetGPUVirtualAddress(ID3D12Resource* r) { return pc::res_gpu_va(pc_of(r)); }
+// On the console every resource has an address, textures too, and it is CPU memory as well: titles
+// write texels through it. A PC texture has none; the address of the console memory the resource
+// holds is returned (what the title writes there is not uploaded to the texture yet).
+D3D12_GPU_VIRTUAL_ADDRESS D3DAPI Res_GetGPUVirtualAddress(ID3D12Resource* r) {
+    uint64_t va = pc::res_gpu_va(pc_of(r));
+    if (va) return va;
+    void* cm = console_memory_of(pc_of(r));
+    static volatile long n = 0;
+    if (InterlockedIncrement(&n) <= 3)
+        XSL_WARN(CH, "GetGPUVirtualAddress of a texture: %s", cm ? "its console memory (CPU writes there do not reach the PC texture yet)" : "no address on a PC");
+    return (uint64_t)(uintptr_t)cm;
+}
 HRESULT D3DAPI Res_GetHeapProperties(ID3D12Resource*, D3D12_HEAP_PROPERTIES* p, D3D12_HEAP_FLAGS* f) {
     if (p) { *p = {}; p->Type = D3D12_HEAP_TYPE_DEFAULT; }
     if (f) *f = D3D12_HEAP_FLAG_NONE;
@@ -793,11 +804,24 @@ void D3DAPI L_IASetPrimitiveTopology(ID3D12GraphicsCommandList* l, D3D12_PRIMITI
 }
 void D3DAPI L_IASetVertexBuffers(ID3D12GraphicsCommandList* l, UINT s, UINT n, const D3D12_VERTEX_BUFFER_VIEW* v) {
     XSL_TRACE("gfx.cmd", "list %p VB %u n=%u va=%llx size=%u stride=%u", (void*)l, s, n, n ? (unsigned long long)v[0].BufferLocation : 0ull, n ? v[0].SizeInBytes : 0, n ? v[0].StrideInBytes : 0);
+    // The address may be the CPU address of unified memory.
+    D3D12_VERTEX_BUFFER_VIEW x[D3D12_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT];
+    if (v && n <= D3D12_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT) {
+        for (UINT i = 0; i < n; i++) {
+            x[i] = v[i];
+            if (x[i].BufferLocation) x[i].BufferLocation = gpu_va(hdr(l)->device, x[i].BufferLocation);
+        }
+        v = x;
+    }
     pc::list_ia_vbs(LPC(l), s, n, v);
 }
 void D3DAPI L_IASetIndexBuffer(ID3D12GraphicsCommandList* l, const D3D12_INDEX_BUFFER_VIEW* v) {
     lx(l)->ibValid = v != nullptr;
-    if (v) lx(l)->ib = *v;
+    if (v) {
+        lx(l)->ib = *v;
+        if (v->BufferLocation) lx(l)->ib.BufferLocation = gpu_va(hdr(l)->device, v->BufferLocation);   // (unified memory)
+        v = &lx(l)->ib;
+    }
     XSL_TRACE("gfx.cmd", "list %p IB va=%llx size=%u fmt=%d", (void*)l, v ? (unsigned long long)v->BufferLocation : 0ull, v ? v->SizeInBytes : 0, v ? v->Format : 0);
     pc::list_ia_ib(LPC(l), v);
 }

@@ -246,6 +246,7 @@ void set_fallback_root_signature(const void* blob, size_t n) {
     }
     t_fallback_rs.assign(d, d + n);
 }
+const std::vector<uint8_t>& fallback_root_signature() { return t_fallback_rs; }
 bool native_translate(const void* in, size_t n, void** out, size_t* outSize) {
     if (mode() == 0) return false;
     gpucode::Container c;

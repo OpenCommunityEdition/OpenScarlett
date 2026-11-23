@@ -125,18 +125,19 @@ bool map_one(uintptr_t va, ULONG_PTR page) {
     VirtualQuery((void*)va, &mbi, sizeof mbi);
     if (mbi.Type == MEM_MAPPED) { UnmapViewOfFile2(GetCurrentProcess(), (void*)va, MEM_PRESERVE_PLACEHOLDER); release_va(va); }
     VirtualQuery((void*)va, &mbi, sizeof mbi);
-    if (mbi.RegionSize > kPage || (uintptr_t)mbi.BaseAddress != va) {
-        // Split the placeholder so this 64 KB unit stands alone.
-        if ((uintptr_t)mbi.BaseAddress < va)
-            VirtualFree(mbi.BaseAddress, va - (uintptr_t)mbi.BaseAddress, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER);
-        VirtualFree((void*)va, kPage, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER);
-    }
+    // Split the placeholder so this 64 KB unit stands alone. (A query reports the region from the
+    // queried address on; a placeholder that begins lower shows in its allocation base.)
+    if ((uintptr_t)mbi.AllocationBase < va) VirtualFree(mbi.AllocationBase, va - (uintptr_t)mbi.AllocationBase, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER);
+    if (mbi.RegionSize > kPage) VirtualFree((void*)va, kPage, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER);
     if (page == (ULONG_PTR)-1) return true;  // unmap only
     HANDLE s = g_chunks[page / kPagesPerChunk];
     ULONG64 off = (ULONG64)(page % kPagesPerChunk) * kPage;
     void* p = MapViewOfFile3(s, GetCurrentProcess(), (void*)va, off, kPage, MEM_REPLACE_PLACEHOLDER, PAGE_READWRITE, nullptr, 0);
     if (p != (void*)va) {
-        XSL_ERR(CH, "MapViewOfFile3 at %p failed (%lu)", (void*)va, GetLastError());
+        DWORD e = GetLastError();
+        VirtualQuery((void*)va, &mbi, sizeof mbi);
+        XSL_ERR(CH, "MapViewOfFile3 at %p failed (%lu): page %llu, region %p+%zx state %lx type %lx, allocation %p", (void*)va, e, (unsigned long long)page,
+                mbi.BaseAddress, mbi.RegionSize, mbi.State, mbi.Type, mbi.AllocationBase);
         return false;
     }
     g_va_page[va] = page;

@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdarg>
+#include <array>
 #include <atomic>
 #include <cstring>
 #include <map>
@@ -499,7 +500,19 @@ HRESULT_T create_device(PcObj* out) {
     }
     if (env_on("XSL_D3D12_DEBUG")) {
         ID3D12Debug* dbg = nullptr;
-        if (SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&dbg)))) { dbg->EnableDebugLayer(); dbg->Release(); }
+        if (SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&dbg)))) {
+            dbg->EnableDebugLayer();
+            // XSL_D3D12_DEBUG=2: GPU-based validation too (descriptors and resource states as shaders
+            // use them; slow).
+            char b[4];
+            ID3D12Debug1* d1 = nullptr;
+            if (GetEnvironmentVariableA("XSL_D3D12_DEBUG", b, 4) && b[0] == '2' && SUCCEEDED(dbg->QueryInterface(IID_PPV_ARGS(&d1)))) {
+                d1->SetEnableGPUBasedValidation(TRUE);
+                d1->Release();
+                XSL_INFO(CH, "GPU-based validation on");
+            }
+            dbg->Release();
+        }
     }
     hr = CreateDXGIFactory2(0, IID_PPV_ARGS(&g_factory));
     if (FAILED(hr)) { XSL_ERR(CH, "CreateDXGIFactory2 failed %08lx", hr); return hr; }
@@ -2645,6 +2658,11 @@ HRESULT_T create_pso_stream(PcObj dev, void* stream, size_t size, PcObj* out) {
     static volatile long dumped = 0;
     if (FAILED(hr) && dumpDir[0] && InterlockedIncrement(&dumped) <= 12) {
         const uint8_t* p = (const uint8_t*)stream;
+        if (auto& rs = fallback_root_signature(); !rs.empty()) {   // the pipeline's root signature (<dir>\pso<n>_rs.bin)
+            char path[MAX_PATH + 64];
+            snprintf(path, sizeof path, "%s\\pso%ld_rs.bin", dumpDir, dumped);
+            if (FILE* f = fopen(path, "wb")) { fwrite(rs.data(), 1, rs.size(), f); fclose(f); }
+        }
         for (size_t o = 0; o + sizeof(void*) <= size;) {
             auto t = *(const D3D12_PIPELINE_STATE_SUBOBJECT_TYPE*)(p + o);
             size_t n = 0;
@@ -2853,6 +2871,16 @@ namespace {
 std::mutex g_remap_mu;
 std::set<ID3D12Resource*> g_remapped;
 DXGI_FORMAT stand_in(DXGI_FORMAT f) {
+    // The console's 16-bit depth with stencil (D16_UNORM_S8_UINT and its two view formats) does not
+    // exist on a PC: the 24-bit family stands in.
+    switch ((int)f) {
+    case 118: return DXGI_FORMAT_D24_UNORM_S8_UINT;
+    case 119: return DXGI_FORMAT_R24_UNORM_X8_TYPELESS;
+    case 120: return DXGI_FORMAT_X24_TYPELESS_G8_UINT;
+    // 16-bit packed colour as a render target with unordered access: not on a PC.
+    case DXGI_FORMAT_B5G5R5A1_UNORM: case DXGI_FORMAT_B5G6R5_UNORM: case DXGI_FORMAT_B4G4R4A4_UNORM: return DXGI_FORMAT_R8G8B8A8_UNORM;
+    default: break;
+    }
     // R16G16B16A16_FLOAT, not R11G11B10: typed UAV stores to the latter are optional on PC GPUs.
     return f == DXGI_FORMAT_R9G9B9E5_SHAREDEXP ? DXGI_FORMAT_R16G16B16A16_FLOAT : DXGI_FORMAT_UNKNOWN;
 }
@@ -2879,6 +2907,12 @@ D3D12_RESOURCE_DESC clean_desc(const void* desc) {
     }
     if (d.Layout > D3D12_TEXTURE_LAYOUT_64KB_STANDARD_SWIZZLE) d.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
     return d;
+}
+// A depth-stencil resource the console starts in the unordered-access state (it allows such
+// views there) starts writable as depth on a PC, which has no such state for it.
+D3D12_RESOURCE_STATES depth_state(const D3D12_RESOURCE_DESC& d, D3D12_RESOURCE_STATES st) {
+    if ((d.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL) && (st & D3D12_RESOURCE_STATE_UNORDERED_ACCESS)) return D3D12_RESOURCE_STATE_DEPTH_WRITE;
+    return st;
 }
 D3D12_HEAP_FLAGS clean_heap_flags(uint32_t f) {
     // Xbox reuses 0x2 (ALLOW_INDIRECT_BUFFERS) where PC has SHARED; ALLOW_DISPLAY has no PC meaning here.
@@ -2964,13 +2998,13 @@ HRESULT_T create_committed_resource(PcObj dev, const void* heapProps, uint32_t h
     D3D12_CLEAR_VALUE cvTmp;
     DXGI_FORMAT standIn = stand_in(d.Format);
     bool remap = standIn != DXGI_FORMAT_UNKNOWN &&
-                 (d.Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS));
+                 (d.Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL));
     if (remap) {
         XSL_INFO(CH, "format %d is not renderable on PC; using %d for this resource", d.Format, standIn);
         d.Format = standIn;
         if (cv) { cvTmp = *cv; cvTmp.Format = standIn; cv = &cvTmp; }
     }
-    D3D12_RESOURCE_STATES st = pc_state(state);
+    D3D12_RESOURCE_STATES st = depth_state(d, pc_state(state));
     if (hp.Type == D3D12_HEAP_TYPE_UPLOAD) st = D3D12_RESOURCE_STATE_GENERIC_READ;
     if (d.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER && cached_upload(&hp)) st = D3D12_RESOURCE_STATE_GENERIC_READ;
     else if (hp.Type == D3D12_HEAP_TYPE_READBACK) st = D3D12_RESOURCE_STATE_COPY_DEST;
@@ -3014,7 +3048,7 @@ HRESULT_T create_reserved_resource(PcObj dev, const void* desc, uint32_t state, 
         d.Format = standIn;
         if (cv) { cvTmp = *cv; cvTmp.Format = standIn; cv = &cvTmp; }
     }
-    HRESULT hr = logged(as<ID3D12Device>(dev)->CreateReservedResource(&d, pc_state(state), cv,
+    HRESULT hr = logged(as<ID3D12Device>(dev)->CreateReservedResource(&d, depth_state(d, pc_state(state)), cv,
                                                                      IID_PPV_ARGS(reinterpret_cast<ID3D12Resource**>(out))), "CreateReservedResource");
     if (SUCCEEDED(hr) && remap) {
         std::lock_guard<std::mutex> g(g_remap_mu);
@@ -3126,7 +3160,7 @@ HRESULT_T create_placed_resource(PcObj dev, PcObj heap, uint64_t offset, const v
     D3D12_RESOURCE_DESC d = clean_desc(desc);
     const D3D12_CLEAR_VALUE* cv = static_cast<const D3D12_CLEAR_VALUE*>(clear);
     if (!(d.Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL))) cv = nullptr;
-    HRESULT hr = as<ID3D12Device>(dev)->CreatePlacedResource(as<ID3D12Heap>(heap), offset, &d, pc_state(state), cv,
+    HRESULT hr = as<ID3D12Device>(dev)->CreatePlacedResource(as<ID3D12Heap>(heap), offset, &d, depth_state(d, pc_state(state)), cv,
                                                              IID_PPV_ARGS(reinterpret_cast<ID3D12Resource**>(out)));
     if (hr == E_INVALIDARG && d.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER) {
         // The PC layout can be larger than the console's (e.g. D32_S8 depth), so a texture placed for
@@ -3135,7 +3169,7 @@ HRESULT_T create_placed_resource(PcObj dev, PcObj heap, uint64_t offset, const v
         D3D12_HEAP_DESC hd = as<ID3D12Heap>(heap)->GetDesc();
         D3D12_RESOURCE_ALLOCATION_INFO ai = as<ID3D12Device>(dev)->GetResourceAllocationInfo(0, 1, &d);
         D3D12_HEAP_PROPERTIES hp = hd.Properties;
-        HRESULT h2 = as<ID3D12Device>(dev)->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &d, pc_state(state), cv,
+        HRESULT h2 = as<ID3D12Device>(dev)->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &d, depth_state(d, pc_state(state)), cv,
                                                                     IID_PPV_ARGS(reinterpret_cast<ID3D12Resource**>(out)));
         static volatile long n = 0;
         if (InterlockedIncrement(&n) <= 5)
@@ -3258,7 +3292,8 @@ void create_rtv(PcObj dev, PcObj res, const void* desc, uint64_t h) {
     as<ID3D12Device>(dev)->CreateRenderTargetView(as<ID3D12Resource>(res), vd, cpu(h));
 }
 void create_dsv(PcObj dev, PcObj res, const void* desc, uint64_t h) {
-    as<ID3D12Device>(dev)->CreateDepthStencilView(as<ID3D12Resource>(res), static_cast<const D3D12_DEPTH_STENCIL_VIEW_DESC*>(desc), cpu(h));
+    D3D12_DEPTH_STENCIL_VIEW_DESC t;
+    as<ID3D12Device>(dev)->CreateDepthStencilView(as<ID3D12Resource>(res), view_fix(res, desc, t), cpu(h));
 }
 void create_srv(PcObj dev, PcObj res, const void* desc, uint64_t h) {
     if (trace_writers() || (trace_rtvs() && res && as<ID3D12Resource>(res)->GetDesc().Dimension == D3D12_RESOURCE_DIMENSION_BUFFER)) {
@@ -3686,6 +3721,310 @@ void list_scissors(PcObj l, uint32_t n, const void* r) {
     if (trace_writers() && n) { std::lock_guard<std::mutex> g(g_wr_mu); g_wr_sc[l] = *static_cast<const D3D12_RECT*>(r); }
     L->RSSetScissorRects(n, static_cast<const D3D12_RECT*>(r));
 }
+// ---- Root signatures described by the shaders themselves ----------------------------------------
+// Some engines keep a compact description of the root signature in the private data of every
+// shader container ("PRIV", bytes DC E2 ...) and create root-signature objects only once per
+// shape (number and kinds of parameters): on the console the ranges inside a descriptor table do
+// not matter, each shader loads its descriptors from fixed table offsets. On a PC the pipeline's
+// root signature must name every register its shaders use, so a pipeline of such shaders gets a
+// root signature of its own, built from that description; a list binds it in place of the title's
+// object when the pipeline is drawn with, and the title's root arguments are applied again.
+namespace {
+struct CompactRs {
+    std::vector<D3D12_ROOT_PARAMETER1> params;
+    std::vector<std::vector<D3D12_DESCRIPTOR_RANGE1>> ranges;
+    std::vector<D3D12_STATIC_SAMPLER_DESC> samplers;
+    uint32_t flags = 0;
+};
+// The description: parameter count, flags (16 bits), two bytes naming the shape, sampler count,
+// then the parameters (tables as four bit-packed register lists: SRV, UAV, CBV, sampler) and the
+// static samplers.
+bool decode_compact_rs(const uint8_t* a, const uint8_t* end, CompactRs& o, size_t* used) {
+    const uint8_t* p = a;
+    if (end - p < 6) return false;
+    const unsigned n = p[0], ns = p[5];
+    o.flags = p[1] | p[2] << 8;
+    p += 6;
+    o.params.resize(n);
+    o.ranges.resize(n);
+    for (unsigned i = 0; i < n; i++) {
+        if (end - p < 2) return false;
+        D3D12_ROOT_PARAMETER1& q = o.params[i];
+        q = {};
+        q.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+        switch (p[0] & 3) {
+        case 0: {
+            const uint32_t space = (p[0] >> 2) & 3;
+            p += 2;
+            for (int kind = 0; kind < 4; kind++) {
+                if (p >= end) return false;
+                if (!*p) { p++; continue; }
+                if (end - p < 2) return false;
+                unsigned count = (p[0] >> 4) | (p[1] << 4), bits = (p[0] & 15) + 3, have = 0;
+                uint64_t acc = 0;
+                p += 2;
+                for (unsigned k = 0; k < count; k++) {
+                    while (have < bits) {
+                        if (p >= end) return false;
+                        acc = (acc << 8) | *p++;
+                        have += 8;
+                    }
+                    D3D12_DESCRIPTOR_RANGE1 r{};
+                    r.RangeType = (D3D12_DESCRIPTOR_RANGE_TYPE)kind;
+                    r.NumDescriptors = 1;
+                    r.BaseShaderRegister = (uint32_t)((acc >> (have - bits)) & ((1ull << bits) - 1));
+                    r.RegisterSpace = space;
+                    r.Flags = D3D12_DESCRIPTOR_RANGE_FLAG_DESCRIPTORS_VOLATILE;
+                    r.OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
+                    o.ranges[i].push_back(r);
+                    have -= bits;
+                    acc &= (1ull << have) - 1;
+                }
+            }
+            q.ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+            break;
+        }
+        case 1:
+            q.ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+            q.Constants.Num32BitValues = (p[0] >> 2) & 31;
+            q.Constants.ShaderRegister = (p[0] >> 7) | (p[1] << 1);
+            p += 2;
+            break;
+        default:
+            q.ParameterType = (p[0] & 3) == 2 ? D3D12_ROOT_PARAMETER_TYPE_SRV : D3D12_ROOT_PARAMETER_TYPE_UAV;
+            q.Descriptor.RegisterSpace = (p[0] >> 4) & 3;
+            q.Descriptor.ShaderRegister = (p[0] >> 6) | (p[1] << 2);
+            p += 2;
+            break;
+        }
+    }
+    for (unsigned i = 0; i < n; i++)
+        if (o.params[i].ParameterType == D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE)
+            o.params[i].DescriptorTable = {(UINT)o.ranges[i].size(), o.ranges[i].data()};
+    auto lod = [&](float& v) {   // one byte in eighths from -3, or FF and the float itself
+        if (p >= end) return false;
+        if (*p != 0xFF) { v = *p++ * 0.125f - 3.0f; return true; }
+        if (end - p < 5) return false;
+        memcpy(&v, p + 1, 4);
+        p += 5;
+        return true;
+    };
+    for (unsigned i = 0; i < ns; i++) {
+        if (end - p < 6) return false;
+        D3D12_STATIC_SAMPLER_DESC d{};
+        d.Filter = (D3D12_FILTER)(p[0] | p[1] << 8);
+        d.AddressU = (D3D12_TEXTURE_ADDRESS_MODE)(p[2] & 15);
+        d.AddressV = (D3D12_TEXTURE_ADDRESS_MODE)(p[2] >> 4);
+        d.AddressW = (D3D12_TEXTURE_ADDRESS_MODE)(p[3] & 15);
+        d.ComparisonFunc = (D3D12_COMPARISON_FUNC)(p[3] >> 4);
+        d.MaxAnisotropy = p[4] & 31;
+        d.BorderColor = (D3D12_STATIC_BORDER_COLOR)(p[4] >> 5);
+        p += 5;
+        if (!lod(d.MipLODBias) || !lod(d.MinLOD) || !lod(d.MaxLOD) || p >= end) return false;
+        d.ShaderRegister = *p & 63;
+        d.RegisterSpace = *p >> 6;
+        d.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+        p++;
+        o.samplers.push_back(d);
+    }
+    *used = (size_t)(p - a);
+    return true;
+}
+// The description inside a shader container, if it has one.
+bool find_compact_rs(const void* code, size_t n, const uint8_t** a, const uint8_t** end) {
+    const uint8_t* d = (const uint8_t*)code;
+    if (!d || n < 36 || memcmp(d, "DXBC", 4)) return false;
+    uint32_t count;
+    memcpy(&count, d + 28, 4);
+    for (uint32_t i = 0; i < count && 32 + 4ull * (i + 1) <= n; i++) {
+        uint32_t off, sz;
+        memcpy(&off, d + 32 + 4 * i, 4);
+        if (off + 8ull > n) return false;
+        memcpy(&sz, d + off + 4, 4);
+        if (memcmp(d + off, "PRIV", 4) || off + 8ull + sz > n || sz < 8 || d[off + 8] != 0xDC || d[off + 9] != 0xE2) continue;
+        *a = d + off + 10;
+        *end = d + off + 8 + sz;
+        return true;
+    }
+    return false;
+}
+std::atomic<bool> g_own_rs_any{false};
+std::mutex g_own_mu;
+std::map<std::vector<uint8_t>, std::pair<PcObj, std::vector<uint8_t>>> g_own_rs;   // description -> (root signature, serialized)
+std::unordered_map<PcObj, std::pair<PcObj, bool>> g_pso_own_rs;                    // pipeline -> (root signature, compute)
+// What the title bound at one bind point of a list, and what the PC list has.
+struct RootBind {
+    PcObj title = nullptr, own = nullptr, bound = nullptr;
+    std::map<uint32_t, std::pair<int, uint64_t>> params;   // index -> (0 table, 1 CBV, 2 SRV, 3 UAV, address/handle)
+    std::map<uint32_t, std::vector<uint32_t>> consts;
+};
+std::mutex g_bind_mu;
+std::unordered_map<PcObj, std::array<RootBind, 2>> g_root_bind;   // list -> [graphics, compute]
+}  // namespace
+PcObj own_root_signature(PcObj dev, const void* const* code, const size_t* size, size_t count, std::vector<uint8_t>* blob) {
+    const uint8_t *a = nullptr, *end = nullptr;
+    CompactRs best;
+    size_t bestRanges = 0, bestUsed = 0;
+    const uint8_t* bestA = nullptr;
+    bool found = false, differ = false;
+    uint32_t flags = 0;
+    for (size_t i = 0; i < count; i++) {
+        if (!code[i] || !find_compact_rs(code[i], size[i], &a, &end)) continue;
+        CompactRs c;
+        size_t used = 0;
+        if (!decode_compact_rs(a, end, c, &used)) {
+            static volatile long w = 0;
+            if (InterlockedIncrement(&w) <= 3) XSL_WARN(CH, "a shader's own root-signature description (%zu bytes) cannot be read", (size_t)(end - a));
+            continue;
+        }
+        size_t nr = 0;
+        for (auto& r : c.ranges) nr += r.size();
+        // Stages of one pipeline describe the same signature; should they differ, the fullest wins.
+        // (The flags differ by stage, input-assembler use for one: all of them apply.)
+        if (found && (used != bestUsed || a[0] != bestA[0] || memcmp(a + 3, bestA + 3, used - 3))) differ = true;
+        flags |= c.flags;
+        if (!found || nr > bestRanges) { best = std::move(c); bestRanges = nr; bestUsed = used; bestA = a; }
+        for (unsigned k = 0; k < best.params.size(); k++)
+            if (best.params[k].ParameterType == D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE)
+                best.params[k].DescriptorTable = {(UINT)best.ranges[k].size(), best.ranges[k].data()};
+        found = true;
+    }
+    if (!found) return nullptr;
+    static const bool trace = getenv("XSL_RS_TRACE") != nullptr;   // what each stage of the first pipelines carries
+    static volatile long traced = 0;
+    if (trace && bestRanges && InterlockedIncrement(&traced) <= 16) {
+        std::string t;
+        for (size_t i = 0; i < count; i++) {
+            char b[40];
+            snprintf(b, sizeof b, " | stage %zu (%zu bytes):", i, size[i]);
+            t += b;
+            if (!code[i] || !find_compact_rs(code[i], size[i], &a, &end)) { t += memcmp(code[i], "DXBC", 4) ? " not a container" : " none"; continue; }
+            for (const uint8_t* q = a; q < end; q++) { snprintf(b, sizeof b, " %02x", *q); t += b; }
+        }
+        XSL_INFO(CH, "root signature descriptions:%s", t.c_str());
+    }
+    if (differ) {
+        static volatile long w = 0;
+        if (InterlockedIncrement(&w) <= 12) {
+            std::string t;
+            for (size_t i = 0; i < count; i++) {
+                if (!code[i] || !find_compact_rs(code[i], size[i], &a, &end)) continue;
+                t += " |";
+                for (const uint8_t* q = a; q < end; q++) { char b[4]; snprintf(b, sizeof b, " %02x", *q); t += b; }
+            }
+            XSL_WARN(CH, "the stages of a pipeline describe different root signatures: the fullest one is used (%s)", t.c_str());
+        }
+    }
+    best.flags = flags;
+    std::vector<uint8_t> key(bestA, bestA + bestUsed);
+    key[1] = (uint8_t)flags;
+    key[2] = (uint8_t)(flags >> 8);
+    std::lock_guard<std::mutex> g(g_own_mu);
+    auto it = g_own_rs.find(key);
+    if (it == g_own_rs.end()) {
+        D3D12_VERSIONED_ROOT_SIGNATURE_DESC d{D3D_ROOT_SIGNATURE_VERSION_1_1};
+        d.Desc_1_1.NumParameters = (UINT)best.params.size();
+        d.Desc_1_1.pParameters = best.params.data();
+        d.Desc_1_1.NumStaticSamplers = (UINT)best.samplers.size();
+        d.Desc_1_1.pStaticSamplers = best.samplers.data();
+        d.Desc_1_1.Flags = (D3D12_ROOT_SIGNATURE_FLAGS)best.flags;
+        ID3DBlob *b = nullptr, *e = nullptr;
+        PcObj rs = nullptr;
+        std::vector<uint8_t> ser;
+        HRESULT hr = D3D12SerializeVersionedRootSignature(&d, &b, &e);
+        if (SUCCEEDED(hr)) {
+            ser.assign((const uint8_t*)b->GetBufferPointer(), (const uint8_t*)b->GetBufferPointer() + b->GetBufferSize());
+            hr = create_root_signature(dev, ser.data(), ser.size(), &rs);
+        }
+        static volatile long n = 0;
+        if (FAILED(hr)) XSL_ERR(CH, "root signature from a shader's own description failed %08lx: %s", hr, e ? (const char*)e->GetBufferPointer() : "");
+        else if (InterlockedIncrement(&n) <= 4)
+            XSL_INFO(CH, "pipelines get the root signature their shaders describe (%zu parameters, %zu table ranges, %zu static samplers)", best.params.size(),
+                     bestRanges, best.samplers.size());
+        if (b) b->Release();
+        if (e) e->Release();
+        it = g_own_rs.emplace(std::move(key), std::make_pair(rs, std::move(ser))).first;
+    }
+    if (it->second.first && blob) *blob = it->second.second;
+    return it->second.first;
+}
+void note_pso_own_rs(PcObj pso, PcObj rs, bool compute) {
+    if (!pso || (!rs && !g_own_rs_any)) return;
+    std::lock_guard<std::mutex> g(g_own_mu);
+    if (rs) { g_pso_own_rs[pso] = {rs, compute}; g_own_rs_any = true; }
+    else g_pso_own_rs.erase(pso);
+}
+static void gm_bind(PcObj l, PcObj rs, bool compute);
+// The root signature a bind point needs is put on the list (with the title's arguments) before work
+// that uses it.
+static void root_ensure(PcObj l, bool compute) {
+    if (!g_own_rs_any) return;
+    RootBind b;
+    {
+        std::lock_guard<std::mutex> g(g_bind_mu);
+        auto& cur = g_root_bind[l][compute];
+        PcObj want = cur.own ? cur.own : cur.title;
+        if (!want || cur.bound == want) return;
+        cur.bound = want;
+        b = cur;
+    }
+    auto* L2 = as<ID3D12GraphicsCommandList>(l);
+    if (compute) L2->SetComputeRootSignature(as<ID3D12RootSignature>(b.bound));
+    else L2->SetGraphicsRootSignature(as<ID3D12RootSignature>(b.bound));
+    gm_bind(l, b.bound, compute);
+    for (auto& [i, v] : b.params) {
+        D3D12_GPU_DESCRIPTOR_HANDLE h{v.second};
+        if (compute) switch (v.first) {
+            case 0: L2->SetComputeRootDescriptorTable(i, h); break;
+            case 1: L2->SetComputeRootConstantBufferView(i, v.second); break;
+            case 2: L2->SetComputeRootShaderResourceView(i, v.second); break;
+            default: L2->SetComputeRootUnorderedAccessView(i, v.second); break;
+        } else switch (v.first) {
+            case 0: L2->SetGraphicsRootDescriptorTable(i, h); break;
+            case 1: L2->SetGraphicsRootConstantBufferView(i, v.second); break;
+            case 2: L2->SetGraphicsRootShaderResourceView(i, v.second); break;
+            default: L2->SetGraphicsRootUnorderedAccessView(i, v.second); break;
+        }
+    }
+    for (auto& [i, c] : b.consts) {
+        if (compute) L2->SetComputeRoot32BitConstants(i, (UINT)c.size(), c.data(), 0);
+        else L2->SetGraphicsRoot32BitConstants(i, (UINT)c.size(), c.data(), 0);
+    }
+}
+// Records a root argument; true when the list has the right root signature for it now.
+static bool root_arg(PcObj l, bool compute, uint32_t i, int kind, uint64_t v) {
+    if (!g_own_rs_any) return true;
+    std::lock_guard<std::mutex> g(g_bind_mu);
+    auto& b = g_root_bind[l][compute];
+    b.params[i] = {kind, v};
+    return b.bound && b.bound == (b.own ? b.own : b.title);
+}
+static bool root_consts(PcObj l, bool compute, uint32_t i, uint32_t n, const void* d, uint32_t o) {
+    if (!g_own_rs_any) return true;
+    std::lock_guard<std::mutex> g(g_bind_mu);
+    auto& b = g_root_bind[l][compute];
+    auto& c = b.consts[i];
+    if (c.size() < o + n) c.resize(o + n);
+    memcpy(c.data() + o, d, n * 4ull);
+    return b.bound && b.bound == (b.own ? b.own : b.title);
+}
+// The title's root signature for a bind point; true when it is to be bound at once (no pipeline
+// with a root signature of its own exists).
+static bool root_title(PcObj l, bool compute, PcObj rs) {
+    if (!g_own_rs_any) return true;
+    std::lock_guard<std::mutex> g(g_bind_mu);
+    auto& b = g_root_bind[l][compute];
+    if (b.title != rs) { b.params.clear(); b.consts.clear(); }
+    b.title = rs;
+    return false;
+}
+// Layer passes that put their own state on a title list call this: the bind point is bound again
+// before the title's next work.
+static void root_lost(PcObj l, bool compute) {
+    if (!g_own_rs_any) return;
+    std::lock_guard<std::mutex> g(g_bind_mu);
+    g_root_bind[l][compute].bound = nullptr;
+}
 void note_pso_rs(PcObj pso, PcObj rs, bool compute) {
     if (!g_info || !pso) return;
     std::lock_guard<std::mutex> g(g_rs_mu);
@@ -3693,6 +4032,7 @@ void note_pso_rs(PcObj pso, PcObj rs, bool compute) {
 }
 void list_set_gfx_root_signature(PcObj l, PcObj rs) {
     if (g_info) { std::lock_guard<std::mutex> g(g_rs_mu); g_list_rs[l].gfx = rs; }
+    if (!root_title(l, false, rs)) return;   // bound before the next draw (root_ensure)
     L->SetGraphicsRootSignature(as<ID3D12RootSignature>(rs));
     gm_bind(l, rs, false);
 }
@@ -3701,6 +4041,7 @@ static void shadow_param(PcObj l, uint32_t i, int kind, uint64_t v) {
     g_cs_shadow[l].params[i] = {kind, v};
 }
 void list_shadow_reset(PcObj l) {
+    if (g_own_rs_any) { std::lock_guard<std::mutex> g(g_bind_mu); g_root_bind.erase(l); }
     std::lock_guard<std::mutex> g(g_cs_mu);
     g_cs_shadow.erase(l);
 }
@@ -3712,6 +4053,7 @@ void list_set_compute_root_signature(PcObj l, PcObj rs) {
         sh.rs = rs;
     }
     if (g_info) { std::lock_guard<std::mutex> g(g_rs_mu); g_list_rs[l].cs = rs; }
+    if (!root_title(l, true, rs)) return;   // bound before the next dispatch (root_ensure)
     L->SetComputeRootSignature(as<ID3D12RootSignature>(rs));
     gm_bind(l, rs, true);
 }
@@ -3733,6 +4075,14 @@ static void check_rs(PcObj l, const char* what) {
 }
 void list_set_pso(PcObj l, PcObj pso) {
     { std::lock_guard<std::mutex> g(g_cs_mu); g_cs_shadow[l].pso = pso; }
+    if (g_own_rs_any) {   // the pipeline's own root signature, if it has one
+        std::pair<PcObj, bool> own{nullptr, false};
+        { std::lock_guard<std::mutex> g(g_own_mu); auto it = g_pso_own_rs.find(pso); if (it != g_pso_own_rs.end()) own = it->second; }
+        std::lock_guard<std::mutex> g(g_bind_mu);
+        auto& b = g_root_bind[l];
+        b[0].own = own.first && !own.second ? own.first : nullptr;
+        b[1].own = own.first && own.second ? own.first : nullptr;
+    }
     if (trace_writers()) { std::lock_guard<std::mutex> g(g_wr_mu); g_wr_pso[l] = pso; }
     if (g_info) { std::lock_guard<std::mutex> g(g_rs_mu); g_list_rs[l].pso = pso; }
     L->SetPipelineState(as<ID3D12PipelineState>(pso));
@@ -3814,8 +4164,18 @@ static void trace_draw_target(PcObj l, uint32_t n) {
 }
 static int32_t prof_begin(PcObj l);
 static void prof_end(PcObj l, int32_t q);
-void list_draw(PcObj l, uint32_t a, uint32_t b, uint32_t c, uint32_t d) { trace_draw_target(l, a * b); if (getenv("XSL_TRACE_BUFFER")) note_dispatch(l, false); note_draw(l); note_reads(l, false); int32_t pq = prof_begin(l); L->DrawInstanced(a, b, c, d); prof_end(l, pq); }
-void list_draw_indexed(PcObj l, uint32_t a, uint32_t b, uint32_t c, int32_t d, uint32_t e) { trace_draw_target(l, a * b); if (getenv("XSL_TRACE_BUFFER")) note_dispatch(l, false); note_draw(l); note_reads(l, false); int32_t pq = prof_begin(l); L->DrawIndexedInstanced(a, b, c, d, e); prof_end(l, pq); }
+// Work of an unusual size (a count read from memory the layer does not fill in yet hangs the GPU):
+// the first few are logged with the pipeline's shaders.
+static void note_big(PcObj l, const char* what, uint64_t n, uint32_t a, uint32_t b, uint32_t c) {
+    if (n < (1ull << 24)) return;
+    static volatile long k = 0;
+    if (InterlockedIncrement(&k) > 24) return;
+    PcObj pso = nullptr;
+    { std::lock_guard<std::mutex> g(g_cs_mu); auto it = g_cs_shadow.find(l); if (it != g_cs_shadow.end()) pso = it->second.pso; }
+    XSL_WARN(CH, "large %s(%u, %u, %u) on list %p, pipeline %p", what, a, b, c, (void*)l, (void*)pso);
+}
+void list_draw(PcObj l, uint32_t a, uint32_t b, uint32_t c, uint32_t d) { note_big(l, "Draw", (uint64_t)a * b, a, b, c); root_ensure(l, false); trace_draw_target(l, a * b); if (getenv("XSL_TRACE_BUFFER")) note_dispatch(l, false); note_draw(l); note_reads(l, false); int32_t pq = prof_begin(l); L->DrawInstanced(a, b, c, d); prof_end(l, pq); }
+void list_draw_indexed(PcObj l, uint32_t a, uint32_t b, uint32_t c, int32_t d, uint32_t e) { note_big(l, "DrawIndexed", (uint64_t)a * b, a, b, c); root_ensure(l, false); trace_draw_target(l, a * b); if (getenv("XSL_TRACE_BUFFER")) note_dispatch(l, false); note_draw(l); note_reads(l, false); int32_t pq = prof_begin(l); L->DrawIndexedInstanced(a, b, c, d, e); prof_end(l, pq); }
 struct EiTrace { long slot; std::string name; uint64_t present; };
 static std::vector<EiTrace> g_ei_trace;   // traced indirect dispatches whose arguments are printed later
 static bool trace_dispatch_size(PcObj l, const char* how, uint32_t x, uint32_t y, uint32_t z, std::string* name) {
@@ -3959,6 +4319,8 @@ static void prof_report(ID3D12CommandQueue* queue) {
     }
 }
 void list_dispatch(PcObj l, uint32_t x, uint32_t y, uint32_t z) {
+    root_ensure(l, true);
+    note_big(l, "Dispatch", (uint64_t)x * y * z * 64, x, y, z);
     trace_dispatch_size(l, "Dispatch", x, y, z, nullptr);
     note_dispatch(l);
     note_reads(l, true);
@@ -4029,6 +4391,7 @@ static void note_dispatch(PcObj l, bool compute) {
     }
 }
 void list_dispatch_mesh(PcObj l, uint32_t x, uint32_t y, uint32_t z) {
+    root_ensure(l, false);
     if (!g_caps.meshShaders) return;
     ID3D12GraphicsCommandList6* l6 = nullptr;
     int32_t pq = prof_begin(l);
@@ -4244,6 +4607,8 @@ static bool fixed_indirect(PcObj l, PcObj sig, uint32_t max, PcObj args, uint64_
     return true;
 }
 void list_execute_indirect(PcObj l, PcObj sig, uint32_t max, PcObj args, uint64_t ao, PcObj cnt, uint64_t co) {
+    root_ensure(l, false);
+    root_ensure(l, true);
     std::string tn;
     if (trace_writers()) note_reads(l, true);   // the views of indirect (compute) dispatches too
     if (trace_dispatch_size(l, "ExecuteIndirect max", max, cnt ? 1 : 0, 0, &tn)) {
@@ -4323,6 +4688,7 @@ void list_set_heaps(PcObj l, uint32_t n, PcObj* h) {
 }
 void list_gfx_root_table(PcObj l, uint32_t i, uint64_t h) {
     if (trace_writers()) { std::lock_guard<std::mutex> g(g_wr_mu); g_gfx_tables[l][i] = h; }
+    if (!root_arg(l, false, i, 0, gpu(h).ptr)) return;
     L->SetGraphicsRootDescriptorTable(i, gpu(h));
 }
 // During the examined frame: every pass that reads one of the frame's large render targets (or a
@@ -4404,12 +4770,13 @@ static void note_reads(PcObj l, bool compute) {
 void list_compute_root_table(PcObj l, uint32_t i, uint64_t h) {
     if (trace_writers()) { std::lock_guard<std::mutex> g(g_wr_mu); g_cs_tables[l][i] = h; }
     shadow_param(l, i, 0, h);
+    if (!root_arg(l, true, i, 0, gpu(h).ptr)) return;
     L->SetComputeRootDescriptorTable(i, gpu(h));
 }
-void list_gfx_root_cbv(PcObj l, uint32_t i, uint64_t va) { L->SetGraphicsRootConstantBufferView(i, va); }
-void list_compute_root_cbv(PcObj l, uint32_t i, uint64_t va) { shadow_param(l, i, 1, va); L->SetComputeRootConstantBufferView(i, va); }
-void list_gfx_root_srv(PcObj l, uint32_t i, uint64_t va) { L->SetGraphicsRootShaderResourceView(i, va); }
-void list_compute_root_srv(PcObj l, uint32_t i, uint64_t va) { shadow_param(l, i, 2, va); L->SetComputeRootShaderResourceView(i, va); }
+void list_gfx_root_cbv(PcObj l, uint32_t i, uint64_t va) { if (root_arg(l, false, i, 1, va)) L->SetGraphicsRootConstantBufferView(i, va); }
+void list_compute_root_cbv(PcObj l, uint32_t i, uint64_t va) { shadow_param(l, i, 1, va); if (root_arg(l, true, i, 1, va)) L->SetComputeRootConstantBufferView(i, va); }
+void list_gfx_root_srv(PcObj l, uint32_t i, uint64_t va) { if (root_arg(l, false, i, 2, va)) L->SetGraphicsRootShaderResourceView(i, va); }
+void list_compute_root_srv(PcObj l, uint32_t i, uint64_t va) { shadow_param(l, i, 2, va); if (root_arg(l, true, i, 2, va)) L->SetComputeRootShaderResourceView(i, va); }
 // XSL_TRACE_BUFFER=<size>: root UAVs into buffers of that size during the examined frame.
 static void trace_root_uav(PcObj l, uint32_t i, uint64_t va, const char* kind) {
     static uint64_t tb = [] { char b[24]; return GetEnvironmentVariableA("XSL_TRACE_BUFFER", b, sizeof b) ? _strtoui64(b, nullptr, 10) : 0ull; }();
@@ -4424,9 +4791,9 @@ static void trace_root_uav(PcObj l, uint32_t i, uint64_t va, const char* kind) {
     if (pso) as<ID3D12PipelineState>(pso)->GetPrivateData(WKPDID_D3DDebugObjectNameW, &sz, wn);
     XSL_INFO(CH, "frame %s root UAV %u of buffer %p +%llu: %ls", kind, i, (void*)m->second.first, (unsigned long long)(va - m->first), wn);
 }
-void list_gfx_root_uav(PcObj l, uint32_t i, uint64_t va) { trace_root_uav(l, i, va, "graphics"); L->SetGraphicsRootUnorderedAccessView(i, va); }
-void list_compute_root_uav(PcObj l, uint32_t i, uint64_t va) { trace_root_uav(l, i, va, "compute"); shadow_param(l, i, 3, va); L->SetComputeRootUnorderedAccessView(i, va); }
-void list_gfx_root_constants(PcObj l, uint32_t i, uint32_t n, const void* d, uint32_t o) { L->SetGraphicsRoot32BitConstants(i, n, d, o); }
+void list_gfx_root_uav(PcObj l, uint32_t i, uint64_t va) { trace_root_uav(l, i, va, "graphics"); if (root_arg(l, false, i, 3, va)) L->SetGraphicsRootUnorderedAccessView(i, va); }
+void list_compute_root_uav(PcObj l, uint32_t i, uint64_t va) { trace_root_uav(l, i, va, "compute"); shadow_param(l, i, 3, va); if (root_arg(l, true, i, 3, va)) L->SetComputeRootUnorderedAccessView(i, va); }
+void list_gfx_root_constants(PcObj l, uint32_t i, uint32_t n, const void* d, uint32_t o) { if (root_consts(l, false, i, n, d, o)) L->SetGraphicsRoot32BitConstants(i, n, d, o); }
 void list_compute_root_constants(PcObj l, uint32_t i, uint32_t n, const void* d, uint32_t o) {
     {
         std::lock_guard<std::mutex> g(g_cs_mu);
@@ -4434,7 +4801,7 @@ void list_compute_root_constants(PcObj l, uint32_t i, uint32_t n, const void* d,
         if (c.size() < o + n) c.resize(o + n);
         memcpy(c.data() + o, d, n * 4);
     }
-    L->SetComputeRoot32BitConstants(i, n, d, o);
+    if (root_consts(l, true, i, n, d, o)) L->SetComputeRoot32BitConstants(i, n, d, o);
 }
 static void restore_compute_state(PcObj l) {
     CsShadow sh;
@@ -4445,7 +4812,8 @@ static void restore_compute_state(PcObj l) {
         sh = it->second;
     }
     if (sh.pso) L->SetPipelineState(as<ID3D12PipelineState>(sh.pso));
-    if (!sh.rs) return;
+    root_lost(l, true);
+    if (!sh.rs || g_own_rs_any) return;   // (with pipelines' own root signatures: bound again by root_ensure)
     L->SetComputeRootSignature(as<ID3D12RootSignature>(sh.rs));
     gm_bind(l, sh.rs, true);
     for (auto& [i, p] : sh.params) {

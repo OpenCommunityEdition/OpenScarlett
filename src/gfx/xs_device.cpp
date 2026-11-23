@@ -210,6 +210,20 @@ static HRESULT pso_result(Device* dev, HRESULT hr, PcObj pso, REFIID riid, void*
     }
     return make_simple(dev, Kind::Pso, nullptr, riid, out);
 }
+// The root signature for a pipeline's translation and creation: the one its shaders describe
+// themselves when they do (pc::own_root_signature), else the title's object. Sets the translator's
+// fallback root signature; returns the PC object to create the pipeline with.
+static PcObj pipeline_root_signature(PcObj dev, PcObj title, std::initializer_list<D3D12_SHADER_BYTECODE> stages, PcObj* own) {
+    const void* code[8];
+    size_t size[8], n = 0;
+    for (auto& bc : stages)
+        if (bc.pShaderBytecode && bc.BytecodeLength && n < 8) { code[n] = bc.pShaderBytecode; size[n++] = bc.BytecodeLength; }
+    std::vector<uint8_t> rsb;
+    *own = n ? pc::own_root_signature(dev, code, size, n, &rsb) : nullptr;
+    if (*own) { pc::set_fallback_root_signature(rsb.data(), rsb.size()); return *own; }
+    if (title && root_signature_blob(title, &rsb)) pc::set_fallback_root_signature(rsb.data(), rsb.size());
+    return title;
+}
 HRESULT D3DAPI D_CreateGraphicsPipelineState(ID3D12Device* d, const D3D12_GRAPHICS_PIPELINE_STATE_DESC* desc, REFIID riid, void** out) {
     if (null_graphics()) return make_simple(DEV(d), Kind::Pso, nullptr, riid, out);
     D3D12_GRAPHICS_PIPELINE_STATE_DESC x = *desc;
@@ -222,13 +236,12 @@ HRESULT D3DAPI D_CreateGraphicsPipelineState(ID3D12Device* d, const D3D12_GRAPHI
     // Console-only topology types: quads and rects are drawn as triangles (see the list's draw path).
     if (x.PrimitiveTopologyType == D3D12XBOX_PRIMITIVE_TOPOLOGY_TYPE_QUAD || x.PrimitiveTopologyType == D3D12XBOX_PRIMITIVE_TOPOLOGY_TYPE_RECT)
         x.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
-    PcObj pso = nullptr;
+    PcObj pso = nullptr, own = nullptr;
     pc::reset_untranslated();
-    std::vector<uint8_t> rsb;
-    if (x.pRootSignature && root_signature_blob((PcObj)x.pRootSignature, &rsb)) pc::set_fallback_root_signature(rsb.data(), rsb.size());
+    x.pRootSignature = (ID3D12RootSignature*)pipeline_root_signature(DPC(d), (PcObj)x.pRootSignature, {x.VS, x.PS, x.DS, x.HS, x.GS}, &own);
     HRESULT hr = pc::create_graphics_pso(DPC(d), &x, &pso);
     pc::set_fallback_root_signature(nullptr, 0);
-    if (SUCCEEDED(hr)) pc::note_pso_rs(pso, x.pRootSignature, false);
+    if (SUCCEEDED(hr)) { pc::note_pso_rs(pso, x.pRootSignature, false); pc::note_pso_own_rs(pso, own, false); }
     return pso_result(DEV(d), hr, pso, riid, out);
 }
 // Compute pipelines are created on a worker: a translated shader can take the driver minutes to
@@ -274,13 +287,12 @@ HRESULT D3DAPI D_CreateComputePipelineStateX(ID3D12Device* d, const D3D12_COMPUT
     D3D12_COMPUTE_PIPELINE_STATE_DESC x = *desc;
     x.pRootSignature = (ID3D12RootSignature*)P(desc->pRootSignature);
     if (!waitMs) {
-        PcObj pso = nullptr;
+        PcObj pso = nullptr, own = nullptr;
         pc::reset_untranslated();
-        std::vector<uint8_t> rsb;
-        if (x.pRootSignature && root_signature_blob((PcObj)x.pRootSignature, &rsb)) pc::set_fallback_root_signature(rsb.data(), rsb.size());
+        x.pRootSignature = (ID3D12RootSignature*)pipeline_root_signature(DPC(d), (PcObj)x.pRootSignature, {x.CS}, &own);
         HRESULT hr = pc::create_compute_pso(DPC(d), &x, &pso);
         pc::set_fallback_root_signature(nullptr, 0);
-        if (SUCCEEDED(hr)) pc::note_pso_rs(pso, x.pRootSignature, true);
+        if (SUCCEEDED(hr)) { pc::note_pso_rs(pso, x.pRootSignature, true); pc::note_pso_own_rs(pso, own, true); }
         return pso_result(DEV(d), hr, pso, riid, out);
     }
     auto job = std::make_shared<AsyncPso>();
@@ -291,12 +303,11 @@ HRESULT D3DAPI D_CreateComputePipelineStateX(ID3D12Device* d, const D3D12_COMPUT
     pso_pool_run([job, code, x, dev]() mutable {
         x.CS = {code->data(), code->size()};
         pc::reset_untranslated();
-        PcObj pso = nullptr;
-        std::vector<uint8_t> rsb;
-        if (x.pRootSignature && root_signature_blob((PcObj)x.pRootSignature, &rsb)) pc::set_fallback_root_signature(rsb.data(), rsb.size());
+        PcObj pso = nullptr, own = nullptr;
+        x.pRootSignature = (ID3D12RootSignature*)pipeline_root_signature(dev, (PcObj)x.pRootSignature, {x.CS}, &own);
         HRESULT hr = pc::create_compute_pso(dev, &x, &pso);
         pc::set_fallback_root_signature(nullptr, 0);
-        if (SUCCEEDED(hr)) pc::note_pso_rs(pso, x.pRootSignature, true);
+        if (SUCCEEDED(hr)) { pc::note_pso_rs(pso, x.pRootSignature, true); pc::note_pso_own_rs(pso, own, true); }
         std::unique_lock<std::mutex> g(job->mu);
         job->hr = hr; job->pso = pso; job->untranslated = pc::had_untranslated(); job->keys = pc::translated_keys(); job->done = true;
         if (job->late) {   // the title holds a placeholder: it becomes this pipeline
@@ -341,6 +352,9 @@ HRESULT D3DAPI D_CreatePipelineState(ID3D12Device2* d, const D3D12_PIPELINE_STAT
     std::vector<void*> owned;  // sanitized shader containers, freed after creation
     bool saw_rs = false, stream_cs = false;
     PcObj stream_rs = nullptr;
+    size_t rs_at = 0;                          // where the root signature sits in the PC stream
+    const void* stage_code[8];
+    size_t stage_size[8], stage_at[8], stages = 0;
     pcs.reserve(desc->SizeInBytes + 64);
     size_t cur_al = 8;  // alignment of the payload being copied (d3dx12 subobject layout)
     auto emit = [&](uint32_t pcType, const void* payload, size_t len) {
@@ -401,6 +415,7 @@ HRESULT D3DAPI D_CreatePipelineState(ID3D12Device2* d, const D3D12_PIPELINE_STAT
             PcObj prs = P(rs);
             std::vector<uint8_t> rsb;   // for shaders without a root signature of their own (cleared below)
             if (prs && root_signature_blob(prs, &rsb)) pc::set_fallback_root_signature(rsb.data(), rsb.size());
+            rs_at = align(align(pcs.size(), 8) + 4, 8);
             emit(0, &prs, sizeof prs);
         } else if (type <= D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CS || type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS ||
                    type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS) {
@@ -415,11 +430,11 @@ HRESULT D3DAPI D_CreatePipelineState(ID3D12Device2* d, const D3D12_PIPELINE_STAT
                 pc::set_fallback_root_signature(nullptr, 0); for (void* o : owned) pc::free_container(o);
                 return E_NOTIMPL;
             }
-            void* o; size_t n;
-            if (bc.pShaderBytecode && pc::sanitize_container(bc.pShaderBytecode, bc.BytecodeLength, &o, &n)) {
-                owned.push_back(o);
-                bc.pShaderBytecode = o;
-                bc.BytecodeLength = n;
+            // (Translated after the loop, once the pipeline's root signature is known.)
+            if (bc.pShaderBytecode && bc.BytecodeLength && stages < 8) {
+                stage_code[stages] = bc.pShaderBytecode;
+                stage_size[stages] = bc.BytecodeLength;
+                stage_at[stages++] = align(align(pcs.size(), 8) + 4, 8);
             }
             emit(mesh ? type + 1 : type, &bc, sizeof bc);  // PC numbering: AS = 24, MS = 25
         } else if (type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY) {
@@ -433,6 +448,11 @@ HRESULT D3DAPI D_CreatePipelineState(ID3D12Device2* d, const D3D12_PIPELINE_STAT
             for (auto& f : a.RTFormats)
                 if (int sf = pc::format_stand_in(f)) f = (DXGI_FORMAT)sf;
             emit(type, &a, sizeof a);
+        } else if (type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL_FORMAT) {
+            DXGI_FORMAT f;
+            memcpy(&f, p, 4);
+            if (int sf = pc::format_stand_in(f)) f = (DXGI_FORMAT)sf;
+            emit(type, &f, 4);
         } else if (type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_FLAGS) {
             uint32_t f;
             memcpy(&f, p, 4);
@@ -449,9 +469,26 @@ HRESULT D3DAPI D_CreatePipelineState(ID3D12Device2* d, const D3D12_PIPELINE_STAT
         static volatile long n = 0;
         if (InterlockedIncrement(&n) <= 5) XSL_INFO(CH, "pipeline stream without a root signature (the shaders' embedded one is used)");
     }
+    // Shaders that describe their own root signature: the pipeline is created with that one.
+    std::vector<uint8_t> ownBlob;
+    PcObj own = stages ? pc::own_root_signature(DPC(d), stage_code, stage_size, stages, &ownBlob) : nullptr;
+    if (own) {
+        cur_al = 8;
+        if (rs_at) memcpy(pcs.data() + rs_at, &own, sizeof own);
+        else emit(0, &own, sizeof own);
+        stream_rs = own;
+        pc::set_fallback_root_signature(ownBlob.data(), ownBlob.size());
+    }
+    for (size_t i = 0; i < stages; i++) {
+        void* o; size_t n;
+        if (!pc::sanitize_container(stage_code[i], stage_size[i], &o, &n)) continue;
+        owned.push_back(o);
+        D3D12_SHADER_BYTECODE bc{o, n};
+        memcpy(pcs.data() + stage_at[i], &bc, sizeof bc);
+    }
     PcObj pso = nullptr;
     HRESULT hr = pc::create_pso_stream(DPC(d), pcs.data(), pcs.size(), &pso);
-    if (SUCCEEDED(hr)) pc::note_pso_rs(pso, stream_rs, stream_cs);
+    if (SUCCEEDED(hr)) { pc::note_pso_rs(pso, stream_rs, stream_cs); pc::note_pso_own_rs(pso, own, stream_cs); }
     pc::set_fallback_root_signature(nullptr, 0); for (void* o : owned) pc::free_container(o);
     return pso_result(DEV(d), hr, pso, riid, out);
 }
@@ -515,6 +552,7 @@ HRESULT D3DAPI D_CreateCommandQueueX(ID3D12Device* d, const D3D12XBOX_COMMAND_QU
 namespace {
 std::mutex g_cm_mu;
 std::map<PcObj, std::pair<void*, ULONGLONG>> g_cm;   // PC resource -> (XMemAlloc memory, attributes)
+const ULONGLONG kShadowMemory = ~0ull;                // attributes of memory the layer allocated itself
 }  // namespace
 static void console_memory_take(PcObj r, const D3D12_RESOURCE_DESC* rd) {
     typedef PVOID(WINAPI * Alloc)(SIZE_T, ULONGLONG);
@@ -548,6 +586,7 @@ void console_memory_release_impl(PcObj r) {
         e = it->second;
         g_cm.erase(it);
     }
+    if (e.second == kShadowMemory) { VirtualFree(e.first, 0, MEM_RELEASE); return; }
     typedef VOID(WINAPI * Free)(PVOID, ULONGLONG);
     static HMODULE m = GetModuleHandleW(L"xmem.dll");
     static auto release = m ? (Free)GetProcAddress(m, "XMemFree") : nullptr;
@@ -1973,6 +2012,21 @@ bool rt_dispatch(PcObj list, const void* so, const uint64_t* tables, const D3D12
     return rt_dispatch_impl(list, so, tables, d, argsVa, samplerHeap);
 }
 void console_memory_release(PcObj r) { console_memory_release_impl(r); }
+// The console memory of a resource; a resource without any gets plain memory of its console size
+// (a title asked for the address of a texture: it means to read or write texels there).
+void* console_memory_of(PcObj r) {
+    std::lock_guard<std::mutex> g(g_cm_mu);
+    auto it = g_cm.find(r);
+    if (it != g_cm.end()) return it->second.first;
+    D3D12_RESOURCE_DESC rd{};
+    pc::res_desc(r, &rd);
+    uint64_t size = 0, align = 0;
+    if (!console_resource_size(&rd, &size, &align) || !size)
+        size = (rd.Width * (uint64_t)rd.Height * rd.DepthOrArraySize * 16) * 4 / 3 + 0x10000;   // more than any format needs
+    void* p = VirtualAlloc(nullptr, (SIZE_T)size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+    if (p) g_cm[r] = {p, kShadowMemory};
+    return p;
+}
 
 HRESULT create_dxgi_device(Device* dev, void** out) {
     init_dxgi();

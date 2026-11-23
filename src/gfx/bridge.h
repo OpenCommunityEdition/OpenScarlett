@@ -181,6 +181,10 @@ bool dred_on();
 // Diagnostics (XSL_D3D12_DEBUG): the root signature each pipeline was made with, checked against
 // the list's bound one at ExecuteIndirect.
 void note_pso_rs(PcObj pso, PcObj rs, bool compute);
+// The root signature the shaders of a pipeline describe themselves (compact form in their private
+// data), created once per description; nullptr when no stage has one. *blob: its serialized form.
+PcObj own_root_signature(PcObj dev, const void* const* code, const size_t* size, size_t count, std::vector<uint8_t>* blob);
+void note_pso_own_rs(PcObj pso, PcObj rs, bool compute);   // rs nullptr: the pipeline has none
 // Ray-tracing acceleration structures. Descriptions are PC layouts with PC addresses (the
 // geometry array layout, never pointers).
 void rt_prebuild_info(PcObj dev, const void* inputs, void* info);
@@ -261,6 +265,7 @@ bool sanitize_container(const void* in, size_t inSize, void** out, size_t* outSi
 // Console machine code -> HLSL -> DXIL for shaders without (usable) DXIL; see native_shaders.cpp.
 bool native_translate(const void* in, size_t inSize, void** out, size_t* outSize);
 void set_fallback_root_signature(const void* blob, size_t n);   // pipeline's root signature for containers without one (0: none)
+const std::vector<uint8_t>& fallback_root_signature();   // the one set above (diagnostics)
 // Whether a shader without DXIL failed translation on this thread since reset_untranslated().
 void reset_untranslated();
 const char* translated_keys();   // keys of shaders translated since reset_untranslated()
