@@ -60,6 +60,11 @@ struct TranslateOptions {
     bool raw_park = false;
     uint32_t raw_park_ptr_vgpr = 0, raw_resume_at = 0, raw_park_vgprs = 64;
     uint32_t raw_park_from = 0, raw_park_to = 0;   // the scheduler's code: only its calls park
+    uint32_t raw_park_disc_shift = 0;   // discovery bit = (target - code_base >> 8) >> shift
+    // Code at several addresses: raw_code holds segments back to back; a byte offset inside one
+    // has address `address + (offset - offset_of_segment)` (empty: code_base + offset).
+    struct RawSegment { uint32_t offset, size; uint64_t address; };
+    std::vector<RawSegment> raw_segments;
     bool barrier_sync = true;        // false: s_barrier without the group sync (debugging hangs) // the PC runtime takes shader model 6.6 ([WaveSize] on compute)
 };
 

@@ -192,7 +192,7 @@ static int rtlink_cmd(const char* tmpl, int n, char** blobs) {
     std::string err;
     if (!rt_link(bs, l, &err)) return fprintf(stderr, "link: %s\n", err.c_str()), 1;
     fprintf(stderr, "image 0x%zx bytes, scheduler @0x%x, %zu traversal entries, %zu exports\n", l.image.size() * 4, l.main, l.traversal.size(), l.exports.size());
-    for (auto& [name, off] : l.exports) fprintf(stderr, "  export %s @0x%x\n", name.c_str(), off);
+    for (auto& [name, a] : l.exports) fprintf(stderr, "  export %s @0x%llx\n", name.c_str(), (unsigned long long)a);
     for (auto& [g, s] : l.hitgroups) fprintf(stderr, "  hit group %s: closest %s, any %s, intersection %s\n", g.c_str(), s[0].c_str(), s[1].c_str(), s[2].c_str());
     for (auto& p : l.parts) fprintf(stderr, "  part 0x%x..0x%x main 0x%x%s\n", p.begin, p.end, p.main, p.raygen ? " (ray generation)" : "");
     if (const char* k = getenv("RT_PARK")) {   // one collection (index into the blobs) as a parking program
@@ -202,13 +202,6 @@ static int rtlink_cmd(const char* tmpl, int n, char** blobs) {
         std::string e2;
         if (!sp.program(ids.at((size_t)atoi(k)), l, &e2)) return fprintf(stderr, "program: %s\n", e2.c_str()), 1;
         fprintf(stderr, "park: pointer v%u, resume at 0x%x, main 0x%x\n", l.park_ptr_vgpr, l.resume_at, l.main);
-    }
-    if (const char* k = getenv("RT_PROGRAM")) {   // translate one per-raygen program instead of the full link
-        auto progs = rt_programs(l);
-        size_t i = (size_t)atoi(k);
-        fprintf(stderr, "%zu programs\n", progs.size());
-        if (i >= progs.size()) return 1;
-        l = progs[i];
     }
     Container c;   // "-": no template (as the layer does)
     if (strcmp(tmpl, "-") && !load_cso(tmpl, c)) return 1;
@@ -247,6 +240,8 @@ static int rtcache_cmd(const char* outdir, const char* salt, int n, char** blobs
         if (!r.ok) { fprintf(stderr, "collection %zu: %s\n", c, r.error.c_str()); continue; }
         char path[1024];
         snprintf(path, sizeof path, "%s/rt_%016llx.hlsl", outdir, (unsigned long long)rt_cache_key(l, salt));
+        fprintf(stderr, "collection %zu: rt_%016llx (image %zu bytes, %zu segments, main 0x%x, %zu entries)\n", c, (unsigned long long)rt_cache_key(l, salt),
+                l.image.size() * 4, l.segs.size(), l.main, l.entries.size());
         FILE* f = fopen(path, "wb");
         if (!f) return fprintf(stderr, "cannot write %s\n", path), 1;
         fwrite(r.hlsl.data(), 1, r.hlsl.size(), f);

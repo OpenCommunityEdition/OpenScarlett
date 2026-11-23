@@ -348,6 +348,8 @@ bool rt_build_pipeline(const gpucode::RtLinked& l, std::vector<uint8_t>& dxil, s
     swprintf(name, 64, L"\\rt_%016llx.dxil", (unsigned long long)key);
     std::wstring path = cache_dir() + name;
     if (read_file(path, dxil) && !dxil.empty()) return true;
+    XSL_INFO(CH, "ray-tracing program rt_%016llx: not cached, compiling (image %zu bytes, %zu segments, main 0x%x, %zu entries)", (unsigned long long)key,
+             l.image.size() * 4, l.segs.size(), l.main, l.entries.size());
     gpucode::Container c;
     c.kind = gpucode::ProgramKind::CS;
     gpucode::RootSig rs;

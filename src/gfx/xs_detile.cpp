@@ -148,6 +148,10 @@ void detile_flush(PcObj pcDevice, PcObj pcQueue) {
         }
         FillCtx ctx{c, e.va, c->GetResourceSizeBytes()};
         bool readable = committed(e.va, ctx.size);
+        // Hash before reading: texels the title writes during or after the upload (e.g. glyphs a
+        // font cache adds) then differ from the hash and are uploaded at a later check. Hashing
+        // afterwards recorded such writes as uploaded and left them out for good.
+        uint64_t hash = readable ? content_hash(e.va, ctx.size) : 0;
         if (readable) hr = pc::upload_texture(pcDevice, pcQueue, r, e.state, fill, &ctx);
         c->Release();
         if (!readable || FAILED(hr)) {
@@ -159,7 +163,7 @@ void detile_flush(PcObj pcDevice, PcObj pcQueue) {
         {
             std::lock_guard<std::mutex> g(g_mu);
             auto it = g_tex.find(r);
-            if (it != g_tex.end()) { it->second.size = ctx.size; it->second.hash = content_hash(e.va, ctx.size); }
+            if (it != g_tex.end()) { it->second.size = ctx.size; it->second.hash = hash; }
         }
         if (InterlockedIncrement(&logged) <= 5 || log_enabled(CH, Level::Trace))
             XSL_INFO(CH, "texture at %llx (%llux%ux%u, %u mips, format %d, layout %#x, %llu bytes): detiled and uploaded", (unsigned long long)e.va,

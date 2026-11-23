@@ -53,7 +53,7 @@ std::vector<RtSection> rt_sections(const uint8_t* b, size_t n) {
 
 // Hit groups of one collection (see rtso.h): a name that is not an export, then three export names
 // or empty strings.
-static void parse_hitgroups(const std::vector<uint8_t>& blob, const std::map<std::string, uint32_t>& exports,
+static void parse_hitgroups(const std::vector<uint8_t>& blob, const std::map<std::string, uint64_t>& exports,
                             std::map<std::string, std::vector<std::string>>& out) {
     const uint8_t* b = blob.data();
     size_t n = blob.size();
@@ -85,52 +85,73 @@ static void parse_hitgroups(const std::vector<uint8_t>& blob, const std::map<std
     }
 }
 
+static uint64_t fnv(const void* p, size_t n, uint64_t h) {
+    auto* b = static_cast<const uint8_t*>(p);
+    for (size_t i = 0; i < n; i++) h = (h ^ b[i]) * 1099511628211ull;
+    return h;
+}
+
+size_t RtSpace::place(std::vector<uint8_t> bytes, std::vector<uint32_t> entries) {
+    auto known = block_of_.find(bytes);
+    if (known != block_of_.end()) return known->second;
+    uint32_t need = uint32_t((bytes.size() + (1u << kSlotShift) - 1) >> kSlotShift);
+    if (!need) need = 1;
+    uint32_t first = uint32_t(kBase >> kSlotShift);   // slots below kBase are not used
+    uint32_t span = kSlots - first - need;
+    uint32_t slot = first + uint32_t(fnv(bytes.data(), bytes.size(), 1469598103934665603ull) % span);
+    for (;;) {   // linear probing over occupied slots
+        bool free = true;
+        for (uint32_t k = 0; k < need && free; k++) free = !slot_used_.count(slot + k);
+        if (free) break;
+        slot = slot + 1 >= first + span ? first : slot + 1;
+    }
+    size_t b = blocks_.size();
+    for (uint32_t k = 0; k < need; k++) slot_used_[slot + k] = b;
+    blocks_.push_back({uint64_t(slot) << kSlotShift, bytes, std::move(entries)});
+    block_of_[std::move(bytes)] = b;
+    return b;
+}
+
 int RtSpace::add(const std::vector<uint8_t>& blob) {
     auto known = by_blob_.find(blob);
     if (known != by_blob_.end()) return known->second;
     Coll c;
+    std::vector<uint8_t> code;          // the collection's own sections, 256-byte aligned
+    std::vector<uint32_t> codeEntries;
+    struct Sym { std::string name; uint32_t at; };
+    std::vector<Sym> syms;
     for (auto& s : rt_sections(blob.data(), blob.size())) {
-        std::vector<uint8_t> code(blob.begin() + s.code, blob.begin() + s.code + s.size);
+        std::vector<uint8_t> bytes(blob.begin() + s.code, blob.begin() + s.code + s.size);
         bool traversalSection = true;
         for (auto& y : s.syms) traversalSection &= y.name == "main" || y.name.rfind("XDXR_TraceRay", 0) == 0;
-        uint32_t base;
-        auto seen = by_code_.find(code);
-        bool fresh = seen == by_code_.end();
-        if (fresh) {   // identical sections (the traversal in every collection) are placed once
-            while (img_.size() % 256) img_.push_back(0);
-            base = (uint32_t)img_.size();
-            img_.insert(img_.end(), code.begin(), code.end());
-            by_code_[code] = base;
-        } else base = seen->second;
-        std::vector<uint32_t> ents{base};
-        for (auto& y : s.syms) ents.push_back(base + y.offset);
         if (traversalSection) {
+            std::vector<uint32_t> ents{0};
+            for (auto& y : s.syms) ents.push_back(y.offset);
+            size_t b = place(bytes, ents);
+            c.travs.push_back(b);
             for (auto& y : s.syms)
-                if (y.name == "XDXR_TraceRay.ss_0") c.traversal.push_back(base + y.offset);
-            size_t t = travs_.size();
-            for (size_t k = 0; k < travs_.size(); k++)
-                if (travs_[k].begin == base) t = k;
-            if (t == travs_.size()) travs_.push_back({base, base + (uint32_t)s.size, ents});
-            c.travs.push_back(t);
+                if (y.name == "XDXR_TraceRay.ss_0") c.traversal.push_back(blocks_[b].address + y.offset);
             continue;
         }
+        while (code.size() % 256) code.push_back(0);
+        uint32_t base = (uint32_t)code.size();
+        code.insert(code.end(), bytes.begin(), bytes.end());
+        codeEntries.push_back(base);
         uint32_t m = 0;
-        for (auto& y : s.syms)
-            if (y.name == "main") m = base + y.offset;
-        size_t part = parts_.size();
-        for (size_t k = 0; k < parts_.size(); k++)
-            if (parts_[k].begin == base) part = k;
-        if (part == parts_.size()) {
-            parts_.push_back({base, base + (uint32_t)s.size, m, s.payload == 0});
-            part_entries_.push_back(ents);
-        }
-        c.parts.push_back(part);
         for (auto& y : s.syms) {
-            size_t p = y.name.rfind(".ss_0");
-            if (y.name.rfind("XDXR_", 0) != 0 && p != std::string::npos && p + 5 == y.name.size()) c.exports[y.name.substr(0, p)] = base + y.offset;
+            codeEntries.push_back(base + y.offset);
+            if (y.name == "main") m = base + y.offset;
+            syms.push_back({y.name, base + y.offset});
         }
+        c.parts.push_back({base, base + (uint32_t)s.size, m, s.payload == 0});
     }
-    if (c.parts.empty() && c.traversal.empty()) return -1;
+    if (c.parts.empty()) return -1;
+    c.code = place(code, codeEntries);
+    for (auto& y : syms) {
+        size_t p = y.name.rfind(".ss_0");
+        if (y.name.rfind("XDXR_", 0) != 0 && p != std::string::npos && p + 5 == y.name.size())
+            c.exports[y.name.substr(0, p)] = blocks_[c.code].address + y.at;
+    }
     parse_hitgroups(blob, c.exports, c.hitgroups);
     colls_.push_back(std::move(c));
     by_blob_[blob] = int(colls_.size() - 1);
@@ -142,7 +163,7 @@ bool RtSpace::identifier(int id, const std::string& name, uint32_t words[3]) con
     const Coll& c = colls_[id];
     auto ptr = [&](const std::string& x) -> uint32_t {
         auto it = c.exports.find(x);
-        return it == c.exports.end() ? 0u : uint32_t((kBase + it->second) >> 8);
+        return it == c.exports.end() ? 0u : uint32_t(it->second >> 8);
     };
     words[0] = words[1] = words[2] = 0;
     auto hg = c.hitgroups.find(name);
@@ -154,46 +175,57 @@ bool RtSpace::identifier(int id, const std::string& name, uint32_t words[3]) con
     return words[0] != 0;
 }
 
+bool RtSpace::has_raygen(int id) const {
+    if (id < 0 || id >= (int)colls_.size()) return false;
+    for (auto& p : colls_[id].parts)
+        if (p.raygen) return true;
+    return false;
+}
+std::vector<uint64_t> RtSpace::traversal(int id) const { return id < 0 || id >= (int)colls_.size() ? std::vector<uint64_t>() : colls_[id].traversal; }
+int RtSpace::collection_in_slot(uint32_t slot) const {
+    auto it = slot_used_.find(slot);
+    if (it == slot_used_.end()) return -1;
+    for (size_t c = 0; c < colls_.size(); c++)
+        if (colls_[c].code == it->second) return int(c);
+    return -1;
+}
+
 bool RtSpace::link(const std::vector<int>& ids, RtLinked& out, std::string* err) const {
     out = RtLinked();
     out.base = kBase;
-    std::vector<uint8_t> img = img_;
-    while (img.size() % 4) img.push_back(0);
-    out.image.assign((const uint32_t*)img.data(), (const uint32_t*)(img.data() + img.size()));
-    std::vector<bool> in(parts_.size(), false), tin(travs_.size(), false);
+    std::vector<uint8_t> img;
+    std::set<size_t> done;
+    auto add_block = [&](size_t b) -> uint32_t {   // image offset of the block
+        while (img.size() % 256) img.push_back(0);
+        uint32_t at = (uint32_t)img.size();
+        const Block& k = blocks_[b];
+        img.insert(img.end(), k.bytes.begin(), k.bytes.end());
+        out.segs.push_back({at, (uint32_t)k.bytes.size(), k.address});
+        for (uint32_t e : k.entries) out.entries.push_back(at + e);
+        return at;
+    };
     for (int id : ids) {
         if (id < 0 || id >= (int)colls_.size()) continue;
         const Coll& c = colls_[id];
         if (out.traversal.empty()) out.traversal = c.traversal;
-        for (size_t t : c.travs) tin[t] = true;
-        for (size_t p : c.parts) in[p] = true;
+        for (size_t t : c.travs)
+            if (done.insert(t).second) add_block(t);
+    }
+    for (int id : ids) {
+        if (id < 0 || id >= (int)colls_.size()) continue;
+        const Coll& c = colls_[id];
+        if (!done.insert(c.code).second) continue;
+        uint32_t at = add_block(c.code);
+        for (auto p : c.parts) out.parts.push_back({at + p.begin, at + p.end, p.main ? at + p.main : 0, p.raygen});
         for (auto& e : c.exports) out.exports.insert(e);
         for (auto& h : c.hitgroups) out.hitgroups.insert(h);
     }
-    for (size_t t = 0; t < travs_.size(); t++) {   // only the collections' own traversal sections
-        if (!tin[t]) { out.skip.push_back({travs_[t].begin, travs_[t].end}); continue; }
-        out.entries.insert(out.entries.end(), travs_[t].entries.begin(), travs_[t].entries.end());
-    }
-    for (size_t p = 0; p < parts_.size(); p++) {
-        if (!in[p]) { out.skip.push_back({parts_[p].begin, parts_[p].end}); continue; }
-        out.parts.push_back(parts_[p]);
-        out.entries.insert(out.entries.end(), part_entries_[p].begin(), part_entries_[p].end());
-    }
+    while (img.size() % 4) img.push_back(0);
+    out.image.assign((const uint32_t*)img.data(), (const uint32_t*)(img.data() + img.size()));
     for (auto& p : out.parts)
         if (p.main && (!out.main || (p.raygen && !out.main_is_raygen))) { out.main = p.main; out.main_is_raygen = p.raygen; }
-    // The image ends with the last included section (what follows depends on later collections).
-    uint32_t end = 0;
-    for (auto& p : out.parts) end = std::max(end, p.end);
-    for (size_t t = 0; t < travs_.size(); t++)
-        if (tin[t]) end = std::max(end, travs_[t].end);
-    end = (end + 3) & ~3u;
-    if (end < out.image.size() * 4) out.image.resize(end / 4);
-    std::vector<std::pair<uint32_t, uint32_t>> sk;
-    for (auto& r : out.skip)
-        if (r.first < end) sk.push_back({r.first, std::min(r.second, end)});
-    out.skip.swap(sk);
     if (out.parts.empty()) { if (err) *err = "no sections"; return false; }
-    if (!out.main) { if (err) *err = "no ray-generation scheduler"; return false; }
+    if (!out.main) { if (err) *err = "no scheduler"; return false; }
     return true;
 }
 
@@ -229,33 +261,15 @@ static bool park_info(const std::vector<uint32_t>& img, uint32_t main, uint32_t*
     return false;
 }
 
-std::vector<int> RtSpace::parts_of(int id) const {
-    std::vector<int> r;
-    if (id >= 0 && id < (int)colls_.size())
-        for (size_t p : colls_[id].parts) r.push_back(int(p));
-    return r;
-}
-
-int RtSpace::collection_at(uint32_t offset) const {
-    for (size_t c = 0; c < colls_.size(); c++)
-        for (size_t p : colls_[c].parts)
-            if (offset >= parts_[p].begin && offset < parts_[p].end) return int(c);
-    return -1;
-}
-
 bool RtSpace::program(int id, RtLinked& out, std::string* err) const {
     if (!link({id}, out, err)) return false;
-    // A collection without a scheduler of its own (none observed) borrows any.
-    if (!out.main)
-        for (auto& p : parts_)
-            if (p.main) { out.main = p.main; break; }
     uint32_t ptr, resume;
     if (!park_info(out.image, out.main, &ptr, &resume)) { if (err) *err = "scheduler not understood"; return false; }
     out.park = true;
     out.park_ptr_vgpr = ptr;
     out.resume_at = resume;
     out.park_from = out.main;
-    for (auto& p : parts_)
+    for (auto& p : out.parts)
         if (out.main >= p.begin && out.main < p.end) out.park_to = p.end;
     return true;
 }
@@ -267,44 +281,13 @@ bool rt_link(const std::vector<std::vector<uint8_t>>& blobs, RtLinked& out, std:
     return s.link(ids, out, err);
 }
 
-std::vector<RtLinked> rt_programs(const RtLinked& l) {
-    size_t n = 0;
-    for (auto& p : l.parts) n += p.raygen && p.main;
-    if (n < 2) return {l};
-    std::vector<RtLinked> out;
-    for (auto& p : l.parts) {
-        if (!p.raygen || !p.main) continue;
-        RtLinked r = l;
-        r.main = p.main;
-        r.entries.clear();
-        for (auto& q : l.parts)
-            if (q.raygen && &q != &p) r.skip.push_back({q.begin, q.end});
-        for (uint32_t e : l.entries) {
-            bool blank = false;
-            for (auto& q : l.parts) blank |= q.raygen && &q != &p && e >= q.begin && e < q.end;
-            if (!blank) r.entries.push_back(e);
-        }
-        out.push_back(std::move(r));
-    }
-    return out;
-}
-
-static uint64_t fnv(const void* p, size_t n, uint64_t h) {
-    auto* b = static_cast<const uint8_t*>(p);
-    for (size_t i = 0; i < n; i++) h = (h ^ b[i]) * 1099511628211ull;
-    return h;
-}
 uint64_t rt_cache_key(const RtLinked& l, const std::string& salt) {
-    uint64_t key = fnv("rt3", 3, 1469598103934665603ull);
+    uint64_t key = fnv("rt4", 3, 1469598103934665603ull);
     key = fnv(salt.data(), salt.size(), key);
-    std::vector<std::pair<uint32_t, uint32_t>> sk = l.skip;
-    std::sort(sk.begin(), sk.end());
-    uint32_t at = 0, end = (uint32_t)l.image.size() * 4;
-    for (auto& [b, e] : sk) {
-        if (b > at) { key = fnv(&at, 4, key); key = fnv((const uint8_t*)l.image.data() + at, std::min(b, end) - at, key); }
-        at = std::max(at, e);
+    for (auto& sg : l.segs) {
+        key = fnv(&sg.address, 8, key);
+        key = fnv((const uint8_t*)l.image.data() + sg.offset, sg.size, key);
     }
-    if (at < end) { key = fnv(&at, 4, key); key = fnv((const uint8_t*)l.image.data() + at, end - at, key); }
     uint32_t v[6] = {l.main, l.park ? 1u : 0u, l.park_ptr_vgpr, l.resume_at, l.park_from, l.park_to};
     key = fnv(v, sizeof v, key);
     return fnv(l.entries.data(), l.entries.size() * 4, key);
@@ -316,7 +299,8 @@ TranslateOptions rt_translate_options(const RtLinked& l) {
     o.entries = l.entries;
     o.global_memory = true;
     o.raw_code = l.image;
-    o.raw_skip = l.skip;
+    o.raw_segments = l.segs;
+    o.raw_park_disc_shift = RtSpace::kSlotShift - 8;
     o.raw_park = l.park;
     o.raw_park_ptr_vgpr = l.park_ptr_vgpr;
     o.raw_resume_at = l.resume_at;

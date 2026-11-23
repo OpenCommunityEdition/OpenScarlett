@@ -736,7 +736,7 @@ struct RtProg {
 struct RtPipe {
     std::vector<int> colls;
     int start = -1;                 // collection whose program starts the rays (round 0)
-    std::vector<uint32_t> traversal;
+    std::vector<uint64_t> traversal;   // traversal entry addresses (the starting collection's)
     uint32_t region = 0;
     std::mutex mu;
     std::set<int> active;           // collections reached (discovery bitmap), run in rounds >= 1
@@ -813,7 +813,6 @@ static std::shared_ptr<RtProg> rt_program(int coll) {
     { std::lock_guard<std::mutex> g(g_space_mu); ok = g_space.program(coll, *link, &err); }
     if (!ok) { XSL_WARN(CH, "ray-tracing collection %d: no program (%s)", coll, err.c_str()); prog->state = -1; return prog; }
     size_t size = link->image.size() * 4;
-    for (auto& [b, e] : link->skip) size -= e - b;
     rt_queue_build(size, [prog, link, coll, size] {
         DWORD t0 = GetTickCount();
         std::vector<uint8_t> dxil;
@@ -833,20 +832,13 @@ static void rt_start_pipeline(Device* dev, const void* so, std::vector<std::vect
     for (auto& b : blobs) pipe->colls.push_back(space_add(b));
     {
         std::lock_guard<std::mutex> g(g_space_mu);
-        gpucode::RtLinked l;
-        std::string err;
-        if (!g_space.link(pipe->colls, l, &err)) { XSL_WARN(CH, "ray-tracing pipeline (%zu collections) not linked: %s", blobs.size(), err.c_str()); return; }
-        pipe->traversal = l.traversal;
-        pipe->parts = l.parts;
-        for (int c : pipe->colls) {   // rays start in the first collection with a ray-generation shader
-            gpucode::RtLinked one;
-            std::string e;
-            if (!g_space.link({c}, one, &e)) continue;
-            bool rg = false;
-            for (auto& q : one.parts) rg |= q.raygen;
-            if (rg) { pipe->start = c; break; }
-        }
-        if (pipe->start < 0 && !pipe->colls.empty()) pipe->start = pipe->colls[0];
+        for (int c : pipe->colls)   // rays start in the first collection with a ray-generation shader
+            if (c >= 0 && g_space.has_raygen(c)) { pipe->start = c; break; }
+        if (pipe->start < 0)
+            for (int c : pipe->colls)
+                if (c >= 0) { pipe->start = c; break; }
+        if (pipe->start < 0) { XSL_WARN(CH, "ray-tracing pipeline (%zu collections): no collection understood", blobs.size()); return; }
+        pipe->traversal = g_space.traversal(pipe->start);
     }
     static std::atomic<uint32_t> regions{0};
     pipe->region = std::min<uint32_t>(regions++, 63);
@@ -868,7 +860,7 @@ static void rt_scan(RtPipe& p) {
     std::vector<int> found;
     {
         std::lock_guard<std::mutex> g(g_space_mu);
-        for (uint32_t u : units) found.push_back(g_space.collection_at(u * 256));
+        for (uint32_t u : units) found.push_back(g_space.collection_in_slot(u + uint32_t(gpucode::RtSpace::kBase >> gpucode::RtSpace::kSlotShift)));
     }
     std::lock_guard<std::mutex> g(p.mu);
     for (int c : found)
@@ -908,7 +900,7 @@ bool rt_dispatch_impl(PcObj list, const void* so, const uint64_t* tables, const 
     a.stackPerLane = kStackPerLane;
     for (int k = 0; k < 3; k++) {
         size_t n = pipe->traversal.size();
-        a.traversal[k] = n ? (uint32_t)((gpucode::RtSpace::kBase + pipe->traversal[std::min<size_t>(k, n - 1)]) >> 8) : 0;
+        a.traversal[k] = n ? (uint32_t)(pipe->traversal[std::min<size_t>(k, n - 1)] >> 8) : 0;
     }
     a.argsVa = argsVa;
     if (d) {

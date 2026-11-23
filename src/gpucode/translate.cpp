@@ -1157,6 +1157,11 @@ struct Translator {
             return false;
         }
     }
+    uint64_t addr_of(uint32_t offset) const {
+        for (auto& sg : opt.raw_segments)
+            if (offset >= sg.offset && offset < sg.offset + sg.size) return sg.address + (offset - sg.offset);
+        return opt.code_base + offset;
+    }
     std::string park_lane() const {
         return "((((gid_.z * RC0_d[0].w + gid_.y) * RC0_d[0].z + gid_.x) * WAVE) + LG)";
     }
@@ -1166,7 +1171,8 @@ struct Translator {
         line(fmt("    if (kexec && %s < RC0_d[1].w) { uint b_ = %s * %uu;", park_lane().c_str(), park_lane().c_str(), stride));
         line("      RTST.Store2(b_, uint2(p_, RC0_d[1].z + 1u));");
         for (unsigned k = 0; k < nv; k += 4) line(fmt("      RTST.Store4(b_ + %uu, uint4(v%u, v%u, v%u, v%u));", 8 + 4 * k, k, k + 1, k + 2, k + 3));
-        line(fmt("      uint u_ = p_ - 0x%xu; if (u_ < (1u << 20)) RTDISC.InterlockedOr((u_ >> 5) * 4u, 1u << (u_ & 31u)); }", uint32_t(opt.code_base >> 8)));
+        line(fmt("      uint u_ = (p_ - 0x%xu) >> %uu; if (u_ < (1u << 20)) RTDISC.InterlockedOr((u_ >> 5) * 4u, 1u << (u_ & 31u)); }", uint32_t(opt.code_base >> 8),
+                 opt.raw_park_disc_shift));
         line(fmt("    if (kexec) v%u = 0u;", opt.raw_park_ptr_vgpr));
         max_v = std::max(max_v, nv);
         uses_park = true;
@@ -1401,7 +1407,7 @@ bool Translator::emit_salu(const Instr& in, size_t idx) {
         if (n == "s_bitset0_b32") { write_s(d, fmt("%s & ~(1u << (%s & 31u))", S(d).c_str(), a().c_str())); return true; }
         if (n == "s_bitset1_b32") { write_s(d, fmt("%s | (1u << (%s & 31u))", S(d).c_str(), a().c_str())); return true; }
         if (n == "s_getpc_b64") {
-            uint64_t a = opt.code_base + in.offset + 4;
+            uint64_t a = addr_of(in.offset + 4);
             line(fmt("%s = 0x%xu; %s = 0x%xu;", S(d).c_str(), uint32_t(a), S(d + 1).c_str(), uint32_t(a >> 32)));
             return true;
         }
@@ -1454,7 +1460,7 @@ bool Translator::emit_salu(const Instr& in, size_t idx) {
         if (n == "s_setpc_b64" || n == "s_swappc_b64") {   // block terminators: the dispatcher continues at the target
             line(fmt("{ uint tlo_ = %s, thi_ = %s;", S(in.src0).c_str(), S(in.src0 + 1).c_str()));
             if (n == "s_swappc_b64") {
-                uint64_t ret = opt.code_base + in.offset + 4;
+                uint64_t ret = addr_of(in.offset + 4);
                 line(fmt("  %s = 0x%xu; %s = 0x%xu;", S(in.dst).c_str(), uint32_t(ret), S(in.dst + 1).c_str(), uint32_t(ret >> 32)));
             }
             if (opt.raw_park && n == "s_swappc_b64" && block_of.count(in.offset + 4) && in.offset >= opt.raw_park_from && in.offset < opt.raw_park_to) {
@@ -3695,10 +3701,16 @@ std::string Translator::generate() {
     }
     if (indirect) {   // code address -> dispatcher case (block start); unknown addresses end the invocation
         h << "uint jump_case(uint lo, uint hi) {\n";
-        h << fmt("  if (hi != 0x%xu) return 0xffffffffu;\n  switch (lo) {\n", uint32_t(opt.code_base >> 32));
+        std::map<uint32_t, std::vector<std::pair<uint32_t, size_t>>> by_hi;
         for (size_t b = 0; b < block_start.size(); b++) {
-            uint64_t a = opt.code_base + ins[block_start[b]].offset;
-            h << fmt("  case 0x%xu: return %zuu;\n", uint32_t(a), b);
+            uint64_t a = addr_of(ins[block_start[b]].offset);
+            by_hi[uint32_t(a >> 32)].push_back({uint32_t(a), b});
+        }
+        h << "  switch (hi) {\n";
+        for (auto& [hi, v] : by_hi) {
+            h << fmt("  case 0x%xu:\n    switch (lo) {\n", hi);
+            for (auto& [lo, b] : v) h << fmt("    case 0x%xu: return %zuu;\n", lo, b);
+            h << "    default: return 0xffffffffu;\n    }\n";
         }
         h << "  default: return 0xffffffffu;\n  }\n}\n";
     }

@@ -123,8 +123,9 @@ collections; offsets from The Matrix Awakens demo, layouts from disassembly):
   hit, intersection).
 - **Identifiers are code addresses.** Titles ask collections (not pipelines) for identifiers and mix
   them in shader tables; pipelines of hit groups only are dispatched with ray-generation shaders of
-  other collections. `gpucode::RtSpace` places every collection once (from `0x100000000`);
-  identifiers are entry >> 8 (hit groups: closest hit, any hit, intersection in dwords 0..2). The
+  other collections. `gpucode::RtSpace` gives every collection's code and every distinct traversal
+  section a 1 MiB slot chosen by a hash of its contents (from `0x100000000`; titles load
+  collections on several threads, so placement must not depend on order); identifiers are entry >> 8 (hit groups: closest hit, any hit, intersection in dwords 0..2). The
   traversal reads dword 0 of a hit record as the closest-hit pointer (0: none).
 - **Runtime table** (scheduler argument `s[0:1]`): +0x0..0xc descriptor-table bases of the global
   root signature (SRV, CBV, sampler, UAV); +0x18 the scheduler's s12..s27: traversal-pointer table
@@ -136,8 +137,9 @@ collections; offsets from The Matrix Awakens demo, layouts from disassembly):
 - **Programs.** DXC time grows much faster than linearly with function size (a 49K-line program
   takes over 10 minutes even at `-Od`), so each collection is its own program (traversal + the
   collection + its scheduler). A scheduler call to code outside the program parks the active lanes
-  (target and VGPRs v0..v63 to a lane-state buffer; target marked in the pipeline's discovery
-  bitmap). A dispatch runs round 0 in the pipeline's ray-generation collection, then further rounds
+  (target and VGPRs v0..v63 to a lane-state buffer; the target's slot marked in the pipeline's
+  discovery bitmap). A program is several code segments at their own addresses
+  (`TranslateOptions::raw_segments`). A dispatch runs round 0 in the pipeline's ray-generation collection, then further rounds
   over the collections rays were seen to reach; a program resumes the lanes parked on its code just
   before the scheduler's loop (the scheduler's prologue is re-run; it is deterministic per wave).
 - **Cache.** Programs are cached by `rt_cache_key` (included code, scheduler, parking settings,
