@@ -38,6 +38,10 @@ constexpr ULONG_PTR kFramesPerPage = 16;
 DWORD pc_protect(DWORD p) {
     p &= ~(DWORD)(PAGE_GRAPHICS_NOACCESS | PAGE_GRAPHICS_READONLY | PAGE_GRAPHICS_READWRITE | PAGE_GRAPHICS_EXECUTE |
                   PAGE_GRAPHICS_EXECUTE_READ | PAGE_GRAPHICS_EXECUTE_READWRITE | PAGE_GRAPHICS_COHERENT | PAGE_GRAPHICS_NOCACHE);
+    // Write-combined and uncached memory is for data the CPU only writes on the console. Here the
+    // layer reads it too (texture detiling, change checks, descriptors), and such reads are slower
+    // by an order of magnitude: the memory is ordinary cached memory.
+    p &= ~(DWORD)(PAGE_WRITECOMBINE | PAGE_NOCACHE);
     if (!(p & 0xFF)) p |= PAGE_READWRITE;
     return p;
 }

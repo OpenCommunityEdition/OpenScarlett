@@ -14,8 +14,10 @@
 #include <windows.h>
 
 #include <iterator>
+#include <atomic>
 #include <map>
 #include <mutex>
+#include <algorithm>
 #include <vector>
 
 #include "xs_detile.h"
@@ -47,6 +49,7 @@ std::mutex g_mu;
 std::map<PcObj, Entry> g_tex;
 std::vector<PcObj> g_queue;
 size_t g_scan = 0;   // round-robin position of the content check
+std::atomic<uint64_t> g_stat[6];   // checked bytes, changed textures, uploads, uploaded bytes, first uploads, textures known
 
 // The whole range is committed (it may span several adjacent regions).
 bool committed(uint64_t va, uint64_t size) {
@@ -57,11 +60,24 @@ bool committed(uint64_t va, uint64_t size) {
     }
     return true;
 }
-uint64_t content_hash(uint64_t va, uint64_t size) {
-    const uint64_t* p = (const uint64_t*)(uintptr_t)va;
+
+// The hash of memory the title may have released since: read through the kernel in pieces, so a
+// range that is gone fails instead of faulting (querying the range first costs milliseconds in a
+// title's fragmented address space, on every check).
+bool content_hash_guarded(uint64_t va, uint64_t size, uint64_t* out) {
+    static thread_local std::vector<uint8_t> buf;
+    const size_t piece = 1u << 20;
+    if (buf.size() < piece) buf.resize(piece);
     uint64_t h = 0x9e3779b97f4a7c15ull;
-    for (uint64_t i = 0, n = size / 8; i < n; i++) h = (h ^ p[i]) * 0x100000001b3ull + (h >> 29);
-    return h;
+    for (uint64_t at = 0; at < size; at += piece) {
+        const size_t n = (size_t)std::min<uint64_t>(piece, size - at);
+        SIZE_T got = 0;
+        if (!ReadProcessMemory(GetCurrentProcess(), (const void*)(uintptr_t)(va + at), buf.data(), n, &got) || got != n) return false;
+        const uint64_t* p = (const uint64_t*)buf.data();
+        for (size_t i = 0, k = n / 8; i < k; i++) h = (h ^ p[i]) * 0x100000001b3ull + (h >> 29);
+    }
+    *out = h;
+    return true;
 }
 
 CreateComputer xg() {
@@ -108,6 +124,11 @@ void detile_register(PcObj pcRes, uint64_t va, const void* consoleDesc, uint32_t
     g_tex[pcRes] = {va, *d, initialState};
 }
 
+void detile_stats(uint64_t out[6]) {
+    for (int i = 0; i < 5; i++) out[i] = g_stat[i].exchange(0);
+    std::lock_guard<std::mutex> g(g_mu);
+    out[5] = g_tex.size();
+}
 void detile_forget(PcObj pcRes) {
     std::lock_guard<std::mutex> g(g_mu);
     g_tex.erase(pcRes);
@@ -136,8 +157,12 @@ void detile_flush(PcObj pcDevice, PcObj pcQueue) {
                 Entry& e = it->second;
                 if (e.done && e.size && e.size <= budget) {
                     budget -= e.size;
-                    if (!committed(e.va, e.size)) e.size = 0;   // the title released the memory: stop checking
-                    else if (content_hash(e.va, e.size) != e.hash) { e.done = false; e.queued = true; g_queue.push_back(it->first); }
+                    uint64_t now = 0;
+                    if (!content_hash_guarded(e.va, e.size, &now)) e.size = 0;   // the title released the memory: stop checking
+                    else {
+                        g_stat[0] += e.size;
+                        if (now != e.hash) { g_stat[1]++; e.done = false; e.queued = true; g_queue.push_back(it->first); }
+                    }
                 }
                 ++it;
             }
@@ -167,8 +192,12 @@ void detile_flush(PcObj pcDevice, PcObj pcQueue) {
         // Hash before reading: texels the title writes during or after the upload (e.g. glyphs a
         // font cache adds) then differ from the hash and are uploaded at a later check. Hashing
         // afterwards recorded such writes as uploaded and left them out for good.
-        uint64_t hash = readable ? content_hash(e.va, ctx.size) : 0;
+        uint64_t hash = 0;
+        if (readable && !content_hash_guarded(e.va, ctx.size, &hash)) readable = false;
         if (readable) hr = pc::upload_texture(pcDevice, pcQueue, r, e.state, fill, &ctx);
+        g_stat[2]++;
+        g_stat[3] += ctx.size;
+        if (!e.size) g_stat[4]++;
         c->Release();
         if (!readable || FAILED(hr)) {
             if (InterlockedIncrement(&failed) <= 5)

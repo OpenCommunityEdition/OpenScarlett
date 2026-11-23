@@ -156,7 +156,22 @@ DxcCreateInstanceProc dxc() {
     return p;
 }
 
+bool compile_here(const std::string& hlsl, const std::string& profile, std::vector<uint8_t>& out, std::string& log, const wchar_t* optOverride);
+// The compiler recurses deeply on large programs and titles create pipelines on threads with small
+// stacks (one overflowed there): each compile runs on a thread of its own with a 256 MB stack.
 bool compile(const std::string& hlsl, const std::string& profile, std::vector<uint8_t>& out, std::string& log, const wchar_t* optOverride = nullptr) {
+    struct Job { const std::string* hlsl; const std::string* profile; std::vector<uint8_t>* out; std::string* log; const wchar_t* opt; bool ok; } j{&hlsl, &profile, &out, &log, optOverride, false};
+    HANDLE th = CreateThread(nullptr, (SIZE_T)256 << 20, [](void* p) -> DWORD {
+        auto* j = (Job*)p;
+        j->ok = compile_here(*j->hlsl, *j->profile, *j->out, *j->log, j->opt);
+        return 0;
+    }, &j, STACK_SIZE_PARAM_IS_A_RESERVATION, nullptr);
+    if (!th) return compile_here(hlsl, profile, out, log, optOverride);
+    WaitForSingleObject(th, INFINITE);
+    CloseHandle(th);
+    return j.ok;
+}
+bool compile_here(const std::string& hlsl, const std::string& profile, std::vector<uint8_t>& out, std::string& log, const wchar_t* optOverride) {
     auto create = dxc();
     if (!create) return false;
     IDxcCompiler3* compiler = nullptr;
@@ -340,7 +355,9 @@ bool native_translate(const void* in, size_t n, void** out, size_t* outSize) {
             o.global_memory = !(g && g[0] == '0') && !getenv("XSL_GM_NO_RS");
         }
         o.wave64_dual = g_host_wave_min <= 32 && (g_host_wave_max <= 32 || g_host_sm66);
+        const DWORD tick0 = GetTickCount();
         gpucode::TranslateResult r = gpucode::translate(c, rs, o);
+        const DWORD tick1 = GetTickCount();
         if (r.ok && !ovr.empty()) r.hlsl.assign(ovr.begin(), ovr.end());
         if (!r.ok) {
             XSL_WARN(CH, "shader %016llx (%s): not translated: %s", (unsigned long long)key, gpucode::kind_name(c.kind), r.error.c_str());
@@ -371,7 +388,8 @@ bool native_translate(const void* in, size_t n, void** out, size_t* outSize) {
         dxil = with_root_signature(dxil, c);
         dump(key, in, n, r.hlsl, "");
         if (!cpath.empty()) write_file(cpath, dxil.data(), dxil.size());
-        XSL_INFO(CH, "shader %016llx (%s, wave%u): translated to %s", (unsigned long long)key, gpucode::kind_name(c.kind), r.wave_size, r.profile.c_str());
+        XSL_INFO(CH, "shader %016llx (%s, wave%u): translated to %s (%zu bytes of code: %lu ms, %zu bytes of HLSL compiled in %lu ms)", (unsigned long long)key,
+                 gpucode::kind_name(c.kind), r.wave_size, r.profile.c_str(), n, tick1 - tick0, r.hlsl.size(), GetTickCount() - tick1);
     }
     char kb[24];
     snprintf(kb, sizeof kb, "%s%016llx", t_keys.empty() ? "" : " ", (unsigned long long)key);

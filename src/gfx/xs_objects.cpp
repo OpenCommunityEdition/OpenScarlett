@@ -1495,14 +1495,41 @@ HRESULT make_list(Device* dev, PcObj pcl, D3D12_COMMAND_LIST_TYPE t, REFIID riid
 // ============================================================================================
 namespace {
 struct QueueExtra { D3D12_COMMAND_QUEUE_DESC desc; };
+// XSL_SUBMIT_TIMES=1 (diagnostics): where the time of submissions goes, every 200 of them.
+static bool submit_times() { static bool on = [] { char b[4]; return GetEnvironmentVariableA("XSL_SUBMIT_TIMES", b, 4) && b[0] == '1'; }(); return on; }
 void D3DAPI Q_Execute(ID3D12CommandQueue* q, UINT n, ID3D12CommandList* const* lists) {
+    static std::atomic<uint64_t> us[5], calls{0};
+    LARGE_INTEGER f, t0, t1;
+    const bool timed = submit_times();
+    if (timed) { QueryPerformanceFrequency(&f); QueryPerformanceCounter(&t0); }
+    auto lap = [&](int k) {
+        if (!timed) return;
+        QueryPerformanceCounter(&t1);
+        us[k] += (uint64_t)((t1.QuadPart - t0.QuadPart) * 1000000 / f.QuadPart);
+        t0 = t1;
+    };
     desc_sync();  // descriptors the title wrote inline since the last submission
+    lap(0);
     cbv_refresh();   // constant buffer view copies: the title has written the constants by now
+    lap(1);
     detile_flush(dev_extra(hdr(q)->device)->pcDevice, pc_of(q));   // CPU-written console textures first
+    lap(2);
     pc::gm_flush(dev_extra(hdr(q)->device)->pcDevice);             // global-memory views and address table
+    lap(3);
     std::vector<PcObj> v(n);
     for (UINT i = 0; i < n; i++) { v[i] = P(lists[i]); XSL_TRACE("gfx.cmd", "Execute list %p", (void*)lists[i]); }
     pc::queue_execute(pc_of(q), n, v.data());
+    lap(4);
+    if (timed && ++calls % 200 == 0)
+        XSL_INFO(CH, "last 200 submissions: descriptors %llu ms, constant views %llu ms, textures %llu ms, global memory %llu ms, execute %llu ms",
+                 (unsigned long long)us[0].exchange(0) / 1000, (unsigned long long)us[1].exchange(0) / 1000, (unsigned long long)us[2].exchange(0) / 1000,
+                 (unsigned long long)us[3].exchange(0) / 1000, (unsigned long long)us[4].exchange(0) / 1000);
+    if (timed && calls % 200 == 0) {
+        uint64_t d[6];
+        detile_stats(d);
+        XSL_INFO(CH, "  textures: %llu known, %llu MB checked, %llu found changed, %llu uploads (%llu first) of %llu MB", (unsigned long long)d[5],
+                 (unsigned long long)(d[0] >> 20), (unsigned long long)d[1], (unsigned long long)d[2], (unsigned long long)d[4], (unsigned long long)(d[3] >> 20));
+    }
 }
 HRESULT D3DAPI Q_Signal(ID3D12CommandQueue* q, ID3D12Fence* f, UINT64 v) { return pc::queue_signal(pc_of(q), P_or_pc(f), v); }
 // Signal with console cache-flush flags: a PC queue signal already follows completion of all prior

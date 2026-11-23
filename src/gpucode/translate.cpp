@@ -28,6 +28,8 @@ std::string fmt(const char* f, ...) {
     return b;
 }
 bool starts(const std::string& s, const char* p) { return s.rfind(p, 0) == 0; }
+// An instruction's name may be null (an encoding the decoder does not know).
+bool starts(const char* s, const char* p) { return s && !strncmp(s, p, strlen(p)); }
 bool ends(const std::string& s, const char* p) {
     size_t n = strlen(p);
     return s.size() >= n && s.compare(s.size() - n, n, p) == 0;
