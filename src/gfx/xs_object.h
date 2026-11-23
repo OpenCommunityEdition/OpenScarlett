@@ -190,6 +190,8 @@ bool desc_shadow_enabled();
 uint64_t desc_view_cpu_start(Device* dev, uint32_t offset);  // 0: shadowing unavailable
 uint64_t desc_view_gpu_start(uint32_t offset);
 bool desc_view_attach(uint32_t first, uint32_t count, void* mem);
+// Placeholder pipelines (no PC pipeline; their work is skipped): why, for the log of skipped work.
+void placeholder_note(void* titleObject, const char* why);
 void* console_memory_of(PcObj pcResource);     // the XMemAlloc memory a committed resource holds, if any
 void console_memory_release(PcObj pcResource);   // XMemAlloc memory a committed resource held (see xs_device.cpp)   // slots whose bytes live in title memory
 void desc_view_detach(uint32_t first);

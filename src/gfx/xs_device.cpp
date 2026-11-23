@@ -208,7 +208,10 @@ static HRESULT pso_result(Device* dev, HRESULT hr, PcObj pso, REFIID riid, void*
         if (pc::had_untranslated()) XSL_WARN(CH, "pipeline with untranslated console shaders: placeholder PSO (its work is skipped)");
         else XSL_WARN(CH, "pipeline of translated shaders %s rejected by the PC runtime (%08lx): placeholder PSO (its work is skipped)", pc::translated_keys(), hr);
     }
-    return make_simple(dev, Kind::Pso, nullptr, riid, out);
+    std::string why = pc::had_untranslated() ? pc::untranslated_reason() : "rejected by the PC runtime";
+    HRESULT r = make_simple(dev, Kind::Pso, nullptr, riid, out);
+    if (SUCCEEDED(r) && out) placeholder_note(*out, why.c_str());
+    return r;
 }
 // The root signature for a pipeline's translation and creation: the one its shaders describe
 // themselves when they do (pc::own_root_signature), else the title's object. Sets the translator's
@@ -523,19 +526,40 @@ HRESULT D3DAPI D_CreateQueryHeap(ID3D12Device* d, const D3D12_QUERY_HEAP_DESC* d
 }
 // Offline-serialized (native ISA) pipelines need a native-shader recompiler (not implemented).
 // Under null graphics a placeholder PSO lets the title run on.
+// A serialized pipeline is native code and register state of the console's GPU; the layer cannot
+// use it, so the call reports what a PC driver reports for a cached pipeline of another driver
+// (D3D12_ERROR_DRIVER_VERSION_MISMATCH): titles then build the pipeline from its shaders.
+// XSL_DESERIALIZE_PSO=0 hands out a placeholder instead (its work is skipped); another value is the
+// result to return (hex).
+static HRESULT deserialize_override() {
+    static HRESULT hr = [] {
+        char b[16];
+        if (!GetEnvironmentVariableA("XSL_DESERIALIZE_PSO", b, sizeof b)) return (HRESULT)0x887E0002;
+        return (HRESULT)strtoul(b, nullptr, 16);
+    }();
+    static volatile long n = 0;
+    if (FAILED(hr) && InterlockedIncrement(&n) == 1) XSL_INFO(CH, "serialized pipelines are refused as from another driver (%08lx): the title builds them from shaders", hr);
+    return hr;
+}
 HRESULT D3DAPI D_DeserializeGraphicsPipelineStateX(ID3D12Device* d, const D3D12XBOX_DESERIALIZE_GRAPHICS_PIPELINE_STATE*, REFIID riid, void** out) {
+    if (FAILED(deserialize_override())) { if (out) *out = nullptr; return deserialize_override(); }
     // A placeholder PSO: draws/dispatches using it are skipped, the rest of the title runs on.
     static volatile long n = 0;
     if (!null_graphics() && InterlockedIncrement(&n) <= 3)
         XSL_WARN(CH, "DeserializeGraphicsPipelineStateX: serialized native pipeline (needs a shader recompiler); its work is skipped");
-    return make_simple(DEV(d), Kind::Pso, nullptr, riid, out);
+    HRESULT r = make_simple(DEV(d), Kind::Pso, nullptr, riid, out);
+    if (SUCCEEDED(r) && out) placeholder_note(*out, "serialized graphics pipeline");
+    return r;
 }
 HRESULT D3DAPI D_DeserializeComputePipelineStateX(ID3D12Device* d, const D3D12XBOX_DESERIALIZE_COMPUTE_PIPELINE_STATE*, REFIID riid, void** out) {
+    if (FAILED(deserialize_override())) { if (out) *out = nullptr; return deserialize_override(); }
     // A placeholder PSO: draws/dispatches using it are skipped, the rest of the title runs on.
     static volatile long n = 0;
     if (!null_graphics() && InterlockedIncrement(&n) <= 3)
         XSL_WARN(CH, "DeserializeComputePipelineStateX: serialized native pipeline (needs a shader recompiler); its work is skipped");
-    return make_simple(DEV(d), Kind::Pso, nullptr, riid, out);
+    HRESULT r = make_simple(DEV(d), Kind::Pso, nullptr, riid, out);
+    if (SUCCEEDED(r) && out) placeholder_note(*out, "serialized compute pipeline");
+    return r;
 }
 HRESULT D3DAPI D_CreateCommandQueueX(ID3D12Device* d, const D3D12XBOX_COMMAND_QUEUE_DESC* xd, REFIID riid, void** out) {
     D3D12_COMMAND_QUEUE_DESC qd{};

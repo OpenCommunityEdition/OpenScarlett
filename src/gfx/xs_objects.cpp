@@ -607,6 +607,7 @@ struct ListExtra {
     D3D12_INDEX_BUFFER_VIEW ib;
     PcObj sampler;                // sampler heap last bound by the title
     bool placeholderPso;          // current PSO has no PC pipeline (serialized native code): skip work
+    int placeholderWhy;           // ... and its reason index (g_ph_why), -1 unknown
     uint64_t csTables[16];        // console GPU handles of the compute root tables (ray dispatches read them)
     const void* rtPipeline;       // state object of SetPipelineState1
     // Whole-resource states set by earlier transitions in this recording (see L_ResourceBarrier).
@@ -615,6 +616,21 @@ struct ListExtra {
     struct { void* res; uint32_t state; } tracked[kTracked];
 };
 volatile long g_skipped_work = 0;   // draws/dispatches skipped for placeholder pipelines
+// Why each placeholder pipeline has no PC pipeline, and how much work each reason skipped.
+std::mutex g_ph_mu;
+std::map<void*, int> g_ph_of;                           // title pipeline object -> reason index
+std::vector<std::pair<std::string, long>> g_ph_why;     // reason, skipped draws/dispatches since the last report
+static int placeholder_reason(void* obj) {
+    std::lock_guard<std::mutex> g(g_ph_mu);
+    auto it = g_ph_of.find(obj);
+    return it == g_ph_of.end() ? -1 : it->second;
+}
+static void placeholder_skip(int why) {
+    InterlockedIncrement(&g_skipped_work);
+    if (why < 0) return;
+    std::lock_guard<std::mutex> g(g_ph_mu);
+    if ((size_t)why < g_ph_why.size()) g_ph_why[why].second++;
+}
 ListExtra* lx(ID3D12GraphicsCommandList* l) { return ex<XList, ListExtra>((XList*)l); }
 
 // Quad emulation: a layer-owned index buffer turning every 4 vertices into 2 triangles.
@@ -660,6 +676,7 @@ HRESULT D3DAPI L_Reset(ID3D12GraphicsCommandList* l, ID3D12CommandAllocator* a, 
     lx(l)->nTracked = 0;
     lx(l)->sampler = nullptr;
     lx(l)->placeholderPso = p && !P(p);
+    lx(l)->placeholderWhy = lx(l)->placeholderPso ? placeholder_reason(p) : -1;
     HRESULT hr = pc::list_reset(LPC(l), P(a), P(p));
     if (SUCCEEDED(hr)) list_bind_global_heap(l, LPC(l));
     return hr;
@@ -780,6 +797,7 @@ void D3DAPI L_SetComputeRootSig(ID3D12GraphicsCommandList* l, ID3D12RootSignatur
 void D3DAPI L_SetPipelineState(ID3D12GraphicsCommandList* l, ID3D12PipelineState* p) {
     if (null_graphics()) return;
     lx(l)->placeholderPso = p && !P(p);
+    lx(l)->placeholderWhy = lx(l)->placeholderPso ? placeholder_reason(p) : -1;
     if (lx(l)->placeholderPso) return;
     XSL_TRACE("gfx.cmd", "list %p PSO %p", (void*)l, (void*)p);
     pc::list_set_pso(LPC(l), P(p));
@@ -827,7 +845,7 @@ void D3DAPI L_IASetIndexBuffer(ID3D12GraphicsCommandList* l, const D3D12_INDEX_B
 }
 void D3DAPI L_DrawInstanced(ID3D12GraphicsCommandList* l, UINT a, UINT b, UINT c, UINT d) {
     if (null_graphics()) return;
-    if (lx(l)->placeholderPso) return;
+    if (lx(l)->placeholderPso) { placeholder_skip(lx(l)->placeholderWhy); return; }
     if (lx(l)->topology == D3D_PRIMITIVE_TOPOLOGY_QUADLIST) {
         D3D12_INDEX_BUFFER_VIEW q = quad_ib(hdr(l)->device);
         uint32_t quads = a / 4;
@@ -841,7 +859,7 @@ void D3DAPI L_DrawInstanced(ID3D12GraphicsCommandList* l, UINT a, UINT b, UINT c
 }
 void D3DAPI L_DrawIndexedInstanced(ID3D12GraphicsCommandList* l, UINT a, UINT b, UINT c, INT d, UINT e) {
     if (null_graphics()) return;
-    if (lx(l)->placeholderPso) { InterlockedIncrement(&g_skipped_work); return; }
+    if (lx(l)->placeholderPso) { placeholder_skip(lx(l)->placeholderWhy); return; }
     XSL_TRACE("gfx.cmd", "list %p DrawIndexed %u x%u", (void*)l, a, b);
     pc::list_draw_indexed(LPC(l), a, b, c, d, e);
 }
@@ -864,7 +882,7 @@ void D3DAPI L_Dispatch(ID3D12GraphicsCommandList* l, UINT x, UINT y, UINT z) {
         static volatile long n = 0;
         if (InterlockedIncrement(&n) <= 20) XSL_INFO(CH, "large Dispatch(%u, %u, %u) on list %p", x, y, z, (void*)l);
     }
-    if (lx(l)->placeholderPso) { InterlockedIncrement(&g_skipped_work); return; }
+    if (lx(l)->placeholderPso) { placeholder_skip(lx(l)->placeholderWhy); return; }
     if (!null_graphics()) pc::list_dispatch(LPC(l), x, y, z);
 }
 // Console lists have no heap binding: descriptor tables address descriptors directly. The layer's
@@ -1035,7 +1053,7 @@ void D3DAPI L_FlushPipelineX(ID3D12GraphicsCommandList* l, D3D12XBOX_FLUSH, D3D1
 }
 void D3DAPI L_ExecuteIndirect(ID3D12GraphicsCommandList* l, ID3D12CommandSignature* sig, UINT max, ID3D12Resource* args, UINT64 ao,
                               ID3D12Resource* cnt, UINT64 co) {
-    if (lx(l)->placeholderPso) InterlockedIncrement(&g_skipped_work);
+    if (lx(l)->placeholderPso) placeholder_skip(lx(l)->placeholderWhy);
     if (null_graphics() || lx(l)->placeholderPso) return;   // placeholder PSO: its work is skipped
     if (sig && args && pc::is_rays_signature(P(sig)) && rt_bind_trace(l)) rt_peek_tables(l, "ExecuteIndirect (rays)");
     if (sig && args && pc::is_rays_signature(P(sig))) {   // indirect rays on a translated pipeline (count buffer ignored)
@@ -1543,7 +1561,15 @@ HRESULT D3DAPI Q_PresentX(ID3D12CommandQueue* q, UINT planes, const D3D12XBOX_PR
         static uint64_t presents = 0;
         if (++presents % 100 == 0) {
             long n = InterlockedExchange(&g_skipped_work, 0);
-            if (n) XSL_INFO(CH, "placeholder pipelines skipped %ld draws/dispatches over the last 100 presents", n);
+            if (n) {
+                std::string t;
+                std::lock_guard<std::mutex> g(g_ph_mu);
+                for (auto& [why, k] : g_ph_why) {
+                    if (k) t += " [" + std::to_string(k) + ": " + why + "]";
+                    k = 0;
+                }
+                XSL_INFO(CH, "placeholder pipelines skipped %ld draws/dispatches over the last 100 presents%s", n, t.c_str());
+            }
         }
     }
     LARGE_INTEGER callQpc;
@@ -1651,6 +1677,14 @@ HWND find_title_window() {
     return c.best;
 }
 
+void placeholder_note(void* obj, const char* why) {
+    std::lock_guard<std::mutex> g(g_ph_mu);
+    int idx = -1;
+    for (size_t i = 0; i < g_ph_why.size(); i++)
+        if (g_ph_why[i].first == why) idx = (int)i;
+    if (idx < 0 && g_ph_why.size() < 64) { g_ph_why.emplace_back(why, 0); idx = (int)g_ph_why.size() - 1; }
+    g_ph_of[obj] = idx;
+}
 }  // namespace xs
 
 namespace xs {

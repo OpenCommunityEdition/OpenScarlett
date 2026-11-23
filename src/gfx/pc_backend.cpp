@@ -297,6 +297,76 @@ static void trap_arm(HANDLE th) {
     for (int i = 0; i < g_ntrap; i++) { *dr[i] = g_trap[i]; c.Dr7 |= 1ull << (2 * i); c.Dr7 &= ~(0xFull << (16 + 4 * i)); }
     SetThreadContext(th, &c);
 }
+// XSL_STACKS=<seconds>[,<seconds>...] (diagnostics): at those times after start-up, the stack of
+// every thread of the title is logged as the return addresses into the title's image found on it
+// (what a title that shows nothing is waiting for).
+static void log_thread_stacks(const char* when) {
+    HMODULE exe = GetModuleHandleW(nullptr);
+    auto* dos = (const IMAGE_DOS_HEADER*)exe;
+    auto* nt = (const IMAGE_NT_HEADERS*)((const uint8_t*)exe + dos->e_lfanew);
+    const uintptr_t lo = (uintptr_t)exe, hi = lo + nt->OptionalHeader.SizeOfImage;
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+    if (snap == INVALID_HANDLE_VALUE) return;
+    THREADENTRY32 te{sizeof te};
+    for (BOOL ok = Thread32First(snap, &te); ok; ok = Thread32Next(snap, &te)) {
+        if (te.th32OwnerProcessID != GetCurrentProcessId() || te.th32ThreadID == GetCurrentThreadId()) continue;
+        HANDLE th = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION, FALSE, te.th32ThreadID);
+        if (!th) continue;
+        if (SuspendThread(th) != (DWORD)-1) {
+            CONTEXT c{};
+            c.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER;
+            std::string t;
+            if (GetThreadContext(th, &c)) {
+                char b[48];
+                HMODULE m = nullptr;
+                char name[MAX_PATH] = "?";
+                if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCSTR)c.Rip, &m) && m) {
+                    GetModuleFileNameA(m, name, MAX_PATH);
+                    const char* bn = strrchr(name, '\\');
+                    snprintf(b, sizeof b, "%.20s+%llx", bn ? bn + 1 : name, (unsigned long long)(c.Rip - (uintptr_t)m));
+                } else snprintf(b, sizeof b, "%llx", (unsigned long long)c.Rip);
+                t = b;
+                MEMORY_BASIC_INFORMATION mbi{};
+                int frames = 0;
+                if (VirtualQuery((void*)c.Rsp, &mbi, sizeof mbi)) {
+                    const uintptr_t end = (uintptr_t)mbi.BaseAddress + mbi.RegionSize;
+                    for (uintptr_t p = c.Rsp & ~7ull; p + 8 <= end && frames < 14; p += 8) {
+                        uintptr_t v = *(const uintptr_t*)p;
+                        if (v < lo + 0x1000 || v >= hi) continue;
+                        const uint8_t* q = (const uint8_t*)v;   // a return address follows a call
+                        bool call = q[-5] == 0xE8 || (q[-2] == 0xFF && ((q[-1] >> 3) & 7) == 2) || (q[-3] == 0xFF && ((q[-2] >> 3) & 7) == 2) ||
+                                    (q[-6] == 0xFF && ((q[-5] >> 3) & 7) == 2) || (q[-7] == 0xFF && ((q[-6] >> 3) & 7) == 2);
+                        if (!call) continue;
+                        snprintf(b, sizeof b, " %llx", (unsigned long long)(v - lo));
+                        t += b;
+                        frames++;
+                    }
+                }
+            }
+            ResumeThread(th);
+            XSL_INFO(CH, "stacks %s: thread %lu: %s", when, te.th32ThreadID, t.c_str());
+        }
+        CloseHandle(th);
+    }
+    CloseHandle(snap);
+}
+static void stacks_start() {
+    char b[128];
+    if (!GetEnvironmentVariableA("XSL_STACKS", b, sizeof b) || !b[0]) return;
+    std::string list = b;
+    std::thread([list] {
+        DWORD t0 = GetTickCount();
+        for (const char* p = list.c_str(); *p;) {
+            unsigned long at = strtoul(p, (char**)&p, 10);
+            while (*p == ',') p++;
+            DWORD now = GetTickCount() - t0;
+            if (at * 1000 > now) Sleep(at * 1000 - now);
+            char w[24];
+            snprintf(w, sizeof w, "at %lu s", at);
+            log_thread_stacks(w);
+        }
+    }).detach();
+}
 static void trap_watch() {
     std::set<DWORD> armed;
     long gen = 0;
@@ -483,7 +553,7 @@ HRESULT_T create_device(PcObj* out) {
     select_agility_runtime();
     if (env_on("XSL_D3D12_DRED") || env_on("XSL_D3D12_DEBUG")) {
         static bool once = false;
-        if (!once) { once = true; AddVectoredExceptionHandler(1, note_exception); trap_start(); }
+        if (!once) { once = true; AddVectoredExceptionHandler(1, note_exception); trap_start(); stacks_start(); }
     }
     HRESULT hr;
     if (env_on("XSL_D3D12_DRED")) {
@@ -789,7 +859,9 @@ static bool gm_in_table(uint64_t va, uint64_t bytes) {   // caller holds g_gm_mu
     --it;
     return va >= it->first && va + bytes <= it->first + it->second;
 }
-std::map<PcObj, uint32_t> g_rs_gm;              // root signature -> appended parameter index
+std::map<PcObj, uint32_t> g_rs_gm;              // root signature -> appended parameter index (| kRsHeaps: the heap tables follow)
+constexpr uint32_t kRsHeaps = 0x80000000u, kHeapTables = 20;
+std::map<PcObj, PcObj> g_list_sampler_heap;    // list -> the sampler heap the title bound
 std::map<PcObj, bool> g_list_global_heap;       // list -> the global heap is bound
 std::map<PcObj, std::pair<PcObj, PcObj>> g_list_gm_rs;   // list -> current (graphics, compute) root signatures
 bool gm_enabled() { static bool on = [] { char b[4]; return !(GetEnvironmentVariableA("XSL_GLOBAL_MEMORY", b, 4) && b[0] == '0'); }(); return on; }
@@ -2360,7 +2432,10 @@ void gm_flush(PcObj devObj) {
     if (InterlockedIncrement(&logged) <= 3) XSL_INFO(CH, "global memory: %u buffers addressable by translated shaders", count);
 }
 // Appends the global-memory table to a serialized root signature (false: left unchanged).
-static bool gm_extend_root_signature(const void* blob, size_t size, std::vector<uint8_t>& out, uint32_t* index) {
+// With `heaps`, the bindless arrays of image access through descriptor memory follow the
+// global-memory table: SRVs and UAVs of the whole view heap in spaces 910..918 (two tables each),
+// cube SRVs in space 919, the title's sampler heap in space 920.
+static bool gm_extend_root_signature(const void* blob, size_t size, std::vector<uint8_t>& out, uint32_t* index, bool heaps) {
     ID3D12VersionedRootSignatureDeserializer* ds = nullptr;
     if (FAILED(D3D12CreateVersionedRootSignatureDeserializer(blob, size, IID_PPV_ARGS(&ds)))) return false;
     const D3D12_VERSIONED_ROOT_SIGNATURE_DESC* vd = nullptr;
@@ -2372,7 +2447,7 @@ static bool gm_extend_root_signature(const void* blob, size_t size, std::vector<
             auto t = d.pParameters[i].ParameterType;
             cost += t == D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE ? 1 : t == D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS ? d.pParameters[i].Constants.Num32BitValues : 2;
         }
-        if (cost < 64) {
+        if (cost + (heaps ? kHeapTables : 0u) < 64) {
             std::vector<D3D12_ROOT_PARAMETER1> params(d.pParameters, d.pParameters + d.NumParameters);
             static const D3D12_DESCRIPTOR_RANGE_FLAGS vol = D3D12_DESCRIPTOR_RANGE_FLAG_DESCRIPTORS_VOLATILE | D3D12_DESCRIPTOR_RANGE_FLAG_DATA_VOLATILE;
             static const D3D12_DESCRIPTOR_RANGE1 ranges[3] = {
@@ -2384,6 +2459,20 @@ static bool gm_extend_root_signature(const void* blob, size_t size, std::vector<
             p.DescriptorTable = {3, ranges};
             p.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
             params.push_back(p);
+            static D3D12_DESCRIPTOR_RANGE1 heap[kHeapTables];
+            static std::once_flag once;
+            std::call_once(once, [] {
+                for (uint32_t k = 0; k < 9; k++) {
+                    heap[2 * k] = {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, UINT_MAX, 0, 910 + k, vol, 0};
+                    heap[2 * k + 1] = {D3D12_DESCRIPTOR_RANGE_TYPE_UAV, UINT_MAX, 0, 910 + k, vol, 0};
+                }
+                heap[18] = {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, UINT_MAX, 0, 919, vol, 0};
+                heap[19] = {D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER, UINT_MAX, 0, 920, D3D12_DESCRIPTOR_RANGE_FLAG_DESCRIPTORS_VOLATILE, 0};
+            });
+            for (uint32_t k = 0; heaps && k < kHeapTables; k++) {
+                p.DescriptorTable = {1, &heap[k]};
+                params.push_back(p);
+            }
             D3D12_VERSIONED_ROOT_SIGNATURE_DESC nd{D3D_ROOT_SIGNATURE_VERSION_1_1};
             nd.Desc_1_1 = d;
             nd.Desc_1_1.NumParameters = (UINT)params.size();
@@ -2402,7 +2491,8 @@ static bool gm_extend_root_signature(const void* blob, size_t size, std::vector<
     ds->Release();
     return ok;
 }
-HRESULT_T create_root_signature(PcObj dev, const void* blob, size_t size, PcObj* out) {
+HRESULT_T create_root_signature(PcObj dev, const void* blob, size_t size, PcObj* out) { return create_root_signature_ex(dev, blob, size, out, false); }
+HRESULT_T create_root_signature_ex(PcObj dev, const void* blob, size_t size, PcObj* out, bool heaps) {
     void* clean = nullptr;
     size_t cleanSize = 0;
     bool owned = sanitize_container(blob, size, &clean, &cleanSize);
@@ -2411,7 +2501,8 @@ HRESULT_T create_root_signature(PcObj dev, const void* blob, size_t size, PcObj*
     std::vector<uint8_t> ext;
     uint32_t gmIndex = 0;
     static bool noRs = getenv("XSL_GM_NO_RS") != nullptr;   // bisecting: views and table only
-    bool extended = gm_enabled() && !noRs && gm_extend_root_signature(use, useSize, ext, &gmIndex);
+    bool extended = gm_enabled() && !noRs && gm_extend_root_signature(use, useSize, ext, &gmIndex, heaps);
+    if (!extended && heaps && gm_enabled() && !noRs) { heaps = false; extended = gm_extend_root_signature(use, useSize, ext, &gmIndex, false); }
     HRESULT hr = as<ID3D12Device>(dev)->CreateRootSignature(0, extended ? ext.data() : use, extended ? ext.size() : useSize,
                                                             IID_PPV_ARGS(reinterpret_cast<ID3D12RootSignature**>(out)));
     if (FAILED(hr) && extended) {   // fall back to the title's own layout
@@ -2420,7 +2511,7 @@ HRESULT_T create_root_signature(PcObj dev, const void* blob, size_t size, PcObj*
     }
     if (owned) free_container(clean);
     if (FAILED(hr)) XSL_ERR(CH, "CreateRootSignature failed %08lx (blob %zu bytes)", hr, size);
-    if (SUCCEEDED(hr) && extended) { std::lock_guard<std::mutex> g(g_gm_mu); g_rs_gm[*out] = gmIndex; }
+    if (SUCCEEDED(hr) && extended) { std::lock_guard<std::mutex> g(g_gm_mu); g_rs_gm[*out] = gmIndex | (heaps ? kRsHeaps : 0u); }
     if (SUCCEEDED(hr) && !extended && gm_enabled() && !noRs) {
         static volatile long n = 0;
         if (InterlockedIncrement(&n) <= 10) XSL_WARN(CH, "root signature (%zu bytes) without the global-memory table (no room, or the extended one was rejected)", size);
@@ -2431,6 +2522,7 @@ std::atomic<uint64_t> g_gm_bind_stats[4];   // bound, root signature without tab
 static void gm_bind(PcObj l, PcObj rs, bool compute) {
     if (!gm_enabled() || !g_gv || !rs) return;
     uint32_t idx;
+    PcObj samp = nullptr;
     {
         std::lock_guard<std::mutex> g(g_gm_mu);
         auto& cur = g_list_gm_rs[l];
@@ -2440,12 +2532,27 @@ static void gm_bind(PcObj l, PcObj rs, bool compute) {
         auto h = g_list_global_heap.find(l);
         if (h == g_list_global_heap.end() || !h->second) { g_gm_bind_stats[h == g_list_global_heap.end() ? 3 : 2]++; return; }   // bound once the global heap is set
         idx = it->second;
+        auto sh = g_list_sampler_heap.find(l);
+        samp = sh == g_list_sampler_heap.end() ? nullptr : sh->second;
     }
     g_gm_bind_stats[0]++;
-    D3D12_GPU_DESCRIPTOR_HANDLE gh{g_gv->GetGPUDescriptorHandleForHeapStart().ptr + (uint64_t)gm_reserved_start() * g_gv_inc};
+    const bool heaps = (idx & kRsHeaps) != 0;
+    idx &= ~kRsHeaps;
+    const D3D12_GPU_DESCRIPTOR_HANDLE g0 = g_gv->GetGPUDescriptorHandleForHeapStart();
+    D3D12_GPU_DESCRIPTOR_HANDLE gh{g0.ptr + (uint64_t)gm_reserved_start() * g_gv_inc};
     auto* L2 = as<ID3D12GraphicsCommandList>(l);
     if (compute) L2->SetComputeRootDescriptorTable(idx, gh);
     else L2->SetGraphicsRootDescriptorTable(idx, gh);
+    if (!heaps) return;
+    for (uint32_t k = 1; k < kHeapTables; k++) {
+        if (compute) L2->SetComputeRootDescriptorTable(idx + k, g0);
+        else L2->SetGraphicsRootDescriptorTable(idx + k, g0);
+    }
+    if (samp) {
+        D3D12_GPU_DESCRIPTOR_HANDLE sg = as<ID3D12DescriptorHeap>(samp)->GetGPUDescriptorHandleForHeapStart();
+        if (compute) L2->SetComputeRootDescriptorTable(idx + kHeapTables, sg);
+        else L2->SetGraphicsRootDescriptorTable(idx + kHeapTables, sg);
+    }
 }
 
 namespace {
@@ -3640,7 +3747,7 @@ void name_recording(PcObj l) {
 void list_shadow_reset(PcObj l);
 HRESULT_T list_reset(PcObj l, PcObj a, PcObj pso) {
     list_shadow_reset(l);
-    if (gm_enabled()) { std::lock_guard<std::mutex> g(g_gm_mu); g_list_global_heap.erase(l); g_list_gm_rs.erase(l); }
+    if (gm_enabled()) { std::lock_guard<std::mutex> g(g_gm_mu); g_list_global_heap.erase(l); g_list_gm_rs.erase(l); g_list_sampler_heap.erase(l); }
     name_recording(l);
     if (g_info) { std::lock_guard<std::mutex> g(g_rs_mu); g_list_rs.erase(l); }
     HRESULT hr = logged(L->Reset(as<ID3D12CommandAllocator>(a), as<ID3D12PipelineState>(pso)), "CommandList::Reset");
@@ -3934,7 +4041,7 @@ PcObj own_root_signature(PcObj dev, const void* const* code, const size_t* size,
         HRESULT hr = D3D12SerializeVersionedRootSignature(&d, &b, &e);
         if (SUCCEEDED(hr)) {
             ser.assign((const uint8_t*)b->GetBufferPointer(), (const uint8_t*)b->GetBufferPointer() + b->GetBufferSize());
-            hr = create_root_signature(dev, ser.data(), ser.size(), &rs);
+            hr = create_root_signature_ex(dev, ser.data(), ser.size(), &rs, true);
         }
         static volatile long n = 0;
         if (FAILED(hr)) XSL_ERR(CH, "root signature from a shader's own description failed %08lx: %s", hr, e ? (const char*)e->GetBufferPointer() : "");
@@ -4677,6 +4784,10 @@ void list_set_heaps(PcObj l, uint32_t n, PcObj* h) {
         std::pair<PcObj, PcObj> cur{};
         {
             std::lock_guard<std::mutex> g(g_gm_mu);
+            PcObj samp = nullptr;
+            for (uint32_t i = 0; i < n; i++)
+                if (h[i] && as<ID3D12DescriptorHeap>(h[i])->GetDesc().Type == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER) samp = h[i];
+            g_list_sampler_heap[l] = samp;
             g_list_global_heap[l] = global;
             cur = g_list_gm_rs[l];
         }

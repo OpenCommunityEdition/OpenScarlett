@@ -52,6 +52,7 @@ uint64_t heap_cpu_start(PcObj heap);
 void heap_desc(PcObj heap, void* desc);  // D3D12_DESCRIPTOR_HEAP_DESC
 uint64_t heap_gpu_start(PcObj heap);
 HRESULT_T create_root_signature(PcObj dev, const void* blob, size_t size, PcObj* out);
+HRESULT_T create_root_signature_ex(PcObj dev, const void* blob, size_t size, PcObj* out, bool heaps);   // heaps: with the bindless heap tables
 // desc: D3D12_GRAPHICS_PIPELINE_STATE_DESC with pRootSignature already a PC pointer.
 HRESULT_T create_graphics_pso(PcObj dev, const void* desc, PcObj* out);
 HRESULT_T create_compute_pso(PcObj dev, const void* desc, PcObj* out);
@@ -270,6 +271,7 @@ const std::vector<uint8_t>& fallback_root_signature();   // the one set above (d
 void reset_untranslated();
 const char* translated_keys();   // keys of shaders translated since reset_untranslated()
 bool had_untranslated();
+const char* untranslated_reason();   // why the first such shader since reset_untranslated() is not translated
 void free_container(void* p);
 
 }  // namespace pc

@@ -206,12 +206,14 @@ void dump(uint64_t key, const void* in, size_t n, const std::string& hlsl, const
 }
 
 std::mutex g_lock;
-std::set<uint64_t> g_failed;
+std::map<uint64_t, std::string> g_failed;   // shader key -> why it is not translated
 thread_local bool t_untranslated = false;   // a shader without DXIL could not be translated
+thread_local std::string t_why;             // ... and why (the first one of the pipeline)
 thread_local std::string t_keys;             // translated shaders since reset (pipeline names)
 }  // namespace
 
-void reset_untranslated() { t_untranslated = false; t_keys.clear(); }
+void reset_untranslated() { t_untranslated = false; t_keys.clear(); t_why.clear(); }
+const char* untranslated_reason() { return t_why.c_str(); }
 bool had_untranslated() { return t_untranslated; }
 static unsigned g_host_wave_min = 32, g_host_wave_max = 32;
 static bool g_host_sm66 = false;
@@ -282,7 +284,11 @@ bool native_translate(const void* in, size_t n, void** out, size_t* outSize) {
     }
     {
         std::lock_guard<std::mutex> g(g_lock);
-        if (g_failed.count(key)) { t_untranslated = !c.has_bitcode; return false; }
+        if (auto f = g_failed.find(key); f != g_failed.end()) {
+            t_untranslated = !c.has_bitcode;
+            if (t_why.empty()) t_why = f->second;
+            return false;
+        }
     }
     wchar_t name[32];
     swprintf(name, 32, L"%016llx.dxil", (unsigned long long)key);
@@ -318,8 +324,9 @@ bool native_translate(const void* in, size_t n, void** out, size_t* outSize) {
             XSL_WARN(CH, "shader %016llx: no usable root signature in the container (%s; %s, %zu bytes: %s)", (unsigned long long)key, err.c_str(),
                      rsp ? "own" : fallbackRs ? "pipeline's" : "none", rsSize, head);
             std::lock_guard<std::mutex> g(g_lock);
-            g_failed.insert(key);
+            g_failed[key] = "no usable root signature";
             t_untranslated = !c.has_bitcode;
+            if (t_why.empty()) t_why = "no usable root signature";
             return false;
         }
         gpucode::TranslateOptions o;
@@ -338,9 +345,17 @@ bool native_translate(const void* in, size_t n, void** out, size_t* outSize) {
         if (!r.ok) {
             XSL_WARN(CH, "shader %016llx (%s): not translated: %s", (unsigned long long)key, gpucode::kind_name(c.kind), r.error.c_str());
             dump(key, in, n, "", r.error);
+            // The reason without its code offset, so that like cases count together.
+            std::string why = std::string(gpucode::kind_name(c.kind)) + ": " + r.error;
+            for (size_t at; (at = why.find(" at 0x")) != std::string::npos;) {
+                size_t e = at + 6;
+                while (e < why.size() && isxdigit((unsigned char)why[e])) e++;
+                why.erase(at, e - at);
+            }
             std::lock_guard<std::mutex> g(g_lock);
-            g_failed.insert(key);
+            g_failed[key] = why;
             t_untranslated = !c.has_bitcode;
+            if (t_why.empty()) t_why = why;
             return false;
         }
         std::string log;
@@ -348,8 +363,9 @@ bool native_translate(const void* in, size_t n, void** out, size_t* outSize) {
             XSL_ERR(CH, "shader %016llx: translated HLSL does not compile:\n%s", (unsigned long long)key, log.c_str());
             dump(key, in, n, r.hlsl, "");
             std::lock_guard<std::mutex> g(g_lock);
-            g_failed.insert(key);
+            g_failed[key] = "translated HLSL does not compile";
             t_untranslated = !c.has_bitcode;
+            if (t_why.empty()) t_why = "translated HLSL does not compile";
             return false;
         }
         dxil = with_root_signature(dxil, c);
