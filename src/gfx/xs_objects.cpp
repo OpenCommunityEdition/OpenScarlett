@@ -786,8 +786,15 @@ void D3DAPI L_ClearDSV(ID3D12GraphicsCommandList* l, D3D12_CPU_DESCRIPTOR_HANDLE
     XSL_TRACE("gfx.cmd", "list %p ClearDSV %llx", (void*)l, (unsigned long long)h.ptr);
     pc::list_clear_dsv(LPC(l), desc_pc_cpu(h.ptr, D3D12_DESCRIPTOR_HEAP_TYPE_DSV), f, d, s, n, r);
 }
-void D3DAPI L_RSSetViewports(ID3D12GraphicsCommandList* l, UINT n, const D3D12_VIEWPORT* v) { pc::list_viewports(LPC(l), n, v); }
-void D3DAPI L_RSSetScissorRects(ID3D12GraphicsCommandList* l, UINT n, const D3D12_RECT* r) { pc::list_scissors(LPC(l), n, r); }
+static bool draw_dump_now();
+void D3DAPI L_RSSetViewports(ID3D12GraphicsCommandList* l, UINT n, const D3D12_VIEWPORT* v) {
+    if (draw_dump_now() && n && v) XSL_INFO(CH, "draw dump: list %p viewport %g,%g %gx%g depth %g..%g", (void*)l, v->TopLeftX, v->TopLeftY, v->Width, v->Height, v->MinDepth, v->MaxDepth);
+    pc::list_viewports(LPC(l), n, v);
+}
+void D3DAPI L_RSSetScissorRects(ID3D12GraphicsCommandList* l, UINT n, const D3D12_RECT* r) {
+    if (draw_dump_now() && n && r) XSL_INFO(CH, "draw dump: list %p scissor %ld,%ld..%ld,%ld", (void*)l, r->left, r->top, r->right, r->bottom);
+    pc::list_scissors(LPC(l), n, r);
+}
 // XSL_DRAW_DUMP=<present> (diagnostics): the draws of the frame before that present, with the first
 // bytes of the vertex buffers they use.
 static bool draw_dump_now() {
@@ -931,6 +938,17 @@ void D3DAPI L_SetDescriptorHeaps(ID3D12GraphicsCommandList* l, UINT n, ID3D12Des
 }
 void D3DAPI L_SetGfxRootTable(ID3D12GraphicsCommandList* l, UINT i, D3D12_GPU_DESCRIPTOR_HANDLE h) {
     XSL_TRACE("gfx.cmd", "list %p RootTable %u %llx", (void*)l, i, (unsigned long long)h.ptr);
+    if (draw_dump_now()) {   // the table's first slots as they lie in descriptor memory
+        std::string t;
+        for (uint32_t k = 0; k < 4; k++) {
+            uint32_t w[8] = {};
+            if (!desc_peek(h.ptr, k, w)) { t += " (not view memory)"; break; }
+            char b[96];
+            snprintf(b, sizeof b, " | %08x %08x %08x %08x %08x %08x %08x %08x", w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7]);
+            t += b;
+        }
+        XSL_INFO(CH, "draw dump: list %p root table %u at view slot %llu:%s", (void*)l, i, (unsigned long long)((h.ptr - desc_view_gpu_start(0)) / 32), t.c_str());
+    }
     pc::list_gfx_root_table(LPC(l), i, desc_pc_gpu(h.ptr));
 }
 void D3DAPI L_SetComputeRootTable(ID3D12GraphicsCommandList* l, UINT i, D3D12_GPU_DESCRIPTOR_HANDLE h) {

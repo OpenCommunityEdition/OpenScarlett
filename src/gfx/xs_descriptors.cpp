@@ -21,6 +21,7 @@
 // - RTV/DSV handles, and the CPU handle of UAV clears, are translated through their tags when used.
 #include <cstring>
 #include <algorithm>
+#include <atomic>
 #include <mutex>
 #include <shared_mutex>
 #include <vector>
@@ -83,7 +84,13 @@ Records g_rec[4];  // by D3D12_DESCRIPTOR_HEAP_TYPE (sampler unused)
 uint8_t* g_view = nullptr;
 std::vector<uint8_t> g_snapshot;
 uint32_t g_viewCount = 0;   // console-layout view slots (title heaps are numbered within these)
-uint32_t g_pcCount = 0;     // of which the PC shader-visible heap holds the first g_pcCount
+uint32_t g_pcCount = 0;     // slots of the PC shader-visible heap (title slots are placed in it by page: pc_slot)
+constexpr uint32_t kPageSlots = 4096;
+constexpr uint32_t kNoSlot = 0xFFFFFFFFu;
+std::mutex g_page_mu;
+std::vector<std::atomic<uint32_t>> g_pcPageOf;   // title page -> PC page + 1 (0: none yet)
+std::vector<uint32_t> g_pcPageOwner;             // PC page -> title page + 1
+uint32_t g_pcPagesFree = 0;                      // lowest PC page that may be free
 uint64_t g_pcCpu = 0, g_pcGpu = 0;
 uint32_t g_pcInc = 0;
 // CPU-only mirror of the global view heap: slot i's current PC descriptor, the source for
@@ -120,6 +127,8 @@ bool ensure(Device* dev) {
     pc::heap_desc(gh, &d);
     g_pcCount = d.NumDescriptors;
     g_viewCount = std::max(pc::global_view_virtual_size(), g_pcCount);
+    g_pcPageOf = std::vector<std::atomic<uint32_t>>(g_viewCount / kPageSlots + 1);
+    g_pcPageOwner.assign(std::min(g_pcCount, pc::gm_reserved_start()) / kPageSlots, 0);
     g_pcCpu = pc::heap_cpu_start(gh);
     g_pcGpu = pc::heap_gpu_start(gh);
     g_pcInc = pc::descriptor_increment(pcdev, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
@@ -144,24 +153,62 @@ bool ensure(Device* dev) {
 }
 
 uint64_t pc_view_cpu(uint32_t i) { return g_pcCpu + (uint64_t)i * g_pcInc; }
+// Title view slots are numbered past what a PC heap holds (a driver limit of about a million
+// descriptors; one title's heap alone has 1.2 million, of which it uses a part of each 4096-slot
+// chunk). The PC heap is therefore handed out in pages of 4096 slots as title pages are first
+// written or bound: a title page keeps its own position when that PC page is free (so titles within
+// the limit map one to one), else it takes the lowest free one. The pages of the global-memory
+// range at the end of the PC heap are never handed out.
+uint32_t pc_slot(uint32_t i) {
+    const uint32_t pg = i / kPageSlots;
+    if (pg >= g_pcPageOf.size()) return kNoSlot;
+    uint32_t have = g_pcPageOf[pg].load(std::memory_order_acquire);
+    if (!have) {
+        std::lock_guard<std::mutex> g(g_page_mu);
+        have = g_pcPageOf[pg].load(std::memory_order_relaxed);
+        if (!have) {
+            uint32_t take = kNoSlot;
+            if (pg < g_pcPageOwner.size() && !g_pcPageOwner[pg]) take = pg;
+            else {
+                while (g_pcPagesFree < g_pcPageOwner.size() && g_pcPageOwner[g_pcPagesFree]) g_pcPagesFree++;
+                if (g_pcPagesFree < g_pcPageOwner.size()) take = g_pcPagesFree;
+            }
+            if (take == kNoSlot) return kNoSlot;
+            if (take != pg) {
+                static volatile long n = 0;
+                if (InterlockedIncrement(&n) == 1)
+                    XSL_INFO(CH, "title view slots past the PC heap (%u slots): pages of %u slots are placed where the PC heap has room", g_pcCount, kPageSlots);
+            }
+            g_pcPageOwner[take] = pg + 1;
+            have = take + 1;
+            g_pcPageOf[pg].store(have, std::memory_order_release);
+        }
+    }
+    return (have - 1) * kPageSlots + i % kPageSlots;
+}
 uint64_t mirror_cpu(uint32_t i) { return g_mirrorCpu + (uint64_t)i * g_pcInc; }
 // Slot i's PC descriptor is in the mirror: publish it to the shader-visible heap.
 uint32_t g_hi[17] = {};   // highest slot published per 125k-slot band (usage diagnostics)
 uint64_t g_unbacked = 0;  // writes to slots past the PC heap
+// Usage per 4096-slot page since the last report (XSL_VIEW_STATS=1): slots published, tables bound.
+uint32_t g_pg_written[512] = {}, g_pg_bound[512] = {};
+bool view_stats() { static bool on = [] { char b[4]; return GetEnvironmentVariableA("XSL_VIEW_STATS", b, 4) && b[0] == '1'; }(); return on; }
 void publish(uint32_t i) {
     if (i / 125000 < 17 && i > g_hi[i / 125000]) g_hi[i / 125000] = i;
-    if (i >= g_pcCount) {   // past the PC heap: kept in descriptor memory only
+    if (i / 4096 < 512) g_pg_written[i / 4096]++;
+    const uint32_t p = pc_slot(i);
+    if (p == kNoSlot) {   // no page of the PC heap left: kept in descriptor memory only
         if (g_unbacked++ == 0)
-            XSL_WARN(CH, "title view slot %u is past the PC heap (%u slots): kept in descriptor memory, not visible to PC descriptor tables", i, g_pcCount);
+            XSL_WARN(CH, "title view slot %u: the PC heap (%u slots) is full, the descriptor is not visible to PC descriptor tables", i, g_pcCount);
         return;
     }
-    if (i >= pc::gm_reserved_start()) {   // the title writes into the range reserved for global memory
+    if (p >= pc::gm_reserved_start()) {   // (cannot happen: those pages are not handed out)
         static volatile long n = 0;
         if (InterlockedIncrement(&n) == 1)
             XSL_ERR(CH, "title view slot %u lies in the global-memory range (from %u): run with XSL_GLOBAL_MEMORY=0", i, pc::gm_reserved_start());
         return;
     }
-    pc::copy_descriptors_simple(dev_extra(g_dev)->pcDevice, 1, pc_view_cpu(i), mirror_cpu(i), D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    pc::copy_descriptors_simple(dev_extra(g_dev)->pcDevice, 1, pc_view_cpu(p), mirror_cpu(i), D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
 }
 void set_slot(uint32_t i, uint64_t src) {   // src: a CPU-only PC descriptor
     pc::copy_descriptors_simple(dev_extra(g_dev)->pcDevice, 1, mirror_cpu(i), src, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
@@ -187,9 +234,20 @@ const ShadowHeap* rtv_dsv_heap(uint64_t h) {
 
 // Decode a console buffer descriptor that an inlined CreateConstantBufferView wrote.
 bool materialize_xbox_cbv(uint32_t i, const uint64_t* q) {
-    if ((q[1] & kXboxCbvFormatMask) != (0x0002403C00000000ull & kXboxCbvFormatMask)) return false;
-    uint64_t addr = q[0] & ((1ull << 48) - 1);
-    uint64_t size = (q[1] & 0xFFFFFFFFull) << 4;
+    uint64_t addr, size;
+    const uint32_t* w = (const uint32_t*)q;
+    if ((q[1] & kXboxCbvFormatMask) == (0x0002403C00000000ull & kXboxCbvFormatMask)) {
+        addr = q[0] & ((1ull << 48) - 1);
+        size = (q[1] & 0xFFFFFFFFull) << 4;
+    } else if (q[0] && q[0] == q[2] && w[2] && !(w[2] & 31) && w[6] == (uint32_t)(q[0] >> 6) && (w[7] >> 20) == w[2] / 32 && !(w[7] & 0xFFFFF)) {
+        // The form newer runtimes inline: the view description as the title gave it (address, size
+        // in bytes; the fourth dword is padding the title left as it was), then the address again,
+        // the address in 64-byte units and the size in 32-byte units (shifted by 20).
+        addr = q[0];
+        size = w[2];
+    } else {
+        return false;
+    }
     PcObj pcdev = dev_extra(g_dev)->pcDevice;
     if (!addr) {
         pc::create_cbv(pcdev, nullptr, mirror_cpu(i));
@@ -354,7 +412,7 @@ void desc_payload_copy(uint64_t dst, uint64_t src) {
         if (const uint32_t* p = stage_at(src)) memcpy(w, p, sizeof w);
     }
     if (view_slot(dst, &i)) {
-        if (w[1] & kDescTexture) w[0] = i;   // texture payloads name their own slot
+        if (w[1] & kDescTexture) w[0] = pc_slot(i);   // texture payloads name their own slot (in the PC heap)
         std::lock_guard<std::mutex> g(g_mu);
         uint8_t* s = slot_ptr(i);
         if (!memcmp(s, w, sizeof w)) return;
@@ -389,7 +447,7 @@ void desc_commit(uint64_t h, D3D12_DESCRIPTOR_HEAP_TYPE type, const Tag& tag) {
         memset(s, 0, kViewSlot);
         if (t_has_payload) {
             uint32_t w[4] = {t_payload[0], t_payload[1], t_payload[2], t_payload[3]};
-            if (w[1] & kDescTexture) w[0] = i;   // textures: the slot's own heap index
+            if (w[1] & kDescTexture) w[0] = pc_slot(i);   // textures: the slot's own index in the PC heap
             memcpy(s, w, sizeof w);
             t_has_payload = false;
         }
@@ -429,7 +487,7 @@ bool desc_copy(uint32_t n, uint64_t dst, uint64_t src, D3D12_DESCRIPTOR_HEAP_TYP
             if (di + k == si + k) continue;
             set_slot(di + k, mirror_cpu(si + k));
             uint32_t* w = (uint32_t*)slot_ptr(di + k);
-            if (w[1] & kDescTexture) w[0] = di + k;   // texture payloads name their own slot
+            if (w[1] & kDescTexture) w[0] = pc_slot(di + k);   // texture payloads name their own slot (in the PC heap)
             memcpy(&g_snapshot[(size_t)(di + k) * kViewSlot], w, kViewSlot);
         }
         return true;
@@ -476,12 +534,14 @@ void desc_publish(uint64_t h) {
 uint64_t desc_pc_gpu(uint64_t h) {
     if (!g_ready || h < g_pcGpu || h >= g_pcGpu + (uint64_t)g_viewCount * kViewSlot) return h;
     uint64_t i = (h - g_pcGpu) / kViewSlot;
-    if (i >= g_pcCount) {   // a table past the PC heap: the heap's start instead (wrong contents, but no GPU fault)
+    if (i / 4096 < 512) g_pg_bound[i / 4096]++;
+    uint32_t p = pc_slot((uint32_t)i);
+    if (p == kNoSlot) {   // no page left for the table: the heap's start instead (wrong contents, but no GPU fault)
         static volatile long n = 0;
-        if (InterlockedIncrement(&n) <= 3) XSL_WARN(CH, "descriptor table at view slot %llu is past the PC heap (%u slots)", (unsigned long long)i, g_pcCount);
-        i = 0;
+        if (InterlockedIncrement(&n) <= 3) XSL_WARN(CH, "descriptor table at view slot %llu: the PC heap (%u slots) is full", (unsigned long long)i, g_pcCount);
+        p = 0;
     }
-    return g_pcGpu + i * g_pcInc;
+    return g_pcGpu + (uint64_t)p * g_pcInc;
 }
 
 // ---- Sync before submission ---------------------------------------------------------------------
@@ -489,6 +549,18 @@ void desc_sync() {
     if (!g_ready) return;
     std::lock_guard<std::mutex> g(g_mu);
     static uint64_t syncs = 0;
+    if (view_stats() && syncs % 600 == 599) {
+        std::string w, b;
+        unsigned pw = 0, pb = 0;
+        for (unsigned k = 0; k < 512; k++) {
+            char t[32];
+            if (g_pg_written[k]) { pw++; if (w.size() < 900) { snprintf(t, sizeof t, " %u:%u", k, g_pg_written[k]); w += t; } }
+            if (g_pg_bound[k]) { pb++; if (b.size() < 900) { snprintf(t, sizeof t, " %u:%u", k, g_pg_bound[k]); b += t; } }
+            g_pg_written[k] = g_pg_bound[k] = 0;
+        }
+        XSL_INFO(CH, "view pages (4096 slots) over 600 submissions: %u written (page:slots%s)", pw, w.c_str());
+        XSL_INFO(CH, "view pages with tables bound: %u (page:binds%s)", pb, b.c_str());
+    }
     if (++syncs % 2000 == 0)
         XSL_INFO(CH, "view slots written, highest per 125k band: %u %u %u %u %u %u %u %u %u %u %u %u %u %u %u %u %u; %llu writes past the PC heap", g_hi[0], g_hi[1], g_hi[2], g_hi[3], g_hi[4],
                  g_hi[5], g_hi[6], g_hi[7], g_hi[8], g_hi[9], g_hi[10], g_hi[11], g_hi[12], g_hi[13], g_hi[14], g_hi[15], g_hi[16], (unsigned long long)g_unbacked);
