@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Console Direct3D 12.X objects implemented over the PC back end.
 #include <cstring>
+#include <algorithm>
+#include <windows.h>
+#include <tlhelp32.h>
 #include <map>
 #include <mutex>
 #include <set>
@@ -158,8 +161,95 @@ struct NoExtra { uint64_t pad; };
 // Fence, root signature, pipeline state, heap (simple objects)
 // ============================================================================================
 namespace {
-UINT64 D3DAPI Fence_GetCompletedValue(ID3D12Fence* f) { return pc::fence_completed(pc_of(f)); }
-HRESULT D3DAPI Fence_SetEventOnCompletion(ID3D12Fence* f, UINT64 v, HANDLE e) { return pc::fence_set_event(pc_of(f), v, e); }
+// XSL_HANG_WATCH=1 (diagnostics): fence polls and waits per fence; when presents stop for 15 s the
+// most polled fences are logged with their completed values and the last values waited for.
+struct FenceWatch { uint64_t polls = 0, lastWait = 0, lastCompleted = 0; };
+std::mutex g_fw_mu;
+std::map<void*, FenceWatch> g_fw;
+// Every other thread's stack as module+offset frames (x64 unwind data; no symbols needed).
+void dump_thread_stacks() {
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+    if (snap == INVALID_HANDLE_VALUE) return;
+    THREADENTRY32 te{sizeof te};
+    DWORD self = GetCurrentThreadId(), pid = GetCurrentProcessId();
+    int shown = 0;
+    for (BOOL ok = Thread32First(snap, &te); ok && shown < 400; ok = Thread32Next(snap, &te)) {
+        if (te.th32OwnerProcessID != pid || te.th32ThreadID == self) continue;
+        HANDLE t = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION, FALSE, te.th32ThreadID);
+        if (!t) continue;
+        if (SuspendThread(t) == (DWORD)-1) { CloseHandle(t); continue; }
+        CONTEXT c{};
+        c.ContextFlags = CONTEXT_FULL;
+        DWORD64 pcs[64];
+        int n = 0;
+        if (GetThreadContext(t, &c)) {   // only unwinding while the thread is suspended (no allocation, no loader calls)
+            for (; n < 64 && c.Rip; n++) {
+                pcs[n] = c.Rip;
+                DWORD64 base = 0;
+                PRUNTIME_FUNCTION rf = RtlLookupFunctionEntry(c.Rip, &base, nullptr);
+                if (!rf) { c.Rip = *(DWORD64*)c.Rsp; c.Rsp += 8; continue; }   // leaf function
+                void* hd = nullptr;
+                DWORD64 est = 0;
+                RtlVirtualUnwind(UNW_FLAG_NHANDLER, base, c.Rip, rf, &c, &hd, &est, nullptr);
+            }
+        }
+        ResumeThread(t);
+        CloseHandle(t);
+        std::string line;
+        for (int f = 0; f < n; f++) {
+            HMODULE m = nullptr;
+            char name[MAX_PATH] = "?";
+            if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCSTR)pcs[f], &m) && m) {
+                GetModuleFileNameA(m, name, MAX_PATH);
+                const char* bs = strrchr(name, '\\');
+                if (bs) memmove(name, bs + 1, strlen(bs + 1) + 1);
+            }
+            char fr[160];
+            snprintf(fr, sizeof fr, " %s+%llx", name, (unsigned long long)(pcs[f] - (uint64_t)m));
+            line += fr;
+        }
+        XSL_WARN(CH, "  thread %lu:%s", te.th32ThreadID, line.c_str());
+        shown++;
+    }
+    CloseHandle(snap);
+}
+bool hang_watch() {
+    static bool on = [] {
+        char b[4];
+        if (!(GetEnvironmentVariableA("XSL_HANG_WATCH", b, 4) && b[0] == '1')) return false;
+        std::thread([] {
+            uint64_t last = 0;
+            int still = 0;
+            for (;;) {
+                Sleep(5000);
+                uint64_t p = pc::present_count();
+                still = p == last ? still + 1 : 0;
+                last = p;
+                if (still != 3) continue;
+                std::vector<std::pair<void*, FenceWatch>> v;
+                { std::lock_guard<std::mutex> g(g_fw_mu); v.assign(g_fw.begin(), g_fw.end()); for (auto& e : g_fw) e.second.polls = 0; }
+                std::sort(v.begin(), v.end(), [](auto& a, auto& b) { return a.second.polls > b.second.polls; });
+                XSL_WARN(CH, "no present for 15 s (present %llu); fences polled since the last report:", (unsigned long long)p);
+                for (size_t k = 0; k < v.size() && k < 8; k++)
+                    XSL_WARN(CH, "  fence %p (PC %p): %llu polls, completed %llu, last wait for %llu", v[k].first, pc_of((ID3D12Fence*)v[k].first),
+                             (unsigned long long)v[k].second.polls, (unsigned long long)v[k].second.lastCompleted, (unsigned long long)v[k].second.lastWait);
+                pc::dump_queue_state();
+                dump_thread_stacks();
+            }
+        }).detach();
+        return true;
+    }();
+    return on;
+}
+UINT64 D3DAPI Fence_GetCompletedValue(ID3D12Fence* f) {
+    UINT64 v = pc::fence_completed(pc_of(f));
+    if (hang_watch()) { std::lock_guard<std::mutex> g(g_fw_mu); auto& w = g_fw[f]; w.polls++; w.lastCompleted = v; }
+    return v;
+}
+HRESULT D3DAPI Fence_SetEventOnCompletion(ID3D12Fence* f, UINT64 v, HANDLE e) {
+    if (hang_watch()) { std::lock_guard<std::mutex> g(g_fw_mu); g_fw[f].lastWait = v; }
+    return pc::fence_set_event(pc_of(f), v, e);
+}
 HRESULT D3DAPI Fence_Signal(ID3D12Fence* f, UINT64 v) { return pc::fence_signal(pc_of(f), v); }
 
 D3D12Fence1_Function_Table g_fence_tbl;

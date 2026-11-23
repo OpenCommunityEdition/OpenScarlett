@@ -80,7 +80,10 @@ std::vector<uint8_t> with_root_signature(const std::vector<uint8_t>& dxil, const
     parts.push_back({gpucode::fourcc("RTS0"), *rs});
     return build_container(parts, dxil.data());
 }
-constexpr const char* kVersion = "gpucode-35";
+constexpr const char* kVersion = "gpucode-36";
+// Ray-tracing programs have their own cache version (rt_cache_key also tags their translation):
+// they are built offline (xsl-gpucode rtcache) and should not be invalidated by unrelated changes.
+constexpr const char* kRtVersion = "gpucode-35";
 
 int mode() {
     static int m = [] {
@@ -344,7 +347,7 @@ bool rt_build_pipeline(const gpucode::RtLinked& l, std::vector<uint8_t>& dxil, s
         if (GetEnvironmentVariableA("XSL_RT_DXC_OPT", b, sizeof b) && b[0] == 'O') { w = L"-"; for (char* c = b; *c; c++) w += wchar_t(*c); }
         return w;
     }();
-    uint64_t key = gpucode::rt_cache_key(l, std::string(kVersion) + std::string(opt.begin(), opt.end()));   // same key as `xsl-gpucode rtcache`
+    uint64_t key = gpucode::rt_cache_key(l, std::string(kRtVersion) + std::string(opt.begin(), opt.end()));   // same key as `xsl-gpucode rtcache`
     wchar_t name[64];
     swprintf(name, 64, L"\\rt_%016llx.dxil", (unsigned long long)key);
     std::wstring path = cache_dir() + name;

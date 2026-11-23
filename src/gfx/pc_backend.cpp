@@ -1320,16 +1320,55 @@ void rt_warm_start() {
             }
         }).detach();
 }
+// The driver's compiled form of a ray-tracing program is kept next to its DXIL (rtpso_<hash>.bin,
+// from GetCachedBlob): the driver needs 15 s to minutes per program and its own cache does not
+// reliably keep programs this large. A blob from another driver or adapter is refused and rebuilt.
+static bool read_all(const std::wstring& path, std::vector<uint8_t>& out) {
+    HANDLE f = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+    if (f == INVALID_HANDLE_VALUE) return false;
+    out.resize(GetFileSize(f, nullptr));
+    DWORD got = 0;
+    bool ok = ReadFile(f, out.data(), (DWORD)out.size(), &got, nullptr) && got == out.size();
+    CloseHandle(f);
+    return ok && !out.empty();
+}
+static void write_all(const std::wstring& path, const void* d, size_t n) {
+    std::wstring tmp = path + L".tmp";
+    HANDLE f = CreateFileW(tmp.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, 0, nullptr);
+    if (f == INVALID_HANDLE_VALUE) return;
+    DWORD put = 0;
+    bool ok = WriteFile(f, d, (DWORD)n, &put, nullptr) && put == n;
+    CloseHandle(f);
+    if (!ok || !MoveFileExW(tmp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING)) DeleteFileW(tmp.c_str());
+}
 PcObj rt_create_pso(PcObj devObj, const std::vector<uint8_t>& dxil) {
     auto* dev = as<ID3D12Device>(devObj);
     ID3D12RootSignature* rs = rt_root_signature(dev);
     if (!rs) return nullptr;
+    uint64_t h = 1469598103934665603ull;
+    for (uint8_t c : dxil) h = (h ^ c) * 1099511628211ull;
+    wchar_t name[64];
+    swprintf(name, 64, L"rtpso_%016llx.bin", (unsigned long long)h);
+    std::wstring path = rt_cache_dir() + name;
     D3D12_COMPUTE_PIPELINE_STATE_DESC pd{};
     pd.pRootSignature = rs;
     pd.CS = {dxil.data(), dxil.size()};
     ID3D12PipelineState* pso = nullptr;
-    HRESULT hr = dev->CreateComputePipelineState(&pd, IID_PPV_ARGS(&pso));
-    if (FAILED(hr)) { XSL_ERR(CH, "ray-tracing pipeline: CreateComputePipelineState failed %08lx", hr); return nullptr; }
+    std::vector<uint8_t> blob;
+    if (read_all(path, blob)) {
+        pd.CachedPSO = {blob.data(), blob.size()};
+        if (FAILED(dev->CreateComputePipelineState(&pd, IID_PPV_ARGS(&pso)))) pso = nullptr;   // another driver: rebuild
+        pd.CachedPSO = {};
+    }
+    if (!pso) {
+        HRESULT hr = dev->CreateComputePipelineState(&pd, IID_PPV_ARGS(&pso));
+        if (FAILED(hr)) { XSL_ERR(CH, "ray-tracing pipeline: CreateComputePipelineState failed %08lx", hr); return nullptr; }
+        ID3DBlob* cb = nullptr;
+        if (SUCCEEDED(pso->GetCachedBlob(&cb)) && cb) {
+            write_all(path, cb->GetBufferPointer(), cb->GetBufferSize());
+            cb->Release();
+        }
+    }
     return (PcObj)pso;
 }
 // Per-wave ray stacks: kRtStackSlots slots of `perWave` bytes in one layer buffer.
@@ -1928,6 +1967,39 @@ void name_translated(PcObj pso) {   // PC pipelines made from translated shaders
     swprintf(w, 512, L"xsl %hs", k);
     as<ID3D12PipelineState>(pso)->SetName(w);
 }
+// Compiled pipelines kept on disk (pso_<hash>.bin from GetCachedBlob, next to the shader cache):
+// translated shaders can take the driver seconds to minutes, every run. A blob the driver refuses
+// (other driver, other root signature) is rebuilt. XSL_PSO_CACHE=0 turns it off.
+static bool pso_cache_on() { static bool on = [] { char b[4]; return !(GetEnvironmentVariableA("XSL_PSO_CACHE", b, 4) && b[0] == '0'); }(); return on; }
+static uint64_t pso_hash(uint64_t h, const void* p, size_t n) {
+    auto* b = static_cast<const uint8_t*>(p);
+    for (size_t i = 0; i < n; i++) h = (h ^ b[i]) * 1099511628211ull;
+    return h;
+}
+static std::wstring pso_cache_path(uint64_t h) {
+    wchar_t name[64];
+    swprintf(name, 64, L"pso_%016llx.bin", (unsigned long long)h);
+    return rt_cache_dir() + name;
+}
+template <class Create>
+static HRESULT cached_pso(uint64_t key, const void*& cachedPtr, SIZE_T& cachedSize, ID3D12PipelineState** out, Create create) {
+    std::vector<uint8_t> blob;
+    std::wstring path = pso_cache_on() ? pso_cache_path(key) : std::wstring();
+    if (!path.empty() && read_all(path, blob)) {
+        cachedPtr = blob.data();
+        cachedSize = blob.size();
+        HRESULT hr = create();
+        cachedPtr = nullptr;
+        cachedSize = 0;
+        if (SUCCEEDED(hr)) return hr;
+    }
+    HRESULT hr = create();
+    if (SUCCEEDED(hr) && !path.empty() && *out) {
+        ID3DBlob* cb = nullptr;
+        if (SUCCEEDED((*out)->GetCachedBlob(&cb)) && cb) { write_all(path, cb->GetBufferPointer(), cb->GetBufferSize()); cb->Release(); }
+    }
+    return hr;
+}
 HRESULT_T create_graphics_pso(PcObj dev, const void* desc, PcObj* out) {
     D3D12_GRAPHICS_PIPELINE_STATE_DESC d = *static_cast<const D3D12_GRAPHICS_PIPELINE_STATE_DESC*>(desc);
     for (UINT i = 0; i < 8; i++)
@@ -1937,7 +2009,25 @@ HRESULT_T create_graphics_pso(PcObj dev, const void* desc, PcObj* out) {
     d.Flags = (D3D12_PIPELINE_STATE_FLAGS)(d.Flags & D3D12_PIPELINE_STATE_FLAG_TOOL_DEBUG);
     d.CachedPSO = {};
     d.NodeMask = 0;
-    HRESULT hr = as<ID3D12Device>(dev)->CreateGraphicsPipelineState(&d, IID_PPV_ARGS(reinterpret_cast<ID3D12PipelineState**>(out)));
+    auto** pso = reinterpret_cast<ID3D12PipelineState**>(out);
+    uint64_t key = pso_hash(1469598103934665603ull, "gfx1", 4);
+    for (auto* bc : {&d.VS, &d.PS, &d.DS, &d.HS, &d.GS}) key = pso_hash(pso_hash(key, &bc->BytecodeLength, 8), bc->pShaderBytecode, bc->BytecodeLength);
+    key = pso_hash(key, d.RTVFormats, sizeof d.RTVFormats);
+    key = pso_hash(key, &d.DSVFormat, sizeof d.DSVFormat);
+    key = pso_hash(key, &d.NumRenderTargets, sizeof d.NumRenderTargets);
+    key = pso_hash(key, &d.PrimitiveTopologyType, sizeof d.PrimitiveTopologyType);
+    key = pso_hash(key, &d.BlendState, sizeof d.BlendState);
+    key = pso_hash(key, &d.RasterizerState, sizeof d.RasterizerState);
+    key = pso_hash(key, &d.DepthStencilState, sizeof d.DepthStencilState);
+    key = pso_hash(key, &d.SampleDesc, sizeof d.SampleDesc);
+    key = pso_hash(key, &d.SampleMask, sizeof d.SampleMask);
+    for (UINT i = 0; i < d.InputLayout.NumElements; i++) {
+        auto& e = d.InputLayout.pInputElementDescs[i];
+        key = pso_hash(key, e.SemanticName, strlen(e.SemanticName));
+        key = pso_hash(key, &e.SemanticIndex, sizeof e - offsetof(D3D12_INPUT_ELEMENT_DESC, SemanticIndex));
+    }
+    HRESULT hr = cached_pso(key, d.CachedPSO.pCachedBlob, d.CachedPSO.CachedBlobSizeInBytes, pso,
+                            [&] { return as<ID3D12Device>(dev)->CreateGraphicsPipelineState(&d, IID_PPV_ARGS(pso)); });
     if (FAILED(hr)) { dump_debug_messages(); XSL_ERR(CH, "CreateGraphicsPipelineState failed %08lx", hr); }
     if (SUCCEEDED(hr)) name_translated(*out);
     if (hr == DXGI_ERROR_DEVICE_REMOVED) report_device_removed(as<ID3D12Device>(dev));
@@ -1950,7 +2040,10 @@ HRESULT_T create_compute_pso(PcObj dev, const void* desc, PcObj* out) {
     d.Flags = D3D12_PIPELINE_STATE_FLAG_NONE;
     d.CachedPSO = {};
     d.NodeMask = 0;
-    HRESULT hr = as<ID3D12Device>(dev)->CreateComputePipelineState(&d, IID_PPV_ARGS(reinterpret_cast<ID3D12PipelineState**>(out)));
+    auto** pso = reinterpret_cast<ID3D12PipelineState**>(out);
+    uint64_t key = pso_hash(pso_hash(1469598103934665603ull, "cs1", 3), d.CS.pShaderBytecode, d.CS.BytecodeLength);
+    HRESULT hr = cached_pso(key, d.CachedPSO.pCachedBlob, d.CachedPSO.CachedBlobSizeInBytes, pso,
+                            [&] { return as<ID3D12Device>(dev)->CreateComputePipelineState(&d, IID_PPV_ARGS(pso)); });
     if (FAILED(hr)) { dump_debug_messages(); XSL_ERR(CH, "CreateComputePipelineState failed %08lx (translated shaders: %s)", hr, translated_keys()); }
     if (SUCCEEDED(hr)) name_translated(*out);
     if (hr == DXGI_ERROR_DEVICE_REMOVED) report_device_removed(as<ID3D12Device>(dev));
@@ -2051,7 +2144,13 @@ HRESULT_T create_pso_stream(PcObj dev, void* stream, size_t size, PcObj* out) {
         hr = d2->CreatePipelineState(&d, IID_PPV_ARGS(reinterpret_cast<ID3D12PipelineState**>(out)));
         d2->Release();
     }
-    if (FAILED(hr)) { dump_debug_messages(); XSL_ERR(CH, "CreatePipelineState (stream, %zu bytes) failed %08lx (translated shaders: %s)", size, hr, translated_keys()); note_removed(hr); }
+    if (FAILED(hr)) {
+        dump_debug_messages();
+        XSL_ERR(CH, "CreatePipelineState (stream, %zu bytes) failed %08lx (translated shaders: %s)", size, hr, translated_keys());
+        note_removed(hr);
+        static volatile long described = 0;
+        if (InterlockedIncrement(&described) <= 6) trace_pso_stream(stream, size);   // what the stream holds
+    }
     // XSL_DUMP_FAILED_PSO=<dir>: the shaders of failed pipeline streams (<dir>\pso<n>_s<type>.bin).
     static char dumpDir[MAX_PATH] = "";
     static bool dumpInit = (GetEnvironmentVariableA("XSL_DUMP_FAILED_PSO", dumpDir, sizeof dumpDir), true);
@@ -2584,6 +2683,7 @@ void report_aliases(PcObj r) {   // resources placed over r's memory
 // XSL_TRACE_WRITERS=1: which pipeline last drew into each render target (the presented image's
 // writer is logged at present).
 std::atomic<uint64_t> g_wr_present{0};   // presents so far (writer tracing)
+uint64_t present_count() { return g_wr_present.load(); }
 static uint64_t env_u64(const char* n) { char b[16]; return GetEnvironmentVariableA(n, b, sizeof b) ? _strtoui64(b, nullptr, 10) : 0ull; }
 // Writer tracing: always with XSL_TRACE_WRITERS=1; with only XSL_RT_STATS / XSL_PLANE_OPS, during the
 // 30 presents before the requested one (tracing slows every draw). RTV handles are always recorded.
@@ -4048,7 +4148,22 @@ void queue_execute(PcObj q, uint32_t n, PcObj* lists) {
     }
     as<ID3D12CommandQueue>(q)->ExecuteCommandLists(n, reinterpret_cast<ID3D12CommandList* const*>(lists));
 }
+// Last GPU-side wait and signal per queue (hang diagnostics: dump_queue_state).
+struct QueueLast { PcObj waitFence = nullptr, sigFence = nullptr; uint64_t waitValue = 0, sigValue = 0, waits = 0, sigs = 0; };
+std::mutex g_ql_mu;
+std::map<PcObj, QueueLast> g_ql;
+void dump_queue_state() {
+    std::lock_guard<std::mutex> g(g_ql_mu);
+    for (auto& [q, s] : g_ql) {
+        uint64_t wd = s.waitFence ? as<ID3D12Fence>(s.waitFence)->GetCompletedValue() : 0;
+        uint64_t sd = s.sigFence ? as<ID3D12Fence>(s.sigFence)->GetCompletedValue() : 0;
+        XSL_WARN(CH, "  queue %p: last wait fence %p >= %llu (completed %llu%s), last signal fence %p = %llu (completed %llu); %llu waits, %llu signals", q,
+                 s.waitFence, (unsigned long long)s.waitValue, (unsigned long long)wd, wd < s.waitValue ? ", BLOCKED" : "", s.sigFence,
+                 (unsigned long long)s.sigValue, (unsigned long long)sd, (unsigned long long)s.waits, (unsigned long long)s.sigs);
+    }
+}
 HRESULT_T queue_signal(PcObj q, PcObj f, uint64_t v) {
+    { std::lock_guard<std::mutex> g(g_ql_mu); auto& s = g_ql[q]; s.sigFence = f; s.sigValue = v; s.sigs++; }
     if (g_dred) {
         static volatile long n = 0;
         if (InterlockedIncrement(&n) <= 400) XSL_INFO(CH, "queue %p signals fence %p = %llu", q, f, (unsigned long long)v);
@@ -4056,6 +4171,7 @@ HRESULT_T queue_signal(PcObj q, PcObj f, uint64_t v) {
     return as<ID3D12CommandQueue>(q)->Signal(as<ID3D12Fence>(f), v);
 }
 HRESULT_T queue_wait(PcObj q, PcObj f, uint64_t v) {
+    { std::lock_guard<std::mutex> g(g_ql_mu); auto& s = g_ql[q]; s.waitFence = f; s.waitValue = v; s.waits++; }
     if (g_dred && f) {   // diagnostics: GPU waits that are not satisfied yet when submitted
         uint64_t done = as<ID3D12Fence>(f)->GetCompletedValue();
         if (done < v) {

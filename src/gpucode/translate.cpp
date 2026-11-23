@@ -899,7 +899,9 @@ struct Translator {
         if (dbg_at >= 0 && (long)in.offset == dbg_at)
             for (int r = 0; r < 24; r++) fprintf(stderr, "s%d: k%d a%u b%u c%u d%u\n", r, int(st[r].k), st[r].a, st[r].b, st[r].c, st[r].d);
         std::string n = in.name;
-        if (in.fmt == Fmt::MUBUF || in.fmt == Fmt::MTBUF) {
+        if ((in.fmt == Fmt::MUBUF) && (n == "buffer_gl0_inv" || n == "buffer_gl1_inv")) {
+            // cache invalidations: nothing to do on PC (no descriptor)
+        } else if (in.fmt == Fmt::MUBUF || in.fmt == Fmt::MTBUF) {
             // Raw dword loads/stores may take a descriptor that only exists at run time (loaded from
             // memory): with global memory they address memory from the descriptor words directly.
             bool rawDw = in.fmt == Fmt::MUBUF && (starts(n, "buffer_load_dword") || starts(n, "buffer_store_dword") || starts(n, "buffer_load_format_") || dyn_atomic_op(n) ||
@@ -1839,6 +1841,11 @@ bool Translator::emit_valu(const Instr& in, size_t idx) {
         uses_wave = true;
         return true;
     }
+    if (n == "v_swap_b32" && in.src0 >= src::kVgpr0) {   // exchange two VGPRs (active lanes)
+        std::string a = V(dst), b = V(in.src0 - src::kVgpr0);
+        line(fmt("if (kexec) { uint t_ = %s; %s = %s; %s = t_; }", a.c_str(), a.c_str(), b.c_str(), b.c_str()));
+        return true;
+    }
     if (n == "v_readfirstlane_b32") { write_s(dst, fmt("WaveReadLaneAt(%s, first_lane(kexec))", src_bits(0, 'u').c_str())); uses_wave = true; return true; }
     if (n == "v_readlane_b32") { write_s(dst, fmt("WaveReadLaneAt(%s, %s & %uu)", src_bits(0, 'u').c_str(), rd(se[1], in).c_str(), W - 1)); uses_wave = true; return true; }
     if (n == "v_writelane_b32") { line(fmt("if (L == (%s & %uu)) %s = %s;", rd(se[1], in).c_str(), W - 1, V(dst).c_str(), rd(se[0], in).c_str())); return true; }
@@ -2247,6 +2254,7 @@ bool Translator::emit_tbuffer_raw(const Instr& in, const Res& R, const std::stri
 }
 bool Translator::emit_mubuf(const Instr& in, size_t idx) {
     std::string n = in.name;
+    if (n == "buffer_gl0_inv" || n == "buffer_gl1_inv") return true;   // cache invalidation: PC memory model handles it
     int r = res_of.count(idx) ? res_of[idx] : -1;
     if (r < 0 && dyn_mubuf.count(idx) && starts(n, "buffer_load_format_")) {
         // Typed load through a run-time descriptor: format = dword 3 [18:12], decoded by fmt_comp().
@@ -4272,6 +4280,13 @@ TranslateResult translate(const Container& c, const RootSig& rs, const Translate
     }
     r.hlsl = t.generate();
     r.wave_size = t.W;
+    // Conservative depth outputs need the position input interpolated noperspective centroid (DXIL
+    // validation; the console hardware has no such rule).
+    if (c.kind == ProgramKind::PS && (r.hlsl.find("SV_DepthLessEqual") != std::string::npos || r.hlsl.find("SV_DepthGreaterEqual") != std::string::npos)) {
+        const std::string a = "  float4 pos_ : SV_Position;\n";
+        size_t at = r.hlsl.find(a);
+        if (at != std::string::npos) r.hlsl.replace(at, a.size(), "  noperspective centroid float4 pos_ : SV_Position;\n");
+    }
     if (!t.err.empty()) {
         r.error = t.err;
         r.hlsl.clear();

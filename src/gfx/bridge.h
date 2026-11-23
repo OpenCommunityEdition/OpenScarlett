@@ -119,6 +119,8 @@ uint64_t sampler_memory_address(PcObj samplerHeap, uint64_t gpuHandle);
 bool list_rays(PcObj l, const std::vector<RtRun>& runs, const RtRaysArgs& args);
 bool is_rays_signature(PcObj sig);
 void note_rays_skipped();   // counted in the frame-rate log
+uint64_t present_count();
+void dump_queue_state();   // hang diagnostics
 uint64_t tlas_scratch_size(uint32_t instances);
 // Bottom-level triangle build in the console layout (into the destination's shadow); false: not built.
 struct BlasGeometry { uint64_t vb, ib, transform; uint32_t vbStride, vbFormat, ibFormat, triangles, flags; };

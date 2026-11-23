@@ -190,16 +190,95 @@ HRESULT D3DAPI D_CreateGraphicsPipelineState(ID3D12Device* d, const D3D12_GRAPHI
     if (SUCCEEDED(hr)) pc::note_pso_rs(pso, x.pRootSignature, false);
     return pso_result(DEV(d), hr, pso, riid, out);
 }
+// Compute pipelines are created on a worker: a translated shader can take the driver minutes to
+// compile (one did, on the title's submission thread, and the title stopped presenting). After
+// XSL_PSO_ASYNC_MS (default 300) the title gets a placeholder (its dispatches are skipped) that
+// becomes the real pipeline when the compile ends.
+// A few worker threads for pipeline compiles (a thread per pipeline ran dozens of multi-GB driver
+// compiles at once and creations failed with E_OUTOFMEMORY). XSL_PSO_THREADS (default 3).
+static void pso_pool_run(std::function<void()> job) {
+    static std::mutex mu;
+    static std::condition_variable cv;
+    static std::deque<std::function<void()>> q;
+    static std::once_flag once;
+    std::call_once(once, [] {
+        char b[8];
+        unsigned n = GetEnvironmentVariableA("XSL_PSO_THREADS", b, sizeof b) ? (unsigned)atoi(b) : 3u;
+        for (unsigned t = 0; t < std::max(1u, n); t++)
+            std::thread([] {
+                for (;;) {
+                    std::function<void()> j;
+                    { std::unique_lock<std::mutex> u(mu); cv.wait(u, [] { return !q.empty(); }); j = std::move(q.front()); q.pop_front(); }
+                    j();
+                }
+            }).detach();
+    });
+    { std::lock_guard<std::mutex> g(mu); q.push_back(std::move(job)); }
+    cv.notify_one();
+}
+struct AsyncPso {
+    std::mutex mu;
+    std::condition_variable cv;
+    bool done = false, untranslated = false, late = false;
+    std::string keys;
+    HRESULT hr = E_FAIL;
+    PcObj pso = nullptr;
+    void* obj = nullptr;   // the placeholder handed out (late completion)
+    PcObj rs = nullptr;
+};
 HRESULT D3DAPI D_CreateComputePipelineStateX(ID3D12Device* d, const D3D12_COMPUTE_PIPELINE_STATE_DESC* desc, UINT, const D3D12XBOX_EXTENDED_COMPUTE_PIPELINE_STATE_DESC*, REFIID riid,
                                              void** out) {
     if (null_graphics()) return make_simple(DEV(d), Kind::Pso, nullptr, riid, out);
+    static DWORD waitMs = [] { char b[16]; return GetEnvironmentVariableA("XSL_PSO_ASYNC_MS", b, sizeof b) ? (DWORD)atoi(b) : 300u; }();
     D3D12_COMPUTE_PIPELINE_STATE_DESC x = *desc;
     x.pRootSignature = (ID3D12RootSignature*)P(desc->pRootSignature);
-    PcObj pso = nullptr;
-    pc::reset_untranslated();
-    HRESULT hr = pc::create_compute_pso(DPC(d), &x, &pso);
-    if (SUCCEEDED(hr)) pc::note_pso_rs(pso, x.pRootSignature, true);
-    return pso_result(DEV(d), hr, pso, riid, out);
+    if (!waitMs) {
+        PcObj pso = nullptr;
+        pc::reset_untranslated();
+        HRESULT hr = pc::create_compute_pso(DPC(d), &x, &pso);
+        if (SUCCEEDED(hr)) pc::note_pso_rs(pso, x.pRootSignature, true);
+        return pso_result(DEV(d), hr, pso, riid, out);
+    }
+    auto job = std::make_shared<AsyncPso>();
+    auto code = std::make_shared<std::vector<uint8_t>>((const uint8_t*)x.CS.pShaderBytecode, (const uint8_t*)x.CS.pShaderBytecode + x.CS.BytecodeLength);
+    job->rs = x.pRootSignature;
+    if (job->rs) pc::addref(job->rs);
+    PcObj dev = DPC(d);
+    pso_pool_run([job, code, x, dev]() mutable {
+        x.CS = {code->data(), code->size()};
+        pc::reset_untranslated();
+        PcObj pso = nullptr;
+        HRESULT hr = pc::create_compute_pso(dev, &x, &pso);
+        if (SUCCEEDED(hr)) pc::note_pso_rs(pso, x.pRootSignature, true);
+        std::unique_lock<std::mutex> g(job->mu);
+        job->hr = hr; job->pso = pso; job->untranslated = pc::had_untranslated(); job->keys = pc::translated_keys(); job->done = true;
+        if (job->late) {   // the title holds a placeholder: it becomes this pipeline
+            if (SUCCEEDED(hr) && job->obj) {
+                hdr(job->obj)->pc = pso;
+                XSL_INFO(CH, "compute pipeline of %s ready after the title went on (placeholder replaced)", job->keys.c_str());
+            }
+            if (job->obj) Release((IGraphicsUnknown*)job->obj);
+        }
+        if (job->rs) pc::release(job->rs);
+        g.unlock();
+        job->cv.notify_all();
+    });
+    std::unique_lock<std::mutex> g(job->mu);
+    if (job->cv.wait_for(g, std::chrono::milliseconds(waitMs), [&] { return job->done; })) {
+        HRESULT hr = job->hr;
+        if (SUCCEEDED(hr)) return make_simple(DEV(d), Kind::Pso, job->pso, riid, out);
+        if (!job->untranslated && job->keys.empty()) return hr;
+        return make_simple(DEV(d), Kind::Pso, nullptr, riid, out);   // placeholder (as pso_result)
+    }
+    HRESULT hr = make_simple(DEV(d), Kind::Pso, nullptr, riid, out);
+    if (SUCCEEDED(hr) && out && *out) {
+        job->late = true;
+        job->obj = *out;
+        AddRef((IGraphicsUnknown*)*out);
+        static volatile long n = 0;
+        if (InterlockedIncrement(&n) <= 10) XSL_WARN(CH, "compute pipeline still compiling after %lu ms: placeholder until it is ready", (unsigned long)waitMs);
+    }
+    return hr;
 }
 HRESULT D3DAPI D_CreateComputePipelineState(ID3D12Device* d, const D3D12_COMPUTE_PIPELINE_STATE_DESC* desc, REFIID riid, void** out) {
     return D_CreateComputePipelineStateX(d, desc, 0, nullptr, riid, out);
@@ -767,7 +846,7 @@ static std::shared_ptr<RtPipe> rt_pipe_of(const void* so) {
     return it == g_rt.end() ? nullptr : it->second.pipe;
 }
 // Builds run on a few worker threads (each compile takes seconds to minutes and much memory),
-// smallest program first. XSL_RT_BUILD_THREADS=<n> (default: a quarter of the logical processors, 1..4).
+// smallest program first. XSL_RT_BUILD_THREADS=<n> (default 1, idle priority; at most 4).
 static void rt_queue_build(size_t size, std::function<void()> job) {
     static std::mutex mu;
     static std::condition_variable cv;
@@ -778,9 +857,10 @@ static void rt_queue_build(size_t size, std::function<void()> job) {
     if (!started) {
         started = true;
         char b[8];
-        unsigned n = GetEnvironmentVariableA("XSL_RT_BUILD_THREADS", b, sizeof b) ? (unsigned)atoi(b) : std::thread::hardware_concurrency() / 4;
+        unsigned n = GetEnvironmentVariableA("XSL_RT_BUILD_THREADS", b, sizeof b) ? (unsigned)atoi(b) : 1u;
         n = std::max(1u, std::min(n, 4u));
         for (unsigned t = 0; t < n; t++) std::thread([] {
+            SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_IDLE);   // behind the title's own pipeline compiles
             for (;;) {
                 std::function<void()> j;
                 {
