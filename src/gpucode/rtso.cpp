@@ -282,7 +282,7 @@ bool rt_link(const std::vector<std::vector<uint8_t>>& blobs, RtLinked& out, std:
 }
 
 uint64_t rt_cache_key(const RtLinked& l, const std::string& salt) {
-    uint64_t key = fnv("rt4", 3, 1469598103934665603ull);
+    uint64_t key = fnv("rt5", 3, 1469598103934665603ull);   // bump when the translation of these programs changes
     key = fnv(salt.data(), salt.size(), key);
     for (auto& sg : l.segs) {
         key = fnv(&sg.address, 8, key);

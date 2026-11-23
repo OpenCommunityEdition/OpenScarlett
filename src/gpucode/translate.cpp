@@ -3668,7 +3668,10 @@ std::string Translator::generate() {
         h << "uint fmt_bits(uint lo, uint hi, uint bit, uint size) {\n"
              "  uint a = lo + (bit >> 3), w = gm_load(a & ~3u, hi + (a < lo ? 1u : 0u)) >> ((a & 3u) * 8u);\n"
              "  return size >= 32u ? w : w & ((1u << size) - 1u);\n}\n";
-        h << "uint fmt_comp(uint lo, uint hi, uint f, uint k) {\n  switch (f) {\n";
+        // Table-driven (one small code path, not a switch over formats: it is inlined at every
+        // typed load and the switch made programs slow to compile): entry = component size |
+        // count << 8 | type << 12 (0 uint, 1 sint, 2 float, 3 unorm, 4 snorm, 5 uscaled, 6 sscaled).
+        uint32_t tbl[128] = {};
         for (auto& fm : kBufFmts) {
             std::string nm = fm.name;
             std::vector<unsigned> sz;
@@ -3679,30 +3682,33 @@ std::string Translator::generate() {
                 p0 = q + 1;
             }
             std::string ty = nm.substr(p0);
-            bool ok = !sz.empty() && (ty == "UNORM" || ty == "SNORM" || ty == "UINT" || ty == "SINT" || ty == "FLOAT" || ty == "USCALED" || ty == "SSCALED");
-            for (unsigned z : sz) ok &= z == 8 || z == 16 || z == 32;
-            if (ty == "FLOAT") for (unsigned z : sz) ok &= z == 16 || z == 32;
-            if (!ok) continue;
-            h << fmt("  case %uu: {\n", fm.id);
-            unsigned bit = 0;
-            for (size_t c = 0; c < sz.size(); c++) {
-                unsigned z = sz[c];
-                std::string v = fmt("fmt_bits(lo, hi, %uu, %uu)", bit, z);
-                std::string e;
-                if (ty == "UINT") e = v;
-                else if (ty == "SINT") e = z == 32 ? v : fmt("uint(int(%s << %uu) >> %uu)", v.c_str(), 32 - z, 32 - z);
-                else if (ty == "FLOAT") e = z == 32 ? v : fmt("asuint(f16tof32(%s))", v.c_str());
-                else if (ty == "UNORM") e = fmt("asuint(float(%s) / %u.0)", v.c_str(), (1u << z) - 1);
-                else if (ty == "SNORM") e = fmt("asuint(max(float(int(%s << %uu) >> %uu) / %u.0, -1.0))", v.c_str(), 32 - z, 32 - z, (1u << (z - 1)) - 1);
-                else if (ty == "USCALED") e = fmt("asuint(float(%s))", v.c_str());
-                else e = fmt("asuint(float(int(%s << %uu) >> %uu))", v.c_str(), 32 - z, 32 - z);
-                h << fmt("    if (k == %zuu) return %s;\n", c, e.c_str());
-                bit += z;
-            }
-            bool flt = ty != "UINT" && ty != "SINT";
-            h << fmt("    return k == 3u ? %s : 0u; }\n", flt ? "0x3f800000u" : "1u");
+            static const char* types[] = {"UINT", "SINT", "FLOAT", "UNORM", "SNORM", "USCALED", "SSCALED"};
+            int t = -1;
+            for (int k = 0; k < 7; k++)
+                if (ty == types[k]) t = k;
+            bool ok = !sz.empty() && t >= 0 && fm.id < 128;
+            for (unsigned z : sz) ok &= (z == 8 || z == 16 || z == 32) && z == sz[0];
+            if (t == 2) for (unsigned z : sz) ok &= z == 16 || z == 32;
+            if (ok) tbl[fm.id] = sz[0] | uint32_t(sz.size()) << 8 | uint32_t(t) << 12;
         }
-        h << "  default: return 0u;\n  }\n}\n";
+        h << "static const uint FMTD[128] = {";
+        for (int k = 0; k < 128; k++) h << (k ? ", " : "") << fmt("0x%xu", tbl[k]);
+        h << "};\n";
+        h << "uint fmt_comp(uint lo, uint hi, uint f, uint k) {\n"
+             "  uint d = FMTD[f & 127u], z = d & 0xffu, n = (d >> 8) & 15u, t = d >> 12;\n"
+             "  if (d == 0u) return 0u;\n"
+             "  if (k >= n) return k == 3u ? (t >= 2u ? 0x3f800000u : 1u) : 0u;\n"
+             "  uint v = fmt_bits(lo, hi, k * z, z), sh = 32u - z;\n"
+             "  int sv = z == 32u ? int(v) : (int(v << sh) >> sh);\n"
+             "  float maxu = float((z == 32u ? 0xffffffffu : (1u << z) - 1u)), maxs = float((1u << (z - 1u)) - 1u);\n"
+             "  if (t == 0u) return v;\n"
+             "  if (t == 1u) return uint(sv);\n"
+             "  if (t == 2u) return z == 32u ? v : asuint(f16tof32(v));\n"
+             "  if (t == 3u) return asuint(float(v) / maxu);\n"
+             "  if (t == 4u) return asuint(max(float(sv) / maxs, -1.0));\n"
+             "  if (t == 5u) return asuint(float(v));\n"
+             "  return asuint(float(sv));\n"
+             "}\n";
     }
     {   // bindless global-heap arrays for image access through descriptor memory (spaces 910+)
         unsigned sp = 910;
