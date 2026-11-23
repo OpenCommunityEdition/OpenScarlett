@@ -1357,7 +1357,12 @@ PcObj rt_create_pso(PcObj devObj, const std::vector<uint8_t>& dxil) {
     std::vector<uint8_t> blob;
     if (read_all(path, blob)) {
         pd.CachedPSO = {blob.data(), blob.size()};
-        if (FAILED(dev->CreateComputePipelineState(&pd, IID_PPV_ARGS(&pso)))) pso = nullptr;   // another driver: rebuild
+        HRESULT ch = dev->CreateComputePipelineState(&pd, IID_PPV_ARGS(&pso));
+        if (FAILED(ch)) {   // another driver: rebuild
+            pso = nullptr;
+            static volatile long n = 0;
+            if (InterlockedIncrement(&n) <= 5) XSL_WARN(CH, "ray-tracing pipeline: stored driver blob refused (%08lx, %zu bytes); rebuilding", ch, blob.size());
+        }
         pd.CachedPSO = {};
     }
     if (!pso) {

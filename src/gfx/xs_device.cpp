@@ -880,7 +880,9 @@ static void rt_queue_build(size_t size, std::function<void()> job) {
 std::mutex g_prog_mu;
 std::map<int, std::shared_ptr<RtProg>> g_progs;
 PcObj g_rt_pcdev = nullptr;
-static std::shared_ptr<RtProg> rt_program(int coll) {
+// first: programs that start a pipeline's rays (every dispatch of the pipeline waits for them) are
+// built before programs found by discovery, each group smallest first.
+static std::shared_ptr<RtProg> rt_program(int coll, bool first = false) {
     std::shared_ptr<RtProg> prog;
     {
         std::lock_guard<std::mutex> g(g_prog_mu);
@@ -896,7 +898,7 @@ static std::shared_ptr<RtProg> rt_program(int coll) {
     size_t size = link->image.size() * 4;
     XSL_INFO(CH, "ray-tracing collection %d: program rt_%016llx queued (%zu KiB code)", coll,
              (unsigned long long)gpucode::rt_cache_key(*link, "gpucode-35-O3"), size / 1024);
-    rt_queue_build(size, [prog, link, coll, size] {
+    rt_queue_build((first ? 0 : (size_t)1 << 40) + size, [prog, link, coll, size] {
         DWORD t0 = GetTickCount();
         std::vector<uint8_t> dxil;
         std::string e;
@@ -926,7 +928,7 @@ static void rt_start_pipeline(Device* dev, const void* so, std::vector<std::vect
     static std::atomic<uint32_t> regions{0};
     pipe->region = std::min<uint32_t>(regions++, 63);
     { std::lock_guard<std::mutex> g(g_rt_mu); g_rt[so].pipe = pipe; g_rt[so].parts = blobs; g_rt[so].colls = pipe->colls; }
-    rt_program(pipe->start);   // the others once rays are seen to reach them (the driver takes 15 s to 2 min per program the first time)
+    rt_program(pipe->start, true);   // the others once rays are seen to reach them (the driver takes 15 s to 2 min per program the first time)
     XSL_INFO(CH, "ray-tracing pipeline %p: %zu collections, rays start in collection %d", so, blobs.size(), pipe->start);
 }
 // Collections the pipeline's rays parked on (discovery bitmap), as program candidates.
