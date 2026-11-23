@@ -337,13 +337,13 @@ bool native_translate(const void* in, size_t n, void** out, size_t* outSize) {
 
 // Linked console ray-tracing pipelines (gpucode/rtso.h): translated and compiled to DXIL, cached
 // by the image's hash (compiling one takes minutes: callers run this off the title's threads).
-// XSL_RT_DXC_OPT=Od|O1|O2|O3: optimization level of these programs (default Od: DXC takes about
-// 3x longer at O3 on these huge single-function programs; the driver optimizes either way).
+// XSL_RT_DXC_OPT=Od|O1|O2|O3: optimization level of these programs (default O3: slower in DXC,
+// but the driver, which compiles each program again on every new machine, is faster with it).
 std::wstring rt_cache_dir() { return cache_dir(); }
 bool rt_build_pipeline(const gpucode::RtLinked& l, std::vector<uint8_t>& dxil, std::string& err) {
     static std::wstring opt = [] {
         char b[8];
-        std::wstring w = L"-Od";
+        std::wstring w = L"-O3";   // the driver compiles O3 DXIL of these programs about 30% faster
         if (GetEnvironmentVariableA("XSL_RT_DXC_OPT", b, sizeof b) && b[0] == 'O') { w = L"-"; for (char* c = b; *c; c++) w += wchar_t(*c); }
         return w;
     }();

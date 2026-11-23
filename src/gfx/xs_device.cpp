@@ -820,6 +820,7 @@ struct RtPipe {
     std::mutex mu;
     std::set<int> active;           // collections reached (discovery bitmap), run in rounds >= 1
     uint32_t scans = 0;
+    bool skipLogged = false;
     std::vector<gpucode::RtLinked::Part> parts;   // diagnostics
 };
 // Every collection's code in one space (gpucode::RtSpace): identifiers are global code addresses.
@@ -893,6 +894,8 @@ static std::shared_ptr<RtProg> rt_program(int coll) {
     { std::lock_guard<std::mutex> g(g_space_mu); ok = g_space.program(coll, *link, &err); }
     if (!ok) { XSL_WARN(CH, "ray-tracing collection %d: no program (%s)", coll, err.c_str()); prog->state = -1; return prog; }
     size_t size = link->image.size() * 4;
+    XSL_INFO(CH, "ray-tracing collection %d: program rt_%016llx queued (%zu KiB code)", coll,
+             (unsigned long long)gpucode::rt_cache_key(*link, "gpucode-35-O3"), size / 1024);
     rt_queue_build(size, [prog, link, coll, size] {
         DWORD t0 = GetTickCount();
         std::vector<uint8_t> dxil;
@@ -957,6 +960,11 @@ bool rt_dispatch_impl(PcObj list, const void* so, const uint64_t* tables, const 
     std::shared_ptr<RtProg> start = pipe && pipe->start >= 0 ? rt_program(pipe->start) : nullptr;
     if (!pipe || !start || start->state.load() != 1 || (!d && !argsVa)) {
         if (d) pc::note_rays_skipped();   // indirect ones are counted where they are skipped
+        if (pipe && start && !pipe->skipLogged) {   // once per pipeline: which program it waits for
+            pipe->skipLogged = true;
+            XSL_INFO(CH, "ray dispatches of pipeline (region %u) wait for collection %d (program %s)", pipe->region, pipe->start,
+                     start->state.load() == 0 ? "building" : "failed");
+        }
         static volatile long n = 0;
         if (InterlockedIncrement(&n) <= 12) {
             std::lock_guard<std::mutex> g(g_rt_mu);

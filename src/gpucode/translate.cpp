@@ -3736,19 +3736,27 @@ std::string Translator::generate() {
         if (uses_park) h << "RWByteAddressBuffer RTST : register(u0, space930);\nRWByteAddressBuffer RTDISC : register(u0, space931);\n";
     }
     if (indirect) {   // code address -> dispatcher case (block start); unknown addresses end the invocation
-        h << "uint jump_case(uint lo, uint hi) {\n";
-        std::map<uint32_t, std::vector<std::pair<uint32_t, size_t>>> by_hi;
-        for (size_t b = 0; b < block_start.size(); b++) {
-            uint64_t a = addr_of(ins[block_start[b]].offset);
-            by_hi[uint32_t(a >> 32)].push_back({uint32_t(a), b});
-        }
-        h << "  switch (hi) {\n";
-        for (auto& [hi, v] : by_hi) {
-            h << fmt("  case 0x%xu:\n    switch (lo) {\n", hi);
-            for (auto& [lo, b] : v) h << fmt("    case 0x%xu: return %zuu;\n", lo, b);
-            h << "    default: return 0xffffffffu;\n    }\n";
-        }
-        h << "  default: return 0xffffffffu;\n  }\n}\n";
+        // Sorted (hi, lo) table searched in fixed branch-free steps: a switch over every block was
+        // inlined at each indirect jump and made programs very slow for the driver to compile.
+        std::vector<std::pair<uint64_t, size_t>> tab;
+        for (size_t b = 0; b < block_start.size(); b++) tab.push_back({addr_of(ins[block_start[b]].offset), b});
+        std::sort(tab.begin(), tab.end());
+        size_t n = tab.size();
+        h << fmt("static const uint JT_HI[%zu] = {", n);
+        for (size_t k = 0; k < n; k++) h << (k ? ", " : "") << fmt("0x%xu", uint32_t(tab[k].first >> 32));
+        h << "};\n" << fmt("static const uint JT_LO[%zu] = {", n);
+        for (size_t k = 0; k < n; k++) h << (k ? ", " : "") << fmt("0x%xu", uint32_t(tab[k].first));
+        h << "};\n" << fmt("static const uint JT_B[%zu] = {", n);
+        for (size_t k = 0; k < n; k++) h << (k ? ", " : "") << fmt("%zuu", tab[k].second);
+        h << "};\n";
+        unsigned top = 1;
+        while (top * 2 <= n) top *= 2;
+        h << "uint jump_case(uint lo, uint hi) {\n  uint a = 0u, t;\n";   // a = count of entries <= (hi, lo)
+        for (unsigned st = top; st; st >>= 1)
+            h << fmt("  t = a + %uu; a = select((t <= %zuu) & ((JT_HI[min(t, %zuu) - 1u] < hi) | ((JT_HI[min(t, %zuu) - 1u] == hi) & (JT_LO[min(t, %zuu) - 1u] <= lo))), t, a);\n",
+                     st, n, n, n, n);
+        h << "  if (a == 0u) return 0xffffffffu;\n";
+        h << "  return (JT_HI[a - 1u] == hi && JT_LO[a - 1u] == lo) ? JT_B[a - 1u] : 0xffffffffu;\n}\n";
     }
     if (uses_codedata) {
         size_t n = (c.precompiled.size() - c.body_begin) / 4;
