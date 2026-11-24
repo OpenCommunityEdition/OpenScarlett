@@ -1869,6 +1869,7 @@ HRESULT D3DAPI Q_PresentX(ID3D12CommandQueue* q, UINT planes, const D3D12XBOX_PR
         if (const ULONGLONG now = GetTickCount64(); now - last >= 10000) {
             last = now;
             long n = InterlockedExchange(&g_skipped_work, 0);
+            XSL_INFO(CH, "%s", pso_pool_stats().c_str());
             if (n) {
                 std::string t;
                 std::lock_guard<std::mutex> g(g_ph_mu);

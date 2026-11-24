@@ -252,6 +252,11 @@ void reset_untranslated() { t_untranslated = false; t_keys.clear(); t_why.clear(
 // where a compile of minutes holds nothing up.
 thread_local bool t_defer_compile = false, t_compile_deferred = false;
 void defer_compiles(bool on) { t_defer_compile = on; t_compile_deferred = false; }
+// The same for translations of a megabyte and more only (minutes of the compiler each: a title has
+// a handful, and they must not hold every worker that compiles).
+thread_local bool t_defer_giant = false;
+void defer_giants(bool on) { t_defer_giant = on; t_compile_deferred = false; }
+constexpr size_t kGiantHlsl = 1u << 20;
 bool compile_deferred() { return t_compile_deferred; }
 // The same for a pipeline the GPU driver has to compile from a large translation (its compiler
 // takes 10 to 30 s per megabyte of DXIL): the backend asks whether this thread defers, and says so.
@@ -516,6 +521,11 @@ bool native_translate(const void* in, size_t n, void** out, size_t* outSize) {
         const DWORD tick1 = GetTickCount();
         if (r.ok && c.kind == gpucode::ProgramKind::VS) note_vs_output(in, n, r.hlsl);
         if (r.ok && !ovr.empty()) r.hlsl.assign(ovr.begin(), ovr.end());
+        if (r.ok && t_defer_giant && !t_dry && ovr.empty() && r.hlsl.size() >= kGiantHlsl) {
+            t_compile_deferred = true;
+            t_untranslated = noFallback;
+            return false;
+        }
         if (!r.ok) {
             XSL_WARN(CH, "shader %016llx (%s): not translated: %s", (unsigned long long)key, gpucode::kind_name(c.kind), r.error.c_str());
             dump(key, in, n, "", r.error);
@@ -555,6 +565,8 @@ bool native_translate(const void* in, size_t n, void** out, size_t* outSize) {
         // many minutes at its full optimization level and seconds at the first; the GPU driver
         // optimizes the result again anyway. (XSL_DXC_OPT, when set, decides for every size.)
         static const bool optSet = [] { char b[8]; return GetEnvironmentVariableA("XSL_DXC_OPT", b, sizeof b) != 0; }();
+        if (r.hlsl.size() >= (256u << 10))   // (minutes for the largest: said before it starts, so a busy worker can be told by its shader)
+            XSL_INFO(CH, "shader %016llx (%s): compiling %zu bytes of HLSL from %zu bytes of code", (unsigned long long)key, r.profile.c_str(), r.hlsl.size(), n);
         if (!compile(r.hlsl, r.profile, dxil, log, !optSet && r.hlsl.size() >= (1u << 20) ? L"-O1" : nullptr)) {
             XSL_ERR(CH, "shader %016llx: translated HLSL does not compile:\n%s", (unsigned long long)key, log.c_str());
             dump(key, in, n, r.hlsl, "");

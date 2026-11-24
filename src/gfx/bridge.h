@@ -291,6 +291,7 @@ const char* untranslated_reason();   // why the first such shader since reset_un
 // defer_compiles(true): shaders this thread meets whose translation is not in the cache are not
 // compiled (they count as untranslated) and compile_deferred() says that one was met.
 void defer_compiles(bool on);
+void defer_giants(bool on);       // the same for translations of a megabyte and more only
 bool compile_deferred();
 bool deferring();                 // defer_compiles(true) is in effect on this thread
 void defer_now();                 // the pipeline being built is one to build elsewhere (compile_deferred() becomes true)

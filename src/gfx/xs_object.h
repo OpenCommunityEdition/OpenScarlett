@@ -13,6 +13,7 @@
 // The pointer handed to the title is the interface struct; the header sits
 // immediately before it.
 #pragma once
+#include <string>
 #include <vector>
 #define INITGUID
 #include <windows.h>
@@ -195,6 +196,7 @@ void placeholder_note(void* titleObject, const char* why);
 void pso_wait_ready(void* titlePipeline);   // a pipeline still being built is built (or awaited) now
 void placed_view_scope(bool on);            // the calling thread is placing a texture for a placed view
 bool pso_thread_group(const void* titlePipeline, uint32_t out[3]);   // a compute pipeline's console thread-group size
+std::string pso_pool_stats();   // what the pipeline worker pools did since the last call (periodic line)
 void* console_memory_peek(PcObj pcResource);   // from the title's allocator only (nullptr: none)
 void* console_memory_ensure(PcObj pcResource); // ... taken now when the resource has none
 void* console_memory_of(PcObj pcResource);     // the XMemAlloc memory a committed resource holds, if any

@@ -266,17 +266,27 @@ struct PsoPool {
     std::condition_variable cv;
     std::deque<std::function<void()>> q;
     std::once_flag once;
+    std::atomic<uint32_t> threads{0}, busy{0}, done{0}, slowest{0};   // (for the periodic line)
+    std::atomic<uint64_t> ms{0};
     void run(std::function<void()> job, bool first, const char* var, unsigned def, bool low) {
         std::call_once(once, [&] {
             char b[8];
             unsigned n = GetEnvironmentVariableA(var, b, sizeof b) ? (unsigned)atoi(b) : def;
+            threads = std::max(1u, n);
             for (unsigned t = 0; t < std::max(1u, n); t++)
                 std::thread([this, low] {
                     if (low) SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
                     for (;;) {
                         std::function<void()> j;
                         { std::unique_lock<std::mutex> u(mu); cv.wait(u, [this] { return !q.empty(); }); j = std::move(q.front()); q.pop_front(); }
+                        busy++;
+                        const ULONGLONG t0 = GetTickCount64();
                         j();
+                        const uint32_t dt = (uint32_t)(GetTickCount64() - t0);
+                        busy--;
+                        done++;
+                        ms += dt;
+                        if (dt > slowest.load()) slowest = dt;
                     }
                 }).detach();
         });
@@ -284,14 +294,33 @@ struct PsoPool {
         cv.notify_one();
     }
 };
+static PsoPool g_pso_pool, g_pso_compile_pool, g_pso_giant_pool;
+// One worker for pipelines with a translation of a megabyte and more: the compiler takes minutes
+// for each (a title has a handful, all asked for while it starts), and with them in the compile
+// pool every one of its workers was held for the whole run while a thousand pipelines waited.
+static void pso_giant_pool_run(std::function<void()> job) { g_pso_giant_pool.run(std::move(job), false, "XSL_GIANT_THREADS", 1, true); }
 static void pso_pool_run(std::function<void()> job, bool first = false) {
-    static PsoPool pool;
-    pool.run(std::move(job), first, "XSL_PSO_THREADS", std::min(8u, std::max(3u, std::thread::hardware_concurrency() / 2)), false);
+    g_pso_pool.run(std::move(job), first, "XSL_PSO_THREADS", std::min(8u, std::max(3u, std::thread::hardware_concurrency() / 2)), false);
 }
 static void pso_compile_pool_run(std::function<void()> job, bool first = false) {
-    static PsoPool pool;
     const unsigned hw = std::thread::hardware_concurrency();
-    pool.run(std::move(job), first, "XSL_COMPILE_THREADS", std::min(6u, std::max(2u, hw > 4 ? hw / 2 - 2 : 2u)), true);
+    g_pso_compile_pool.run(std::move(job), first, "XSL_COMPILE_THREADS", std::min(6u, std::max(2u, hw > 4 ? hw / 2 - 2 : 2u)), true);
+}
+// For the periodic line: what the two pools did since the last call.
+static std::string pso_pool_stats_impl() {
+    std::string t;
+    PsoPool* pools[3] = {&g_pso_pool, &g_pso_compile_pool, &g_pso_giant_pool};
+    for (int k = 0; k < 3; k++) {
+        PsoPool& p = *pools[k];
+        size_t waiting;
+        { std::lock_guard<std::mutex> g(p.mu); waiting = p.q.size(); }
+        char b[160];
+        const uint32_t done = p.done.exchange(0);
+        snprintf(b, sizeof b, "%s%s pool: %u built in %llu ms of work (slowest %u ms), %u of %u threads busy, %zu waiting", k ? "; " : "", k == 2 ? "giant" : k ? "compile" : "pipeline", done,
+                 (unsigned long long)p.ms.exchange(0), p.slowest.exchange(0), p.busy.load(), p.threads.load(), waiting);
+        t += b;
+    }
+    return t;
 }
 // With XSL_DRAW_DUMP set, pipelines the title gets as placeholders are logged with their object and
 // shaders, so the dump's "skipped" lines can be told apart.
@@ -469,18 +498,23 @@ static void pso_note_used(uint64_t key) {
 }
 static std::mutex g_pending_mu;
 static std::unordered_map<void*, std::shared_ptr<PendingPso>> g_pending;
-static void pending_run(const std::shared_ptr<PendingPso>& j, bool slow = false) {
+// level 0: the pipeline workers (no compiling there), 1: the compile workers (no translations of a
+// megabyte and more there), 2: the one worker for those.
+static void pending_run(const std::shared_ptr<PendingPso>& j, int level = 0) {
     int queued = 0;
-    if (!slow && !j->state.compare_exchange_strong(queued, 1)) return;   // another thread has it
-    pc::defer_compiles(!slow);
+    if (!level && !j->state.compare_exchange_strong(queued, 1)) return;   // another thread has it
+    pc::defer_compiles(level == 0);
+    pc::defer_giants(level == 1);
     const bool again = j->build();
     pc::defer_compiles(false);
-    if (again && !slow) {   // (first in line: a pipeline is built when a list wants it, or was used by an earlier run)
+    pc::defer_giants(false);
+    if (again && level == 0) {   // (first in line: a pipeline is built when a list wants it, or was used by an earlier run)
         { std::lock_guard<std::mutex> g(j->mu); j->handedOn = true; }
         j->cv.notify_all();
-        pso_compile_pool_run([j] { pending_run(j, true); }, true);
+        pso_compile_pool_run([j] { pending_run(j, 1); }, true);
         return;
     }
+    if (again && level == 1) { pso_giant_pool_run([j] { pending_run(j, 2); }); return; }
     { std::lock_guard<std::mutex> g(j->mu); j->state = 2; }
     j->cv.notify_all();
 }
@@ -2402,6 +2436,7 @@ bool rt_dispatch(PcObj list, const void* so, const uint64_t* tables, const D3D12
 void console_memory_release(PcObj r) { console_memory_release_impl(r); }
 void pso_wait_ready(void* titlePipeline) { pso_wait_ready_impl(titlePipeline); }
 bool pso_thread_group(const void* titlePipeline, uint32_t out[3]) { return pso_thread_group_impl(titlePipeline, out); }
+std::string pso_pool_stats() { return pso_pool_stats_impl(); }
 // The memory a resource took from the title's allocator, if any.
 void* console_memory_peek(PcObj r) {
     std::lock_guard<std::mutex> g(g_cm_mu);
