@@ -130,6 +130,7 @@ void report_device_removed(ID3D12Device* dev) {
     if (!dev || InterlockedExchange(&once, 1)) return;
     XSL_ERR(CH, "device removed: reason %08lx", dev->GetDeviceRemovedReason());
     prof_report_now();   // (a profiled frame's times, when the device went before their report)
+    dump_debug_messages();
     ID3D12DeviceRemovedExtendedData* dred = nullptr;
     if (FAILED(dev->QueryInterface(IID_PPV_ARGS(&dred)))) return;
     ID3D12DeviceRemovedExtendedData1* dred1 = nullptr;
@@ -1113,11 +1114,30 @@ HRESULT_T create_list(PcObj dev, int type, PcObj alloc, PcObj pso, PcObj* out) {
 struct SvHeap { uint64_t gpu, cpu, bytes; };
 std::vector<SvHeap> g_sv_heaps;
 std::mutex g_sv_mu;
+// Sampler heaps and which of their slots hold a sampler: a shader that samples through a slot the
+// title never wrote reads whatever the heap's memory held (see the table check).
+struct SampHeap { uint64_t cpu, gpu; uint32_t n, inc; std::vector<uint8_t> init; };
+std::mutex g_samp_mu;
+std::vector<SampHeap> g_samp_heaps;
+uint64_t g_samp_fixed = 0;
+static SampHeap* samp_heap_cpu(uint64_t h) {   // caller holds g_samp_mu
+    for (auto& s : g_samp_heaps)
+        if (h >= s.cpu && h < s.cpu + (uint64_t)s.n * s.inc) return &s;
+    return nullptr;
+}
 HRESULT_T create_descriptor_heap(PcObj dev, const void* desc, PcObj* out) {
     D3D12_DESCRIPTOR_HEAP_DESC d = *static_cast<const D3D12_DESCRIPTOR_HEAP_DESC*>(desc);
     d.Flags &= D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
     if ((int)d.Type > 3) d.Type = D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER;  // Xbox "sampler unbounded"
     HRESULT hr = logged(as<ID3D12Device>(dev)->CreateDescriptorHeap(&d, IID_PPV_ARGS(reinterpret_cast<ID3D12DescriptorHeap**>(out))), "CreateDescriptorHeap");
+    if (SUCCEEDED(hr) && d.Type == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER) {
+        auto* h = as<ID3D12DescriptorHeap>(*out);
+        std::lock_guard<std::mutex> g(g_samp_mu);
+        const uint64_t c = h->GetCPUDescriptorHandleForHeapStart().ptr;
+        g_samp_heaps.erase(std::remove_if(g_samp_heaps.begin(), g_samp_heaps.end(), [&](const SampHeap& s) { return s.cpu == c; }), g_samp_heaps.end());
+        g_samp_heaps.push_back({c, (d.Flags & D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE) ? h->GetGPUDescriptorHandleForHeapStart().ptr : 0, d.NumDescriptors,
+                                as<ID3D12Device>(dev)->GetDescriptorHandleIncrementSize(d.Type), std::vector<uint8_t>(d.NumDescriptors, 0)});
+    }
     if (SUCCEEDED(hr) && (d.Flags & D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE) && d.Type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) {
         auto* h = as<ID3D12DescriptorHeap>(*out);
         std::lock_guard<std::mutex> g(g_sv_mu);
@@ -3028,6 +3048,7 @@ HRESULT_T create_graphics_pso(PcObj dev, const void* desc, PcObj* out) {
     if (hr == DXGI_ERROR_DEVICE_REMOVED) report_device_removed(as<ID3D12Device>(dev));
     return hr;
 }
+static void table_check_note(PcObj pso, const void* code, size_t size);
 HRESULT_T create_compute_pso(PcObj dev, const void* desc, PcObj* out) {
     D3D12_COMPUTE_PIPELINE_STATE_DESC d = *static_cast<const D3D12_COMPUTE_PIPELINE_STATE_DESC*>(desc);
     ShaderFix fx;
@@ -3048,6 +3069,7 @@ HRESULT_T create_compute_pso(PcObj dev, const void* desc, PcObj* out) {
     HRESULT hr = cached_pso(key, d.CachedPSO.pCachedBlob, d.CachedPSO.CachedBlobSizeInBytes, pso,
                             [&] { return as<ID3D12Device>(dev)->CreateComputePipelineState(&d, IID_PPV_ARGS(pso)); }, d.CS.BytecodeLength >= heavy_pipeline_bytes());
     if (FAILED(hr) && compile_deferred()) return hr;
+    if (SUCCEEDED(hr)) table_check_note(*pso, d.CS.pShaderBytecode, d.CS.BytecodeLength);
     if (const ULONGLONG dt = GetTickCount64() - t0c; dt >= 5000) {
         static volatile long shown = 0;
         if (InterlockedIncrement(&shown) <= 40) XSL_WARN(CH, "CreateComputePipelineState took %llu ms in the driver (shaders %s)", (unsigned long long)dt, translated_keys());
@@ -4104,10 +4126,17 @@ void create_cbv(PcObj dev, const void* desc, uint64_t h) {
 }
 void create_sampler(PcObj dev, const void* desc, uint64_t h) {
     as<ID3D12Device>(dev)->CreateSampler(static_cast<const D3D12_SAMPLER_DESC*>(desc), cpu(h));
+    { std::lock_guard<std::mutex> g(g_samp_mu); if (SampHeap* s = samp_heap_cpu(h)) s->init[(h - s->cpu) / s->inc] = 1; }
     removed_after("CreateSampler");
 }
 void copy_descriptors_simple(PcObj dev, uint32_t n, uint64_t dst, uint64_t src, int type) {
     if (type > 3) type = D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER;
+    if (type == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER) {
+        std::lock_guard<std::mutex> g(g_samp_mu);
+        SampHeap *d = samp_heap_cpu(dst), *s = samp_heap_cpu(src);
+        for (uint32_t k = 0; d && k < n && (dst - d->cpu) / d->inc + k < d->n; k++)
+            d->init[(dst - d->cpu) / d->inc + k] = s && (src - s->cpu) / s->inc + k < s->n ? s->init[(src - s->cpu) / s->inc + k] : 1;
+    }
     if (trace_writers() && type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) {
         std::lock_guard<std::mutex> g(g_wr_mu);
         uint32_t inc = g_gv_inc ? g_gv_inc : 32;
@@ -4720,6 +4749,59 @@ void list_scissors(PcObj l, uint32_t n, const void* r) {
 // root signature must name every register its shaders use, so a pipeline of such shaders gets a
 // root signature of its own, built from that description; a list binds it in place of the title's
 // object when the pipeline is drawn with, and the title's root arguments are applied again.
+// XSL_TABLE_CHECK=1 (diagnostics): before each dispatch, every resource the compute shader declares
+// (its container's PSV0 part) is looked up in the tables the title bound, through the pipeline's
+// own root signature: a slot the title left empty, a view of another kind than the shader declares
+// (a buffer where it reads a 3D texture) or a table that continues in a page which is not behind
+// its first in the PC heap is logged, once per pipeline. A PC GPU reads such a descriptor as what
+// the shader says it is; what follows is not defined, and a hung device is one of the outcomes.
+struct TcRes { uint32_t type, space, lo, hi, kind; };
+struct TcRange { uint32_t param, type, base, space, num, offset; };
+std::mutex g_tc_mu;
+std::unordered_map<PcObj, std::vector<TcRes>> g_tc_pso;     // pipeline -> what its shader declares
+std::unordered_map<PcObj, std::vector<TcRange>> g_tc_rs;    // own root signature -> its table ranges
+std::unordered_map<PcObj, int> g_tc_done;                   // pipeline -> reports made
+bool (*g_tc_read)(uint64_t, uint32_t, uint32_t*, uint32_t*, bool*) = nullptr;
+int (*g_tc_fix)(uint64_t, uint32_t, uint32_t) = nullptr;
+void set_table_slot_reader(bool (*read)(uint64_t, uint32_t, uint32_t*, uint32_t*, bool*), int (*fix)(uint64_t, uint32_t, uint32_t)) { g_tc_read = read; g_tc_fix = fix; }
+// The same walk puts two cases right in the PC heap unless XSL_TABLE_FIX=0 (see table_slot_fix in
+// xs_descriptors.cpp): empty slots and constant buffer views where the shader reads a buffer.
+static bool table_log_on() { static const bool on = env_on("XSL_TABLE_CHECK"); return on; }
+static bool table_check_on() { static const bool on = [] { char b[4]; return !(GetEnvironmentVariableA("XSL_TABLE_FIX", b, 4) && b[0] == '0'); }() || table_log_on(); return on; }
+static bool table_fix_on() { static const bool on = [] { char b[4]; return !(GetEnvironmentVariableA("XSL_TABLE_FIX", b, 4) && b[0] == '0'); }(); return on; }
+static void table_check_note(PcObj pso, const void* code, size_t size) {
+    const uint8_t* c = (const uint8_t*)code;
+    if (!table_check_on() || !pso || !c || size < 32 || memcmp(c, "DXBC", 4)) return;
+    uint32_t parts = 0;
+    memcpy(&parts, c + 28, 4);
+    std::vector<TcRes> out;
+    for (uint32_t i = 0; i < parts && 32 + 4ull * (i + 1) <= size; i++) {
+        uint32_t off = 0, len = 0;
+        memcpy(&off, c + 32 + 4 * i, 4);
+        if (off + 8ull > size || memcmp(c + off, "PSV0", 4)) continue;
+        memcpy(&len, c + off + 4, 4);
+        const uint8_t *p = c + off + 8, *end = p + len;
+        if (end > c + size || len < 8) break;
+        uint32_t info = 0, n = 0, each = 0;
+        memcpy(&info, p, 4);
+        p += 4 + info;
+        if (p + 4 > end) break;
+        memcpy(&n, p, 4);
+        p += 4;
+        if (!n || p + 4 > end) break;
+        memcpy(&each, p, 4);
+        p += 4;
+        for (uint32_t k = 0; k < n && each >= 16 && p + each <= end; k++, p += each) {
+            TcRes r{};
+            memcpy(&r, p, 16);
+            if (each >= 20) memcpy(&r.kind, p + 16, 4);
+            out.push_back(r);
+        }
+        break;
+    }
+    std::lock_guard<std::mutex> g(g_tc_mu);
+    g_tc_pso[pso] = std::move(out);
+}
 namespace {
 struct CompactRs {
     std::vector<D3D12_ROOT_PARAMETER1> params;
@@ -4926,6 +5008,20 @@ PcObj own_root_signature(PcObj dev, const void* const* code, const size_t* size,
         if (SUCCEEDED(hr)) {
             ser.assign((const uint8_t*)b->GetBufferPointer(), (const uint8_t*)b->GetBufferPointer() + b->GetBufferSize());
             hr = create_root_signature_ex(dev, ser.data(), ser.size(), &rs, true);
+        }
+        if (SUCCEEDED(hr) && table_check_on()) {
+            std::vector<TcRange> rr;
+            for (uint32_t k = 0; k < best.params.size(); k++) {
+                if (best.params[k].ParameterType != D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE) continue;
+                uint32_t at = 0;
+                for (auto& q : best.ranges[k]) {
+                    if (q.OffsetInDescriptorsFromTableStart != D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND) at = q.OffsetInDescriptorsFromTableStart;
+                    rr.push_back({k, (uint32_t)q.RangeType, q.BaseShaderRegister, q.RegisterSpace, q.NumDescriptors, at});
+                    at += q.NumDescriptors;
+                }
+            }
+            std::lock_guard<std::mutex> g2(g_tc_mu);
+            g_tc_rs[rs] = std::move(rr);
         }
         static volatile long n = 0;
         if (FAILED(hr)) XSL_ERR(CH, "root signature from a shader's own description failed %08lx: %s", hr, e ? (const char*)e->GetBufferPointer() : "");
@@ -5252,6 +5348,8 @@ struct GpuProf {
     ID3D12QueryHeap* heap = nullptr;
     ID3D12Resource* rb = nullptr;
     ID3D12CommandQueue* queue = nullptr;   // (for its timestamp frequency)
+    uint64_t freq = 0;
+    uint64_t* map = nullptr;               // the read-back buffer, mapped for good (a removed device maps nothing)
     uint32_t next = 0;
     std::vector<GpuProfOp> ops;
     bool done = false;
@@ -5328,6 +5426,8 @@ static int32_t prof_begin(PcObj l, char kind, uint32_t a, uint32_t b, uint32_t c
         if (FAILED(g_main_device->CreateQueryHeap(&qd, IID_PPV_ARGS(&g_prof.heap))) ||
             FAILED(g_main_device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&g_prof.rb))))
             return -1;
+        g_prof.rb->Map(0, nullptr, (void**)&g_prof.map);
+        if (g_prof.queue) g_prof.queue->GetTimestampFrequency(&g_prof.freq);
     }
     if (g_prof.next + 2 > kProfQueries) return -1;
     uint32_t q = g_prof.next;
@@ -5349,16 +5449,14 @@ static void prof_report(ID3D12CommandQueue* queue, bool now = false) {
     if (queue) g_prof.queue = queue;
     if (!at || g_prof.done) return;
     std::lock_guard<std::mutex> g(g_prof.mu);
-    if (!g_prof.rb || !g_prof.queue || g_prof.ops.empty()) return;
+    if (queue && !g_prof.freq) queue->GetTimestampFrequency(&g_prof.freq);
+    if (!g_prof.map || g_prof.ops.empty()) return;
     const uint64_t present = g_wr_present.load();
     const bool full = g_prof.next + 2 > kProfQueries;
     if (!now && !(full && present >= g_prof.ops.back().present + 4) && present < at + 40) return;
     g_prof.done = true;
-    uint64_t freq = 0;
-    g_prof.queue->GetTimestampFrequency(&freq);
-    uint64_t* t = nullptr;
-    D3D12_RANGE r{0, g_prof.next * 8ull};
-    if (FAILED(g_prof.rb->Map(0, &r, (void**)&t)) || !freq) return;
+    const uint64_t freq = g_prof.freq ? g_prof.freq : 1;
+    const uint64_t* t = g_prof.map;
     auto name_of = [](PcObj pso, wchar_t* name, UINT bytes) {
         wcscpy(name, L"(none)");
         if (pso) as<ID3D12PipelineState>(pso)->GetPrivateData(WKPDID_D3DDebugObjectNameW, &bytes, name);
@@ -5401,7 +5499,7 @@ static void prof_report(ID3D12CommandQueue* queue, bool now = false) {
             name_of(v[i].second, name, sizeof name);
             XSL_INFO(CH, "  %9.1f us in %4u ops: %ls", v[i].first, per[v[i].second].second, name);
         }
-        for (size_t i = 0; i < single.size() && i < 8; i++) {
+        for (size_t i = 0; i < single.size() && i < 40; i++) {
             const GpuProfOp& o = g_prof.ops[single[i].second];
             wchar_t name[128];
             name_of(o.pso, name, sizeof name);
@@ -5409,11 +5507,163 @@ static void prof_report(ID3D12CommandQueue* queue, bool now = false) {
         }
         i0 = i1;
     }
-    g_prof.rb->Unmap(0, nullptr);
 }
 static void prof_report_now() { prof_report(nullptr, true); }
+// (see XSL_TABLE_CHECK above)
+static void table_check(PcObj l) {
+    if (!table_check_on() || !g_tc_read || !g_own_rs_any) return;
+    PcObj pso = nullptr;
+    { std::lock_guard<std::mutex> g(g_cs_mu); auto it = g_cs_shadow.find(l); if (it != g_cs_shadow.end()) pso = it->second.pso; }
+    if (!pso) return;
+    RootBind b;
+    { std::lock_guard<std::mutex> g(g_bind_mu); auto it = g_root_bind.find(l); if (it == g_root_bind.end()) return; b = it->second[1]; }
+    std::vector<TcRes> res;
+    std::vector<TcRange> ranges;
+    bool logIt = false;
+    {
+        std::lock_guard<std::mutex> g(g_tc_mu);
+        logIt = table_log_on() && g_tc_done[pso] < 2;
+        if (!logIt && !table_fix_on()) return;
+        auto p = g_tc_pso.find(pso);
+        auto r = g_tc_rs.find(b.own ? b.own : b.title);   // (what the dispatch runs with; `bound` is unset after the layer's own dispatches)
+        if (logIt && (p == g_tc_pso.end() || r == g_tc_rs.end())) {
+            static volatile long n = 0;
+            wchar_t nm[128] = L"";
+            UINT sz = sizeof nm;
+            as<ID3D12PipelineState>(pso)->GetPrivateData(WKPDID_D3DDebugObjectNameW, &sz, nm);
+            if (InterlockedIncrement(&n) <= 40)
+                XSL_INFO(CH, "table check: %ls is not checked (%s; root signature %p, own %p, title %p)", nm,
+                         p == g_tc_pso.end() ? "its resources are not known" : "its root signature is not one made from a shader's description", b.bound, b.own, b.title);
+            g_tc_done[pso] = 2;
+        }
+        if (p == g_tc_pso.end() || r == g_tc_rs.end()) return;
+        res = p->second;
+        ranges = r->second;
+    }
+    // PSV0: type 1 sampler, 2 constant buffer, 3..5 shader resource (typed, raw, structured), 6..9
+    // unordered access; kind 1 Texture1D, 2 2D, 3 2DMS, 4 3D, 5 cube, 6 1D array, 7 2D array, 8 2DMS
+    // array, 9 cube array, 10..12 buffers, 16 acceleration structure. Views: see desc_set_kind.
+    static const uint8_t dimOf[17] = {0, 2, 4, 6, 8, 9, 3, 5, 7, 10, 1, 1, 1, 0, 0, 0, 11};
+    static const char* kindName[17] = {"?", "Texture1D", "Texture2D", "Texture2DMS", "Texture3D", "TextureCube", "Texture1DArray", "Texture2DArray", "Texture2DMSArray",
+                                       "TextureCubeArray", "typed buffer", "raw buffer", "structured buffer", "cbuffer", "sampler", "tbuffer", "acceleration structure"};
+    std::string report;
+    int bad = 0, checked = 0;
+    // XSL_TABLE_CHECK=<part of a pipeline's name>: every resource of that pipeline, as found.
+    static const std::wstring full = [] { char b[40] = ""; GetEnvironmentVariableA("XSL_TABLE_CHECK", b, sizeof b); return strlen(b) > 4 ? std::wstring(b, b + strlen(b)) : std::wstring(); }();
+    bool all = false;
+    if (logIt && !full.empty()) {
+        wchar_t nm[128] = L"";
+        UINT sz = sizeof nm;
+        as<ID3D12PipelineState>(pso)->GetPrivateData(WKPDID_D3DDebugObjectNameW, &sz, nm);
+        all = wcsstr(nm, full.c_str()) != nullptr;
+    }
+    for (auto& q : res) {
+        if (q.type == 1) {   // a sampler: its slot in the sampler heap must have been written
+            const TcRange* in = nullptr;
+            for (auto& r : ranges)
+                if (r.type == D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER && r.space == q.space && q.lo >= r.base && q.lo - r.base < r.num) { in = &r; break; }
+            auto pa = in ? b.params.find(in->param) : b.params.end();
+            int state = -1;   // -1 not in a table, 0 no table bound, 1 not a known heap, 2 written, 3 not written, 4 not written and given a sampler
+            uint64_t index = 0;
+            if (in) {
+                state = 0;
+                if (pa != b.params.end() && pa->second.first == 0) {
+                    state = 1;
+                    std::lock_guard<std::mutex> g(g_samp_mu);
+                    for (auto& sh : g_samp_heaps) {
+                        const uint64_t h = pa->second.second;
+                        if (!sh.gpu || h < sh.gpu || h >= sh.gpu + (uint64_t)sh.n * sh.inc) continue;
+                        index = (h - sh.gpu) / sh.inc + in->offset + (q.lo - in->base);
+                        if (index >= sh.n) break;
+                        state = sh.init[index] ? 2 : 3;
+                        if (state == 3 && table_fix_on() && g_main_device) {
+                            D3D12_SAMPLER_DESC sd{};
+                            sd.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+                            sd.AddressU = sd.AddressV = sd.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+                            sd.ComparisonFunc = D3D12_COMPARISON_FUNC_NEVER;
+                            sd.MaxAnisotropy = 1;
+                            sd.MaxLOD = D3D12_FLOAT32_MAX;
+                            g_main_device->CreateSampler(&sd, D3D12_CPU_DESCRIPTOR_HANDLE{(SIZE_T)(sh.cpu + index * sh.inc)});
+                            sh.init[index] = 1;
+                            g_samp_fixed++;
+                            state = 4;
+                        }
+                        break;
+                    }
+                }
+            }
+            if (all || state == 0 || state == 3 || state == 4) {
+                static const char* st[] = {"in no table range", "no table bound", "its table is in no sampler heap the layer knows", "written", "never written", "never written (given a sampler)"};
+                char t[160];
+                snprintf(t, sizeof t, " | s%u space%u: %s (heap slot %llu)", q.lo, q.space, st[state + 1], (unsigned long long)index);
+                report += t;
+                if (state == 0 || state == 3 || state == 4) bad++;
+            }
+            continue;
+        }
+        if (q.type < 2 || q.type > 9) continue;
+        const uint32_t cls = q.type == 2 ? D3D12_DESCRIPTOR_RANGE_TYPE_CBV : q.type <= 5 ? D3D12_DESCRIPTOR_RANGE_TYPE_SRV : D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
+        const char reg = cls == D3D12_DESCRIPTOR_RANGE_TYPE_CBV ? 'b' : cls == D3D12_DESCRIPTOR_RANGE_TYPE_SRV ? 't' : 'u';
+        const TcRange* in = nullptr;
+        for (auto& r : ranges)
+            if (r.type == cls && r.space == q.space && q.lo >= r.base && q.lo - r.base < r.num) { in = &r; break; }
+        if (!in && all) { char t[96]; snprintf(t, sizeof t, " | %c%u space%u: in no table range", reg, q.lo, q.space); report += t; }
+        if (!in) continue;   // (a root descriptor, the global-memory tables, or a register the signature does not name)
+        auto pa = b.params.find(in->param);
+        char line[256];
+        if (pa == b.params.end() || pa->second.first != 0) {
+            snprintf(line, sizeof line, " | %c%u space%u: no table bound at parameter %u", reg, q.lo, q.space, in->param);
+            report += line;
+            bad++;
+            continue;
+        }
+        uint32_t kind = 0, slot = 0;
+        bool split = false;
+        const uint32_t at = in->offset + (q.lo - in->base);
+        if (!g_tc_read(pa->second.second, at, &kind, &slot, &split)) continue;
+        checked++;
+        const uint32_t want = cls == D3D12_DESCRIPTOR_RANGE_TYPE_CBV ? 1u : (cls == D3D12_DESCRIPTOR_RANGE_TYPE_SRV ? 0x10u : 0x20u) | dimOf[q.kind <= 16 ? q.kind : 0];
+        if (kind >= 0x100) { if ((kind & 0xff) == want) continue; kind = 0xff; }   // (already put right by the layer)
+        const bool buffer = (want & 15) == 1 && want != 1;
+        const uint32_t form = q.type == 4 || q.type == 7 ? 1u : q.type == 5 || q.type >= 8 ? 2u : 0u;
+        int fixed = 0;
+        if (table_fix_on() && g_tc_fix && q.kind && q.kind <= 16 && (kind == 0 || ((kind == 1 || kind == 2) && buffer && cls == D3D12_DESCRIPTOR_RANGE_TYPE_SRV)))
+            fixed = g_tc_fix(pa->second.second, at, want | form << 8);
+        if (fixed > 0 && !logIt) continue;
+        const char* what = nullptr;
+        char held[48] = "";
+        if (kind == 0) what = fixed > 0 ? "empty (given a view of no resource)" : "empty";
+        else if ((kind == 1 || kind == 2) && buffer && cls == D3D12_DESCRIPTOR_RANGE_TYPE_SRV) what = fixed > 0 ? "a constant buffer view (given a buffer view)" : "a constant buffer view";
+        else if (kind == 0xfe) what = "a tag whose record is gone";
+        else if (kind == 0xff || kind == 2) what = nullptr;   // (unknown kind, or console bytes: a constant or buffer view)
+        else if ((kind & 0x7f) != want && q.kind && q.kind <= 16) { snprintf(held, sizeof held, "a view of kind %02x%s", kind & 0x7f, kind & 0x80 ? " (null)" : ""); what = held; }
+        if (kind == 2 && cls != D3D12_DESCRIPTOR_RANGE_TYPE_CBV && dimOf[q.kind <= 16 ? q.kind : 0] != 1) what = "console bytes (a constant or buffer view)";
+        if (!what && !split && all) {
+            snprintf(line, sizeof line, " | %c%u space%u (%s, wants %02x) at %u + %u, slot %u: kind %02x", reg, q.lo, q.space, kindName[q.kind <= 16 ? q.kind : 0], want, in->param, at, slot, kind);
+            report += line;
+            bad++;
+        }
+        if (!what && !split) continue;
+        snprintf(line, sizeof line, " | %c%u space%u (%s, wants %02x) at parameter %u + %u, title slot %u: %s%s", reg, q.lo, q.space, kindName[q.kind <= 16 ? q.kind : 0], want, in->param, at,
+                 slot, what ? what : "", split ? (what ? ", and its page is not behind the table's" : "its page is not behind the table's") : "");
+        if (report.size() < (all ? 12000u : 3000u)) report += line;
+        bad++;
+    }
+    if (!bad || !logIt) return;
+    {
+        std::lock_guard<std::mutex> g(g_tc_mu);
+        if (g_tc_done[pso]++ >= 2) return;
+    }
+    wchar_t name[128] = L"?";
+    UINT sz = sizeof name;
+    as<ID3D12PipelineState>(pso)->GetPrivateData(WKPDID_D3DDebugObjectNameW, &sz, name);
+    for (size_t at = 0; at < report.size() || !at; at += 1700)   // (a log line holds 2,048 characters)
+        XSL_WARN(CH, "table check: %ls (present %llu): %d of %d declared resources are not what the shader reads:%s", name, (unsigned long long)g_wr_present.load(), bad, checked + 0,
+                 report.substr(at, 1700).c_str());
+}
 void list_dispatch(PcObj l, uint32_t x, uint32_t y, uint32_t z) {
     root_ensure(l, true);
+    table_check(l);
     note_big(l, "Dispatch", (uint64_t)x * y * z * 64, x, y, z);
     trace_dispatch_size(l, "Dispatch", x, y, z, nullptr);
     note_dispatch(l);
@@ -5706,6 +5956,7 @@ static bool fixed_indirect(PcObj l, PcObj sig, uint32_t max, PcObj args, uint64_
         barrier(g_arg_ring.res, uav, ind);
         restore_compute_state(l);
     } else barrier(g_arg_ring.res, D3D12_RESOURCE_STATE_COPY_DEST, ind);
+    table_check(l);
     int32_t pq = prof_begin(l, 'I', max, 0, 0);
     L->ExecuteIndirect(as<ID3D12CommandSignature>(sig), max, g_arg_ring.res, off, as<ID3D12Resource>(cnt), co);
     prof_end(l, pq);
@@ -6847,7 +7098,11 @@ HRESULT_T present(PcObj devObj, PcObj queueObj, PcObj resObj, void* hwndPtr, uin
         prof_report(as<ID3D12CommandQueue>(q));
         ++g_gm_frame;
         if (getenv("XSL_AS_DUMP") || getenv("XSL_TLAS_DUMP")) print_dumps();
-        if (g_info && g_present_count % 30 == 0) dump_debug_messages();   // debug layer: what it reported since the last dump
+        {   // debug layer: what it reported since the last dump (every 30 presents, and once a second when presents are slow)
+            static ULONGLONG last = 0;
+            const ULONGLONG now = GetTickCount64();
+            if (g_info && (g_present_count % 30 == 0 || now - last >= 1000)) { last = now; dump_debug_messages(); }
+        }
         if (trace_writers()) { std::lock_guard<std::mutex> g(g_wr_mu); g_planes.insert((PcObj)res); }
         if (trace_writers() && plane_ops_now()) { XSL_INFO(CH, "plane op: present %llu of %p on queue %p", (unsigned long long)g_present_count, (void*)res, (void*)q); report_aliases((PcObj)res); }
         g_wr_present = g_present_count;

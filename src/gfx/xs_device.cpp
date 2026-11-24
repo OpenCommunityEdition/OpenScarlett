@@ -1108,6 +1108,16 @@ void D3DAPI D_CreateSRV(ID3D12Device* d, ID3D12Resource* r, const D3D12_SHADER_R
             else buffer_payload(P_or_pc(r), DXGI_FORMAT_UNKNOWN, 0, (uint32_t)(rd.Width / 4), 0, true);
         } else texture_payload(f, false);
     }
+    {
+        uint32_t dim = v ? (uint32_t)v->ViewDimension : 0;
+        if (!dim && r) {
+            D3D12_RESOURCE_DESC rd;
+            pc::res_desc(P_or_pc(r), &rd);
+            dim = rd.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER ? 1 : rd.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D ? 2 : rd.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D ? 8 :
+                  rd.DepthOrArraySize > 1 ? 5 : 4;
+        }
+        desc_set_kind(0x10 | dim | (r ? 0 : 0x80));
+    }
     write_view(h.ptr, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, [&](uint64_t ph) { pc::create_srv(DPC(d), P_or_pc(r), v, ph); });   // video frames: PC resources
     if (r && is_ours(r)) detile_view_created(P(r));   // CPU-written console texture: convert before the next submission
 }
@@ -1121,6 +1131,16 @@ void D3DAPI D_CreateUAV(ID3D12Device* d, ID3D12Resource* r, ID3D12Resource* c, c
                 buffer_payload(P(r), f, v->Buffer.FirstElement, v->Buffer.NumElements, v->Buffer.StructureByteStride, (v->Buffer.Flags & D3D12_BUFFER_UAV_FLAG_RAW) != 0);
             else buffer_payload(P(r), DXGI_FORMAT_UNKNOWN, 0, (uint32_t)(rd.Width / 4), 0, true);
         } else texture_payload(f, true);
+    }
+    {
+        uint32_t dim = v ? (uint32_t)v->ViewDimension : 0;
+        if (!dim && r) {
+            D3D12_RESOURCE_DESC rd;
+            pc::res_desc(P(r), &rd);
+            dim = rd.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER ? 1 : rd.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D ? 2 : rd.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D ? 8 :
+                  rd.DepthOrArraySize > 1 ? 5 : 4;
+        }
+        desc_set_kind(0x20 | dim | (r ? 0 : 0x80));
     }
     write_view(h.ptr, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, [&](uint64_t ph) { pc::create_uav(DPC(d), P(r), P(c), v, ph); });
 }
@@ -1271,6 +1291,7 @@ void D3DAPI D_CreatePlacedUAV(ID3D12Device* d, ID3D12Resource* r, const D3D12XBO
 void D3DAPI D_CreateCBV(ID3D12Device* d, const D3D12_CONSTANT_BUFFER_VIEW_DESC* v, D3D12_CPU_DESCRIPTOR_HANDLE h) {
     // Console CBVs need 16-byte alignment, PC ones 256: unaligned views point at an aligned copy.
     D3D12_CONSTANT_BUFFER_VIEW_DESC x;
+    const uint64_t titleAt = v ? v->BufferLocation : 0;
     if (v && v->BufferLocation) {
         x = *v;
         x.BufferLocation = gpu_va(DEV(d), v->BufferLocation);
@@ -1280,6 +1301,7 @@ void D3DAPI D_CreateCBV(ID3D12Device* d, const D3D12_CONSTANT_BUFFER_VIEW_DESC* 
         if (x.BufferLocation & 255) x.BufferLocation = cbv_fix_view(DEV(d), v->BufferLocation, x.BufferLocation, v->SizeInBytes);
         v = &x;
     }
+    desc_set_kind(1, titleAt);
     write_view(h.ptr, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, [&](uint64_t ph) { pc::create_cbv(DPC(d), v, ph); });
 }
 void D3DAPI D_CreateSampler(ID3D12Device* d, const D3D12_SAMPLER_DESC* v, D3D12_CPU_DESCRIPTOR_HANDLE h) { pc::create_sampler(DPC(d), v, h.ptr); }

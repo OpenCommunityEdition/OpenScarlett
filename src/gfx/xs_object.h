@@ -211,6 +211,9 @@ void desc_commit(uint64_t h, D3D12_DESCRIPTOR_HEAP_TYPE type, const DescTag& tag
 // format), acceleration structures their address, textures {heap index, kDescTexture | kind}.
 constexpr uint32_t kDescTexture = 0x80000000u;   // payload dword 1 flag: dword 0 is the slot's heap index
 void desc_set_payload(const uint32_t words[4]);
+// What the next view written on this thread is, for the table check: 1 a constant buffer view,
+// 0x10 + D3D12_SRV_DIMENSION, 0x20 + D3D12_UAV_DIMENSION; 0x80 added for a view of no resource.
+void desc_set_kind(uint32_t kind, uint64_t titleAddress = 0);   // (the address: a constant buffer view's, as the title gave it)
 bool desc_peek(uint64_t gpuHandle, uint32_t slot, uint32_t out[8]);   // diagnostics: the slot's 32 bytes
 // Payloads of views in CPU-only (staging) heaps (xs_descriptors.cpp).
 void desc_staging_heap(uint64_t cpuStart, uint32_t count, uint32_t inc, bool add);

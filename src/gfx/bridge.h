@@ -123,6 +123,9 @@ bool list_rays(PcObj l, const std::vector<RtRun>& runs, const RtRaysArgs& args);
 bool is_rays_signature(PcObj sig);
 void note_rays_skipped(int why);   // counted in the frame-rate log (0 no pipeline, 1 start program building, 2 failed, 3 a reached program building, 4 indirect)
 uint64_t present_count();
+// XSL_TABLE_CHECK=1 (diagnostics): the layer's descriptor memory answers what a title slot holds.
+void set_table_slot_reader(bool (*read)(uint64_t pcGpuHandle, uint32_t index, uint32_t* kind, uint32_t* titleSlot, bool* split),
+                           int (*fix)(uint64_t pcGpuHandle, uint32_t index, uint32_t want));
 std::string gm_describe_address(uint64_t address);   // diagnostics: registered buffers around and over an address
 int rt_warm_shard(void* pcDevice, unsigned shard, unsigned shards);   // tools/rtwarm
 void dump_queue_state();   // hang diagnostics

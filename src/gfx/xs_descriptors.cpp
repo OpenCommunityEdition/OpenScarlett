@@ -31,6 +31,8 @@
 #include "xs_unified.h"
 
 namespace xs {
+static bool table_slot_read(uint64_t pcGpu, uint32_t k, uint32_t* kind, uint32_t* titleSlot, bool* split);
+static int table_slot_fix(uint64_t pcGpu, uint32_t k, uint32_t want);
 namespace {
 constexpr uint32_t kViewSlot = 32, kRtvSlot = 112, kDsvSlot = 128;
 constexpr uint32_t kMagic = 0x444C5358;  // "XSLD"
@@ -49,6 +51,8 @@ struct Records {
     // passed over when the ring comes round: a title keeps the views of streamed resources for
     // minutes and copies them into tables all the while, by copying the tag.
     std::vector<uint32_t> refs;
+    std::vector<uint8_t> kind;   // what the view is (desc_set_kind), for the table check
+    std::vector<uint64_t> src;   // constant buffer views: the title's address of the range (desc_set_kind)
     uint64_t pinned = 0, passed = 0;
     bool init(PcObj dev, D3D12_DESCRIPTOR_HEAP_TYPE type, uint32_t cap) {
         D3D12_DESCRIPTOR_HEAP_DESC d{type, cap, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
@@ -57,7 +61,7 @@ struct Records {
         inc = pc::descriptor_increment(dev, type);
         capacity = cap;
         gen.assign(cap, 0);
-        if (type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) refs.assign(cap, 0);
+        if (type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) { refs.assign(cap, 0); kind.assign(cap, 0); src.assign(cap, 0); }
         return true;
     }
     // A fresh record; its tag stays valid while a slot names it, and else until the ring wraps past it.
@@ -105,6 +109,10 @@ std::vector<uint32_t> g_pcPageOwner;             // PC page -> title page + 1
 std::vector<std::atomic<uint64_t>> g_pgUsed;     // title page -> the present count at its last write or bind
 std::vector<uint8_t> g_pgTable;                  // title page: tables were bound in it (it may lose its PC page while unused)
 std::vector<uint8_t> g_pgWritten;                // title page: the mirror holds descriptors of it
+// Title slot -> the kind of view the layer put in its PC slot in place of what the title's bytes
+// say (table_slot_fix), until the title writes the slot again; 0: none.
+std::vector<uint16_t> g_slotFix;
+uint64_t g_fixNull = 0, g_fixBuffer = 0, g_fixNone = 0;
 uint64_t g_pgPlaced = 0, g_pgEvicted = 0, g_pgMoved = 0, g_pgNoRoom = 0, g_pgSplit = 0;
 constexpr uint64_t kPageIdle = 4;                // presents without a use before a table page may lose its PC page
 constexpr uint32_t kTableSpan = 1024;            // a table bound this close to its page's end may reach into the next page
@@ -167,6 +175,8 @@ bool ensure(Device* dev) {
     // at 0xF0000000 in global memory, refreshed from written pages at each submission.
     g_viewGpu = (uint8_t*)pc::gm_low_buffer(pcdev, 0, bytes, &g_viewGpuAddr);
     if (g_viewGpu) memcpy(g_viewGpu, g_view, bytes);
+    pc::set_table_slot_reader(table_slot_read, table_slot_fix);
+    g_slotFix.assign(g_viewCount, 0);
     XSL_INFO(CH, "descriptor memory in console layout (32/112/128-byte slots), synced to PC descriptors at submission");
     g_ready = true;
     return true;
@@ -401,6 +411,7 @@ constexpr size_t kTagOffset = 16;   // view slots: payload in bytes 0..15, tag i
 // Slot i's snapshot becomes the bytes at s; the records the old and the new tag name follow.
 void snapshot_set(uint32_t i, const void* s) {
     uint8_t* d = &g_snapshot[(size_t)i * kViewSlot];
+    if (i < g_slotFix.size()) g_slotFix[i] = 0;
     Tag o, n;
     memcpy(&o, d + kTagOffset, sizeof o);
     memcpy(&n, (const uint8_t*)s + kTagOffset, sizeof n);
@@ -435,7 +446,9 @@ void materialize(uint32_t i) {
         static const uint8_t zero[kViewSlot] = {};
         if (memcmp(s, zero, kViewSlot) != 0) {
             static volatile long n = 0;
-            if (InterlockedIncrement(&n) <= 3) XSL_WARN(CH, "descriptor slot %u holds console bytes the layer cannot decode yet", i);
+            const uint32_t* w = (const uint32_t*)s;
+            if (InterlockedIncrement(&n) <= 12)
+                XSL_WARN(CH, "descriptor slot %u holds console bytes the layer cannot decode yet: %08x %08x %08x %08x %08x %08x %08x %08x", i, w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7]);
         }
     }
     snapshot_set(i, s);
@@ -515,6 +528,151 @@ uint32_t desc_increment(D3D12_DESCRIPTOR_HEAP_TYPE t, uint32_t pcInc) {
 
 // ---- Descriptor creation: returns the PC handle to write, or 0 to use `h` itself ----------------
 // After the PC descriptor is written there, desc_commit() publishes it to the title's slot.
+thread_local uint8_t t_kind = 0;
+thread_local uint64_t t_src = 0;
+void desc_set_kind(uint32_t kind, uint64_t titleAddress) { t_kind = (uint8_t)kind; t_src = titleAddress; }
+// Diagnostics (XSL_TABLE_CHECK): what the title's slot holds that lies k entries after the table
+// bound at PC handle h. kind: 0 nothing, 2 console bytes written in line (a constant or buffer
+// view), 0xfe a tag whose record is gone, 0xff a view of unknown kind, else as desc_set_kind.
+static bool table_slot_read(uint64_t pcGpu, uint32_t k, uint32_t* kind, uint32_t* titleSlot, bool* split) {
+    std::lock_guard<std::mutex> g(g_mu);
+    if (!g_ready || pcGpu < g_pcGpu) return false;
+    const uint64_t p = (pcGpu - g_pcGpu) / g_pcInc;
+    if (p / kPageSlots >= g_pcPageOwner.size() || !g_pcPageOwner[p / kPageSlots]) return false;
+    const uint64_t t = (uint64_t)(g_pcPageOwner[p / kPageSlots] - 1) * kPageSlots + p % kPageSlots + k;
+    if (t >= g_viewCount) return false;
+    *titleSlot = (uint32_t)t;
+    const uint32_t have = g_pcPageOf[t / kPageSlots].load(std::memory_order_relaxed);
+    *split = !have || (uint64_t)(have - 1) * kPageSlots + t % kPageSlots != p + k;
+    const uint8_t* s = slot_ptr((uint32_t)t);
+    static const uint8_t zero[kViewSlot] = {};
+    Tag tg;
+    memcpy(&tg, s + 16, sizeof tg);
+    const Records& r = g_rec[D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV];
+    uint64_t rec;
+    if (g_slotFix[t] && !memcmp(s, &g_snapshot[(size_t)t * kViewSlot], kViewSlot)) *kind = 0x100 | (g_slotFix[t] & 0xff);   // (given that kind by the layer)
+    else if (!memcmp(s, zero, kViewSlot)) *kind = 0;
+    else if (tg.magic != 0x444C5358u) *kind = 2;
+    else if (!r.resolve(tg, &rec)) *kind = 0xfe;
+    else *kind = r.kind[tg.record] ? r.kind[tg.record] : 0xff;
+    return true;
+}
+// A shader reads the title's slot k entries after the table at PC handle h as `want` (bits 0..7 as
+// desc_set_kind, bits 8..9 for buffers: 0 typed, 1 raw, 2 structured) and the slot holds something
+// else. Two cases are put right in the PC heap, because a PC GPU takes a descriptor for what the
+// shader declares and what follows is not defined (devices were hung by it):
+// - the title left the slot empty (code that never reads it on its path): a view of no resource;
+// - the title made a constant buffer view where the shader reads a buffer (on the console both are
+//   an address and a size): a buffer view of the same bytes, in 4-byte elements, which takes any
+//   offset a console constant view has; the shader's own element size indexes it.
+// Returns 1 or 2 for these, 0 when nothing was to do, -1 when the slot holds a view the layer does
+// not replace.
+static int table_slot_fix(uint64_t pcGpu, uint32_t k, uint32_t want) {
+    std::lock_guard<std::mutex> g(g_mu);
+    if (!g_ready || pcGpu < g_pcGpu) return 0;
+    const uint64_t p = (pcGpu - g_pcGpu) / g_pcInc;
+    if (p / kPageSlots >= g_pcPageOwner.size() || !g_pcPageOwner[p / kPageSlots]) return 0;
+    const uint64_t t64 = (uint64_t)(g_pcPageOwner[p / kPageSlots] - 1) * kPageSlots + p % kPageSlots + k;
+    if (t64 >= g_viewCount) return 0;
+    const uint32_t t = (uint32_t)t64;
+    const uint8_t* s = slot_ptr(t);
+    if (memcmp(s, &g_snapshot[(size_t)t * kViewSlot], kViewSlot) != 0) materialize(t);   // (written since the last submission)
+    if (g_slotFix[t] == (uint16_t)(want | 0x8000)) return 0;
+    static const uint8_t zero[kViewSlot] = {};
+    Tag tg;
+    memcpy(&tg, s + 16, sizeof tg);
+    const Records& r = g_rec[D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV];
+    uint64_t rec;
+    const bool empty = !memcmp(s, zero, kViewSlot);
+    const uint32_t cur = empty ? 0 : tg.magic != 0x444C5358u ? 2 : !r.resolve(tg, &rec) ? 0xfe : r.kind[tg.record];
+    const uint32_t cls = want & 0x30, dim = want & 15, form = (want >> 8) & 3;
+    PcObj dev = dev_extra(g_dev)->pcDevice;
+    auto srv_buffer = [&](PcObj res, uint64_t first, uint32_t count) {
+        D3D12_SHADER_RESOURCE_VIEW_DESC sd{};
+        sd.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+        sd.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        sd.Format = form == 0 ? DXGI_FORMAT_R32_UINT : form == 1 ? DXGI_FORMAT_R32_TYPELESS : DXGI_FORMAT_UNKNOWN;
+        sd.Buffer.FirstElement = first;
+        sd.Buffer.NumElements = count ? count : 1;
+        sd.Buffer.StructureByteStride = form == 2 ? 4 : 0;
+        sd.Buffer.Flags = form == 1 ? D3D12_BUFFER_SRV_FLAG_RAW : D3D12_BUFFER_SRV_FLAG_NONE;
+        pc::create_srv(dev, res, &sd, mirror_cpu(t));
+    };
+    // (Console bytes that name no memory are a view of nothing too.)
+    bool nothing = empty;
+    if (cur == 2 && !nothing) {
+        const uint64_t* q = (const uint64_t*)s;
+        const uint32_t* w = (const uint32_t*)s;
+        nothing = ((q[1] & kXboxCbvFormatMask) == (0x0002403C00000000ull & kXboxCbvFormatMask) && !(q[0] & ((1ull << 48) - 1))) || (!q[0] && !w[2] && !q[3]);
+    }
+    if (nothing && cur == 2 && want == 1) return 0;   // (a constant buffer view of nothing is what the sync made of it)
+    if (nothing) {
+        if (want == 1) pc::create_cbv(dev, nullptr, mirror_cpu(t));
+        else if (cls == 0x10) {
+            if (dim == 1) srv_buffer(nullptr, 0, 1);
+            else if (dim == 11) return -1;
+            else {
+                D3D12_SHADER_RESOURCE_VIEW_DESC sd{};
+                sd.ViewDimension = (D3D12_SRV_DIMENSION)dim;
+                sd.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+                sd.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+                switch (dim) {
+                    case 2: sd.Texture1D.MipLevels = 1; break;
+                    case 3: sd.Texture1DArray.MipLevels = 1; sd.Texture1DArray.ArraySize = 1; break;
+                    case 4: sd.Texture2D.MipLevels = 1; break;
+                    case 5: sd.Texture2DArray.MipLevels = 1; sd.Texture2DArray.ArraySize = 1; break;
+                    case 7: sd.Texture2DMSArray.ArraySize = 1; break;
+                    case 8: sd.Texture3D.MipLevels = 1; break;
+                    case 9: sd.TextureCube.MipLevels = 1; break;
+                    case 10: sd.TextureCubeArray.MipLevels = 1; sd.TextureCubeArray.NumCubes = 1; break;
+                    default: break;
+                }
+                pc::create_srv(dev, nullptr, &sd, mirror_cpu(t));
+            }
+        } else if (cls == 0x20) {
+            D3D12_UNORDERED_ACCESS_VIEW_DESC ud{};
+            ud.ViewDimension = (D3D12_UAV_DIMENSION)dim;
+            ud.Format = dim == 1 ? (form == 0 ? DXGI_FORMAT_R32_UINT : form == 1 ? DXGI_FORMAT_R32_TYPELESS : DXGI_FORMAT_UNKNOWN) : DXGI_FORMAT_R8G8B8A8_UNORM;
+            if (dim == 1) { ud.Buffer.NumElements = 1; ud.Buffer.StructureByteStride = form == 2 ? 4 : 0; ud.Buffer.Flags = form == 1 ? D3D12_BUFFER_UAV_FLAG_RAW : D3D12_BUFFER_UAV_FLAG_NONE; }
+            else if (dim == 3) ud.Texture1DArray.ArraySize = 1;
+            else if (dim == 5) ud.Texture2DArray.ArraySize = 1;
+            else if (dim == 8) ud.Texture3D.WSize = 1;
+            pc::create_uav(dev, nullptr, nullptr, &ud, mirror_cpu(t));
+        } else return -1;
+        publish(t);
+        g_slotFix[t] = (uint16_t)(want | 0x8000);
+        g_fixNull++;
+        return 1;
+    }
+    if ((cur == 1 || cur == 2) && cls == 0x10 && dim == 1 && form != 0) {
+        const uint64_t* q = (const uint64_t*)s;
+        const uint32_t* w = (const uint32_t*)s;
+        uint64_t a = 0, bytes = 0;
+        if (cur == 1) { a = r.src[tg.record] ? r.src[tg.record] : w[0] | (uint64_t)(w[1] & 0xffff) << 32; bytes = w[2]; }
+        else if ((q[1] & kXboxCbvFormatMask) == (0x0002403C00000000ull & kXboxCbvFormatMask)) { a = gpu_va(g_dev, q[0] & ((1ull << 48) - 1)); bytes = (q[1] & 0xFFFFFFFFull) << 4; }
+        else if (q[0] && q[0] == q[2] && w[2] && !(w[2] & 31) && w[6] == (uint32_t)(q[0] >> 6)) { a = gpu_va(g_dev, q[0]); bytes = w[2]; }
+        else if (q[0] && q[3] == q[0] && w[5] && !(w[5] & 3)) { a = q[0]; bytes = w[5]; }
+        UnifiedRef u{};
+        bool ok = a && (unified_lookup(g_dev, a, &u) || unified_from_gpu(a, &u));
+        uint64_t off = u.offset;
+        if (a && !ok) { PcObj res = nullptr; uint64_t avail = 0; ok = pc::gm_resolve(a, &res, &off, &avail) && res; u.res = res; }
+        if (!ok || (off & 3)) {
+            if (g_fixNone++ < 6)
+                XSL_WARN(CH, "view slot %u holds a constant buffer view (%llu bytes at %llx, kind %u) where a shader reads a buffer: %s (slot bytes %08x %08x %08x %08x %08x %08x %08x %08x)", t,
+                         (unsigned long long)bytes, (unsigned long long)a, cur, ok ? "its offset is not a multiple of 4" : "no PC buffer is known at that address", w[0], w[1], w[2], w[3],
+                         w[4], w[5], w[6], w[7]);
+            return -1;
+        }
+        srv_buffer(u.res, off / 4, (uint32_t)(bytes / 4));
+        publish(t);
+        g_slotFix[t] = (uint16_t)(want | 0x8000);
+        if (g_fixBuffer++ < 4)
+            XSL_INFO(CH, "view slot %u holds a constant buffer view (%llu bytes at %llx) where a shader reads a buffer: a buffer view of the same bytes takes its place", t,
+                     (unsigned long long)bytes, (unsigned long long)a);
+        return 2;
+    }
+    return -1;
+}
 void desc_set_payload(const uint32_t words[4]) {
     memcpy(t_payload, words, sizeof t_payload);
     t_has_payload = true;
@@ -582,6 +740,7 @@ uint64_t desc_begin_write(uint64_t h, D3D12_DESCRIPTOR_HEAP_TYPE type, Tag* tagO
     if (type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV ? view_slot(h, &i) : (rtvDsv && h != 0)) {
         uint64_t rec;
         *tagOut = g_rec[type].allocate(type, &rec);
+        if (type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) { g_rec[type].kind[tagOut->record] = t_kind; g_rec[type].src[tagOut->record] = t_src; t_kind = 0; t_src = 0; }
         return rec;
     }
     return 0;
@@ -755,6 +914,8 @@ void desc_sync() {
                      "view records: %llu made, %llu in use by slots, %llu passed over",
                  held, g_pcPageOwner.size(), tables, (unsigned long long)g_pgPlaced, (unsigned long long)g_pgEvicted, (unsigned long long)g_pgMoved,
                  (unsigned long long)g_pgNoRoom, (unsigned long long)g_pgSplit, (unsigned long long)r.next, (unsigned long long)r.pinned, (unsigned long long)r.passed);
+        XSL_INFO(CH, "tables put right for what shaders declare: %llu empty slots given views of no resource, %llu constant buffer views given buffer views, %llu left (no PC memory known)",
+                 (unsigned long long)g_fixNull, (unsigned long long)g_fixBuffer, (unsigned long long)g_fixNone);
     }
     size_t bytes = (size_t)g_viewCount * kViewSlot;
     static std::vector<void*> pages;
