@@ -98,7 +98,8 @@ https://github.com/user-attachments/assets/7e01f974-c23e-4f67-9e05-39103014cb84
 5. **First run is slow.** Every shader is console machine code and is translated, compiled and then
    compiled again by the GPU driver. The results are cached (`%LOCALAPPDATA%\OpenScarlett\shadercache`,
    or `XSL_SHADER_CACHE=dir`), so later runs start much faster. Expect stalls the first time each
-   scene appears.
+   scene appears. `xsl-shaderwarm` ([docs/gpucode.md](docs/gpucode.md)) can fill the cache from a
+   folder of shader containers before the first run.
 
 Known issues: Lumen's hardware ray tracing runs on translated programs, each of which the GPU
 driver needs 15 s to minutes to prepare the first time. Until a scene's programs are ready its

@@ -274,6 +274,33 @@ void set_fallback_root_signature(const void* blob, size_t n) {
 }
 const std::vector<uint8_t>& fallback_root_signature() { return t_fallback_rs; }
 void note_vs_output(const void* in, size_t n, const std::string& hlsl);   // below (rectangle lists)
+// The cache key of a console shader: the translator's version, the container, the root signature
+// it is translated against when it carries none, and what else changes the output.
+static uint64_t shader_key(const gpucode::Container& c, const void* in, size_t n, bool* fallbackRs, bool* meshKind) {
+    uint64_t key = fnv(kVersion, strlen(kVersion), fnv(in, n));
+    *fallbackRs = !c.part("RTS0") && !t_fallback_rs.empty();
+    if (*fallbackRs) key = fnv(t_fallback_rs.data(), t_fallback_rs.size(), key);   // translated against the pipeline's root signature
+    if (const char* g = getenv("XSL_LOOP_GUARD"); g && *g) key = fnv(g, strlen(g), key);   // changes the output
+    *meshKind = c.kind == gpucode::ProgramKind::MS || c.kind == gpucode::ProgramKind::AS;
+    if (*meshKind) key = fnv("mg1", 3, key);   // mesh stages: small step limit (below)
+    if (getenv("XSL_NO_BARRIER_SYNC")) key = fnv("nb", 2, key);
+    return key;
+}
+// For the warm-up tool (tools/shaderwarm): -1 when the container holds no console program the
+// translator takes, 1 when its translation is in the cache, 0 when it is not. The root signature
+// set with set_fallback_root_signature on this thread counts, as it does for a pipeline.
+int shader_cache_state(const void* in, size_t n, char stage[8]) {
+    if (stage) stage[0] = 0;
+    gpucode::Container c;
+    if (mode() == 0 || !gpucode::read_container(in, n, c) || !c.has_native || (c.has_bitcode && mode() != 1)) return -1;
+    if (stage) snprintf(stage, 8, "%s", gpucode::kind_name(c.kind));
+    bool fallbackRs = false, meshKind = false;
+    const uint64_t key = shader_key(c, in, n, &fallbackRs, &meshKind);
+    if (cache_dir().empty()) return 0;
+    wchar_t name[32];
+    swprintf(name, 32, L"%016llx.dxil", (unsigned long long)key);
+    return GetFileAttributesW((cache_dir() + name).c_str()) != INVALID_FILE_ATTRIBUTES ? 1 : 0;
+}
 bool native_translate(const void* in, size_t n, void** out, size_t* outSize) {
     if (mode() == 0) return false;
     gpucode::Container c;
@@ -293,13 +320,8 @@ bool native_translate(const void* in, size_t n, void** out, size_t* outSize) {
         if (InterlockedIncrement(&w) <= 3) XSL_INFO(CH, "%s shader excluded by XSL_NATIVE_STAGES (DXIL program: %d)", gpucode::kind_name(c.kind), (int)c.has_bitcode);
         return false;
     }
-    uint64_t key = fnv(kVersion, strlen(kVersion), fnv(in, n));
-    const bool fallbackRs = !c.part("RTS0") && !t_fallback_rs.empty();
-    if (fallbackRs) key = fnv(t_fallback_rs.data(), t_fallback_rs.size(), key);   // translated against the pipeline's root signature
-    if (const char* g = getenv("XSL_LOOP_GUARD"); g && *g) key = fnv(g, strlen(g), key);   // changes the output
-    const bool meshKind = c.kind == gpucode::ProgramKind::MS || c.kind == gpucode::ProgramKind::AS;
-    if (meshKind) key = fnv("mg1", 3, key);   // mesh stages: small step limit (below)
-    if (getenv("XSL_NO_BARRIER_SYNC")) key = fnv("nb", 2, key);
+    bool fallbackRs = false, meshKind = false;
+    const uint64_t key = shader_key(c, in, n, &fallbackRs, &meshKind);
     if (const char* sk = getenv("XSL_SKIP_SHADERS"); sk && *sk) {   // debugging: these keys become placeholders
         char k[20];
         snprintf(k, sizeof k, "%016llx", (unsigned long long)key);
@@ -387,6 +409,23 @@ bool native_translate(const void* in, size_t n, void** out, size_t* outSize) {
                 while (e < why.size() && isxdigit((unsigned char)why[e])) e++;
                 why.erase(at, e - at);
             }
+            std::lock_guard<std::mutex> g(g_lock);
+            g_failed[key] = why;
+            t_untranslated = !c.has_bitcode;
+            if (t_why.empty()) t_why = why;
+            return false;
+        }
+        XSL_TRACE(CH, "shader %016llx (%s): %zu bytes of HLSL from %zu bytes of code in %lu ms; compiling", (unsigned long long)key, gpucode::kind_name(c.kind),
+                  r.hlsl.size(), n, tick1 - tick0);
+        // Some programs come out of the translator tens of megabytes large (their branches are
+        // written out path by path). The compiler then runs for many minutes on gigabytes of
+        // memory without an end in sight, holding a pipeline worker all that time: such a
+        // translation counts as failed. XSL_HLSL_MAX_MB sets the limit (default 16, 0: none).
+        static const size_t hlslMax = [] { char b[16]; return (size_t)(GetEnvironmentVariableA("XSL_HLSL_MAX_MB", b, sizeof b) ? atoi(b) : 16) << 20; }();
+        if (hlslMax && r.hlsl.size() > hlslMax && ovr.empty()) {
+            XSL_WARN(CH, "shader %016llx (%s): not compiled: the translation is %zu MB of HLSL (limit %zu MB, XSL_HLSL_MAX_MB)", (unsigned long long)key,
+                     gpucode::kind_name(c.kind), r.hlsl.size() >> 20, hlslMax >> 20);
+            const std::string why = std::string(gpucode::kind_name(c.kind)) + ": translation too large for the compiler";
             std::lock_guard<std::mutex> g(g_lock);
             g_failed[key] = why;
             t_untranslated = !c.has_bitcode;

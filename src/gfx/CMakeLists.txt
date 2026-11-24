@@ -20,3 +20,8 @@ set_target_properties(d3d12_xs PROPERTIES OUTPUT_NAME d3d12_xs PREFIX "")
 # Offline warm-up of the driver's pipeline cache for translated ray-tracing programs (tools/rtwarm).
 add_executable(xsl-rtwarm EXCLUDE_FROM_ALL ${CMAKE_SOURCE_DIR}/tools/rtwarm/main.cpp)
 target_link_libraries(xsl-rtwarm PRIVATE xsl_gfx_pc xsl_platform xsl_common d3d12 dxgi dxguid)
+
+# Offline fill of the shader cache from a folder of console shader containers (tools/shaderwarm).
+add_executable(xsl-shaderwarm EXCLUDE_FROM_ALL ${CMAKE_SOURCE_DIR}/tools/shaderwarm/main.cpp)
+target_include_directories(xsl-shaderwarm PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(xsl-shaderwarm PRIVATE xsl_gfx_pc xsl_platform xsl_common d3d12 dxgi dxguid)

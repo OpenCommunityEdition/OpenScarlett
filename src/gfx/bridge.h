@@ -271,6 +271,7 @@ HRESULT_T device_removed_reason(PcObj dev);
 bool sanitize_container(const void* in, size_t inSize, void** out, size_t* outSize);
 // Console machine code -> HLSL -> DXIL for shaders without (usable) DXIL; see native_shaders.cpp.
 bool native_translate(const void* in, size_t inSize, void** out, size_t* outSize);
+int shader_cache_state(const void* in, size_t n, char stage[8]);   // tools/shaderwarm: -1 not console code, 0 not cached, 1 cached
 void set_fallback_root_signature(const void* blob, size_t n);   // pipeline's root signature for containers without one (0: none)
 const std::vector<uint8_t>& fallback_root_signature();   // the one set above (diagnostics)
 // Whether a shader without DXIL failed translation on this thread since reset_untranslated().

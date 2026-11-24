@@ -1,0 +1,143 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
+"""xsl-warm <folder or file>... [--cache DIR] [--jobs N] [--check] [--report FILE] [--build DIR]
+
+Fills the shader cache from console shader containers on disk before a title runs (Windows).
+It puts xsl-shaderwarm.exe (build it with `ninja -C build xsl-shaderwarm`) in <build>/warm together
+with the shader compiler and the D3D12 runtime the layer uses, and runs it there: the tool finds
+those next to itself, as the layer does next to a title.
+
+The shader compiler does not use several processors well inside one process, so this starts one
+process per job, each on its own share of the files, and adds up what they report.
+
+    --cache DIR    the cache folder (default: XSL_SHADER_CACHE, else the layer's own default)
+    --jobs N       processes at a time (default: the logical processors less two)
+    --check        only count what the cache has and lacks
+    --report FILE  one line per shader that did not translate: file name, tab, reason
+    --build DIR    the build folder (default: build next to tools)
+"""
+import os
+import pathlib
+import re
+import shutil
+import subprocess
+import sys
+import time
+
+
+PROGRESS = re.compile(r"(\d+) / (\d+): (\d+) already cached, (\d+) compiled, (\d+) not translated, (\d+) not cached, (\d+) other")
+NAMES = ("done", "files", "already cached", "compiled", "not translated", "not cached", "other")
+
+
+def last_progress(path):
+    """The numbers of a process's latest progress line (zeros before its first one)."""
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            found = PROGRESS.findall(f.read())
+    except OSError:
+        found = []
+    return [int(v) for v in found[-1]] if found else [0] * len(NAMES)
+
+
+def main():
+    args = sys.argv[1:]
+    build = pathlib.Path(__file__).resolve().parent.parent / "build"
+    cache = report = None
+    jobs = max(1, (os.cpu_count() or 4) - 2)
+    check = False
+    paths = []
+    i = 0
+    while i < len(args):
+        if args[i] in ("--build", "--cache", "--report", "--jobs") and i + 1 < len(args):
+            if args[i] == "--build":
+                build = pathlib.Path(args[i + 1])
+            elif args[i] == "--cache":
+                cache = args[i + 1]
+            elif args[i] == "--report":
+                report = args[i + 1]
+            else:
+                jobs = max(1, int(args[i + 1]))
+            i += 2
+        elif args[i] == "--check":
+            check = True; i += 1
+        else:
+            paths.append(os.path.abspath(args[i])); i += 1
+    if not paths or os.name != "nt":
+        sys.exit(__doc__ if not paths else "xsl-warm runs on Windows, on the machine and GPU the title will run on")
+    exe = build / "src/gfx/xsl-shaderwarm.exe"
+    if not exe.exists():
+        sys.exit(f"{exe} not found: build it with `ninja -C build xsl-shaderwarm`")
+    stage = build / "warm"
+    (stage / "D3D12").mkdir(parents=True, exist_ok=True)
+    shutil.copy2(exe, stage / exe.name)
+    for name in ("dxcompiler.dll", "dxil.dll"):
+        src = build / "deps/dxc-pc/bin/x64" / name
+        if not src.exists():
+            sys.exit(f"{src} not found (tools/get-dxc.sh)")
+        shutil.copy2(src, stage / name)
+    agility = build / "deps/agility"
+    if (agility / "x64/D3D12Core.dll").exists():      # optional: without it the system runtime is used
+        for name in ("D3D12Core.dll", "d3d12SDKLayers.dll"):
+            shutil.copy2(agility / "x64" / name, stage / "D3D12" / name)
+        shutil.copy2(agility / "VERSION", stage / "D3D12" / "VERSION")
+    env = dict(os.environ)
+    if cache:
+        os.makedirs(cache, exist_ok=True)
+        env["XSL_SHADER_CACHE"] = cache
+    env.setdefault("XSL_LOG", "error")                # the tool prints its own progress
+
+    work = stage / "run"
+    shutil.rmtree(work, ignore_errors=True)
+    work.mkdir()
+    procs, logs = [], []
+    for k in range(jobs):
+        cmd = [str(stage / exe.name), *paths, "--jobs", "1", "--shard", f"{k}/{jobs}", "--report", str(work / f"report.{k}.tsv")]
+        if check:
+            cmd.append("--check")
+        logs.append(work / f"out.{k}.log")
+        out = open(logs[-1], "w")
+        procs.append(subprocess.Popen(cmd, env=env, cwd=stage, stdout=out, stderr=subprocess.STDOUT))
+        out.close()
+    start = time.time()
+    print(f"{jobs} processes{' (check only)' if check else ''}", flush=True)
+
+    def totals():
+        return [sum(col) for col in zip(*(last_progress(p) for p in logs))]
+
+    def line(t):
+        return f"{t[0]} / {t[1]}: " + ", ".join(f"{v} {n}" for v, n in zip(t[2:], NAMES[2:])) + f" ({time.time() - start:.0f} s)"
+
+    while any(p.poll() is None for p in procs):
+        time.sleep(5)
+        print(line(totals()), flush=True)
+    t = totals()
+    failed = [p.returncode for p in procs if p.returncode]
+    print(f"\ndone in {time.time() - start:.0f} s: {t[1]} files")
+    for v, n in zip(t[2:], NAMES[2:]):
+        print(f"  {v} {n}")
+    rows = []
+    for k in range(jobs):
+        try:
+            with open(work / f"report.{k}.tsv", encoding="utf-8", errors="replace") as f:
+                rows += [l.rstrip("\n") for l in f if "\t" in l]
+        except OSError:
+            pass
+    rows.sort()
+    reasons = {}
+    for row in rows:
+        why = row.split("\t", 1)[1]
+        reasons[why] = reasons.get(why, 0) + 1
+    if reasons:
+        print("\nwhy:" if check else "\nwhy shaders did not translate:")
+        for why, n in sorted(reasons.items(), key=lambda kv: -kv[1]):
+            print(f"  {n:6d}  {why}")
+    if report:
+        with open(report, "w", encoding="utf-8", newline="\n") as f:
+            f.write("".join(r + "\n" for r in rows))
+    if failed:
+        print(f"\n{len(failed)} of the {jobs} processes ended with an error; see {work}")
+    sys.exit(1 if failed else 0)
+
+
+if __name__ == "__main__":
+    main()

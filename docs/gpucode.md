@@ -202,3 +202,20 @@ each of these programs. `xsl-rtwarm <shard> <shards>` (`tools/rtwarm`, `ninja xs
 that outside the game for the `rt_*.dxil` files in the cache directory; one process per shard
 (e.g. 12) uses the whole machine. `RT_STATS=1 xsl-gpucode rtcache ...` writes the `XSL_RT_DEBUG`
 variants.
+
+### Filling the cache before a run
+
+`xsl-shaderwarm <folder>... [--jobs N] [--check] [--report FILE]` (`tools/shaderwarm`,
+`ninja xsl-shaderwarm`) translates and compiles every console shader container found in a folder
+into the cache, with the code and the cache key the layer uses when a pipeline is created. What is
+in the cache already is skipped, so a stopped run continues, and after a translator update the
+cache is refilled here instead of at first use in the title. `--check` only counts what the cache
+has and lacks; `--report` lists the shaders that did not translate with the reason, and the tool
+ends with those reasons counted, which shows what the translator still lacks for a set of shaders.
+
+A shader that describes its own root signature is translated against that one; a shader that needs
+its pipeline's root signature cannot be prepared this way. The translation follows the GPU
+(wave sizes, shader model), so run it on the machine the title will run on. The tool looks for the
+shader compiler and the D3D12 runtime next to itself; `tools/xsl-warm <folder> [--cache DIR]`
+(Windows) puts them there and runs it. Where the containers come from is up to you: files dumped
+from a run, or extracted from your own copy of a title with a tool that knows its archives.
