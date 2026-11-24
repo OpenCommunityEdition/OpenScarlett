@@ -3825,7 +3825,7 @@ static uint64_t env_u64(const char* n) { char b[16]; return GetEnvironmentVariab
 // Writer tracing: always with XSL_TRACE_WRITERS=1; with only XSL_RT_STATS / XSL_PLANE_OPS, during the
 // 30 presents before the requested one (tracing slows every draw). RTV handles are always recorded.
 static bool trace_rtvs() {
-    static bool on = env_on("XSL_TRACE_WRITERS") || env_u64("XSL_RT_STATS") || env_u64("XSL_PLANE_OPS") || getenv("XSL_DRAW_DUMP");
+    static bool on = env_on("XSL_TRACE_WRITERS") || env_u64("XSL_RT_STATS") || env_u64("XSL_PLANE_OPS") || getenv("XSL_DRAW_DUMP") || getenv("XSL_RT_DUMP");
     return on;
 }
 static bool trace_writers() {
@@ -4507,7 +4507,10 @@ uint64_t res_gpu_va(PcObj r) { return as<ID3D12Resource>(r)->GetGPUVirtualAddres
 HRESULT_T alloc_reset(PcObj a) { return logged(as<ID3D12CommandAllocator>(a)->Reset(), "CommandAllocator::Reset"); }
 
 #define L as<ID3D12GraphicsCommandList>(l)
+static void rt_dump_pass_end(PcObj l);
 HRESULT_T list_close(PcObj l) {
+    static const bool rtDump = getenv("XSL_RT_DUMP") != nullptr;
+    if (rtDump) rt_dump_pass_end(l);   // (the list's last pass)
     HRESULT hr = logged(L->Close(), "CommandList::Close");
     if (g_info && g_info->GetNumStoredMessages()) dump_debug_messages();  // errors recorded into a list that still closed
     return hr;
@@ -4584,10 +4587,75 @@ void list_barriers(PcObj l, uint32_t n, const void* b) {
     if (k) L->ResourceBarrier(k, tmp);
 }
 std::map<PcObj, uint64_t> g_wr_rtv0;   // writer tracing: RTV handle 0 per list
+// XSL_RT_DUMP=<present> (diagnostics): the colour targets of every pass of the frame before that
+// present, as they are when the pass ends (when a list binds other targets, or closes). Each is
+// copied inside the title's own list, where its state is known, and written at the present to
+// rt_<pass>_<slot>_<width>x<height>_f<format>.bmp beside the shader cache (float formats tone-
+// mapped, one-channel formats grey). Multisampled targets and levels other than the first are
+// not copied.
+struct RtDump { ID3D12Resource* copy; D3D12_RESOURCE_DESC desc; unsigned pass, slot; };
+static std::mutex g_rtd_mu;
+static std::vector<RtDump> g_rtd;
+static std::map<PcObj, std::vector<ID3D12Resource*>> g_rtd_bound;   // list -> colour targets bound now
+static unsigned g_rtd_pass = 0;
+static bool rt_dump_now() {
+    static const uint64_t at = env_u64("XSL_RT_DUMP");
+    return at && g_wr_present.load() + 1 == at;
+}
+static void rt_dump_pass_end(PcObj l) {
+    std::vector<ID3D12Resource*> bound;
+    {
+        std::lock_guard<std::mutex> g(g_rtd_mu);
+        auto it = g_rtd_bound.find(l);
+        if (it == g_rtd_bound.end()) return;
+        bound.swap(it->second);
+        g_rtd_bound.erase(it);
+    }
+    if (bound.empty() || !rt_dump_now() || !g_main_device) return;
+    unsigned pass;
+    { std::lock_guard<std::mutex> g(g_rtd_mu); pass = g_rtd_pass++; }
+    for (unsigned slot = 0; slot < bound.size(); slot++) {
+        ID3D12Resource* res = bound[slot];
+        if (!res) continue;
+        D3D12_RESOURCE_DESC d = res->GetDesc();
+        if (d.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || d.SampleDesc.Count != 1 || g_rtd.size() >= 400) continue;
+        D3D12_RESOURCE_DESC cd = d;
+        cd.MipLevels = 1;
+        cd.DepthOrArraySize = 1;
+        cd.Flags = D3D12_RESOURCE_FLAG_NONE;
+        cd.Alignment = 0;
+        D3D12_HEAP_PROPERTIES hp{D3D12_HEAP_TYPE_DEFAULT};
+        ID3D12Resource* copy = nullptr;
+        if (FAILED(g_main_device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &cd, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&copy)))) continue;
+        D3D12_RESOURCE_BARRIER b{};
+        b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        b.Transition = {res, 0, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE};
+        L->ResourceBarrier(1, &b);
+        D3D12_TEXTURE_COPY_LOCATION dst{copy, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, {}}, src{res, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, {}};
+        L->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+        std::swap(b.Transition.StateBefore, b.Transition.StateAfter);
+        L->ResourceBarrier(1, &b);
+        std::lock_guard<std::mutex> g(g_rtd_mu);
+        g_rtd.push_back({copy, cd, pass, slot});
+    }
+}
 void list_om_set_render_targets(PcObj l, uint32_t n, const uint64_t* rtvs, int single, const uint64_t* dsv) {
     D3D12_CPU_DESCRIPTOR_HANDLE r[8];
     uint32_t cnt = single ? (n ? 1 : 0) : n;
     for (uint32_t i = 0; i < cnt && i < 8; i++) r[i] = cpu(rtvs[i]);
+    if (env_u64("XSL_RT_DUMP")) {
+        rt_dump_pass_end(l);
+        if (rt_dump_now()) {
+            std::lock_guard<std::mutex> g(g_wr_mu);
+            std::vector<ID3D12Resource*> now;
+            for (uint32_t i = 0; i < cnt && i < 8; i++) {
+                auto it = g_rtv_res.find(rtvs[i]);
+                now.push_back(it == g_rtv_res.end() ? nullptr : as<ID3D12Resource>(it->second));
+            }
+            std::lock_guard<std::mutex> g2(g_rtd_mu);
+            g_rtd_bound[l] = now;
+        }
+    }
     if (trace_writers()) {
         std::lock_guard<std::mutex> g(g_wr_mu);
         auto it = cnt ? g_rtv_res.find(rtvs[0]) : g_rtv_res.end();
@@ -6068,6 +6136,50 @@ struct SwapState {
 std::mutex g_present_mu;
 uint64_t g_present_count = 0;
 
+// One texel of a render target as displayable BGRA (render target dumps): float colours tone-mapped
+// x / (1 + x) and gamma 2.2, one- and two-channel formats as grey or red/green, integers by their
+// low byte.
+static void texel_bgra(const uint8_t* t, DXGI_FORMAT f, size_t bytes, uint8_t out[4]) {
+    auto half = [](uint16_t h) -> float {
+        const uint32_t e = (h >> 10) & 31, m = h & 1023;
+        const float v = e == 0 ? std::ldexp((float)m, -24) : e == 31 ? (m ? 0.0f : 65504.0f) : std::ldexp((float)(m + 1024), (int)e - 25);
+        return (h & 0x8000) ? -v : v;
+    };
+    auto packedf = [](uint32_t bits, int mant) -> float {
+        const uint32_t e = bits >> mant, m = bits & ((1u << mant) - 1);
+        if (e == 31) return m ? 0.0f : 65504.0f;
+        return e ? std::ldexp(1.0f + m / float(1u << mant), (int)e - 15) : std::ldexp(m / float(1u << mant), -14);
+    };
+    auto tone = [](float x) -> uint8_t {
+        if (!(x > 0)) return 0;
+        const float v = std::pow(x / (1.0f + x), 1.0f / 2.2f);
+        return (uint8_t)(v >= 1.0f ? 255 : v * 255.0f + 0.5f);
+    };
+    auto unorm = [](float x) -> uint8_t { return (uint8_t)(x <= 0 ? 0 : x >= 1 ? 255 : x * 255.0f + 0.5f); };
+    uint8_t r = 0, g = 0, b = 0;
+    uint16_t h4[4] = {};
+    uint32_t w0 = 0;
+    float f4[4] = {};
+    if (bytes >= 4) memcpy(&w0, t, 4);
+    switch (f) {
+        case DXGI_FORMAT_R16G16B16A16_FLOAT: memcpy(h4, t, 8); r = tone(half(h4[0])); g = tone(half(h4[1])); b = tone(half(h4[2])); break;
+        case DXGI_FORMAT_R32G32B32A32_FLOAT: memcpy(f4, t, 16); r = tone(f4[0]); g = tone(f4[1]); b = tone(f4[2]); break;
+        case DXGI_FORMAT_R11G11B10_FLOAT: r = tone(packedf(w0 & 0x7ff, 6)); g = tone(packedf((w0 >> 11) & 0x7ff, 6)); b = tone(packedf(w0 >> 22, 5)); break;
+        case DXGI_FORMAT_R16G16B16A16_UNORM: memcpy(h4, t, 8); r = h4[0] >> 8; g = h4[1] >> 8; b = h4[2] >> 8; break;
+        case DXGI_FORMAT_R16G16_FLOAT: memcpy(h4, t, 4); r = unorm(half(h4[0]) * 0.5f + 0.5f); g = unorm(half(h4[1]) * 0.5f + 0.5f); break;
+        case DXGI_FORMAT_R16G16_UNORM: memcpy(h4, t, 4); r = h4[0] >> 8; g = h4[1] >> 8; break;
+        case DXGI_FORMAT_R8G8_UNORM: r = t[0]; g = t[1]; break;
+        case DXGI_FORMAT_R32G32_FLOAT: memcpy(f4, t, 8); r = unorm(f4[0] * 0.5f + 0.5f); g = unorm(f4[1] * 0.5f + 0.5f); break;
+        case DXGI_FORMAT_R16_FLOAT: memcpy(h4, t, 2); r = g = b = tone(half(h4[0])); break;
+        case DXGI_FORMAT_R32_FLOAT: case DXGI_FORMAT_D32_FLOAT: case DXGI_FORMAT_R32_TYPELESS: memcpy(f4, t, 4); r = g = b = unorm(f4[0]); break;
+        case DXGI_FORMAT_R16_UNORM: case DXGI_FORMAT_D16_UNORM: case DXGI_FORMAT_R16_TYPELESS: memcpy(h4, t, 2); r = g = b = h4[0] >> 8; break;
+        case DXGI_FORMAT_R8_UNORM: case DXGI_FORMAT_A8_UNORM: r = g = b = t[0]; break;
+        default:   // integers and anything else: the low bytes
+            r = t[0]; g = bytes > 1 ? t[1] : t[0]; b = bytes > 2 ? t[2] : t[0];
+            break;
+    }
+    out[0] = b; out[1] = g; out[2] = r; out[3] = 0xFF;
+}
 // XSL_CAPTURE=<path.bmp>[@frame]: write the presented plane of one frame (default 60) to a BMP.
 // Used to check rendering against reference images without a screen grab.
 void capture_plane(ID3D12Device* dev, ID3D12CommandQueue* q, ID3D12Resource* res, const char* path,
@@ -6166,6 +6278,11 @@ void capture_plane(ID3D12Device* dev, ID3D12CommandQueue* q, ID3D12Resource* res
     } else if (SUCCEEDED(mapHr)) {
         UINT w = fp.Footprint.Width, h = fp.Footprint.Height;
         bool rgba = rd.Format == DXGI_FORMAT_R8G8B8A8_UNORM || rd.Format == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB || rd.Format == DXGI_FORMAT_R8G8B8A8_TYPELESS;
+        // Other formats than the ones a plane has (render target dumps): converted texel by texel.
+        const size_t bpt = w ? fp.Footprint.RowPitch / w : 4;
+        const bool bgra = rd.Format == DXGI_FORMAT_B8G8R8A8_UNORM || rd.Format == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB || rd.Format == DXGI_FORMAT_B8G8R8A8_TYPELESS;
+        const bool general = !rgba && !bgra && rd.Format != DXGI_FORMAT_R10G10B10A2_UNORM && rd.Format != DXGI_FORMAT_R10G10B10A2_TYPELESS;
+        std::vector<uint8_t> line;
         FILE* out = fopen(path, "wb");
         if (out) {
             BITMAPFILEHEADER fh{0x4D42, (DWORD)(sizeof(BITMAPFILEHEADER) + sizeof(BITMAPINFOHEADER) + w * h * 4), 0, 0,
@@ -6185,6 +6302,12 @@ void capture_plane(ID3D12Device* dev, ID3D12CommandQueue* q, ID3D12Resource* res
                         row[x * 4 + 2] = uint8_t((v & 0x3ff) >> 2);
                     }
                 // Scan-out ignores alpha; titles may leave it 0, which viewers would show as transparent.
+                if (general) {
+                    line.resize((size_t)w * 4);
+                    for (UINT x = 0; x < w; x++) texel_bgra(row + (size_t)x * bpt, rd.Format, bpt, &line[(size_t)x * 4]);
+                    fwrite(line.data(), 4, w, out);
+                    continue;
+                }
                 for (UINT x = 0; x < w; x++) row[x * 4 + 3] = 0xFF;
                 fwrite(row, 4, w, out);
             }
@@ -6194,6 +6317,26 @@ void capture_plane(ID3D12Device* dev, ID3D12CommandQueue* q, ID3D12Resource* res
         rb->Unmap(0, nullptr);
     }
     f->Release(); l->Release(); a->Release(); rb->Release();
+}
+// The render targets copied during the dump frame (XSL_RT_DUMP), written beside the shader cache.
+static void rt_dump_write(ID3D12Device* dev, ID3D12CommandQueue* q) {
+    std::vector<RtDump> all;
+    {
+        std::lock_guard<std::mutex> g(g_rtd_mu);
+        if (g_rtd.empty() || rt_dump_now()) return;   // (not while the frame is still being recorded)
+        all.swap(g_rtd);
+    }
+    const std::wstring wdir = rt_cache_dir() + L"rtdump";
+    CreateDirectoryW(wdir.c_str(), nullptr);
+    char dir[MAX_PATH];
+    WideCharToMultiByte(CP_ACP, 0, wdir.c_str(), -1, dir, sizeof dir, nullptr, nullptr);
+    for (auto& d : all) {
+        char path[MAX_PATH + 64];
+        snprintf(path, sizeof path, "%s\\rt_%03u_%u_%llux%u_f%d.bmp", dir, d.pass, d.slot, (unsigned long long)d.desc.Width, d.desc.Height, (int)d.desc.Format);
+        capture_plane(dev, q, d.copy, path, D3D12_RESOURCE_STATE_COPY_DEST);
+        d.copy->Release();
+    }
+    XSL_INFO(CH, "render target dump: %zu targets of %u passes written to %s", all.size(), g_rtd_pass, dir);
 }
 std::map<HWND, SwapState> g_swap;
 
@@ -6745,6 +6888,7 @@ HRESULT_T present(PcObj devObj, PcObj queueObj, PcObj resObj, void* hwndPtr, uin
             capture_plane(dev, q, bb, path);
             DeleteFileA(trig);
         }
+        rt_dump_write(dev, q);
     }
     bb->Release();
     hr = s.sc->Present(sync, 0);

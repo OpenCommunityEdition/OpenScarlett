@@ -185,9 +185,18 @@ bool compile_here(const std::string& hlsl, const std::string& profile, std::vect
         if (GetEnvironmentVariableA("XSL_DXC_OPT", b, sizeof b) && b[0] == 'O') { w = L"-"; for (char* c = b; *c; c++) w += wchar_t(*c); }
         return w;
     }();
-    LPCWSTR args[] = {L"-T", prof.c_str(), L"-E", L"main", L"-HV", L"2021", optOverride ? optOverride : opt.c_str(), L"-Qstrip_debug", L"-Qstrip_reflect"};
+    // XSL_DXC_EXTRA=<arguments> (diagnostics): more compiler arguments, separated by spaces (e.g. "-opt-disable gvn").
+    static const std::vector<std::wstring> extra = [] {
+        std::vector<std::wstring> v;
+        char b[256];
+        if (!GetEnvironmentVariableA("XSL_DXC_EXTRA", b, sizeof b)) return v;
+        for (char* t = strtok(b, " "); t; t = strtok(nullptr, " ")) v.emplace_back(t, t + strlen(t));
+        return v;
+    }();
+    std::vector<LPCWSTR> args = {L"-T", prof.c_str(), L"-E", L"main", L"-HV", L"2021", optOverride ? optOverride : opt.c_str(), L"-Qstrip_debug", L"-Qstrip_reflect"};
+    for (auto& e : extra) args.push_back(e.c_str());
     DxcBuffer buf{hlsl.data(), hlsl.size(), DXC_CP_UTF8};
-    if (SUCCEEDED(hr)) hr = compiler->Compile(&buf, args, UINT32(sizeof args / sizeof *args), nullptr, __uuidof(IDxcResult), (void**)&result);
+    if (SUCCEEDED(hr)) hr = compiler->Compile(&buf, args.data(), UINT32(args.size()), nullptr, __uuidof(IDxcResult), (void**)&result);
     HRESULT status = E_FAIL;
     if (SUCCEEDED(hr)) result->GetStatus(&status);
     if (result) {
