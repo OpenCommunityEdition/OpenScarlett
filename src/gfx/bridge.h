@@ -157,6 +157,7 @@ void res_desc(PcObj r, void* outDesc);
 uint64_t res_gpu_va(PcObj r);
 void* map_shadow_base(PcObj r);   // the CPU copy a mapped video-memory texture got, if any
 std::string list_pso_name(PcObj l);   // the selected pipeline's name (diagnostics)
+std::string rtv_describe(uint64_t pcHandle);   // the resource behind a PC render-target handle (with XSL_DRAW_DUMP)
 bool map_shadow_written(PcObj r);   // the title wrote into that copy since the last call
 
 // Allocator and command list
@@ -286,6 +287,9 @@ const char* untranslated_reason();   // why the first such shader since reset_un
 // compiled (they count as untranslated) and compile_deferred() says that one was met.
 void defer_compiles(bool on);
 bool compile_deferred();
+bool deferring();                 // defer_compiles(true) is in effect on this thread
+void defer_now();                 // the pipeline being built is one to build elsewhere (compile_deferred() becomes true)
+size_t heavy_pipeline_bytes();    // translated shader bytes from which the driver's compile counts as long (XSL_PSO_HEAVY_KB, default 256)
 void free_container(void* p);
 // Rectangle lists (rect_gs.cpp): a geometry shader that turns each three-vertex rectangle of the
 // console vertex shader `vs` (its container, as the title gave it) into a four-vertex strip. The

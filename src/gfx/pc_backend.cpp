@@ -2930,7 +2930,7 @@ static std::wstring pso_cache_path(uint64_t h) {
     return rt_cache_dir() + name;
 }
 template <class Create>
-static HRESULT cached_pso(uint64_t key, const void*& cachedPtr, SIZE_T& cachedSize, ID3D12PipelineState** out, Create create) {
+static HRESULT cached_pso(uint64_t key, const void*& cachedPtr, SIZE_T& cachedSize, ID3D12PipelineState** out, Create create, bool heavy = false) {
     std::vector<uint8_t> blob;
     std::wstring path = pso_cache_on() ? pso_cache_path(key) : std::wstring();
     if (!path.empty() && read_all(path, blob)) {
@@ -2943,6 +2943,9 @@ static HRESULT cached_pso(uint64_t key, const void*& cachedPtr, SIZE_T& cachedSi
         if (pso_times()) XSL_INFO(CH, "pso %p: created from its stored blob (%zu bytes) in %llu ms: %08lx", SUCCEEDED(hr) ? (void*)*out : nullptr, blob.size(), (unsigned long long)(GetTickCount64() - t0), hr);
         if (SUCCEEDED(hr)) return hr;
     }
+    // Not stored yet: the driver compiles it. From a large translation that takes it long enough
+    // to keep a worker for minutes, so a thread that must stay quick hands such a pipeline on.
+    if (heavy && deferring()) { defer_now(); return E_FAIL; }
     const ULONGLONG t1 = GetTickCount64();
     HRESULT hr = create();
     if (pso_times()) XSL_INFO(CH, "pso %p: created by the driver in %llu ms: %08lx", SUCCEEDED(hr) ? (void*)*out : nullptr, (unsigned long long)(GetTickCount64() - t1), hr);
@@ -2981,8 +2984,11 @@ HRESULT_T create_graphics_pso(PcObj dev, const void* desc, PcObj* out) {
     }
     if (driver_refused(translated_keys())) return E_FAIL;
     DriverCall inDriver(translated_keys());
+    size_t translated = 0;
+    for (auto* bc : {&d.VS, &d.PS, &d.DS, &d.HS, &d.GS}) translated += bc->BytecodeLength;
     HRESULT hr = cached_pso(key, d.CachedPSO.pCachedBlob, d.CachedPSO.CachedBlobSizeInBytes, pso,
-                            [&] { return as<ID3D12Device>(dev)->CreateGraphicsPipelineState(&d, IID_PPV_ARGS(pso)); });
+                            [&] { return as<ID3D12Device>(dev)->CreateGraphicsPipelineState(&d, IID_PPV_ARGS(pso)); }, translated >= heavy_pipeline_bytes());
+    if (FAILED(hr) && compile_deferred()) return hr;
     if (FAILED(hr)) { dump_debug_messages(); XSL_ERR(CH, "CreateGraphicsPipelineState failed %08lx", hr); }
     if (SUCCEEDED(hr)) name_translated(*out);
     if (hr == DXGI_ERROR_DEVICE_REMOVED) report_device_removed(as<ID3D12Device>(dev));
@@ -3006,7 +3012,8 @@ HRESULT_T create_compute_pso(PcObj dev, const void* desc, PcObj* out) {
     if (driver_refused(translated_keys())) return E_FAIL;
     DriverCall inDriver(translated_keys());
     HRESULT hr = cached_pso(key, d.CachedPSO.pCachedBlob, d.CachedPSO.CachedBlobSizeInBytes, pso,
-                            [&] { return as<ID3D12Device>(dev)->CreateComputePipelineState(&d, IID_PPV_ARGS(pso)); });
+                            [&] { return as<ID3D12Device>(dev)->CreateComputePipelineState(&d, IID_PPV_ARGS(pso)); }, d.CS.BytecodeLength >= heavy_pipeline_bytes());
+    if (FAILED(hr) && compile_deferred()) return hr;
     if (const ULONGLONG dt = GetTickCount64() - t0c; dt >= 5000) {
         static volatile long shown = 0;
         if (InterlockedIncrement(&shown) <= 40) XSL_WARN(CH, "CreateComputePipelineState took %llu ms in the driver (shaders %s)", (unsigned long long)dt, translated_keys());
@@ -3773,7 +3780,7 @@ static uint64_t env_u64(const char* n) { char b[16]; return GetEnvironmentVariab
 // Writer tracing: always with XSL_TRACE_WRITERS=1; with only XSL_RT_STATS / XSL_PLANE_OPS, during the
 // 30 presents before the requested one (tracing slows every draw). RTV handles are always recorded.
 static bool trace_rtvs() {
-    static bool on = env_on("XSL_TRACE_WRITERS") || env_u64("XSL_RT_STATS") || env_u64("XSL_PLANE_OPS");
+    static bool on = env_on("XSL_TRACE_WRITERS") || env_u64("XSL_RT_STATS") || env_u64("XSL_PLANE_OPS") || getenv("XSL_DRAW_DUMP");
     return on;
 }
 static bool trace_writers() {
@@ -4933,6 +4940,16 @@ static void check_rs(PcObj l, const char* what) {
              p->second.first, bound);
 }
 // The name of the pipeline a list has selected ("xsl <shader keys>" for translated ones), for dumps.
+// What a PC render-target handle points at, for the draw dump (known with XSL_DRAW_DUMP set).
+std::string rtv_describe(uint64_t h) {
+    std::lock_guard<std::mutex> g(g_wr_mu);
+    auto it = g_rtv_res.find(h);
+    if (it == g_rtv_res.end() || !it->second) return "?";
+    const D3D12_RESOURCE_DESC d = as<ID3D12Resource>(it->second)->GetDesc();
+    char b[96];
+    snprintf(b, sizeof b, "%p %llux%u format %d", (void*)it->second, (unsigned long long)d.Width, d.Height, (int)d.Format);
+    return b;
+}
 std::string list_pso_name(PcObj l) {
     PcObj pso = nullptr;
     { std::lock_guard<std::mutex> g(g_cs_mu); auto it = g_cs_shadow.find(l); if (it != g_cs_shadow.end()) pso = it->second.pso; }

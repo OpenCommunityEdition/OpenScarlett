@@ -244,6 +244,14 @@ void reset_untranslated() { t_untranslated = false; t_keys.clear(); t_why.clear(
 thread_local bool t_defer_compile = false, t_compile_deferred = false;
 void defer_compiles(bool on) { t_defer_compile = on; t_compile_deferred = false; }
 bool compile_deferred() { return t_compile_deferred; }
+// The same for a pipeline the GPU driver has to compile from a large translation (its compiler
+// takes 10 to 30 s per megabyte of DXIL): the backend asks whether this thread defers, and says so.
+bool deferring() { return t_defer_compile; }
+void defer_now() { t_compile_deferred = true; }
+size_t heavy_pipeline_bytes() {
+    static const size_t n = [] { char b[16]; return GetEnvironmentVariableA("XSL_PSO_HEAVY_KB", b, sizeof b) ? (size_t)atoi(b) << 10 : (size_t)256 << 10; }();
+    return n;
+}
 const char* untranslated_reason() { return t_why.c_str(); }
 bool had_untranslated() { return t_untranslated; }
 static unsigned g_host_wave_min = 32, g_host_wave_max = 32;

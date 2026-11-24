@@ -660,6 +660,7 @@ struct ListExtra {
     PcObj sampler;                // sampler heap last bound by the title
     bool placeholderPso;          // current PSO has no PC pipeline (serialized native code): skip work
     int placeholderWhy;           // ... and its reason index (g_ph_why), -1 unknown
+    const void* psoObj;           // the title's pipeline object last selected (draw dump)
     uint64_t csTables[16];        // console GPU handles of the compute root tables (ray dispatches read them)
     const void* rtPipeline;       // state object of SetPipelineState1
     // Whole-resource states set by earlier transitions in this recording (see L_ResourceBarrier).
@@ -806,6 +807,8 @@ D3D12XBOX_RESOURCE_BARRIER_ACTIONS D3DAPI L_ResourceBarrier(ID3D12GraphicsComman
     }
     return (D3D12XBOX_RESOURCE_BARRIER_ACTIONS)0;
 }
+static bool draw_dump_now();
+static std::string dump_skipped(ID3D12GraphicsCommandList* l);
 void D3DAPI L_OMSetRenderTargets(ID3D12GraphicsCommandList* l, UINT n, const D3D12_CPU_DESCRIPTOR_HANDLE* rtv, BOOL single,
                                  const D3D12_CPU_DESCRIPTOR_HANDLE* dsv) {
     uint64_t r[8] = {};
@@ -821,6 +824,11 @@ void D3DAPI L_OMSetRenderTargets(ID3D12GraphicsCommandList* l, UINT n, const D3D
     }
     uint64_t d = dsv ? desc_pc_cpu(dsv->ptr, D3D12_DESCRIPTOR_HEAP_TYPE_DSV) : 0;
     XSL_TRACE("gfx.cmd", "list %p OMSetRenderTargets n=%u rtv0=%llx dsv=%llx", (void*)l, n, (unsigned long long)r[0], (unsigned long long)d);
+    if (draw_dump_now()) {
+        std::string t;
+        for (UINT i = 0; i < n && i < 8; i++) t += " [" + pc::rtv_describe(r[i]) + "]";
+        XSL_INFO(CH, "draw dump: list %p render targets (%u):%s%s", (void*)l, n, t.c_str(), dsv ? ", with depth" : "");
+    }
     pc::list_om_set_render_targets(LPC(l), n, r, single, dsv ? &d : nullptr);
 }
 void D3DAPI L_ClearRTV(ID3D12GraphicsCommandList* l, D3D12_CPU_DESCRIPTOR_HANDLE h, const FLOAT c[4], UINT n, const D3D12_RECT* r) {
@@ -856,6 +864,15 @@ static bool draw_dump_now() {
     const uint64_t p = pc::present_count() + 1;
     return at && p >= at && p <= last;
 }
+// " (skipped: why)" when the list's pipeline is a placeholder (draw dump).
+static std::string dump_skipped(ID3D12GraphicsCommandList* l) {
+    if (!lx(l)->placeholderPso) return "";
+    std::lock_guard<std::mutex> g(g_ph_mu);
+    const int why = lx(l)->placeholderWhy;
+    char obj[40];
+    snprintf(obj, sizeof obj, ", pipeline object %p", lx(l)->psoObj);   // (its creation is logged with XSL_DRAW_DUMP set)
+    return " (skipped: " + (why >= 0 && (size_t)why < g_ph_why.size() ? g_ph_why[why].first : std::string("pipeline not built yet or a placeholder")) + obj + ")";
+}
 // The first bytes at a title address, when the CPU can read them (draw dump).
 static std::string dump_bytes(uint64_t a, size_t n = 48) {
     uint32_t w[16] = {};
@@ -885,6 +902,7 @@ void D3DAPI L_SetPipelineState(ID3D12GraphicsCommandList* l, ID3D12PipelineState
     if (p && !P(p)) pso_wait_ready(p);
     lx(l)->placeholderPso = p && !P(p);
     lx(l)->placeholderWhy = lx(l)->placeholderPso ? placeholder_reason(p) : -1;
+    lx(l)->psoObj = p;
     if (lx(l)->placeholderPso) return;
     XSL_TRACE("gfx.cmd", "list %p PSO %p", (void*)l, (void*)p);
     pc::list_set_pso(LPC(l), P(p));
@@ -941,8 +959,8 @@ void D3DAPI L_IASetIndexBuffer(ID3D12GraphicsCommandList* l, const D3D12_INDEX_B
 }
 void D3DAPI L_DrawInstanced(ID3D12GraphicsCommandList* l, UINT a, UINT b, UINT c, UINT d) {
     if (null_graphics()) return;
-    if (draw_dump_now()) XSL_INFO(CH, "draw dump: list %p Draw(%u vertices, %u instances, first %u), topology %d%s", (void*)l, a, b, c, lx(l)->topology, lx(l)->placeholderPso ? " (skipped)" : "");
-    if (draw_dump_now()) XSL_INFO(CH, "draw dump: list %p   pipeline %s", (void*)l, pc::list_pso_name(LPC(l)).c_str());
+    if (draw_dump_now()) XSL_INFO(CH, "draw dump: list %p Draw(%u vertices, %u instances, first %u), topology %d, pipeline %s%s", (void*)l, a, b, c, lx(l)->topology,
+                                  pc::list_pso_name(LPC(l)).c_str(), dump_skipped(l).c_str());
     if (lx(l)->placeholderPso) { placeholder_skip(lx(l)->placeholderWhy); return; }
     if (lx(l)->topology == D3D_PRIMITIVE_TOPOLOGY_QUADLIST) {
         D3D12_INDEX_BUFFER_VIEW q = quad_ib(hdr(l)->device);
@@ -957,6 +975,8 @@ void D3DAPI L_DrawInstanced(ID3D12GraphicsCommandList* l, UINT a, UINT b, UINT c
 }
 void D3DAPI L_DrawIndexedInstanced(ID3D12GraphicsCommandList* l, UINT a, UINT b, UINT c, INT d, UINT e) {
     if (null_graphics()) return;
+    if (draw_dump_now()) XSL_INFO(CH, "draw dump: list %p DrawIndexed(%u indices, %u instances, first %u, base %d), topology %d, pipeline %s%s", (void*)l, a, b, c, d, lx(l)->topology,
+                                  pc::list_pso_name(LPC(l)).c_str(), dump_skipped(l).c_str());
     if (lx(l)->placeholderPso) { placeholder_skip(lx(l)->placeholderWhy); return; }
     XSL_TRACE("gfx.cmd", "list %p DrawIndexed %u x%u", (void*)l, a, b);
     pc::list_draw_indexed(LPC(l), a, b, c, d, e);
@@ -980,6 +1000,7 @@ void D3DAPI L_Dispatch(ID3D12GraphicsCommandList* l, UINT x, UINT y, UINT z) {
         static volatile long n = 0;
         if (InterlockedIncrement(&n) <= 20) XSL_INFO(CH, "large Dispatch(%u, %u, %u) on list %p", x, y, z, (void*)l);
     }
+    if (draw_dump_now()) XSL_INFO(CH, "draw dump: list %p Dispatch(%u, %u, %u), pipeline %s%s", (void*)l, x, y, z, pc::list_pso_name(LPC(l)).c_str(), dump_skipped(l).c_str());
     if (lx(l)->placeholderPso) { placeholder_skip(lx(l)->placeholderWhy); return; }
     if (!null_graphics()) pc::list_dispatch(LPC(l), x, y, z);
 }
@@ -1225,6 +1246,7 @@ void D3DAPI L_FlushPipelineX(ID3D12GraphicsCommandList* l, D3D12XBOX_FLUSH, D3D1
 }
 void D3DAPI L_ExecuteIndirect(ID3D12GraphicsCommandList* l, ID3D12CommandSignature* sig, UINT max, ID3D12Resource* args, UINT64 ao,
                               ID3D12Resource* cnt, UINT64 co) {
+    if (draw_dump_now()) XSL_INFO(CH, "draw dump: list %p ExecuteIndirect(up to %u), pipeline %s%s", (void*)l, max, pc::list_pso_name(LPC(l)).c_str(), dump_skipped(l).c_str());
     if (lx(l)->placeholderPso) placeholder_skip(lx(l)->placeholderWhy);
     if (null_graphics() || lx(l)->placeholderPso) return;   // placeholder PSO: its work is skipped
     if (sig && args && pc::is_rays_signature(P(sig)) && rt_bind_trace(l)) rt_peek_tables(l, "ExecuteIndirect (rays)");
