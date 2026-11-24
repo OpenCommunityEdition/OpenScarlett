@@ -13,6 +13,7 @@
 #include <map>
 #include <unordered_map>
 #include <set>
+#include <psapi.h>
 #include <thread>
 #include <windows.h>
 #include <tlhelp32.h>
@@ -824,6 +825,33 @@ void rt_warm_start();
 // D3D12 Agility SDK runtime: when xsl-run placed one in D3D12\ next to the layer
 // (tools/get-agility.sh), select it before the first device. Titles compile shader model 6.6+ DXIL
 // at run time, which the Windows 10 system runtime rejects. XSL_AGILITY=0 keeps the system runtime.
+// A title can need more memory than the system has left to commit (its textures exist twice: in
+// its own memory and on the GPU). At the commit limit every allocation of every process fails:
+// other programs die, remote sessions cannot start a command. So the process ends itself, with a
+// line in the log, when less than XSL_MIN_COMMIT_MB (default 2048; 0: never) can still be committed.
+static void commit_guard_start() {
+    static std::once_flag once;
+    std::call_once(once, [] {
+        char b[16];
+        const uint64_t floorMb = GetEnvironmentVariableA("XSL_MIN_COMMIT_MB", b, sizeof b) ? (uint64_t)_strtoui64(b, nullptr, 10) : 2048;
+        if (!floorMb) return;
+        std::thread([floorMb] {
+            for (;;) {
+                Sleep(250);
+                MEMORYSTATUSEX ms{};
+                ms.dwLength = sizeof ms;
+                if (!GlobalMemoryStatusEx(&ms) || (ms.ullAvailPageFile >> 20) >= floorMb) continue;
+                PROCESS_MEMORY_COUNTERS_EX pm{};
+                pm.cb = sizeof pm;
+                GetProcessMemoryInfo(GetCurrentProcess(), (PROCESS_MEMORY_COUNTERS*)&pm, sizeof pm);
+                XSL_ERR(CH, "the system can commit only %llu MB more (limit %llu MB; this process holds %llu MB): ending the process before allocations fail everywhere (XSL_MIN_COMMIT_MB)",
+                        (unsigned long long)(ms.ullAvailPageFile >> 20), (unsigned long long)(ms.ullTotalPageFile >> 20), (unsigned long long)(pm.PrivateUsage >> 20));
+                Sleep(100);   // (let the log line out)
+                TerminateProcess(GetCurrentProcess(), 0xC000012D);   // STATUS_COMMITMENT_LIMIT
+            }
+        }).detach();
+    });
+}
 static void select_agility_runtime() {
     static bool done = false;
     if (done) return;
@@ -856,6 +884,7 @@ static void select_agility_runtime() {
 }
 HRESULT_T create_device(PcObj* out) {
     select_agility_runtime();
+    commit_guard_start();
     { static bool once = false; if (!once) { once = true; profile_start(); } }
     if (env_on("XSL_D3D12_DRED") || env_on("XSL_D3D12_DEBUG")) {
         static bool once = false;
@@ -1061,12 +1090,15 @@ HRESULT_T create_queue(PcObj dev, const void* desc, PcObj* out) {
     d.Priority = 0;
     return logged(as<ID3D12Device>(dev)->CreateCommandQueue(&d, IID_PPV_ARGS(reinterpret_cast<ID3D12CommandQueue**>(out))), "CreateCommandQueue");
 }
+static std::atomic<long> g_n_allocators{0}, g_n_lists{0}, g_n_oneoff{0};   // XSL_MEM_STATS: what has been created so far
 HRESULT_T create_allocator(PcObj dev, int type, PcObj* out) {
+    if (const long n = ++g_n_allocators; getenv("XSL_MEM_STATS") && (n <= 4 || n % 50 == 0)) XSL_INFO(CH, "mem: %ld command allocators created by the title so far (%ld lists, %ld one-off uploads)", n, g_n_lists.load(), g_n_oneoff.load());
     return logged(as<ID3D12Device>(dev)->CreateCommandAllocator((D3D12_COMMAND_LIST_TYPE)pc_list_type(type), IID_PPV_ARGS(reinterpret_cast<ID3D12CommandAllocator**>(out))), "CreateCommandAllocator");
 }
 void name_recording(PcObj l);
 void list_set_pso(PcObj l, PcObj pso);
 HRESULT_T create_list(PcObj dev, int type, PcObj alloc, PcObj pso, PcObj* out) {
+    ++g_n_lists;
     HRESULT hr = logged(as<ID3D12Device>(dev)->CreateCommandList(0, (D3D12_COMMAND_LIST_TYPE)pc_list_type(type), as<ID3D12CommandAllocator>(alloc),
                                                            as<ID3D12PipelineState>(pso), IID_PPV_ARGS(reinterpret_cast<ID3D12GraphicsCommandList**>(out))), "CreateCommandList");
     if (SUCCEEDED(hr)) {   // a new list is recording: name it like a Reset
@@ -3523,10 +3555,22 @@ bool cached_upload(D3D12_HEAP_PROPERTIES* hp) {
 static void note_texture(PcObj r);
 static void note_buffer(PcObj r);
 static void note_buffer_fwd(PcObj r) { note_buffer(r); }
+// XSL_MEM_STATS=1 (diagnostics): every buffer or heap of 4 MB or more the title has the layer make,
+// with the heap type it asked for (what a process's memory is made of when it grows past the
+// title's own).
+static bool mem_stats() { static const bool on = getenv("XSL_MEM_STATS") != nullptr; return on; }
+static void mem_note(const char* what, uint64_t bytes, int type, int dim) {
+    if (!mem_stats() || bytes < (4u << 20)) return;
+    static std::atomic<uint64_t> total{0};
+    static volatile long n = 0;
+    const uint64_t t = total += bytes;
+    if (InterlockedIncrement(&n) <= 1500) XSL_INFO(CH, "mem: %s of %llu KB, heap type %d, dimension %d (%.2f GB of these so far)", what, (unsigned long long)(bytes >> 10), type, dim, t / 1073741824.0);
+}
 HRESULT_T create_committed_resource(PcObj dev, const void* heapProps, uint32_t heapFlags, const void* desc,
                                     uint32_t state, const void* clear, PcObj* out) {
     D3D12_RESOURCE_DESC d = clean_desc(desc);
     D3D12_HEAP_PROPERTIES hp = *static_cast<const D3D12_HEAP_PROPERTIES*>(heapProps);
+    if (d.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) mem_note("committed buffer", d.Width, (int)hp.Type, (int)d.Dimension);
     hp.CreationNodeMask = hp.VisibleNodeMask = 0;
     if (hp.Type == D3D12_HEAP_TYPE_DEFAULT && d.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
         switch (mappable_default(as<ID3D12Device>(dev))) {
@@ -3674,6 +3718,7 @@ void queue_map_tiles(PcObj q, PcObj res, uint32_t n, const TileCoord* tiles, PcO
 }
 HRESULT_T create_heap(PcObj dev, const void* desc, PcObj* out) {
     D3D12_HEAP_DESC d = *static_cast<const D3D12_HEAP_DESC*>(desc);
+    mem_note("heap", d.SizeInBytes, (int)d.Properties.Type, 0);
     d.Flags = clean_heap_flags(d.Flags);
     d.Properties.CreationNodeMask = d.Properties.VisibleNodeMask = 0;
     // Multisampled textures need 4 MB placement alignment on PC; console heaps that can hold
@@ -4250,6 +4295,7 @@ HRESULT_T upload_buffer(PcObj devObj, PcObj qObj, PcObj dstObj, uint64_t offset,
     bd.SampleDesc.Count = 1;
     bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
     UploadJob j{};
+    ++g_n_oneoff;
     HRESULT hr = dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&j.buf));
     if (FAILED(hr)) return hr;
     uint8_t* p = nullptr;
@@ -4304,6 +4350,7 @@ HRESULT_T upload_texture(PcObj devObj, PcObj qObj, PcObj dstObj, uint32_t state,
     bd.SampleDesc.Count = 1;
     bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
     UploadJob j{};
+    ++g_n_oneoff;
     HRESULT hr = dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&j.buf));
     if (FAILED(hr)) return hr;
     uint8_t* p = nullptr;

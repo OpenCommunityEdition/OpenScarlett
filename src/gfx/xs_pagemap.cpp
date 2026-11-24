@@ -27,7 +27,8 @@ constexpr uint64_t kPage = 64 * 1024;
 struct Pool {
     uint64_t va;
     uint32_t pages;
-    PcObj heap;
+    mutable PcObj heap;   // made when a tile is first mapped to the pool (pool_heap)
+    PcObj dev;
 };
 struct Placed {
     uint64_t va, extent;
@@ -39,6 +40,20 @@ struct PageMap {
     uint32_t index;
 };
 std::mutex g_mu;
+// The PC heap of a pool. It is as large as the pool (4 GB in one title, and write-combined memory
+// of the process on at least one driver) and only resources placed on reserved address space use
+// it; a title whose placed textures are all filled from its own memory never does. So it is made
+// when the first tile is mapped to it.
+PcObj pool_heap(const Pool* pool) {
+    static std::mutex mu;
+    std::lock_guard<std::mutex> g(mu);
+    if (!pool->heap) {
+        if (FAILED(pc::create_page_pool_heap(pool->dev, (uint64_t)pool->pages * kPage, &pool->heap))) pool->heap = nullptr;
+        else XSL_INFO(CH, "page pool %llx: its PC heap (%llu MB) is made now, for the first resource on reserved address space that maps its pages", (unsigned long long)pool->va,
+                      (unsigned long long)((uint64_t)pool->pages * kPage >> 20));
+    }
+    return pool->heap;
+}
 std::map<uint64_t, Pool*> g_pools;       // pool VA -> pool
 std::vector<PcObj> g_retired_heaps;      // unregistered pools stay alive while tiles may map them
 std::map<uint64_t, Placed*> g_placed;    // placed VA -> resource
@@ -108,7 +123,7 @@ void apply_page(std::map<Placed*, Pending>& out, uint64_t pageVa, const PageMap&
 void flush(PcObj queue, std::map<Placed*, Pending>& pending) {
     for (auto& [p, pend] : pending) {
         if (!pend.mapped.empty())
-            pc::queue_map_tiles(queue, p->res, (uint32_t)pend.mapped.size(), pend.mapped.data(), pend.pool->heap, pend.heapPages.data());
+            if (PcObj heap = pool_heap(pend.pool)) pc::queue_map_tiles(queue, p->res, (uint32_t)pend.mapped.size(), pend.mapped.data(), heap, pend.heapPages.data());
         if (!pend.unmapped.empty()) pc::queue_map_tiles(queue, p->res, (uint32_t)pend.unmapped.size(), pend.unmapped.data(), nullptr, nullptr);
     }
 }
@@ -162,9 +177,7 @@ const Pool* find_pool(uint64_t va, UINT pageCount) {
 
 HRESULT D3DAPI D_RegisterPagePoolX(ID3D12Device* d, D3D12_GPU_VIRTUAL_ADDRESS va, UINT pageCount, HANDLE* out) {
     if (!out || !pageCount) return E_INVALIDARG;
-    auto* pool = new Pool{va, pageCount, nullptr};
-    HRESULT hr = pc::create_page_pool_heap(dev_extra(d)->pcDevice, (uint64_t)pageCount * kPage, &pool->heap);
-    if (FAILED(hr)) { delete pool; return hr; }
+    auto* pool = new Pool{va, pageCount, nullptr, dev_extra(d)->pcDevice};
     std::lock_guard<std::mutex> g(g_mu);
     g_pools[va] = pool;
     static volatile long n = 0;
@@ -175,7 +188,7 @@ HRESULT D3DAPI D_RegisterPagePoolX(ID3D12Device* d, D3D12_GPU_VIRTUAL_ADDRESS va
         void* addrs[4];
         DWORD gran = 0;
         UINT ww = GetWriteWatch(0, (void*)va, 0x10000, addrs, &cnt, &gran);
-        XSL_INFO(CH, "page pool %llx: %u pages backed by a PC heap (title memory: state %lx type %lx protect %lx, allocation %p, region %zu bytes, write watch %s)",
+        XSL_INFO(CH, "page pool %llx: %u pages (title memory: state %lx type %lx protect %lx, allocation %p, region %zu bytes, write watch %s)",
                  (unsigned long long)va, pageCount, mbi.State, mbi.Type, mbi.Protect, mbi.AllocationBase, (size_t)mbi.RegionSize, ww == 0 ? "available" : "not available");
     }
     *out = (HANDLE)pool;
@@ -185,7 +198,7 @@ HRESULT D3DAPI D_UnregisterPagePoolX(ID3D12Device*, HANDLE h) {
     std::lock_guard<std::mutex> g(g_mu);
     for (auto it = g_pools.begin(); it != g_pools.end(); ++it) {
         if ((HANDLE)it->second != h) continue;
-        g_retired_heaps.push_back(it->second->heap);
+        if (it->second->heap) g_retired_heaps.push_back(it->second->heap);
         for (auto p = g_pages.begin(); p != g_pages.end();) p = p->second.pool == it->second ? g_pages.erase(p) : std::next(p);
         delete it->second;
         g_pools.erase(it);
@@ -315,7 +328,7 @@ HRESULT D3DAPI D_CreatePlacedResourceX(ID3D12Device* d, D3D12_GPU_VIRTUAL_ADDRES
     }
     PcObj queue = de->pcQueue;
     for (auto& [pool, bp] : byPool)
-        if (queue) pc::queue_map_tiles(queue, p->res, (uint32_t)bp.mapped.size(), bp.mapped.data(), pool->heap, bp.heapPages.data());
+        if (PcObj heap = queue ? pool_heap(pool) : nullptr) pc::queue_map_tiles(queue, p->res, (uint32_t)bp.mapped.size(), bp.mapped.data(), heap, bp.heapPages.data());
     return S_OK;
 }
 
