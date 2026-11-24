@@ -168,8 +168,24 @@ static int translate_cmd(const char* path, const char* rspath, const char* codep
     if (!load_cso(path, c)) return 1;
     if (codepath && !splice_code(c, read_file(codepath))) return fprintf(stderr, "%s: cannot use code %s\n", path, codepath), 1;
     std::vector<uint8_t> rsb;
-    if (rspath) rsb = read_file(rspath);
-    else if (auto* p = c.part("RTS0")) rsb = *p;
+    if (rspath) {
+        rsb = read_file(rspath);
+        // A serialized root signature is the RTS0 data itself or a DXBC container holding it.
+        if (rsb.size() >= 32 && !memcmp(rsb.data(), "DXBC", 4)) {
+            uint32_t count;
+            memcpy(&count, rsb.data() + 28, 4);
+            for (uint32_t i = 0; i < count && 32 + 4ull * (i + 1) <= rsb.size(); i++) {
+                uint32_t off, sz;
+                memcpy(&off, rsb.data() + 32 + 4 * i, 4);
+                if (off + 8ull > rsb.size()) break;
+                memcpy(&sz, rsb.data() + off + 4, 4);
+                if (!memcmp(rsb.data() + off, "RTS0", 4) && off + 8ull + sz <= rsb.size()) {
+                    rsb = std::vector<uint8_t>(rsb.begin() + off + 8, rsb.begin() + off + 8 + sz);
+                    break;
+                }
+            }
+        }
+    } else if (auto* p = c.part("RTS0")) rsb = *p;
     RootSig rs;
     std::string err;
     if (!parse_root_signature(rsb.data(), rsb.size(), rs, &err)) return fprintf(stderr, "%s: root signature: %s\n", path, err.c_str()), 1;
@@ -263,6 +279,27 @@ static int meta_cmd(const char* path) {
            m.user_sgprs(), m.tgid_en(0), m.tgid_en(1), m.tgid_en(2), m.tid_comps(), m.lds_bytes(), m.numthreads[0], m.numthreads[1], m.numthreads[2]);
     for (auto& a : m.args) printf("  arg kind %u size %u reg %u param %u loc %u\n", a.kind, a.size, a.reg, a.param, a.loc);
     for (auto& r : m.resources) printf("  res kind 0x%x offset %u reg %u elem %u param %u loc %u dwords %u\n", r.kind, r.offset, r.reg, r.elem, r.param, r.loc, r.dwords);
+    // The signatures and the stage's input/output records as stored (bytes).
+    for (const char* cc : {"ISG1", "OSG1", "PSG1"})
+        if (const auto* part = c.part(cc))
+            for (auto& e : parse_signature(*part))
+                printf("  %s %s%u: register %u mask %x type %u system value %u\n", cc, e.name.c_str(), e.index, e.reg, e.mask, e.comptype, e.sysval);
+    const uint8_t* b = c.precompiled.data();
+    const size_t n = c.precompiled.size();
+    auto recs = [&](const char* what, size_t at, size_t size, size_t countAt) {
+        if (countAt + 4 > n) return;
+        uint32_t cnt;
+        memcpy(&cnt, b + countAt, 4);
+        for (uint32_t k = 0; k < cnt && k < 32 && at + size * (k + 1) <= n; k++) {
+            printf("  %s %u:", what, k);
+            for (size_t j = 0; j < size; j++) printf(" %02x", b[at + size * k + j]);
+            printf("\n");
+        }
+    };
+    const size_t E = 0x114;   // the stage data: after the program record
+    if (c.kind == ProgramKind::PS) recs("pixel input", E + 0x24, 8, E + 0x124);
+    if (c.kind == ProgramKind::VS) { recs("vertex input", E + 0x24, 5, E + 0xc4); recs("vertex output", E + 0xc8, 6, E + 0x188); }
+    if (c.kind == ProgramKind::MS) recs("mesh output", E + 0xc8, 6, E + 0x188);
     return 0;
 }
 
@@ -291,7 +328,14 @@ int main(int argc, char** argv) {
         return dis(d, 0, d.size() & ~size_t(3), "", false);
     }
     if (argc >= 3 && !strcmp(argv[1], "dis-elf")) return dis_elf(read_file(argv[2]));
+    if (argc >= 3 && !strcmp(argv[1], "dis-cso")) {   // the instructions of a container's precompiled code
+        Container c;
+        if (!load_cso(argv[2], c)) return 1;
+        const std::vector<uint32_t> code = c.code();
+        std::vector<uint8_t> d((const uint8_t*)code.data(), (const uint8_t*)code.data() + code.size() * 4);
+        return dis(d, 0, d.size(), "", false);
+    }
     fprintf(stderr, "usage: xsl-gpucode cso|meta <file.cso> | translate <file.cso> [rootsig.bin] [--code <bin>] [--wave64-dual=0|1] [--global-memory]\n"
-                    "       | dis <code.bin> | dis-elf <file.elf> | cso2elf <out.elf> <file.cso>...\n");
+                    "       | dis <code.bin> | dis-cso <file.cso> | dis-elf <file.elf> | cso2elf <out.elf> <file.cso>...\n");
     return 2;
 }

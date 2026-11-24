@@ -220,6 +220,9 @@ struct Translator {
                 v += l.n;
             }
             for (size_t k = 0; k < meta.ps_inputs.size(); k++) attr_reg[unsigned(k)] = meta.ps_inputs[k].reg;
+            // (The records name their attribute; they are in attribute order in every program seen.)
+            for (size_t k = 0; k < meta.ps_inputs.size(); k++)
+                if (meta.ps_inputs[k].attr < 64 && meta.ps_inputs[k].attr != k) attr_reg[meta.ps_inputs[k].attr] = meta.ps_inputs[k].reg;
         }
         code = opt.raw_code.empty() ? c.code() : opt.raw_code;
         ins = decode_all(code.data(), code.size());
@@ -260,6 +263,7 @@ struct Translator {
             if (ends(n, "_b64") && (in.dst == 126 || in.src0 == 126 || in.src1 == 126) && in.fmt != Fmt::VOP3) W = 64;
             if (has(n, "saveexec_b64") || has(n, "wrexec_b64")) W = 64;
         }
+        if (c.wave_hint) W = c.wave_hint;   // the container says (its code may use 64-bit forms on a pair in wave32 code)
         if (c.kind == ProgramKind::CS && W == 64 && opt.wave64_dual) {
             unsigned nt = meta.numthreads[0] * meta.numthreads[1] * meta.numthreads[2];
             if (nt % 64 == 0) dual = true;   // partial console waves: single-lane mapping (approximate)
@@ -334,7 +338,8 @@ struct Translator {
     bool uses_fmt_comp = false;            // fmt_comp(): typed buffer components from a run-time format
     std::set<size_t> dyn_mimg;             // image loads/stores on descriptors from descriptor memory
     std::set<size_t> dyn_samp;             // samplers read from descriptor memory (layer payload: sampler-heap index)
-    bool uses_heap_sampler = false;
+    bool uses_heap_sampler = false, uses_heap_sampler_cmp = false;
+    bool uses_dot4 = false;   // dot4_i8(): the 8-bit dot products
     bool uses_heap_cube = false;
     bool uses_park = false;   // ray-tracing program parking (TranslateOptions::raw_park)   // cube textures sampled through descriptor memory (space 919)
     bool uses_gm_atomic = false;
@@ -464,6 +469,14 @@ struct Translator {
                 r = AV::cst(x.a * y.a);
             } else if (n == "s_sub_u32" && x.k == AV::Const && y.k == AV::Const) {
                 r = AV::cst(x.a - y.a);
+            } else if (n == "s_bfm_b32" && x.k == AV::Const && y.k == AV::Const) {
+                // (a run of ones: how code writes the level range of a sampler it builds in place)
+                r = AV::cst(((1u << (x.a & 31)) - 1) << (y.a & 31));
+            } else if (n == "s_bfm_b64" && x.k == AV::Const && y.k == AV::Const) {
+                const uint64_t m = ((x.a & 63) ? (~0ull >> (64 - (x.a & 63))) : 0) << (y.a & 63);
+                setd(in.dst, AV::cst(uint32_t(m)));
+                setd(in.dst + 1, AV::cst(uint32_t(m >> 32)));
+                break;
             }
             setd(in.dst, r);
             if (wide_dst(n) || n == "s_bfe_u64" || n == "s_bfe_i64") setd(in.dst + 1, AV::top());
@@ -710,9 +723,14 @@ struct Translator {
             for (unsigned k = 0; k < cnt; k++) vote[r] += store ? producer_kind(i, in.vdata + k, 0) : consumer_kind(i, in.vdata + k);
         }
         // Typed buffers only moved through (constants, raw loads, zeros) stay integers: indirect
-        // arguments and counters are written that way. Images keep float without evidence.
+        // arguments and counters are written that way. Images keep float without evidence, and
+        // an image that is also filtered is not an integer one whatever its loads feed (the PC
+        // cannot sample those at all).
+        std::set<int> sampled;
+        for (auto& [i, r] : res_of)
+            if (r >= 0 && ins[i].name && starts(ins[i].name, "image_sample")) sampled.insert(r);
         for (auto& [r, v] : vote)
-            if (v > 0 || (v == 0 && res[r].kind == ResKind::TypedBuf)) res[r].is_uint = true;
+            if ((v > 0 || (v == 0 && res[r].kind == ResKind::TypedBuf)) && !sampled.count(r)) res[r].is_uint = true;
     }
 
     const ResRecord* record(uint32_t param, uint32_t where, uint32_t offset_dw, bool any_offset = false) const {
@@ -881,6 +899,22 @@ struct Translator {
                     only = &rr;
                     count++;
                 }
+            // XSL_SAMPLER_PAIRS=1 (diagnostics): the constant sampler words and the static samplers
+            // the shader's records name, to check the decoding of the words against the root signature.
+            static const bool pairs = getenv("XSL_SAMPLER_PAIRS") != nullptr;
+            if (pairs && count >= 1) {
+                std::string t = fmt("SAMP %08x %08x %08x %08x n=%d", st[s].a, st[s + 1].a, st[s + 2].k == AV::Const ? st[s + 2].a : 0xdeadbeefu,
+                                    st[s + 3].k == AV::Const ? st[s + 3].a : 0xdeadbeefu, count);
+                for (auto& rr : meta.resources) {
+                    if (rr.kind != 0x401) continue;
+                    for (auto& ss : rs.samplers)
+                        if (ss.reg() == rr.reg) {
+                            t += fmt(" | reg %u:", rr.reg);
+                            for (int k = 0; k < 10; k++) t += fmt(" %x", ss.words[k]);
+                        }
+                }
+                fprintf(stderr, "%s\n", t.c_str());
+            }
             if (count >= 1) {
                 r.kind = ResKind::StaticSampler;
                 r.reg = only->reg;
@@ -889,8 +923,56 @@ struct Translator {
                 for (auto& ss : rs.samplers)
                     if (ss.reg() == only->reg) r.space = ss.space();
                 if (count > 1) {
-                    fail(fmt("%s at 0x%x: several static samplers; matching by sampler state not implemented", in.name, in.offset));
-                    return -1;
+                    // Several static samplers: the one whose state the four sampler words in the code
+                    // hold. The words (checked against 8,000 shaders with one static sampler):
+                    // word 0 = address modes of x, y, z (3 bits each from bit 0: 0 wrap, 1 mirror,
+                    // 2 clamp, 3 mirror once, 6 border), log2 of the anisotropy (bits 9-11), comparison
+                    // function less one (bits 12-14); word 1 = lowest and highest level in 1/256
+                    // (12 bits each); word 2 = level bias (signed 14 bits, 1/256), magnification and
+                    // minification filters (bits 20-21, 22-23: 1 linear, 2-3 anisotropic), mip filter
+                    // (bits 26-27: 2 linear); word 3 bits 30-31 = border colour. A word 2 the code does
+                    // not give as a constant goes with point filtering in every shader seen.
+                    const uint32_t h0 = st[s].a, h1 = st[s + 1].a;
+                    const uint32_t h2 = st[s + 2].k == AV::Const ? st[s + 2].a : 0, h3 = st[s + 3].k == AV::Const ? st[s + 3].a : 0;
+                    auto addr = [](uint32_t hw) { return hw == 0 ? 1u : hw == 1 ? 2u : hw == 2 ? 3u : hw == 3 ? 5u : hw == 6 ? 4u : 0u; };
+                    const uint32_t mag = (h2 >> 20) & 3, mn = (h2 >> 22) & 3, mip = (h2 >> 26) & 3, func = (h0 >> 12) & 7;
+                    const bool aniso = mag >= 2 || mn >= 2;
+                    const float hmin = float(h1 & 0xfff) / 256.0f, hmax = float((h1 >> 12) & 0xfff) / 256.0f;
+                    const float hbias = float(int32_t(h2 << 18) >> 18) / 256.0f;
+                    auto near_ = [](float x, float y) { float d = x - y; return d < 0.006f && d > -0.006f; };
+                    auto lod = [](float v) { return v < 0 ? 0.0f : v > 4095.0f / 256.0f ? 4095.0f / 256.0f : v; };
+                    const RsStaticSampler* best = nullptr;
+                    bool differ = false;
+                    for (auto& ss : rs.samplers) {
+                        bool listed = false;
+                        for (auto& rr : meta.resources)
+                            if (rr.kind == 0x401 && rr.reg == ss.reg()) listed = true;
+                        if (!listed) continue;
+                        const uint32_t f = ss.words[0];
+                        float bias, lo, hi;
+                        memcpy(&bias, &ss.words[4], 4);
+                        memcpy(&lo, &ss.words[8], 4);
+                        memcpy(&hi, &ss.words[9], 4);
+                        bool ok = addr(h0 & 7) == ss.words[1] && addr((h0 >> 3) & 7) == ss.words[2] && addr((h0 >> 6) & 7) == ss.words[3];
+                        ok = ok && ((f & 0x40) != 0) == aniso;
+                        if (aniso) ok = ok && (1u << ((h0 >> 9) & 7)) == ss.words[5];
+                        else ok = ok && ((f >> 2) & 1) == (mag & 1) && ((f >> 4) & 1) == (mn & 1) && (f & 1) == (mip == 2 ? 1u : 0u);
+                        ok = ok && ((f & 0x80) ? func + 1 == ss.words[6] : func == 0);
+                        ok = ok && near_(hbias, bias) && near_(hmin, lod(lo)) && near_(hmax, lod(hi));
+                        // (The border colour only when the code gives word 3: with a white border it comes at run time.)
+                        if (st[s + 3].k == AV::Const && (ss.words[1] == 4 || ss.words[2] == 4 || ss.words[3] == 4)) ok = ok && (h3 >> 30) == ss.words[7];
+                        if (!ok) continue;
+                        if (best && memcmp(best->words, ss.words, 10 * sizeof(uint32_t))) differ = true;   // (equal ones are interchangeable)
+                        if (!best) best = &ss;
+                    }
+                    if (!best || differ) {
+                        fail(fmt("%s at 0x%x: several static samplers and %s matches the sampler words %08x %08x %08x %08x", in.name, in.offset,
+                                 best ? "more than one" : "none", h0, h1, h2, h3));
+                        return -1;
+                    }
+                    r.reg = best->reg();
+                    r.space = best->space();
+                    r.offset = best->reg();
                 }
                 return add_res(r);
             }
@@ -912,8 +994,9 @@ struct Translator {
         } else if (in.fmt == Fmt::MUBUF || in.fmt == Fmt::MTBUF) {
             // Raw dword loads/stores may take a descriptor that only exists at run time (loaded from
             // memory): with global memory they address memory from the descriptor words directly.
-            bool rawDw = in.fmt == Fmt::MUBUF && (starts(n, "buffer_load_dword") || starts(n, "buffer_store_dword") || starts(n, "buffer_load_format_") || dyn_atomic_op(n) ||
-                                                  dyn_small_op(n)) && !in.lds;
+            bool rawDw = ((in.fmt == Fmt::MUBUF && (starts(n, "buffer_load_dword") || starts(n, "buffer_store_dword") || starts(n, "buffer_load_format_") || dyn_atomic_op(n) ||
+                                                    dyn_small_op(n))) ||
+                          (in.fmt == Fmt::MTBUF && starts(n, "tbuffer_load_format_"))) && !in.lds;
             soft_trace = rawDw && (opt.global_memory || opt.global_memory_test);
             int r = resource(st, in.srsrc, 4, in, false);
             soft_trace = false;
@@ -925,7 +1008,7 @@ struct Translator {
             bool bvh = has(n, "bvh");   // inert acceleration structures (emit_mimg): no resource
             // Image loads/stores may take a descriptor read from descriptor memory at run time: the
             // layer stamps its global-heap index and view kind into descriptor dwords 0 and 1.
-            bool dynSample = n == "image_sample" || n == "image_sample_l" || n == "image_sample_lz" || n == "image_sample_d" || n == "image_gather4_lz" || n == "image_gather4";
+            bool dynSample = starts(n, "image_sample") || starts(n, "image_gather4") || n == "image_get_lod" || n == "image_get_resinfo";
             bool dynOk = !bvh && (n == "image_load" || n == "image_store" || n == "image_load_mip" || dynSample) && (opt.global_memory || opt.global_memory_test);
             soft_trace = dynOk;
             int r = bvh ? -2 : resource(st, in.srsrc, 8, in, false);
@@ -1151,12 +1234,15 @@ struct Translator {
                           const std::function<std::string(const std::string&)>& word);
     bool emit_mimg(const Instr& in, size_t idx);
     bool emit_heap_image(const Instr& in, size_t idx);
-    bool emit_heap_sample(const Instr& in, size_t idx);
     bool emit_ds(const Instr& in, size_t idx);
     bool emit_vintrp(const Instr& in, size_t idx);
     bool emit_exp(const Instr& in, size_t idx);
     bool emit_global(const Instr& in, size_t idx);
     std::string attr_value(unsigned attr, unsigned chan, const std::string& mode);
+    std::string attr_at(unsigned reg, unsigned chan, const std::string& mode, const SigElem** elem = nullptr);
+    bool emit_interp16(const Instr& in);
+    bool emit_param_records(const Instr& in, unsigned p, const std::string comp[4]);
+    int half_partner(unsigned row, bool pixel = false);
     bool per_lane(const Instr& in) const {
         switch (in.fmt) {
         case Fmt::VOP1: case Fmt::VOP2: case Fmt::VOPC: case Fmt::VOP3: case Fmt::VOP3P:
@@ -1671,6 +1757,7 @@ char type_of_suffix(const std::string& s) {
 
 bool Translator::emit_valu(const Instr& in, size_t idx) {
     std::string n = in.name;
+    if (n == "v_interp_p1ll_f16" || n == "v_interp_p1lv_f16" || n == "v_interp_p2_f16") return emit_interp16(in);
     const bool vop3 = in.fmt == Fmt::VOP3;
     // Sources: encodings (DPP/SDWA handled by src_bits).
     uint16_t se[3] = {in.src0, in.src1, in.src2};
@@ -2005,6 +2092,7 @@ bool Translator::emit_valu(const Instr& in, size_t idx) {
         {"v_cubeid_f32", 'f', "fff", "cube_id(a, b, c)"}, {"v_cubesc_f32", 'f', "fff", "cube_sc(a, b, c)"},
         {"v_cubetc_f32", 'f', "fff", "cube_tc(a, b, c)"}, {"v_cubema_f32", 'f', "fff", "cube_ma(a, b, c)"},
         {"v_dot2c_f32_f16", 'f', "uuD", "dot2_f16(a, b, d)"}, {"v_dot2_f32_f16", 'f', "uuf", "dot2_f16(a, b, c)"},
+        {"v_dot4c_i32_i8", 'u', "uuD", "dot4_i8(a, b, d)"}, {"v_pk_fmac_f16", 'u', "uuD", "pk_fmac(a, b, d)"},
         // integer
         {"v_add_nc_u32", 'u', "uu", "a + b"}, {"v_sub_nc_u32", 'u', "uu", "a - b"}, {"v_subrev_nc_u32", 'u', "uu", "b - a"},
         {"v_add_u32", 'u', "uu", "a + b"}, {"v_sub_u32", 'u', "uu", "a - b"}, {"v_subrev_u32", 'u', "uu", "b - a"},
@@ -2138,6 +2226,16 @@ bool Translator::emit_valu(const Instr& in, size_t idx) {
             if (has(v, "^NEG")) v = v.substr(0, v.size() - 4);
             return v;
         };
+        if (n == "v_dot4_i32_i8" || n == "v_dot4_u32_u8") {
+            // Four byte products summed onto the third source. op_sel chooses each source's 16-bit
+            // halves as for the other packed operations (measured by others on the hardware: with
+            // op_sel 2 and op_sel_hi 5 the second source's halves are exchanged).
+            if (n == "v_dot4_u32_u8") return fail(fmt("%s at 0x%x not supported", in.name, in.offset));
+            uses_dot4 = true;
+            auto whole = [&](int k) { return "(" + ih(k, false) + " | (" + ih(k, true) + " << 16))"; };
+            write_v(dst, fmt("dot4_i8(%s, %s, %s)", whole(0).c_str(), whole(1).c_str(), rd(se[2], in, 'u').c_str()));
+            return true;
+        }
         if (n == "v_fma_mix_f32" || n == "v_fma_mixlo_f16" || n == "v_fma_mixhi_f16") {
             // Each source is f32 or f16 according to opsel_hi; opsel picks the f16 half.
             auto ms = [&](int k) -> std::string {
@@ -2299,6 +2397,41 @@ bool Translator::emit_mubuf(const Instr& in, size_t idx) {
         line(fmt("if (kexec) { uint off_ = %s + %s + %uu + %s * ((%s >> 16) & 0x3fffu);", voff.c_str(), so.c_str(), uint32_t(in.offset_imm), vidx.c_str(), d1.c_str()));
         line(fmt("  uint lo_ = %s + off_, hi_ = (%s & 0xffffu) + (lo_ < %s ? 1u : 0u), f_ = (%s >> 12) & 0x7fu;", d0.c_str(), d1.c_str(), d0.c_str(), d3.c_str()));
         for (unsigned k = 0; k < cnt; k++) line(fmt("  %s = fmt_comp(lo_, hi_, f_, %uu);", V(in.vdata + k).c_str(), k));
+        line("}");
+        return true;
+    }
+    if (r < 0 && dyn_mubuf.count(idx) && starts(n, "tbuffer_load_format_")) {
+        // The same with the format the instruction names (the descriptor gives the address and
+        // the stride): only the formats fmt_comp() decodes, components of one size of 8, 16 or 32 bits.
+        if (in.d16) return fail(n + ": D16 through a run-time descriptor not supported");
+        const char* fname = nullptr;
+        for (auto& f : kBufFmts) if (f.id == in.format) fname = f.name;
+        bool ok = fname != nullptr;
+        if (ok) {
+            std::string nm = fname;
+            unsigned first = 0, comps = 0;
+            for (size_t p0 = 0; p0 < nm.size() && isdigit((unsigned char)nm[p0]);) {
+                size_t q = nm.find('_', p0);
+                unsigned z = (unsigned)atoi(nm.substr(p0, q - p0).c_str());
+                if (!comps) first = z;
+                ok = ok && z == first && (z == 8 || z == 16 || z == 32);
+                comps++;
+                p0 = q == std::string::npos ? nm.size() : q + 1;
+            }
+            ok = ok && comps > 0;
+        }
+        if (!ok) return fail(fmt("%s at 0x%x: buffer format %s (%u) through a run-time descriptor not supported", in.name, in.offset, fname ? fname : "?", in.format));
+        uses_gm = true;
+        uses_fmt_comp = true;
+        unsigned cnt = ends(n, "_xyzw") ? 4 : ends(n, "_xyz") ? 3 : ends(n, "_xy") ? 2 : 1;
+        unsigned va = in.vaddr;
+        std::string vidx = in.idxen ? V(va) : "0u";
+        std::string voff = in.offen ? V(in.idxen ? va + 1 : va) : "0u";
+        std::string so = rd(in.soffset, in);
+        const std::string d0 = S(in.srsrc), d1 = S(in.srsrc + 1);
+        line(fmt("if (kexec) { uint off_ = %s + %s + %uu + %s * ((%s >> 16) & 0x3fffu);", voff.c_str(), so.c_str(), uint32_t(in.offset_imm), vidx.c_str(), d1.c_str()));
+        line(fmt("  uint lo_ = %s + off_, hi_ = (%s & 0xffffu) + (lo_ < %s ? 1u : 0u);", d0.c_str(), d1.c_str(), d0.c_str()));
+        for (unsigned k = 0; k < cnt; k++) line(fmt("  %s = fmt_comp(lo_, hi_, %uu, %uu);", V(in.vdata + k).c_str(), (unsigned)in.format, k));
         line("}");
         return true;
     }
@@ -2539,61 +2672,8 @@ bool Translator::emit_mubuf(const Instr& in, size_t idx) {
 // Image load/store through the global heap: descriptor dword 0 = heap index, dword 1 = view kind
 // (bit 0 UAV, bits 7:4 class 0 float / 1 uint / 2 sint). Arrays HU<dim><cls> (UAVs) and HS<dim><cls>
 // (SRVs) cover the whole heap (spaces 910+). 2D, 2D array and 3D; no A16/D16.
-// Sampling a texture whose descriptor is read from descriptor memory: dword 0 = global-heap index
-// (float views; cubes in space 919); the sampler is a traced one or, read from memory too, dword 0 =
-// sampler-heap index (space 920).
-bool Translator::emit_heap_sample(const Instr& in, size_t idx) {
-    std::string n = in.name;
-    if (in.a16 || in.d16) return fail(n + ": A16/D16 through descriptor memory not supported");
-    const unsigned dim = in.dim;
-    if (dim != 1 && dim != 5 && dim != 2 && dim != 3) return fail(fmt("%s at 0x%x: dim %u through descriptor memory not supported", in.name, in.offset, dim));
-    if (dim == 3) uses_heap_cube = true;
-    else heap_dims.insert(dim);
-    auto areg0 = [&](unsigned k) { return V(in.nsa && k ? in.addr_extra[k - 1] : in.vaddr + k); };
-    // image_sample_d: gradients first (dx, dy: 2 components for 2D/arrays/cubes, 3 for 3D), then coordinates
-    const unsigned ng = n == "image_sample_d" ? (dim == 2 ? 3 : 2) : 0;
-    auto areg = [&](unsigned k) { return areg0(k + 2 * ng); };
-    const char* tag = dim == 1 ? "2" : dim == 5 ? "2A" : dim == 3 ? "C" : "3";
-    unsigned nc = dim == 1 ? 2 : 3;
-    std::string tc = nc == 2 ? fmt("float2(asfloat(%s), asfloat(%s))", areg(0).c_str(), areg(1).c_str())
-                             : dim == 3 ? fmt("cube_dir(asfloat(%s), asfloat(%s), asfloat(%s))", areg(0).c_str(), areg(1).c_str(), areg(2).c_str())
-                             : dim == 5 ? fmt("float3(asfloat(%s), asfloat(%s), round(asfloat(%s)))", areg(0).c_str(), areg(1).c_str(), areg(2).c_str())
-                                        : fmt("float3(asfloat(%s), asfloat(%s), asfloat(%s))", areg(0).c_str(), areg(1).c_str(), areg(2).c_str());
-    std::string lod = n == "image_sample_l" ? fmt("asfloat(%s)", areg(nc).c_str()) : std::string("0.0");   // compute: implicit LOD = level 0
-    std::string SS;
-    int sr = samp_of.count(idx) ? samp_of[idx] : -1;
-    if (sr >= 0) SS = sn(idx, sr);
-    else if (dyn_samp.count(idx)) { uses_heap_sampler = true; SS = fmt("HSMP[NonUniformResourceIndex(%s)]", S(in.ssamp).c_str()); }
-    else return fail(fmt("%s at 0x%x: sampler not known", in.name, in.offset));
-    std::string T = fmt("HS%sF[NonUniformResourceIndex(%s)]", tag, S(in.srsrc).c_str());
-    std::string call;
-    if (starts(n, "image_gather4")) {
-        if (dim == 2) return fail(n + " on 3D through descriptor memory");
-        const char* ch = in.dmask == 1 ? "Red" : in.dmask == 2 ? "Green" : in.dmask == 4 ? "Blue" : "Alpha";
-        call = fmt("%s.Gather%s(%s, %s)", T.c_str(), ch, SS.c_str(), tc.c_str());
-        line(fmt("if (kexec) { float4 t_ = %s;", call.c_str()));
-        for (int b = 0; b < 4; b++) line(fmt("  %s = asuint(t_[%d]);", V(in.vdata + b).c_str(), b));
-        line("}");
-        return true;
-    }
-    if (ng) {
-        if (dim == 3) return fail(n + " on a cube through descriptor memory");
-        auto g = [&](unsigned b) {
-            return ng == 2 ? fmt("float2(asfloat(%s), asfloat(%s))", areg0(b).c_str(), areg0(b + 1).c_str())
-                           : fmt("float3(asfloat(%s), asfloat(%s), asfloat(%s))", areg0(b).c_str(), areg0(b + 1).c_str(), areg0(b + 2).c_str());
-        };
-        line(fmt("if (kexec) { float4 t_ = %s.SampleGrad(%s, %s, %s, %s);", T.c_str(), SS.c_str(), tc.c_str(), g(0).c_str(), g(ng).c_str()));
-    } else line(fmt("if (kexec) { float4 t_ = %s.SampleLevel(%s, %s, %s);", T.c_str(), SS.c_str(), tc.c_str(), lod.c_str()));
-    unsigned o = 0;
-    for (int b = 0; b < 4; b++)
-        if (in.dmask >> b & 1) line(fmt("  %s = asuint(t_[%d]);", V(in.vdata + o++).c_str(), b));
-    line("}");
-    return true;
-}
 bool Translator::emit_heap_image(const Instr& in, size_t idx) {
     std::string n = in.name;
-    if (starts(n, "image_sample") || starts(n, "image_gather4")) return emit_heap_sample(in, idx);
-    if (in.d16) return fail(n + ": D16 through descriptor memory not supported");
     auto areg = [&](unsigned k) -> std::string {   // A16: two 16-bit coordinates per register
         if (!in.a16) return V(in.nsa && k ? in.addr_extra[k - 1] : in.vaddr + k);
         unsigned r = k / 2;
@@ -2601,11 +2681,12 @@ bool Translator::emit_heap_image(const Instr& in, size_t idx) {
         return fmt("((%s >> %uu) & 0xffffu)", v.c_str(), 16 * (k & 1));
     };   // NSA: scattered address registers
     const unsigned dim = in.dim;
-    if (dim != 1 && dim != 5 && dim != 2) return fail(fmt("%s at 0x%x: dim %u through descriptor memory not supported", in.name, in.offset, dim));
+    if (dim != 0 && dim != 1 && dim != 5 && dim != 2) return fail(fmt("%s at 0x%x: dim %u through descriptor memory not supported", in.name, in.offset, dim));
     heap_dims.insert(dim);
-    const char* tag = dim == 1 ? "2" : dim == 5 ? "2A" : "3";
-    unsigned nc = dim == 1 ? 2 : 3;
-    std::string c = nc == 2 ? fmt("uint2(%s, %s)", areg(0).c_str(), areg(1).c_str())
+    const char* tag = dim == 0 ? "1" : dim == 1 ? "2" : dim == 5 ? "2A" : "3";
+    unsigned nc = dim == 0 ? 1 : dim == 1 ? 2 : 3;
+    std::string c = nc == 1 ? fmt("uint(%s)", areg(0).c_str())
+                  : nc == 2 ? fmt("uint2(%s, %s)", areg(0).c_str(), areg(1).c_str())
                             : fmt("uint3(%s, %s, %s)", areg(0).c_str(), areg(1).c_str(), areg(2).c_str());
     std::string mip = n == "image_load_mip" ? areg(nc) : std::string("0u");
     const std::string hi = S(in.srsrc), hk = S(in.srsrc + 1);   // layer payload: heap index, view kind
@@ -2613,8 +2694,17 @@ bool Translator::emit_heap_image(const Instr& in, size_t idx) {
         std::string fv, uv, iv;
         unsigned o = 0;
         for (unsigned k = 0; k < 4; k++) {
-            std::string e = (in.dmask >> k & 1) ? V(in.vdata + o++) : std::string("0u");
-            fv += (k ? ", " : "") + ("asfloat(" + e + ")");
+            std::string e = "0u", fe;
+            if (in.dmask >> k & 1) {
+                if (in.d16) {   // 16-bit components, two per register (floats as f16)
+                    std::string r = V(in.vdata + o / 2);
+                    e = o % 2 ? "(" + r + " >> 16)" : "(" + r + " & 0xffffu)";
+                    fe = "f16tof32(" + e + ")";
+                    o++;
+                } else e = V(in.vdata + o++);
+            }
+            if (fe.empty()) fe = "asfloat(" + e + ")";
+            fv += (k ? ", " : "") + fe;
             uv += (k ? ", " : "") + e;
             iv += (k ? ", " : "") + ("int(" + e + ")");
         }
@@ -2625,7 +2715,8 @@ bool Translator::emit_heap_image(const Instr& in, size_t idx) {
         return true;
     }
     // image_load / image_load_mip: UAVs read without a level, SRVs with one
-    std::string lc = nc == 2 ? fmt("int3(%s, int(%s))", c.c_str(), mip.c_str()) : fmt("int4(%s, int(%s))", c.c_str(), mip.c_str());
+    std::string lc = nc == 1 ? fmt("int2(%s, int(%s))", c.c_str(), mip.c_str())
+                   : nc == 2 ? fmt("int3(%s, int(%s))", c.c_str(), mip.c_str()) : fmt("int4(%s, int(%s))", c.c_str(), mip.c_str());
     line(fmt("if (kexec) { uint hix_ = %s, hk_ = %s, cls_ = (hk_ >> 4) & 15u; uint4 t_;", hi.c_str(), hk.c_str()));
     line("  if (hk_ & 1u) {");
     line(fmt("    if (cls_ == 1u) t_ = HU%sU[NonUniformResourceIndex(hix_)][%s];", tag, c.c_str()));
@@ -2638,6 +2729,17 @@ bool Translator::emit_heap_image(const Instr& in, size_t idx) {
     line("  }");
     unsigned o = 0;
     static const char* comp = "xyzw";
+    if (in.d16) {
+        // 16-bit results, two per register: float views as f16 (the class is known at run time).
+        std::vector<std::string> cs;
+        for (unsigned k = 0; k < 4; k++)
+            if (in.dmask >> k & 1) cs.push_back(fmt("(cls_ == 0u ? f32tof16(asfloat(t_.%c)) : (t_.%c & 0xffffu))", comp[k], comp[k]));
+        for (size_t i = 0; i < cs.size(); i += 2)
+            line(fmt("  %s = %s%s;", V(in.vdata + unsigned(i / 2)).c_str(), cs[i].c_str(), i + 1 < cs.size() ? (" | (" + cs[i + 1] + " << 16)").c_str() : ""));
+        if (in.tfe) line(fmt("  %s = 0u;", V(in.vdata + unsigned((cs.size() + 1) / 2)).c_str()));
+        line("}");
+        return true;
+    }
     for (unsigned k = 0; k < 4; k++)
         if (in.dmask >> k & 1) line(fmt("  %s = t_.%c;", V(in.vdata + o++).c_str(), comp[k]));
     line("}");
@@ -2674,10 +2776,26 @@ bool Translator::emit_mimg(const Instr& in, size_t idx) {
         return true;
     }
     int r = res_of.count(idx) ? res_of[idx] : -1;
-    if (r < 0 && dyn_mimg.count(idx)) return emit_heap_image(in, idx);
-    if (r < 0) return fail(fmt("%s at 0x%x: image descriptor not known", in.name, in.offset));   // never drop the access silently
-    Res& R = res[r];
-    const std::string RN = rn(idx, r);
+    const bool dyn = r < 0 && dyn_mimg.count(idx);
+    if (dyn && (n == "image_load" || n == "image_load_mip" || n == "image_store")) return emit_heap_image(in, idx);
+    if (r < 0 && !dyn) return fail(fmt("%s at 0x%x: image descriptor not known", in.name, in.offset));   // never drop the access silently
+    // A descriptor read from descriptor memory at run time: the layer stamps the view's index in
+    // the global heap into dword 0, and the texture is that element of the bindless array of the
+    // instruction's dimension (float views; see the arrays' declaration). Everything below treats
+    // it like a traced texture.
+    Res dynRes;
+    std::string dynName;
+    if (dyn) {
+        static const char* const tags[8] = {"1", "2", "3", "C", nullptr, "2A", nullptr, nullptr};
+        if (!tags[in.dim]) return fail(fmt("%s at 0x%x: dim %u through descriptor memory not supported", in.name, in.offset, (unsigned)in.dim));
+        if (in.dim == 3) uses_heap_cube = true;
+        else heap_dims.insert(in.dim);
+        dynRes.kind = ResKind::Image;
+        dynRes.dim = in.dim;
+        dynName = fmt("HS%sF[NonUniformResourceIndex(%s)]", tags[in.dim], S(in.srsrc).c_str());
+    }
+    Res& R = dyn ? dynRes : res[r];
+    const std::string RN = dyn ? dynName : rn(idx, r);
     if (R.kind != ResKind::Image) return fail(fmt("%s at 0x%x: not an image resource", in.name, in.offset));
     if (R.dim < 0) R.dim = in.dim;
     else if (R.dim != in.dim && !(R.dim == 3 && in.dim == 5) && !(R.dim == 5 && in.dim == 3))
@@ -2688,6 +2806,20 @@ bool Translator::emit_mimg(const Instr& in, size_t idx) {
         if (in.dim == 6 || in.dim == 7) return fail(n + " on a multisampled image not supported");
         std::string mip = V(in.vaddr);
         line("if (kexec) { uint w_ = 1u, h_ = 1u, d_ = 1u, l_ = 1u;");
+        if (dyn) {
+            // (Dword 1 bit 0: the view is a UAV, which has no level argument.)
+            static const char* const tags[8] = {"1", "2", "3", "C", nullptr, "2A", nullptr, nullptr};
+            const std::string U = fmt("HU%sF[NonUniformResourceIndex(%s)]", tags[in.dim], S(in.srsrc).c_str());
+            const char* dims = in.dim == 0 ? "w_" : in.dim == 1 || in.dim == 3 ? "w_, h_" : "w_, h_, d_";
+            if (in.dim == 3) line(fmt("  %s.GetDimensions(%s, %s, l_);", RN.c_str(), mip.c_str(), dims));
+            else line(fmt("  if (%s & 1u) %s.GetDimensions(%s); else %s.GetDimensions(%s, %s, l_);", S(in.srsrc + 1).c_str(), U.c_str(), dims, RN.c_str(), mip.c_str(), dims));
+            const char* val[4] = {"w_", "h_", "d_", "l_"};
+            unsigned o = 0;
+            for (unsigned c = 0; c < 4; c++)
+                if (in.dmask >> c & 1) line(fmt("  %s = %s;", V(in.vdata + o++).c_str(), val[c]));
+            line("}");
+            return true;
+        }
         bool rw = R.uav;
         switch (in.dim) {
         case 0: line(rw ? fmt("  %s.GetDimensions(w_);", RN.c_str()) : fmt("  %s.GetDimensions(%s, w_, l_);", RN.c_str(), mip.c_str())); break;
@@ -2792,9 +2924,14 @@ bool Translator::emit_mimg(const Instr& in, size_t idx) {
     };
     if (samp) {
         int s = samp_of.count(idx) ? samp_of[idx] : -1;
-        if (s < 0) return false;
-        Res& SR = res[s];
-        if (!zc.empty()) SR.cmp_sampler = true;
+        std::string dynSS;
+        if (s < 0 && dyn_samp.count(idx)) {
+            // A sampler read from descriptor memory: dword 0 is its index in the title's sampler
+            // heap, seen as plain and as comparison samplers.
+            if (zc.empty()) { uses_heap_sampler = true; dynSS = fmt("HSMP[NonUniformResourceIndex(%s)]", S(in.ssamp).c_str()); }
+            else { uses_heap_sampler_cmp = true; dynSS = fmt("HSMPC[NonUniformResourceIndex(%s)]", S(in.ssamp).c_str()); }
+        } else if (s < 0) return err.empty() ? fail(fmt("%s at 0x%x: sampler not known", in.name, in.offset)) : false;
+        if (s >= 0 && !zc.empty()) res[s].cmp_sampler = true;
         std::string tc;
         if (dim == 3) {
             // AMD cube coordinates: face-relative s, t in [1, 2] and face id + 8 * array slice.
@@ -2825,7 +2962,7 @@ bool Translator::emit_mimg(const Instr& in, size_t idx) {
         }
         std::string call;
         const std::string T = RN;
-        const std::string SS = sn(idx, s);
+        const std::string SS = s >= 0 ? sn(idx, s) : dynSS;
         if (n == "image_get_lod") {
             line(fmt("if (kexec) { float l_ = %s.CalculateLevelOfDetailUnclamped(%s, %s); float lc_ = %s.CalculateLevelOfDetail(%s, %s);", T.c_str(), SS.c_str(), tc.c_str(), T.c_str(), SS.c_str(), tc.c_str()));
             unsigned o = 0;
@@ -2864,6 +3001,12 @@ bool Translator::emit_mimg(const Instr& in, size_t idx) {
                 for (size_t i = 0; i < v.size(); i++) s += (i ? ", " : "") + std::string("asfloat(") + v[i] + ")";
                 return s + ")";
             };
+            if (dim == 3 && ddx.size() == 2 && ddy.size() == 2) {
+                // A cube's gradients are those of the face coordinates; the PC wants them as
+                // gradients of the direction (linear in s and t on one face).
+                call = fmt("%s.SampleGrad(%s, %s, cube_grad(asfloat(%s), asfloat(%s), asfloat(%s)), cube_grad(asfloat(%s), asfloat(%s), asfloat(%s)))", T.c_str(), SS.c_str(),
+                           tc.c_str(), ddx[0].c_str(), ddx[1].c_str(), crd[2].c_str(), ddy[0].c_str(), ddy[1].c_str(), crd[2].c_str());
+            } else
             call = fmt("%s.SampleGrad(%s, %s, %s, %s)", T.c_str(), SS.c_str(), tc.c_str(), vec(ddx).c_str(), vec(ddy).c_str());
         } else { call = fmt("%s.Sample(%s, %s)", T.c_str(), SS.c_str(), tc.c_str()); uses_quad = true; }
         write_result(call);
@@ -3041,7 +3184,11 @@ bool Translator::emit_ds(const Instr& in, size_t idx) {
 std::string Translator::attr_value(unsigned attr, unsigned chan, const std::string& mode) {
     auto it = attr_reg.find(attr);
     if (it == attr_reg.end()) { fail(fmt("pixel shader reads attribute %u that has no input record", attr)); return "0u"; }
-    unsigned reg = it->second;
+    return attr_at(it->second, chan, mode);
+}
+// Component `chan` (a column of the register) of the pixel input in signature register `reg`, as
+// bits: floats as their bit pattern, integers as they are.
+std::string Translator::attr_at(unsigned reg, unsigned chan, const std::string& mode, const SigElem** elem) {
     const SigElem* el = nullptr;
     for (auto& e : isg)
         if (e.reg == reg && ((e.mask >> chan) & 1) && e.sysval == 0) el = &e;
@@ -3054,7 +3201,54 @@ std::string Translator::attr_value(unsigned attr, unsigned chan, const std::stri
     unsigned comp = chan - first;
     unsigned w = unsigned(__builtin_popcount(el->mask));
     std::string f = w > 1 ? fmt("I.a%u_%u.%c", el->reg, first, "xyzw"[comp]) : fmt("I.a%u_%u", el->reg, first);
+    if (elem) *elem = el;
     return el->is_float() ? "asuint(" + f + ")" : "uint(" + f + ")";
+}
+
+// Half-float interpolation (v_interp_p1ll_f16 / p1lv / p2_f16). The first source field is not a
+// register: it names the attribute (bits 0-5), a dword of the parameter (bits 6-7) and its upper
+// half (bit 8); the second is the barycentric. The input's record says how 16-bit values lie in
+// the parameter (Meta::PsInput). As with the 32-bit pair both steps write the finished value,
+// here as a 16-bit pattern: the PC input is a 32-bit float the rasterizer has interpolated.
+bool Translator::emit_interp16(const Instr& in) {
+    const unsigned raw = in.src0 & 0x1ffu, attr = raw & 63u, dword = (raw >> 6) & 3u, high = raw >> 8;
+    const Meta::PsInput* rec = nullptr;
+    for (auto& r : meta.ps_inputs)
+        if (r.attr == attr) rec = &r;
+    if (!rec && attr < meta.ps_inputs.size()) rec = &meta.ps_inputs[attr];
+    if (!rec) return fail(fmt("%s at 0x%x: attribute %u has no input record", in.name, in.offset, attr));
+    if (!rec->fp16) return fail(fmt("%s at 0x%x: attribute %u is not a 16-bit input", in.name, in.offset, attr));
+    unsigned row = rec->reg, index = dword;
+    if (rec->pack2) {
+        // The register's own elements take half a dword each (the record's mask byte does not say
+        // how many dwords: it is 3 for every packed record).
+        unsigned n1 = 0;
+        for (auto& e : isg)
+            if (e.reg == rec->reg && e.sysval == 0) n1 += unsigned(__builtin_popcount(e.mask));
+        const unsigned first = (n1 + 1) / 2;
+        if (dword < first) index = 2 * dword + high;
+        else {
+            const int partner = half_partner(rec->reg, true);
+            if (partner < 0) return fail(fmt("%s at 0x%x: attribute %u dword %u has no second register", in.name, in.offset, attr, dword));
+            row = unsigned(partner);
+            index = 2 * (dword - first) + high;
+        }
+    } else if (high) return fail(fmt("%s at 0x%x: upper half of an unpacked 16-bit attribute", in.name, in.offset));
+    // The register's elements start at its lowest column.
+    unsigned col0 = 4;
+    for (auto& e : isg)
+        if (e.reg == row && e.sysval == 0 && e.mask) col0 = std::min(col0, unsigned(__builtin_ctz(e.mask)));
+    if (col0 == 4) return fail(fmt("%s at 0x%x: pixel input register %u not in the input signature", in.name, in.offset, row));
+    auto b = bary_mode.find(unsigned(in.src1 - src::kVgpr0));
+    std::string w = b == bary_mode.end() ? "center" : b->second;
+    std::string mode = w == "center" ? "linear" : w == "centroid" ? "centroid" : w == "sample" ? "sample" : w == "ncenter" ? "noperspective"
+         : w == "ncentroid" ? "noperspective centroid" : w == "nsample" ? "noperspective sample" : "linear";
+    if (rec->flat) mode = "nointerpolation";
+    const SigElem* el = nullptr;
+    std::string v = attr_at(row, col0 + index, mode, &el);
+    if (!err.empty() || !el) return false;
+    write_v(in.dst, el->is_float() ? "f32tof16(asfloat(" + v + "))" : "(" + v + " & 0xffffu)");
+    return true;
 }
 
 bool Translator::emit_vintrp(const Instr& in, size_t idx) {
@@ -3070,6 +3264,103 @@ bool Translator::emit_vintrp(const Instr& in, size_t idx) {
     }
     // p1 produces an intermediate that only p2 consumes; both write the interpolated value.
     write_v(in.dst, attr_value(in.attr, in.attr_chan, mode));
+    return true;
+}
+
+// ---- parameter exports by the stage's output records -----------------------------------------
+// The second register of a packed pair of 16-bit values: the next 16-bit register of the
+// signature that no record names, taken in register order by the packed records (-1: none). The
+// same on both sides: vertex and mesh outputs, and pixel inputs (whose records hold a byte that
+// names it in most shaders, but names the register itself in some that do have a second one).
+int Translator::half_partner(unsigned row, bool pixel) {
+    std::vector<std::pair<unsigned, bool>> recs;   // register, packed: the 16-bit records
+    std::vector<unsigned> named;
+    if (pixel) {
+        for (auto& i : meta.ps_inputs) { named.push_back(i.reg); if (i.fp16) recs.push_back({i.reg, i.pack2}); }
+    } else {
+        for (auto& o : meta.vs_outputs) {
+            if (o.prim) continue;
+            named.push_back(o.row);
+            if (o.fp16) recs.push_back({o.row, o.pack2});
+        }
+    }
+    std::vector<unsigned> free;
+    for (auto& e : pixel ? isg : osg) {
+        if (e.sysval != 0 || !e.is_half()) continue;
+        if (std::find(named.begin(), named.end(), e.reg) == named.end() && std::find(free.begin(), free.end(), e.reg) == free.end()) free.push_back(e.reg);
+    }
+    std::sort(free.begin(), free.end());
+    std::sort(recs.begin(), recs.end());
+    for (auto& o : recs) {
+        int got = -1;
+        if (o.second)
+            for (size_t k = 0; k < free.size(); k++)
+                if (free[k] > o.first) { got = int(free[k]); free.erase(free.begin() + k); break; }
+        if (o.first == row) return got;
+    }
+    return -1;
+}
+// `exp param<p>`: each dword goes to the signature register its record names. 16-bit outputs sit
+// in the low halves, or two per dword (element 2d low, 2d + 1 high), the register's own elements
+// first and its partner's from the next whole dword; the PC outputs are 32-bit floats.
+bool Translator::emit_param_records(const Instr& in, unsigned p, const std::string comp[4]) {
+    const Meta::VsOutput* rec = nullptr;
+    for (auto& o : meta.vs_outputs)
+        if (o.param == p) rec = &o;
+    if (!rec || (rec->prim && c.kind != ProgramKind::MS)) return true;   // exported but not consumed
+    const std::vector<SigElem>& sig = rec->prim ? psg : osg;
+    const char* obj = rec->prim ? "P.p" : "O.o";
+    // One element (index-th component of the register's elements, in column order) = value.
+    auto put = [&](unsigned row, unsigned index, const std::string& bits16or32, bool half) {
+        unsigned seen = 0;
+        std::vector<const SigElem*> els;
+        for (auto& e : sig)
+            if (e.sysval == 0 && e.reg == row) els.push_back(&e);
+        std::sort(els.begin(), els.end(), [](const SigElem* a, const SigElem* b) { return (a->mask & -a->mask) < (b->mask & -b->mask); });
+        for (auto* e : els) {
+            const unsigned first = unsigned(__builtin_ctz(e->mask));
+            for (unsigned k = 0; k < 4; k++) {
+                if (!((e->mask >> k) & 1)) continue;
+                if (seen++ != index) continue;
+                std::string v;
+                if (half) v = e->is_float() ? "f16tof32(" + bits16or32 + ")" : e->is_sint() ? "(int(" + bits16or32 + " << 16u) >> 16)" : bits16or32;
+                else v = e->is_float() ? "asfloat(" + bits16or32 + ")" : e->is_sint() ? "int(" + bits16or32 + ")" : bits16or32;
+                line(fmt("  %s%u_%u.%c = %s;", obj, e->reg, first, "xyzw"[k - first], v.c_str()));
+                return;
+            }
+        }
+    };
+    auto channels = [&](unsigned row) {
+        unsigned n = 0;
+        for (auto& e : sig)
+            if (e.sysval == 0 && e.reg == row) n += unsigned(__builtin_popcount(e.mask));
+        return n;
+    };
+    line("if (kexec) {");
+    const int partner = rec->pack2 && !rec->prim ? half_partner(rec->row) : -1;
+    const unsigned n1 = channels(rec->row), d1 = (n1 + 1) / 2;
+    for (unsigned k = 0; k < 4; k++) {
+        if (!((in.exp_en >> k) & 1)) continue;
+        const std::string bits = "asuint(" + comp[k] + ")";
+        if (!rec->fp16) {
+            // (A 32-bit register: dword k is column k of the register.)
+            for (auto& e : sig) {
+                if (e.sysval != 0 || e.reg != rec->row || !((e.mask >> k) & 1)) continue;
+                const unsigned first = unsigned(__builtin_ctz(e.mask));
+                std::string v = e.is_float() ? comp[k] : e.is_sint() ? "int(" + bits + ")" : bits;
+                line(fmt("  %s%u_%u.%c = %s;", obj, e.reg, first, "xyzw"[k - first], v.c_str()));
+            }
+        } else if (!rec->pack2) {
+            put(rec->row, k, "(" + bits + " & 0xffffu)", true);
+        } else {
+            for (unsigned h = 0; h < 2; h++) {
+                const std::string half = h ? "(" + bits + " >> 16u)" : "(" + bits + " & 0xffffu)";
+                if (k < d1) { if (2 * k + h < n1) put(rec->row, 2 * k + h, half, true); }
+                else if (partner >= 0) put(unsigned(partner), 2 * (k - d1) + h, half, true);
+            }
+        }
+    }
+    line("}");
     return true;
 }
 
@@ -3200,6 +3491,7 @@ bool Translator::emit_exp(const Instr& in, size_t idx) {
         if (t >= 32 && t < 64) {
             unsigned p = t - 32;
             vs_params.insert(p);
+            if (!meta.vs_outputs.empty()) return emit_param_records(in, p, comp);
             // Param N is the Nth output register (non-system elements, register order).
             std::vector<unsigned> regs;
             for (auto& e : osg)
@@ -3491,6 +3783,13 @@ float3 cube_dir(float s, float t, float f) {
   if (face == 2u) return float3(u, 1.0, v); if (face == 3u) return float3(u, -1.0, -v);
   if (face == 4u) return float3(u, -v, 1.0); return float3(-u, -v, -1.0);
 }
+float3 cube_grad(float gs, float gt, float f) {
+  float u = gs * 2.0, v = gt * 2.0; uint face = uint(round(f)) % 8u;
+  if (face == 0u) return float3(0.0, -v, -u); if (face == 1u) return float3(0.0, -v, u);
+  if (face == 2u) return float3(u, 0.0, v); if (face == 3u) return float3(u, 0.0, -v);
+  if (face == 4u) return float3(u, -v, 0.0); return float3(-u, -v, 0.0);
+}
+uint64_t asuint64(double d) { uint lo_, hi_; asuint(d, lo_, hi_); return uint64_t(lo_) | (uint64_t(hi_) << 32); }
 // Cross-lane reads (exact within one PC wave).
 #ifndef XL_N
 #define XL_N WAVE
@@ -3540,6 +3839,12 @@ std::string Translator::generate() {
         // Masks only use the low SGPR; keep the high views zero so the shared conditions work.
     }
     const size_t nb = block_start.size();
+    // The blocks an invocation can still reach a barrier from (itself included). Past the last
+    // barrier nobody waits for it any more, so there the small step limit applies again: a list
+    // walk over data an earlier pass did not prepare otherwise runs to the large limit, at
+    // hundreds of milliseconds of GPU time per dispatch.
+    std::vector<bool> barrier_ahead(nb, true);
+    bool barriers = false;
     if (!loops) line(fmt("bool reach[%zu]; [unroll] for (uint i_ = 0u; i_ < %zuu; i_++) reach[i_] = false; reach[0] = true;", nb + 1, nb + 1));
     // The guard bounds the block transitions so a mistranslated loop ends the shader instead of
     // hanging the GPU (which removes the PC device).
@@ -3550,10 +3855,35 @@ std::string Translator::generate() {
         for (auto& i : ins)
             if (i.name && (starts(i.name, "s_cbranch") || !strcmp(i.name, "s_branch")) && i.simm16 < 0)
                 first_head = std::min(first_head, uint32_t(int32_t(i.offset) + 4 + i.simm16 * 4));
-        bool barriers = false;
         for (auto& i : ins) barriers |= i.name && !strcmp(i.name, "s_barrier") && i.offset >= first_head;
+        if (barriers && !indirect) {
+            auto succ_of = [&](size_t b, std::vector<size_t>& succ) {
+                succ.clear();
+                const Instr& last = ins[block_end(b) - 1];
+                std::string ln = last.name ? last.name : "";
+                if (last.fmt == Fmt::SOPP && (starts(ln, "s_branch") || starts(ln, "s_cbranch"))) {
+                    auto it = block_of.find(uint32_t(int32_t(last.offset) + 4 + last.simm16 * 4));
+                    if (it != block_of.end()) succ.push_back(it->second);
+                }
+                if (!(last.fmt == Fmt::SOPP && (ln == "s_endpgm" || starts(ln, "s_branch"))) && b + 1 < nb) succ.push_back(b + 1);
+            };
+            for (size_t b = 0; b < nb; b++) {
+                barrier_ahead[b] = false;
+                for (size_t i = block_start[b]; i < block_end(b); i++) barrier_ahead[b] = barrier_ahead[b] || (ins[i].name && !strcmp(ins[i].name, "s_barrier"));
+            }
+            std::vector<size_t> succ;
+            for (bool changed = true; changed;) {
+                changed = false;
+                for (size_t b = nb; b-- > 0;) {
+                    if (barrier_ahead[b]) continue;
+                    succ_of(b, succ);
+                    for (size_t x : succ)
+                        if (barrier_ahead[x]) { barrier_ahead[b] = true; changed = true; break; }
+                }
+            }
+        }
         size_t start = opt.raw_code.empty() || !block_of.count(opt.raw_entry) ? 0 : block_of[opt.raw_entry];
-        line(fmt("uint pc = %zuu, guard_ = 0u;\n  [loop] for (;;) {\n  if (++guard_ > %uu) %s\n  [forcecase] switch (pc) {", start,
+        line(fmt("uint pc = %zuu, guard_ = 0u, guard2_ = 0u;\n  [loop] for (;;) {\n  if (++guard_ > %uu) %s\n  [forcecase] switch (pc) {", start,
                  barriers ? opt.loop_guard_barrier : opt.loop_guard, opt.raw_stats ? "{ dbg_add(5u); dbg_set2(19u, pc, guard_); RETURN; }" : "RETURN;"));
     }
     // Blocks not reachable from the entry (data after the last instruction) are not emitted.
@@ -3582,6 +3912,8 @@ std::string Translator::generate() {
         if (!live[b]) continue;
         if (!loops) line(fmt("if (reach[%zu]) {", b));
         else line(fmt("case %zuu: {", b));
+        if (loops && barriers && !barrier_ahead[b])   // past the last barrier: the small limit (see barrier_ahead)
+            line(fmt("if (++guard2_ > %uu) %s", opt.loop_guard, opt.raw_stats ? "{ dbg_add(5u); dbg_set2(19u, pc, guard_); RETURN; }" : "RETURN;"));
         jumped = false;
         for (size_t i = block_start[b]; i < e; i++)
             if (!emit(ins[i], i) && !err.empty()) break;
@@ -3657,6 +3989,18 @@ std::string Translator::generate() {
     }
     h << kPrelude;
     if (uses_quad) h << kQuadPrelude;
+    const std::string emitted = body.str();
+    if (uses_dot4 || has(emitted, "dot4_i8(")) {   // (the two-source form is in the table of simple operations)
+        uses_dot4 = true;
+        if (opt.dot4_intrinsic) h << "uint dot4_i8(uint a, uint b, uint c) { return uint(dot4add_i8packed(a, b, int(c))); }\n";
+        else h << "uint dot4_i8(uint a, uint b, uint c) {\n"
+                  "  int4 x = int4(int(a << 24) >> 24, int(a << 16) >> 24, int(a << 8) >> 24, int(a) >> 24);\n"
+                  "  int4 y = int4(int(b << 24) >> 24, int(b << 16) >> 24, int(b << 8) >> 24, int(b) >> 24);\n"
+                  "  return uint(x.x * y.x + x.y * y.y + x.z * y.z + x.w * y.w) + c;\n}\n";
+    }
+    if (has(emitted, "pk_fmac("))
+        h << "uint pk_fmac(uint a, uint b, uint d) {   // packed f16: d + a * b in each half\n"
+             "  return (f16r(f16tof32(a) * f16tof32(b) + f16tof32(d)) & 0xffffu) | (f16r(f16tof32(a >> 16) * f16tof32(b >> 16) + f16tof32(d >> 16)) << 16);\n}\n";
     if (uses_gm && opt.global_memory_test) {
         h << "ByteAddressBuffer GMTEST : register(t1, space0);   // tests: global memory = this buffer\n"
              "uint gm_load(uint lo, uint hi) { uint n_; GMTEST.GetDimensions(n_); return hi == 0u && lo + 4u <= n_ ? GMTEST.Load(lo & ~3u) : 0u; }\n"
@@ -3805,9 +4149,10 @@ std::string Translator::generate() {
     }
     {   // bindless global-heap arrays for image access through descriptor memory (spaces 910+)
         unsigned sp = 910;
-        for (unsigned d : {1u, 5u, 2u}) {
-            const char* tag = d == 1 ? "2" : d == 5 ? "2A" : "3";
-            const char* ty = d == 1 ? "Texture2D" : d == 5 ? "Texture2DArray" : "Texture3D";
+        for (unsigned d : {1u, 5u, 2u, 0u}) {   // spaces 910-918, and (past the cubes and samplers) 1D textures in 921-923
+            const char* tag = d == 1 ? "2" : d == 5 ? "2A" : d == 0 ? "1" : "3";
+            const char* ty = d == 1 ? "Texture2D" : d == 5 ? "Texture2DArray" : d == 0 ? "Texture1D" : "Texture3D";
+            if (d == 0) sp = 921;
             if (heap_dims.count(d)) {
                 h << fmt("RW%s<float4> HU%sF[] : register(u0, space%u);\nRW%s<uint4> HU%sU[] : register(u0, space%u);\nRW%s<int4> HU%sI[] : register(u0, space%u);\n",
                          ty, tag, sp, ty, tag, sp + 1, ty, tag, sp + 2);
@@ -3818,6 +4163,7 @@ std::string Translator::generate() {
         }
         if (uses_heap_cube) h << "TextureCube<float4> HSCF[] : register(t0, space919);\n";
         if (uses_heap_sampler) h << "SamplerState HSMP[] : register(s0, space920);\n";
+        if (uses_heap_sampler_cmp) h << "SamplerComparisonState HSMPC[] : register(s0, space925);\n";
         if (uses_park) h << "RWByteAddressBuffer RTST : register(u0, space930);\nRWByteAddressBuffer RTDISC : register(u0, space931);\n";
     }
     if (indirect) {   // code address -> dispatcher case (block start); unknown addresses end the invocation
@@ -3855,7 +4201,7 @@ std::string Translator::generate() {
     }
     auto type_of = [](const SigElem& e) {
         unsigned w = unsigned(__builtin_popcount(e.mask));
-        const char* b = e.comptype == 1 ? "uint" : e.comptype == 2 ? "int" : "float";
+        const char* b = e.base_type();
         return w > 1 ? fmt("%s%u", b, w) : std::string(b);
     };
     auto sem = [](const SigElem& e) { return e.index ? fmt("%s%u", e.name.c_str(), e.index) : e.name; };
@@ -3987,7 +4333,7 @@ std::string Translator::generate() {
             if (e.sysval == 1) { h << "  float4 pos_ : SV_Position;\n"; pos_in_sig = true; continue; }
             if (e.sysval != 0) continue;
             unsigned w = unsigned(__builtin_popcount(e.mask));
-            const char* b = e.comptype == 1 ? "uint" : e.comptype == 2 ? "int" : "float";
+            const char* b = e.base_type();
             h << "  " << (w > 1 ? fmt("%s%u", b, w) : std::string(b)) << " o" << e.reg << "_" << __builtin_ctz(e.mask) << " : " << sem(e) << ";\n";
         }
         if (!pos_in_sig) h << "  float4 pos_ : SV_Position;\n";
@@ -4009,7 +4355,7 @@ std::string Translator::generate() {
             if (e.sysval == 1) { h << "  float4 pos_ : SV_Position;\n"; pos_in_sig = true; continue; }
             if (e.sysval != 0) continue;
             unsigned w = unsigned(__builtin_popcount(e.mask));
-            const char* b = e.comptype == 1 ? "uint" : e.comptype == 2 ? "int" : "float";
+            const char* b = e.base_type();
             h << "  " << (w > 1 ? fmt("%s%u", b, w) : std::string(b)) << " o" << e.reg << "_" << __builtin_ctz(e.mask) << " : " << sem(e) << ";\n";
         }
         if (!pos_in_sig) h << "  float4 pos_ : SV_Position;\n";
@@ -4021,7 +4367,7 @@ std::string Translator::generate() {
             for (auto& e : sorted(psg)) {
                 if (e.sysval != 0) continue;
                 unsigned w = unsigned(__builtin_popcount(e.mask));
-                const char* b = e.comptype == 1 ? "uint" : e.comptype == 2 ? "int" : "float";
+                const char* b = e.base_type();
                 h << "  " << (w > 1 ? fmt("%s%u", b, w) : std::string(b)) << " p" << e.reg << "_" << __builtin_ctz(e.mask) << " : " << sem(e) << ";\n";
             }
             h << "};\n" << (dual ? "static MSP P_0, P_1;\n" : "static MSP P;\n");
@@ -4303,7 +4649,7 @@ bool translate_gs_copy(const Container& c, TranslateResult& r) {
             if (e.sysval == 5) { o += "  uint vpi_ : SV_ViewportArrayIndex;\n"; continue; }
             if (e.sysval != 0) continue;
             unsigned w = unsigned(__builtin_popcount(e.mask));
-            const char* b = e.comptype == 1 ? "uint" : e.comptype == 2 ? "int" : "float";
+            const char* b = e.base_type();
             o += "  " + (w > 1 ? fmt("%s%u", b, w) : std::string(b)) + fmt(" o%u_%u : ", e.reg, __builtin_ctz(e.mask)) + sem(e) + ";\n";
         }
         if (!pos) o += "  float4 pos_ : SV_Position;\n";
@@ -4338,7 +4684,7 @@ bool translate_gs_copy(const Container& c, TranslateResult& r) {
                 } else {
                     bits = fmt("%uu", it->second.v);
                 }
-                const char* cast = e.sysval == 4 || e.sysval == 5 || e.comptype == 1 ? "" : e.comptype == 2 ? "asint" : "asfloat";
+                const char* cast = e.sysval == 4 || e.sysval == 5 || e.is_uint() ? "" : e.is_sint() ? "asint" : "asfloat";
                 h << "  O." << field(e, comp) << " = " << cast << "(" << bits << ");\n";
             }
         }
@@ -4354,6 +4700,37 @@ bool translate_gs_copy(const Container& c, TranslateResult& r) {
     return true;
 }
 }  // namespace
+
+// ---- cache key salts ---------------------------------------------------------------------------
+uint64_t translation_salt(const Container& c) {
+    const std::vector<uint32_t> code = c.code();
+    bool barrier = false, backward = false, global_write = false;
+    for (size_t i = 0; i < code.size();) {
+        Instr in;
+        if (!decode(code.data(), code.size(), i, in)) break;
+        i += in.len ? in.len : 1;
+        if (!in.name) continue;
+        if (!strcmp(in.name, "s_barrier")) barrier = true;
+        if ((starts(in.name, "s_cbranch") || !strcmp(in.name, "s_branch")) && in.simm16 < 0) backward = true;
+        if (starts(in.name, "global_store_") || starts(in.name, "global_atomic_")) global_write = true;
+    }
+    uint64_t h = 0;
+    auto add = [&](const char* tag) { for (const char* p = tag; *p; p++) h = (h ^ (uint8_t)*p) * 1099511628211ull + 0x9e3779b97f4a7c15ull; };
+    // 2026-11: the step limit of programs with barriers and loops went from 2^22 to 2^16, with the
+    // small limit past the last barrier.
+    if (barrier && backward) add("barrier-limit-2");
+    // 2026-11: global stores take their data from the data field (they read v0); global atomics.
+    if (global_write) add("global-write-2");
+    // 2026-11: 16-bit vertex and mesh outputs are unpacked into the registers their records name
+    // (they went out as 16-bit patterns, and a packed pair's later registers into the wrong ones).
+    Meta m;
+    if ((c.kind == ProgramKind::VS || c.kind == ProgramKind::MS) && parse_meta(c, m)) {
+        bool half = false;
+        for (auto& o : m.vs_outputs) half |= o.fp16;
+        if (half) add("fp16-out-1");
+    }
+    return h;
+}
 
 TranslateResult translate(const Container& c, const RootSig& rs, const TranslateOptions& opt) {
     TranslateResult r;
@@ -4409,7 +4786,7 @@ TranslateResult translate(const Container& c, const RootSig& rs, const Translate
         return r;
     }
     r.ok = true;
-    if (c.kind == ProgramKind::CS) r.profile = t.uses_quad || (t.dual && opt.wave_size_attr) ? "cs_6_6" : "cs_6_0";
+    if (c.kind == ProgramKind::CS) r.profile = t.uses_quad || (t.dual && opt.wave_size_attr) ? "cs_6_6" : t.uses_dot4 && opt.dot4_intrinsic ? "cs_6_4" : "cs_6_0";
     else if (c.kind == ProgramKind::PS) r.profile = "ps_6_0";
     else if (c.kind == ProgramKind::MS) r.profile = "ms_6_5";
     else r.profile = "vs_6_0";

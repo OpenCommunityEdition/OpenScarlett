@@ -23,8 +23,13 @@ struct SigElem {
     std::string name;
     uint32_t index = 0, sysval = 0, comptype = 0, reg = 0, stream = 0, minprec = 0;
     uint8_t mask = 0, rwmask = 0;
-    bool is_float() const { return comptype == 3 || comptype == 0; }
-    bool is_sint() const { return comptype == 2; }
+    // Component types: 1 uint32, 2 sint32, 3 float32, and the 16-bit ones 4 uint16, 5 sint16,
+    // 6 float16 (declared as their 32-bit kinds on the PC; the console stores them in 16 bits).
+    bool is_float() const { return comptype == 3 || comptype == 0 || comptype == 6; }
+    bool is_sint() const { return comptype == 2 || comptype == 5; }
+    bool is_uint() const { return comptype == 1 || comptype == 4; }
+    bool is_half() const { return comptype >= 4 && comptype <= 6; }
+    const char* base_type() const { return is_uint() ? "uint" : is_sint() ? "int" : "float"; }
 };
 std::vector<SigElem> parse_signature(const std::vector<uint8_t>& part);
 
@@ -40,6 +45,7 @@ struct Container {
     int sm_major = 0, sm_minor = 0;
     bool has_bitcode = false;    // false when the bitcode is the 'NOBC' stub (shipping mode "machine code only")
     bool has_native = false;     // a precompiled shader is present
+    unsigned wave_hint = 0;      // 32 or 64 when the container states the program's wave size (0: found from the code)
     std::vector<uint8_t> precompiled;   // inflated precompiled blob ('FSSM' structure)
     // Code region inside `precompiled`: the hash-marker instructions, then code up to the first run
     // of s_code_end padding.

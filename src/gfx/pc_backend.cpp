@@ -1095,7 +1095,7 @@ static bool gm_in_table(uint64_t va, uint64_t bytes) {   // caller holds g_gm_mu
     return va >= it->first && va + bytes <= it->first + it->second;
 }
 std::map<PcObj, uint32_t> g_rs_gm;              // root signature -> appended parameter index (| kRsHeaps: the heap tables follow)
-constexpr uint32_t kRsHeaps = 0x80000000u, kHeapTables = 20;
+constexpr uint32_t kRsHeaps = 0x80000000u, kHeapTables = 2;   // the view heap's table, the sampler heap's
 std::map<PcObj, PcObj> g_list_sampler_heap;    // list -> the sampler heap the title bound
 std::map<PcObj, bool> g_list_global_heap;       // list -> the global heap is bound
 std::map<PcObj, std::pair<PcObj, PcObj>> g_list_gm_rs;   // list -> current (graphics, compute) root signatures
@@ -2668,8 +2668,10 @@ void gm_flush(PcObj devObj) {
 }
 // Appends the global-memory table to a serialized root signature (false: left unchanged).
 // With `heaps`, the bindless arrays of image access through descriptor memory follow the
-// global-memory table: SRVs and UAVs of the whole view heap in spaces 910..918 (two tables each),
-// cube SRVs in space 919, the title's sampler heap in space 920.
+// global-memory table as two tables. One holds the whole view heap seen through every array (the
+// ranges all start at the heap's first descriptor): SRVs and UAVs of 2D, 2D array and 3D textures
+// in spaces 910..918 (float, uint, int each), cube SRVs in 919, 1D textures in 921..923. The other
+// holds the title's sampler heap as samplers (space 920) and as comparison samplers (925).
 static bool gm_extend_root_signature(const void* blob, size_t size, std::vector<uint8_t>& out, uint32_t* index, bool heaps) {
     ID3D12VersionedRootSignatureDeserializer* ds = nullptr;
     if (FAILED(D3D12CreateVersionedRootSignatureDeserializer(blob, size, IID_PPV_ARGS(&ds)))) return false;
@@ -2694,18 +2696,22 @@ static bool gm_extend_root_signature(const void* blob, size_t size, std::vector<
             p.DescriptorTable = {3, ranges};
             p.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
             params.push_back(p);
-            static D3D12_DESCRIPTOR_RANGE1 heap[kHeapTables];
+            static D3D12_DESCRIPTOR_RANGE1 views[32], smps[2];
+            static UINT nviews = 0;
             static std::once_flag once;
             std::call_once(once, [] {
-                for (uint32_t k = 0; k < 9; k++) {
-                    heap[2 * k] = {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, UINT_MAX, 0, 910 + k, vol, 0};
-                    heap[2 * k + 1] = {D3D12_DESCRIPTOR_RANGE_TYPE_UAV, UINT_MAX, 0, 910 + k, vol, 0};
+                for (uint32_t sp : {910u, 911u, 912u, 913u, 914u, 915u, 916u, 917u, 918u, 921u, 922u, 923u}) {
+                    views[nviews++] = {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, UINT_MAX, 0, sp, vol, 0};
+                    views[nviews++] = {D3D12_DESCRIPTOR_RANGE_TYPE_UAV, UINT_MAX, 0, sp, vol, 0};
                 }
-                heap[18] = {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, UINT_MAX, 0, 919, vol, 0};
-                heap[19] = {D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER, UINT_MAX, 0, 920, D3D12_DESCRIPTOR_RANGE_FLAG_DESCRIPTORS_VOLATILE, 0};
+                views[nviews++] = {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, UINT_MAX, 0, 919, vol, 0};
+                smps[0] = {D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER, UINT_MAX, 0, 920, D3D12_DESCRIPTOR_RANGE_FLAG_DESCRIPTORS_VOLATILE, 0};
+                smps[1] = {D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER, UINT_MAX, 0, 925, D3D12_DESCRIPTOR_RANGE_FLAG_DESCRIPTORS_VOLATILE, 0};
             });
-            for (uint32_t k = 0; heaps && k < kHeapTables; k++) {
-                p.DescriptorTable = {1, &heap[k]};
+            if (heaps) {
+                p.DescriptorTable = {nviews, views};
+                params.push_back(p);
+                p.DescriptorTable = {2, smps};
                 params.push_back(p);
             }
             D3D12_VERSIONED_ROOT_SIGNATURE_DESC nd{D3D_ROOT_SIGNATURE_VERSION_1_1};
@@ -2807,14 +2813,12 @@ static void gm_bind(PcObj l, PcObj rs, bool compute) {
     if (compute) L2->SetComputeRootDescriptorTable(idx, gh);
     else L2->SetGraphicsRootDescriptorTable(idx, gh);
     if (!heaps) return;
-    for (uint32_t k = 1; k < kHeapTables; k++) {
-        if (compute) L2->SetComputeRootDescriptorTable(idx + k, g0);
-        else L2->SetGraphicsRootDescriptorTable(idx + k, g0);
-    }
+    if (compute) L2->SetComputeRootDescriptorTable(idx + 1, g0);
+    else L2->SetGraphicsRootDescriptorTable(idx + 1, g0);
     if (samp) {
         D3D12_GPU_DESCRIPTOR_HANDLE sg = as<ID3D12DescriptorHeap>(samp)->GetGPUDescriptorHandleForHeapStart();
-        if (compute) L2->SetComputeRootDescriptorTable(idx + kHeapTables, sg);
-        else L2->SetGraphicsRootDescriptorTable(idx + kHeapTables, sg);
+        if (compute) L2->SetComputeRootDescriptorTable(idx + 2, sg);
+        else L2->SetGraphicsRootDescriptorTable(idx + 2, sg);
     }
 }
 

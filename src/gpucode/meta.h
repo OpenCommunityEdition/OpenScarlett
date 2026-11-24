@@ -68,8 +68,17 @@ struct Meta {
     // interpolated inputs ({signature register, component mask, flat}), colour-target mask and
     // depth-export control.
     uint32_t ps_input_ena = 0, cb_shader_mask = 0, db_shader_control = 0;
-    struct PsInput { uint32_t reg, mask; bool flat; };
+    // reg: the input signature register; mask: the parameter's dwords in use; attr: the attribute
+    // v_interp names. fp16: 16-bit values, one per dword (low half) unless pack2: then two per
+    // dword (element 2d in the low half of dword d, 2d + 1 in the high half), this register's
+    // elements first and, from the next whole dword, those of register row2 (0: none).
+    struct PsInput { uint32_t reg, mask; bool flat; uint32_t attr = 0, row2 = 0; bool fp16 = false, pack2 = false; };
     std::vector<PsInput> ps_inputs;
+    // Vertex and mesh shaders: what `exp param<param>` writes. row: the output signature register
+    // (the primitive signature's when prim, mesh shaders only); fp16 / pack2 as for pixel inputs,
+    // the second register of a packed pair being the next 16-bit register no record names.
+    struct VsOutput { uint32_t row, param; bool prim, fp16, pack2; };
+    std::vector<VsOutput> vs_outputs;
     std::vector<UserArg> args;
     std::vector<ResRecord> resources;
     unsigned user_sgprs() const { return (rsrc2 >> 1) & 31; }

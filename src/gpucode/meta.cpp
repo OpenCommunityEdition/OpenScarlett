@@ -81,7 +81,20 @@ bool parse_meta(const Container& c, Meta& m, std::string* err) {
         uint32_t ni = w(142);
         for (uint32_t k = 0; k < ni && k < 32; k++) {
             uint32_t a = w(78 + 2 * k), b = w(79 + 2 * k);
-            m.ps_inputs.push_back({(a >> 8) & 0xff, (a >> 16) & 0xf, (b >> 24) == 1});
+            // Bytes: usage, register, dword mask, attribute | default, second register, slot,
+            // flags (bit 0 flat, bit 3 16-bit values, bit 4 two of them per dword).
+            const uint32_t fl = b >> 24;
+            m.ps_inputs.push_back({(a >> 8) & 0xff, (a >> 16) & 0xf, (fl & 1) != 0, a >> 24, (b >> 8) & 0xff, (fl & 8) != 0, (fl & 0x10) != 0});
+        }
+    }
+    if ((c.kind == ProgramKind::VS || c.kind == ProgramKind::MS) && c.precompiled.size() >= 0x2a0 && m.header_dwords * 4u >= 0x2a0) {
+        // Output records of 6 bytes at 0x1dc, their count at 0x29c: usage, register, parameter
+        // (bit 7: a mesh shader's per-primitive output), register again, slot, flags (bit 0
+        // 16-bit values, bit 1 two of them per dword).
+        const uint32_t no = rd32(b + 0x29c);
+        for (uint32_t k = 0; k < no && k < 32; k++) {
+            const uint8_t* e = b + 0x1dc + 6 * k;
+            m.vs_outputs.push_back({e[1], uint32_t(e[2] & 0x7f), (e[2] & 0x80) != 0, (e[5] & 1) != 0, (e[5] & 2) != 0});
         }
     }
     // Records follow the s_code_end padding: 5 dwords each, ending with {0, 0, ~0, 0, x}.

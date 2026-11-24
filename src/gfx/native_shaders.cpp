@@ -234,13 +234,34 @@ std::map<uint64_t, std::string> g_failed;   // shader key -> why it is not trans
 thread_local bool t_untranslated = false;   // a shader without DXIL could not be translated
 thread_local std::string t_why;             // ... and why (the first one of the pipeline)
 thread_local std::string t_keys;             // translated shaders since reset (pipeline names)
+thread_local bool t_dry = false, t_dry_ok = false;   // shader_translates(): translate only, never read or write the cache
 }  // namespace
 
 void reset_untranslated() { t_untranslated = false; t_keys.clear(); t_why.clear(); }
+// A pipeline is first built on a thread that must stay quick (xs_device.cpp): there a shader whose
+// translation is not in the cache is not compiled, it is reported so the build can be done again
+// where a compile of minutes holds nothing up.
+thread_local bool t_defer_compile = false, t_compile_deferred = false;
+void defer_compiles(bool on) { t_defer_compile = on; t_compile_deferred = false; }
+bool compile_deferred() { return t_compile_deferred; }
 const char* untranslated_reason() { return t_why.c_str(); }
 bool had_untranslated() { return t_untranslated; }
 static unsigned g_host_wave_min = 32, g_host_wave_max = 32;
 static bool g_host_sm66 = false;
+int shader_cache_state(const void* in, size_t n, char stage[8]);
+bool native_translate(const void* in, size_t n, void** out, size_t* outSize);
+// For the warm-up tool's --purge: whether the translator of this build translates the shader
+// (1 yes, 0 no, -1 not console code it takes). Nothing is compiled or cached.
+int shader_translates(const void* in, size_t n) {
+    if (shader_cache_state(in, n, nullptr) < 0) return -1;
+    t_dry = true;
+    t_dry_ok = false;
+    void* o = nullptr;
+    size_t on = 0;
+    if (native_translate(in, n, &o, &on) && o) free(o);
+    t_dry = false;
+    return t_dry_ok ? 1 : 0;
+}
 void set_host_waves(unsigned min_lanes, unsigned max_lanes, bool sm66) {
     g_host_wave_min = min_lanes;
     g_host_wave_max = max_lanes;
@@ -312,6 +333,7 @@ static uint64_t shader_key(const gpucode::Container& c, const void* in, size_t n
     *meshKind = c.kind == gpucode::ProgramKind::MS || c.kind == gpucode::ProgramKind::AS;
     if (*meshKind) key = fnv("mg1", 3, key);   // mesh stages: small step limit (below)
     if (getenv("XSL_NO_BARRIER_SYNC")) key = fnv("nb", 2, key);
+    if (const uint64_t salt = gpucode::translation_salt(c)) key = fnv(&salt, sizeof salt, key);   // fixes that concern this program only
     return key;
 }
 // For the warm-up tool (tools/shaderwarm): -1 when the container holds no console program the
@@ -329,6 +351,16 @@ int shader_cache_state(const void* in, size_t n, char stage[8]) {
     swprintf(name, 32, L"%016llx.dxil", (unsigned long long)key);
     return GetFileAttributesW((cache_dir() + name).c_str()) != INVALID_FILE_ATTRIBUTES ? 1 : 0;
 }
+// Removes a shader's cached translation (the warm-up tool's --purge). False: there was none.
+bool shader_cache_drop(const void* in, size_t n) {
+    gpucode::Container c;
+    if (cache_dir().empty() || !gpucode::read_container(in, n, c) || !c.has_native) return false;
+    bool fallbackRs = false, meshKind = false;
+    const uint64_t key = shader_key(c, in, n, &fallbackRs, &meshKind);
+    wchar_t name[32];
+    swprintf(name, 32, L"%016llx.dxil", (unsigned long long)key);
+    return DeleteFileW((cache_dir() + name).c_str()) != 0;
+}
 bool native_translate(const void* in, size_t n, void** out, size_t* outSize) {
     if (mode() == 0) return false;
     gpucode::Container c;
@@ -336,8 +368,8 @@ bool native_translate(const void* in, size_t n, void** out, size_t* outSize) {
     if (!c.has_native) {
         if (!c.has_bitcode && !c.part("DXIL") && c.part("ACCC")) {
             // A console program in the console driver's own container (middleware ships these, with
-            // no DXIL beside them). The translator does not read it: the pipeline becomes a
-            // placeholder whose work is skipped, like any other untranslated console program.
+            // no DXIL beside them) whose directory the translator could not read: the pipeline
+            // becomes a placeholder whose work is skipped, like any other untranslated program.
             static volatile long w = 0;
             if (InterlockedIncrement(&w) <= 3) XSL_WARN(CH, "shader (%s, %zu bytes) holds a console program in a container the translator does not read (ACCC): placeholder pipeline", gpucode::kind_name(c.kind), n);
             t_untranslated = true;
@@ -407,8 +439,13 @@ bool native_translate(const void* in, size_t n, void** out, size_t* outSize) {
         snprintf(k, sizeof k, "%016llx", (unsigned long long)key);
         if (strstr(dk, k)) cpath.clear();
     }
-    bool cached = !cpath.empty() && read_file(cpath, dxil);
+    bool cached = !t_dry && !cpath.empty() && read_file(cpath, dxil);
     if (cached) XSL_INFO(CH, "shader %016llx (%s): from cache", (unsigned long long)key, gpucode::kind_name(c.kind));
+    if (!cached && t_defer_compile && !t_dry && ovr.empty()) {
+        t_compile_deferred = true;
+        t_untranslated = noFallback;
+        return false;
+    }
     if (!cached) {
         const auto* rsp = c.part("RTS0");
         gpucode::RootSig rs;
@@ -440,6 +477,7 @@ bool native_translate(const void* in, size_t n, void** out, size_t* outSize) {
             o.global_memory = !(g && g[0] == '0') && !getenv("XSL_GM_NO_RS");
         }
         o.wave64_dual = g_host_wave_min <= 32 && (g_host_wave_max <= 32 || g_host_sm66);
+        o.dot4_intrinsic = g_host_sm66;   // (shader model 6.4)
         const DWORD tick0 = GetTickCount();
         gpucode::TranslateResult r = gpucode::translate(c, rs, o);
         const DWORD tick1 = GetTickCount();
@@ -461,6 +499,7 @@ bool native_translate(const void* in, size_t n, void** out, size_t* outSize) {
             if (t_why.empty()) t_why = why;
             return false;
         }
+        if (t_dry) { t_dry_ok = true; return false; }
         XSL_TRACE(CH, "shader %016llx (%s): %zu bytes of HLSL from %zu bytes of code in %lu ms; compiling", (unsigned long long)key, gpucode::kind_name(c.kind),
                   r.hlsl.size(), n, tick1 - tick0);
         // Some programs come out of the translator tens of megabytes large (their branches are
@@ -479,7 +518,11 @@ bool native_translate(const void* in, size_t n, void** out, size_t* outSize) {
             return false;
         }
         std::string log;
-        if (!compile(r.hlsl, r.profile, dxil, log)) {
+        // A megabyte of HLSL and more (ray-tracing programs come out at five) takes the compiler
+        // many minutes at its full optimization level and seconds at the first; the GPU driver
+        // optimizes the result again anyway. (XSL_DXC_OPT, when set, decides for every size.)
+        static const bool optSet = [] { char b[8]; return GetEnvironmentVariableA("XSL_DXC_OPT", b, sizeof b) != 0; }();
+        if (!compile(r.hlsl, r.profile, dxil, log, !optSet && r.hlsl.size() >= (1u << 20) ? L"-O1" : nullptr)) {
             XSL_ERR(CH, "shader %016llx: translated HLSL does not compile:\n%s", (unsigned long long)key, log.c_str());
             dump(key, in, n, r.hlsl, "");
             if (fallbackRs) dump_rs(key, t_fallback_rs.data(), t_fallback_rs.size());

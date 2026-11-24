@@ -29,8 +29,11 @@ struct TranslateOptions {
     // with a cycle in bad data, would otherwise reset the PC's GPU). Shaders with barriers use the
     // larger limit: a wave that stops early would leave the others waiting at the barrier.
     unsigned loop_guard = 1u << 12;   // dispatcher steps (runaway loops: an invocation stops after this many)
-    unsigned loop_guard_barrier = 1u << 22;
+    unsigned loop_guard_barrier = 1u << 16;
     bool wave_size_attr = false;
+    // The packed 8-bit dot products as the shader model 6.4 intrinsics (a network pass is
+    // thousands of them, and they compile much faster than shifts and multiplies).
+    bool dot4_intrinsic = false;
     // Global memory (title GPU addresses) through the layer's address table: t0 space901 = table,
     // t0.. / u0.. space900 = raw views (docs/gpucode.md). False: only code-embedded data is readable.
     bool global_memory = false;
@@ -96,5 +99,11 @@ struct TranslateResult {
 // `rs` is the root signature the shader was compiled against (the container's RTS0 part, or the
 // one the title passes when it creates the pipeline).
 TranslateResult translate(const Container& c, const RootSig& rs, const TranslateOptions& opt = {});
+
+// A value for the cache key of a program's translation that changes only for the programs a
+// translator fix changes the output of: each fix that does not touch every program names the
+// instructions it concerns here instead of making every cached translation stale. 0 for a
+// program none of them concerns.
+uint64_t translation_salt(const Container& c);
 
 }  // namespace gpucode

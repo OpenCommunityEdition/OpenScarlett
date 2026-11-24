@@ -272,6 +272,8 @@ bool sanitize_container(const void* in, size_t inSize, void** out, size_t* outSi
 // Console machine code -> HLSL -> DXIL for shaders without (usable) DXIL; see native_shaders.cpp.
 bool native_translate(const void* in, size_t inSize, void** out, size_t* outSize);
 int shader_cache_state(const void* in, size_t n, char stage[8]);   // tools/shaderwarm: -1 not console code, 0 not cached, 1 cached
+int shader_translates(const void* in, size_t n);                  // tools/shaderwarm --purge: translation only (1 yes, 0 no, -1 not console code)
+bool shader_cache_drop(const void* in, size_t n);                 // ... and the removal of a cached translation
 void set_fallback_root_signature(const void* blob, size_t n);   // pipeline's root signature for containers without one (0: none)
 const std::vector<uint8_t>& fallback_root_signature();   // the one set above (diagnostics)
 // Whether a shader without DXIL failed translation on this thread since reset_untranslated().
@@ -279,6 +281,10 @@ void reset_untranslated();
 const char* translated_keys();   // keys of shaders translated since reset_untranslated()
 bool had_untranslated();
 const char* untranslated_reason();   // why the first such shader since reset_untranslated() is not translated
+// defer_compiles(true): shaders this thread meets whose translation is not in the cache are not
+// compiled (they count as untranslated) and compile_deferred() says that one was met.
+void defer_compiles(bool on);
+bool compile_deferred();
 void free_container(void* p);
 // Rectangle lists (rect_gs.cpp): a geometry shader that turns each three-vertex rectangle of the
 // console vertex shader `vs` (its container, as the title gave it) into a four-vertex strip. The
