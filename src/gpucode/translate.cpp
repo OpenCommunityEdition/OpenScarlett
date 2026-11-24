@@ -13,6 +13,7 @@
 #include <map>
 #include <set>
 #include <sstream>
+#include <string_view>
 
 #include "isa.h"
 
@@ -336,6 +337,7 @@ struct Translator {
     std::set<size_t> dyn_mubuf;
     std::set<size_t> dyn_sbuf;
     bool uses_fmt_comp = false;            // fmt_comp(): typed buffer components from a run-time format
+    bool uses_fmt_put = false;             // fmt_put(): the same for stores
     std::set<size_t> dyn_mimg;             // image loads/stores on descriptors from descriptor memory
     std::set<size_t> dyn_samp;             // samplers read from descriptor memory (layer payload: sampler-heap index)
     bool uses_heap_sampler = false, uses_heap_sampler_cmp = false;
@@ -994,8 +996,8 @@ struct Translator {
         } else if (in.fmt == Fmt::MUBUF || in.fmt == Fmt::MTBUF) {
             // Raw dword loads/stores may take a descriptor that only exists at run time (loaded from
             // memory): with global memory they address memory from the descriptor words directly.
-            bool rawDw = ((in.fmt == Fmt::MUBUF && (starts(n, "buffer_load_dword") || starts(n, "buffer_store_dword") || starts(n, "buffer_load_format_") || dyn_atomic_op(n) ||
-                                                    dyn_small_op(n))) ||
+            bool rawDw = ((in.fmt == Fmt::MUBUF && (starts(n, "buffer_load_dword") || starts(n, "buffer_store_dword") || starts(n, "buffer_load_format_") ||
+                                                    starts(n, "buffer_store_format_") || dyn_atomic_op(n) || dyn_small_op(n))) ||
                           (in.fmt == Fmt::MTBUF && starts(n, "tbuffer_load_format_"))) && !in.lds;
             soft_trace = rawDw && (opt.global_memory || opt.global_memory_test);
             int r = resource(st, in.srsrc, 4, in, false);
@@ -1323,23 +1325,76 @@ struct Translator {
         if (!in.name) return fail(fmt("unknown %s opcode %u at 0x%x", fmt_name(in.fmt), in.op, in.offset));
         if (!strcmp(in.name, "v_illegal")) return true;
         if (dual && per_lane(in)) {
-            // Once per console lane copy: L/LG = console lane, EXEC/VCC bits and captured outputs renamed.
-            static const char* names[] = {"kexec", "kvcc", "O", "P", "prim_", "hasv_", "hasp_", "clipcull_"};
+            // Once per console lane copy: L/LG = console lane, EXEC/VCC bits and captured outputs
+            // renamed. The names are replaced in the copy's text (they were preprocessor macros
+            // switched around every instruction: 34 lines for one multiply, a 141 KB program came
+            // to 14 MB of HLSL), and the lane is set only for a copy that reads it.
             bool ok = true;
             for (int c = 0; c < 2 && ok; c++) {
                 cp = c;
-                out << fmt("  L = LP_ + %du; LG = L;\n", 32 * c);
-                for (auto nm : names) out << "#define " << nm << " " << nm << "_" << c << "\n";
+                std::ostringstream saved;
+                std::swap(saved, out);
                 ok = emit1(in, idx);
-                for (auto nm : names) out << "#undef " << nm << "\n";
+                bool usesLane = false;
+                const std::string t = lane_names(out.str(), c, &usesLane);
+                std::swap(saved, out);
+                if (usesLane) out << fmt("  L = LP_ + %du; LG = L;\n", 32 * c);
+                lane_stale = !usesLane;   // (after copy 1: whether L is what every instruction used to leave, the second lane)
+                out << t;
             }
             cp = -1;
             return ok;
         }
         cp = 0;
+        if (dual && lane_stale) {
+            // An instruction emitted once: should it read the lane, it reads the second copy's, as
+            // it did when every per-lane instruction set it.
+            std::ostringstream saved;
+            std::swap(saved, out);
+            bool ok = emit1(in, idx);
+            bool usesLane = false;
+            const std::string t = lane_names(out.str(), -1, &usesLane);
+            std::swap(saved, out);
+            if (usesLane) { out << "  L = LP_ + 32u; LG = L;\n"; lane_stale = false; }
+            out << t;
+            cp = -1;
+            return ok;
+        }
         bool ok = emit1(in, idx);
         cp = -1;
         return ok;
+    }
+    bool lane_stale = false;   // two-lane mode: L may not be the second lane's (its last users did not read it)
+    // The text of one lane copy with the per-lane names made that copy's (c < 0: unchanged), and
+    // whether it reads the lane number.
+    static std::string lane_names(const std::string& t, int c, bool* usesLane) {
+        static const char* names[] = {"kexec", "kvcc", "O", "P", "prim_", "hasv_", "hasp_", "clipcull_"};
+        std::string r;
+        r.reserve(t.size() + 64);
+        for (size_t i = 0; i < t.size();) {
+            const unsigned char ch = (unsigned char)t[i];
+            if (isalpha(ch) || ch == '_') {
+                size_t j = i + 1;
+                while (j < t.size() && (isalnum((unsigned char)t[j]) || t[j] == '_')) j++;
+                const size_t n = j - i;
+                r.append(t, i, n);
+                // (L and LG are globals: the helpers that read them count too, which are those with
+                // "lane" in their names and quadperm)
+                if ((n == 1 && t[i] == 'L') || (n == 2 && t[i] == 'L' && t[i + 1] == 'G') || t.compare(i, n, "quadperm") == 0 ||
+                    std::string_view(t).substr(i, n).find("lane") != std::string_view::npos)
+                    *usesLane = true;
+                else if (c >= 0)
+                    for (auto nm : names)
+                        if (strlen(nm) == n && !t.compare(i, n, nm)) { r += c ? "_1" : "_0"; break; }
+                i = j;
+            } else if (isdigit(ch)) {   // a number (0x1fu, 1.0e5): not an identifier
+                size_t j = i + 1;
+                while (j < t.size() && (isalnum((unsigned char)t[j]) || t[j] == '.' || t[j] == '_')) j++;
+                r.append(t, i, j - i);
+                i = j;
+            } else r += t[i++];
+        }
+        return r;
     }
     bool emit1(const Instr& in, size_t idx) {
         lane_pred.clear();
@@ -2400,6 +2455,25 @@ bool Translator::emit_mubuf(const Instr& in, size_t idx) {
         line("}");
         return true;
     }
+    if (r < 0 && dyn_mubuf.count(idx) && starts(n, "buffer_store_format_")) {
+        // Typed store through a run-time descriptor: each component is encoded for the format in
+        // dword 3 [18:12] and written to global memory (fmt_put()).
+        if (in.d16) return fail(n + ": D16 through a run-time descriptor not supported");
+        uses_gm = true;
+        uses_fmt_comp = true;
+        uses_fmt_put = true;
+        unsigned cnt = ends(n, "_xyzw") ? 4 : ends(n, "_xyz") ? 3 : ends(n, "_xy") ? 2 : 1;
+        unsigned va = in.vaddr;
+        std::string vidx = in.idxen ? V(va) : "0u";
+        std::string voff = in.offen ? V(in.idxen ? va + 1 : va) : "0u";
+        std::string so = rd(in.soffset, in);
+        const std::string d0 = S(in.srsrc), d1 = S(in.srsrc + 1), d3 = S(in.srsrc + 3);
+        line(fmt("if (kexec) { uint off_ = %s + %s + %uu + %s * ((%s >> 16) & 0x3fffu);", voff.c_str(), so.c_str(), uint32_t(in.offset_imm), vidx.c_str(), d1.c_str()));
+        line(fmt("  uint lo_ = %s + off_, hi_ = (%s & 0xffffu) + (lo_ < %s ? 1u : 0u), f_ = (%s >> 12) & 0x7fu;", d0.c_str(), d1.c_str(), d0.c_str(), d3.c_str()));
+        for (unsigned k = 0; k < cnt; k++) line(fmt("  fmt_put(lo_, hi_, f_, %uu, %s);", k, V(in.vdata + k).c_str()));
+        line("}");
+        return true;
+    }
     if (r < 0 && dyn_mubuf.count(idx) && starts(n, "tbuffer_load_format_")) {
         // The same with the format the instruction names (the descriptor gives the address and
         // the stride): only the formats fmt_comp() decodes, components of one size of 8, 16 or 32 bits.
@@ -2655,8 +2729,15 @@ bool Translator::emit_mubuf(const Instr& in, size_t idx) {
                 else line(fmt("  InterlockedCompareExchange(%s, %s, %s, o_);", word("a_").c_str(), V(in.vdata + 1).c_str(), V(in.vdata).c_str()));
             } else if (R.kind == ResKind::RawBuf) {
                 line(fmt("  %s.%s(a_, %s, o_);", RN.c_str(), p[1], tv.c_str()));
+            } else if (sgn) {
+                // A structured buffer's elements are unsigned here, and so is its InterlockedMin/Max:
+                // the signed forms are a compare-and-swap that gives up when the value no longer wins.
+                const std::string t = word("a_");
+                line(fmt("  uint c_ = %s, w_ = %s;", t.c_str(), val.c_str()));
+                line(fmt("  [loop] for (uint i_ = 0u; i_ < 24u; i_++) { if (!(int(w_) %s int(c_))) break; uint p_; InterlockedCompareExchange(%s, c_, w_, p_); if (p_ == c_) break; c_ = p_; }",
+                         op == "smin" ? "<" : ">", t.c_str()));
+                line("  o_ = int(c_);");
             } else {
-                if (sgn) return fail(n + " on structured buffer (signed) not supported");
                 line(fmt("  %s(%s, %s, o_);", p[1], word("a_").c_str(), tv.c_str()));
             }
             if (rtn) line(fmt("  %s = uint(o_);", V(in.vdata).c_str()));
@@ -2945,11 +3026,16 @@ bool Translator::emit_mimg(const Instr& in, size_t idx) {
             if (R.cube_array) tc = fmt("float4(%s, float(uint(round(asfloat(%s))) / 6u))", tc.c_str(), crd[2].c_str());
         } else if (dim == 5) tc = fmt("float3(asfloat(%s), asfloat(%s), round(asfloat(%s)))", crd[0].c_str(), crd[1].c_str(), crd[2].c_str());
         else tc = fcoord(nc);
+        std::string gatherOfs;
         if (!offs.empty()) {
             // Texel offsets (signed 6-bit x [5:0], y [13:8]): on 2D textures and 2D arrays sampled at an
             // explicit level they become a UV shift of offset / mip size (exact at level 0).
             bool explicit_lod = has(n, "_lz") || !lod.empty();
             bool flat = dim == 1 || (dim == 5 && R.dim != 3);
+            if (flat && has(n, "gather")) {
+                // A gather takes its offset in texels as it is (signed 6-bit x and y).
+                gatherOfs = fmt(", int2(int(%s << 26) >> 26, int(%s << 18) >> 26)", offs.c_str(), offs.c_str());
+            } else {
             if (!flat || !explicit_lod || has(n, "gather")) return fail(n + ": texel offsets not supported yet");
             std::string mip = has(n, "_lz") ? std::string("0u") : fmt("uint(max(round(asfloat(%s)), 0.0))", lod.c_str());
             static std::atomic<unsigned> ofsSerial{0};   // one name per instruction (a resource may be sampled many times)
@@ -2959,6 +3045,7 @@ bool Translator::emit_mimg(const Instr& in, size_t idx) {
                      ofs.c_str(), offs.c_str(), RN.c_str(), mip.c_str(), dim == 5 ? "d_, " : "", ofs.c_str()));
             if (dim == 1) tc = fmt("(%s + %s)", tc.c_str(), ofs.c_str());
             else tc = fmt("(%s + float3(%s, 0.0))", tc.c_str(), ofs.c_str());
+            }
         }
         std::string call;
         const std::string T = RN;
@@ -2974,9 +3061,8 @@ bool Translator::emit_mimg(const Instr& in, size_t idx) {
         }
         if (starts(n, "image_gather4")) {
             const char* ch = in.dmask == 1 ? "Red" : in.dmask == 2 ? "Green" : in.dmask == 4 ? "Blue" : "Alpha";
-            if (!zc.empty()) call = fmt("%s.GatherCmp%s(%s, %s, asfloat(%s))", T.c_str(), ch, SS.c_str(), tc.c_str(), zc.c_str());
-            else if (!lod.empty() || has(n, "_lz")) call = fmt("%s.Gather%s(%s, %s)", T.c_str(), ch, SS.c_str(), tc.c_str());   // level must be 0 for HLSL Gather
-            else call = fmt("%s.Gather%s(%s, %s)", T.c_str(), ch, SS.c_str(), tc.c_str());
+            if (!zc.empty()) call = fmt("%s.GatherCmp%s(%s, %s, asfloat(%s)%s)", T.c_str(), ch, SS.c_str(), tc.c_str(), zc.c_str(), gatherOfs.c_str());
+            else call = fmt("%s.Gather%s(%s, %s%s)", T.c_str(), ch, SS.c_str(), tc.c_str(), gatherOfs.c_str());   // (HLSL gathers at level 0)
             // Gather returns 4 values regardless of dmask.
             line(fmt("if (kexec) { %s t_ = %s;", R.is_uint ? "uint4" : "float4", call.c_str()));
             if (in.d16)
@@ -3910,6 +3996,7 @@ std::string Translator::generate() {
     for (size_t b = 0; b < nb; b++) {
         size_t e = block_end(b);
         if (!live[b]) continue;
+        lane_stale = true;   // (a block is entered from several places: what L holds there is not known)
         if (!loops) line(fmt("if (reach[%zu]) {", b));
         else line(fmt("case %zuu: {", b));
         if (loops && barriers && !barrier_ahead[b])   // past the last barrier: the small limit (see barrier_ahead)
@@ -4145,6 +4232,22 @@ std::string Translator::generate() {
              "  if (t == 4u) return asuint(max(float(sv) / maxs, -1.0));\n"
              "  if (t == 5u) return asuint(float(v));\n"
              "  return asuint(float(sv));\n"
+             "}\n";
+        // The other way: component k (float results as bits) encoded and written. Components the
+        // format does not have are not stored.
+        if (uses_fmt_put)
+        h << "void fmt_put(uint lo, uint hi, uint f, uint k, uint v) {\n"
+             "  uint d = FMTD[f & 127u], z = d & 0xffu, n = (d >> 8) & 15u, t = d >> 12;\n"
+             "  if (d == 0u || k >= n) return;\n"
+             "  uint mask = z == 32u ? 0xffffffffu : (1u << z) - 1u, e = v;\n"
+             "  float maxu = float(mask), maxs = float((1u << (z - 1u)) - 1u), x = asfloat(v);\n"
+             "  if (t == 2u) e = z == 32u ? v : f32tof16(x);\n"
+             "  else if (t == 3u) e = uint(round(saturate(x) * maxu));\n"
+             "  else if (t == 4u) e = uint(int(round(clamp(x, -1.0, 1.0) * maxs)));\n"
+             "  else if (t == 5u) e = uint(max(x, 0.0));\n"
+             "  else if (t == 6u) e = uint(int(x));\n"
+             "  uint a = lo + k * (z >> 3), ah = hi + (a < lo ? 1u : 0u);\n"
+             "  if (z == 32u) gm_store(a, ah, e); else gm_store_bits(a, ah, e & mask, mask);\n"
              "}\n";
     }
     {   // bindless global-heap arrays for image access through descriptor memory (spaces 910+)
