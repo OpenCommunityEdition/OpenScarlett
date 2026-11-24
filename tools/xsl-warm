@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: MIT
-"""xsl-warm <folder or file>... [--cache DIR] [--jobs N] [--check] [--report FILE] [--build DIR]
+"""xsl-warm <folder or file>... [--cache DIR] [--jobs N] [--check] [--purge] [--dry] [--report FILE] [--build DIR]
 
 Fills the shader cache from console shader containers on disk before a title runs (Windows).
 It puts xsl-shaderwarm.exe (build it with `ninja -C build xsl-shaderwarm`) in <build>/warm together
@@ -13,6 +13,10 @@ process per job, each on its own share of the files, and adds up what they repor
     --cache DIR    the cache folder (default: XSL_SHADER_CACHE, else the layer's own default)
     --jobs N       processes at a time (default: the logical processors less two)
     --check        only count what the cache has and lacks
+    --purge        remove cached translations of shaders this build no longer translates
+    --rs-dir DIR   also write each shader's own root signature to DIR (for xsl-gpucode translate)
+    --dry          translate everything without compiling: what translates, and why not the rest
+                   (the "compiled" count is then the number translated)
     --report FILE  one line per shader that did not translate: file name, tab, reason
     --build DIR    the build folder (default: build next to tools)
 """
@@ -25,8 +29,8 @@ import sys
 import time
 
 
-PROGRESS = re.compile(r"(\d+) / (\d+): (\d+) already cached, (\d+) compiled, (\d+) not translated, (\d+) not cached, (\d+) other")
-NAMES = ("done", "files", "already cached", "compiled", "not translated", "not cached", "other")
+PROGRESS = re.compile(r"(\d+) / (\d+): (\d+) already cached, (\d+) compiled, (\d+) not translated, (\d+) not cached, (\d+) other, (\d+) dropped")
+NAMES = ("done", "files", "already cached", "compiled", "not translated", "not cached", "other", "dropped")
 
 
 def last_progress(path):
@@ -42,24 +46,30 @@ def last_progress(path):
 def main():
     args = sys.argv[1:]
     build = pathlib.Path(__file__).resolve().parent.parent / "build"
-    cache = report = None
+    cache = report = rs_dir = None
     jobs = max(1, (os.cpu_count() or 4) - 2)
-    check = False
+    check = purge = dry = False
     paths = []
     i = 0
     while i < len(args):
-        if args[i] in ("--build", "--cache", "--report", "--jobs") and i + 1 < len(args):
+        if args[i] in ("--build", "--cache", "--report", "--jobs", "--rs-dir") and i + 1 < len(args):
             if args[i] == "--build":
                 build = pathlib.Path(args[i + 1])
             elif args[i] == "--cache":
                 cache = args[i + 1]
             elif args[i] == "--report":
                 report = args[i + 1]
+            elif args[i] == "--rs-dir":
+                rs_dir = os.path.abspath(args[i + 1])
             else:
                 jobs = max(1, int(args[i + 1]))
             i += 2
         elif args[i] == "--check":
             check = True; i += 1
+        elif args[i] == "--purge":
+            purge = True; i += 1
+        elif args[i] == "--dry":
+            dry = True; i += 1
         else:
             paths.append(os.path.abspath(args[i])); i += 1
     if not paths or os.name != "nt":
@@ -94,6 +104,12 @@ def main():
         cmd = [str(stage / exe.name), *paths, "--jobs", "1", "--shard", f"{k}/{jobs}", "--report", str(work / f"report.{k}.tsv")]
         if check:
             cmd.append("--check")
+        if purge:
+            cmd.append("--purge")
+        if dry:
+            cmd.append("--dry")
+        if rs_dir:
+            cmd += ["--rs-dir", rs_dir]
         logs.append(work / f"out.{k}.log")
         out = open(logs[-1], "w")
         procs.append(subprocess.Popen(cmd, env=env, cwd=stage, stdout=out, stderr=subprocess.STDOUT))
@@ -128,7 +144,7 @@ def main():
         why = row.split("\t", 1)[1]
         reasons[why] = reasons.get(why, 0) + 1
     if reasons:
-        print("\nwhy:" if check else "\nwhy shaders did not translate:")
+        print("\nwhy:" if check or purge else "\nwhy shaders did not translate:")
         for why, n in sorted(reasons.items(), key=lambda kv: -kv[1]):
             print(f"  {n:6d}  {why}")
     if report:
