@@ -18,6 +18,10 @@
 // gamepad stand-in on the aggregate pad: Esc = View, Enter = Menu, arrows = D-pad, Z/X/C/V = A/B/X/Y.
 #include <windows.h>
 #include <xinput.h>
+#include <setupapi.h>
+extern "C" {
+#include <hidsdi.h>
+}
 
 #include <GameInput.h>
 
@@ -42,6 +46,107 @@ HMODULE g_xinput_mod = [] {
 }();
 PFN_XInputGetState g_xget = g_xinput_mod ? (PFN_XInputGetState)GetProcAddress(g_xinput_mod, "XInputGetState") : nullptr;
 PFN_XInputSetState g_xset = g_xinput_mod ? (PFN_XInputSetState)GetProcAddress(g_xinput_mod, "XInputSetState") : nullptr;
+
+// ---- Sony pads over HID ------------------------------------------------------------------
+// XInput does not see a DualShock 4 or DualSense; game streaming hosts also present a remote
+// PlayStation pad as a virtual DualShock 4. One such pad is read here from its HID input
+// reports on a thread and offered as the first slot that XInput leaves empty.
+struct SonyPad {
+    std::mutex mu;
+    XINPUT_STATE state{};
+    std::atomic<bool> present{false};
+} g_sony;
+SHORT sony_axis(uint8_t v, bool invert) {
+    int a = ((int)v - 128) * 258;
+    if (invert) a = -a - 1;
+    return (SHORT)(a < -32768 ? -32768 : a > 32767 ? 32767 : a);
+}
+void sony_report(const uint8_t* b, DWORD n, bool dualsense) {
+    // USB-style report 1. DualShock 4: sticks 1-4, buttons 5-7, triggers 8-9.
+    // DualSense: sticks 1-4, triggers 5-6, buttons 8-10.
+    if (n < 11 || b[0] != 1) return;
+    const uint8_t b0 = dualsense ? b[8] : b[5], b1 = dualsense ? b[9] : b[6];
+    const uint8_t lt = dualsense ? b[5] : b[8], rt = dualsense ? b[6] : b[9];
+    WORD w = 0;
+    static const WORD hat[8] = {XINPUT_GAMEPAD_DPAD_UP, XINPUT_GAMEPAD_DPAD_UP | XINPUT_GAMEPAD_DPAD_RIGHT, XINPUT_GAMEPAD_DPAD_RIGHT,
+                                XINPUT_GAMEPAD_DPAD_RIGHT | XINPUT_GAMEPAD_DPAD_DOWN, XINPUT_GAMEPAD_DPAD_DOWN,
+                                XINPUT_GAMEPAD_DPAD_DOWN | XINPUT_GAMEPAD_DPAD_LEFT, XINPUT_GAMEPAD_DPAD_LEFT,
+                                XINPUT_GAMEPAD_DPAD_LEFT | XINPUT_GAMEPAD_DPAD_UP};
+    if ((b0 & 15) < 8) w |= hat[b0 & 15];
+    if (b0 & 0x10) w |= XINPUT_GAMEPAD_X;   // square
+    if (b0 & 0x20) w |= XINPUT_GAMEPAD_A;   // cross
+    if (b0 & 0x40) w |= XINPUT_GAMEPAD_B;   // circle
+    if (b0 & 0x80) w |= XINPUT_GAMEPAD_Y;   // triangle
+    if (b1 & 0x01) w |= XINPUT_GAMEPAD_LEFT_SHOULDER;
+    if (b1 & 0x02) w |= XINPUT_GAMEPAD_RIGHT_SHOULDER;
+    if (b1 & 0x10) w |= XINPUT_GAMEPAD_BACK;    // share / create
+    if (b1 & 0x20) w |= XINPUT_GAMEPAD_START;   // options
+    if (b1 & 0x40) w |= XINPUT_GAMEPAD_LEFT_THUMB;
+    if (b1 & 0x80) w |= XINPUT_GAMEPAD_RIGHT_THUMB;
+    std::lock_guard<std::mutex> g(g_sony.mu);
+    g_sony.state.dwPacketNumber++;
+    g_sony.state.Gamepad.wButtons = w;
+    g_sony.state.Gamepad.bLeftTrigger = lt;
+    g_sony.state.Gamepad.bRightTrigger = rt;
+    g_sony.state.Gamepad.sThumbLX = sony_axis(b[1], false);
+    g_sony.state.Gamepad.sThumbLY = sony_axis(b[2], true);
+    g_sony.state.Gamepad.sThumbRX = sony_axis(b[3], false);
+    g_sony.state.Gamepad.sThumbRY = sony_axis(b[4], true);
+}
+// Opens the first Sony pad among the HID devices (null: none).
+HANDLE sony_open(bool* dualsense) {
+    GUID hid;
+    HidD_GetHidGuid(&hid);
+    HDEVINFO set = SetupDiGetClassDevsW(&hid, nullptr, nullptr, DIGCF_PRESENT | DIGCF_DEVICEINTERFACE);
+    if (set == INVALID_HANDLE_VALUE) return nullptr;
+    HANDLE found = nullptr;
+    SP_DEVICE_INTERFACE_DATA ifd{sizeof ifd};
+    for (DWORD i = 0; !found && SetupDiEnumDeviceInterfaces(set, nullptr, &hid, i, &ifd); i++) {
+        alignas(8) uint8_t buf[1024];
+        auto* det = (SP_DEVICE_INTERFACE_DETAIL_DATA_W*)buf;
+        det->cbSize = sizeof(SP_DEVICE_INTERFACE_DETAIL_DATA_W);
+        if (!SetupDiGetDeviceInterfaceDetailW(set, &ifd, det, sizeof buf, nullptr, nullptr)) continue;
+        HANDLE h = CreateFileW(det->DevicePath, GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, 0, nullptr);
+        if (h == INVALID_HANDLE_VALUE) h = CreateFileW(det->DevicePath, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, 0, nullptr);
+        if (h == INVALID_HANDLE_VALUE) continue;
+        HIDD_ATTRIBUTES at{sizeof at};
+        const bool sony = HidD_GetAttributes(h, &at) && at.VendorID == 0x054C;
+        const bool ds4 = sony && (at.ProductID == 0x05C4 || at.ProductID == 0x09CC || at.ProductID == 0x0BA0);
+        const bool ds5 = sony && (at.ProductID == 0x0CE6 || at.ProductID == 0x0DF2);
+        if (ds4 || ds5) { found = h; *dualsense = ds5; XSL_INFO(CH, "Sony pad %04x:%04x read over HID (XInput does not list it)", at.VendorID, at.ProductID); }
+        else CloseHandle(h);
+    }
+    SetupDiDestroyDeviceInfoList(set);
+    return found;
+}
+DWORD WINAPI sony_thread(void*) {
+    for (;;) {
+        bool dualsense = false;
+        HANDLE h = sony_open(&dualsense);
+        if (!h) { Sleep(2000); continue; }
+        g_sony.present = true;
+        uint8_t rep[128];
+        DWORD got = 0;
+        while (ReadFile(h, rep, sizeof rep, &got, nullptr)) sony_report(rep, got, dualsense);
+        g_sony.present = false;   // unplugged: look again
+        { std::lock_guard<std::mutex> g(g_sony.mu); g_sony.state = {}; }
+        CloseHandle(h);
+        Sleep(1000);
+    }
+}
+// Gamepad state of a slot: XInput's, else the Sony pad on the first slot XInput leaves empty.
+DWORD pad_get(DWORD slot, XINPUT_STATE* x) {
+    static const bool started = [] { HANDLE t = CreateThread(nullptr, 0, sony_thread, nullptr, 0, nullptr); if (t) CloseHandle(t); return true; }();
+    (void)started;
+    if (g_xget && g_xget(slot, x) == ERROR_SUCCESS) return ERROR_SUCCESS;
+    if (!g_sony.present) return ERROR_DEVICE_NOT_CONNECTED;
+    XINPUT_STATE other{};
+    for (DWORD i = 0; i < slot; i++)
+        if (!g_xget || g_xget(i, &other) != ERROR_SUCCESS) return ERROR_DEVICE_NOT_CONNECTED;   // an earlier empty slot has it
+    std::lock_guard<std::mutex> g(g_sony.mu);
+    *x = g_sony.state;
+    return ERROR_SUCCESS;
+}
 
 uint64_t now_us() {
     static LARGE_INTEGER f = [] { LARGE_INTEGER x; QueryPerformanceFrequency(&x); return x; }();
@@ -115,7 +220,7 @@ void scripted_sticks(float* ry, float* ly) {
 bool pad_state(DWORD slot, GameInputGamepadState* s) {
     *s = {};
     XINPUT_STATE x{};
-    if (!g_xget || g_xget(slot, &x) != ERROR_SUCCESS) {
+    if (pad_get(slot, &x) != ERROR_SUCCESS) {
         if (slot == 0 && !input_script().empty()) {   // scripted presses need no physical pad
             uint32_t o = 0;
             scripted(&o, nullptr);
@@ -720,7 +825,7 @@ DWORD WINAPI poll_thread(void*) {
             for (Device* d : devices()) {
                 if (d->type != Dev::Pad) continue;
                 XINPUT_STATE x;
-                bool now = (g_xget && g_xget(d->slot, &x) == ERROR_SUCCESS) || (d->slot == 0 && !input_script().empty());
+                bool now = (pad_get(d->slot, &x) == ERROR_SUCCESS) || (d->slot == 0 && !input_script().empty());
                 if (now == d->connected) continue;
                 GameInputDeviceStatus prev = d->status();
                 d->connected = now;
@@ -780,7 +885,7 @@ void start_threads() {
     std::call_once(once, [] {
         for (Device* d : devices()) {
             XINPUT_STATE x;
-            if (d->type == Dev::Pad) d->connected = (g_xget && g_xget(d->slot, &x) == ERROR_SUCCESS) || (d->slot == 0 && !input_script().empty());   // scripted input: a virtual pad
+            if (d->type == Dev::Pad) d->connected = (pad_get(d->slot, &x) == ERROR_SUCCESS) || (d->slot == 0 && !input_script().empty());   // scripted input: a virtual pad
             if (d->connected) record(d);
         }
         CloseHandle(CreateThread(nullptr, 0, raw_thread, nullptr, 0, nullptr));
