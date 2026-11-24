@@ -245,6 +245,38 @@ bool materialize_xbox_cbv(uint32_t i, const uint64_t* q) {
         // the address in 64-byte units and the size in 32-byte units (shifted by 20).
         addr = q[0];
         size = w[2];
+    } else if (q[0] && q[3] == q[0] && w[5] && !(w[5] & 3) && w[5] <= (1u << 24) && w[2] == w[5] / 4 - 1) {
+        // An inlined shader view of a small buffer (a title's movie and UI quads keep their
+        // transforms in one): the address, the size in dwords less one, a dword the title leaves
+        // as it was, flags, the size in bytes, and the address again. The element size is the
+        // shader's business on the console; here the view is made of 64-byte elements when the
+        // size allows (matrices), else of dwords.
+        const uint64_t a = q[0];
+        const uint32_t bytes = w[5], stride = bytes % 64 == 0 ? 64 : 4;
+        UnifiedRef u{};
+        PcObj pcd = dev_extra(g_dev)->pcDevice;
+        bool ok = unified_from_gpu(a, &u) || unified_lookup(g_dev, a, &u);
+        uint64_t off = u.offset;
+        if (!ok) { PcObj r = nullptr; uint64_t avail = 0; ok = pc::gm_resolve(a, &r, &off, &avail) && r; u.res = r; }
+        static volatile long n = 0;
+        const long k = InterlockedIncrement(&n);
+        if (k == 1 || (!ok && k <= 8))
+            XSL_INFO(CH, "inline buffer view of %u bytes at %llx: %s", bytes, (unsigned long long)a, ok ? "a shader view of its PC buffer" : "no PC memory known there, null view");
+        D3D12_SHADER_RESOURCE_VIEW_DESC sd{};
+        sd.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+        sd.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        sd.Format = DXGI_FORMAT_UNKNOWN;
+        sd.Buffer.StructureByteStride = stride;
+        sd.Buffer.NumElements = bytes / stride;
+        if (ok && off % stride == 0) {
+            sd.Buffer.FirstElement = off / stride;
+            pc::create_srv(pcd, u.res, &sd, mirror_cpu(i));
+        } else {
+            sd.Buffer.NumElements = 1;
+            pc::create_srv(pcd, nullptr, &sd, mirror_cpu(i));
+        }
+        publish(i);
+        return true;
     } else {
         return false;
     }

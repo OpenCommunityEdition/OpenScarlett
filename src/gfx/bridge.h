@@ -156,6 +156,8 @@ void res_unmap(PcObj r, uint32_t sub, const void* range);
 void res_desc(PcObj r, void* outDesc);
 uint64_t res_gpu_va(PcObj r);
 void* map_shadow_base(PcObj r);   // the CPU copy a mapped video-memory texture got, if any
+std::string list_pso_name(PcObj l);   // the selected pipeline's name (diagnostics)
+bool map_shadow_written(PcObj r);   // the title wrote into that copy since the last call
 
 // Allocator and command list
 HRESULT_T alloc_reset(PcObj a);

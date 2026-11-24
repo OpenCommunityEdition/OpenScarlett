@@ -35,13 +35,51 @@ std::wstring widen(const char* s) {
 std::mutex g_mu;
 std::map<ATOM, WNDPROC> g_procs;  // title class -> its window procedure
 
+// Diagnostics: a message that stays in a title's window procedure for seconds is logged with the
+// messages nested above it (a title whose render thread owns the window stops presenting while it
+// sits there).
+struct InProc { volatile LONG tid; volatile LONG depth; UINT msg[6]; ULONGLONG start; volatile LONG reported; };
+InProc g_inproc[8];
+DWORD WINAPI inproc_watch(void*) {
+    for (;;) {
+        Sleep(2000);
+        const ULONGLONG now = GetTickCount64();
+        for (auto& e : g_inproc) {
+            if (!e.tid || e.depth <= 0 || now - e.start < 3000 || InterlockedExchange(&e.reported, 1)) continue;
+            XSL_WARN("platform", "thread %ld has been in the title's window procedure for %llu ms: messages %#x > %#x > %#x > %#x (depth %ld)", e.tid,
+                     (unsigned long long)(now - e.start), e.msg[0], e.msg[1], e.msg[2], e.msg[3], e.depth);
+        }
+    }
+}
+struct InProcScope {
+    InProc* e = nullptr;
+    InProcScope(UINT m) {
+        static HANDLE th = CreateThread(nullptr, 0, inproc_watch, nullptr, 0, nullptr);
+        (void)th;
+        const LONG tid = (LONG)GetCurrentThreadId();
+        for (auto& s : g_inproc) if (s.tid == tid) { e = &s; break; }
+        if (!e) for (auto& s : g_inproc) if (InterlockedCompareExchange(&s.tid, tid, 0) == 0) { e = &s; break; }
+        if (!e) return;
+        const LONG d = e->depth;
+        if (d == 0) { e->start = GetTickCount64(); e->reported = 0; for (auto& x : e->msg) x = 0; }
+        if (d >= 0 && d < 6) e->msg[d] = m;
+        e->depth = d + 1;
+    }
+    ~InProcScope() { if (e) e->depth = e->depth - 1; }
+};
+
 LRESULT CALLBACK close_wrapper(HWND h, UINT m, WPARAM w, LPARAM l) {
+    InProcScope scope(m);
     WNDPROC orig = nullptr;
     {
         std::lock_guard<std::mutex> g(g_mu);
         auto it = g_procs.find((ATOM)GetClassLongPtrW(h, GCW_ATOM));
         if (it != g_procs.end()) orig = it->second;
     }
+    // The ALT key (or F10) alone opens the window menu, a modal loop in DefWindowProc: a title
+    // whose render thread owns the window stops presenting until the menu is dismissed (one sat
+    // there until its own watchdog ended it). A console title has no window menu.
+    if (m == WM_SYSCOMMAND && (w & 0xFFF0) == SC_KEYMENU) return 0;
     if (m == WM_CLOSE) {
         static bool exits = [] { char b[4]; return !(GetEnvironmentVariableA("XSL_CLOSE_EXITS", b, 4) && b[0] == '0'); }();
         if (exits) {

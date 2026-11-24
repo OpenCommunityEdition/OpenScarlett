@@ -123,8 +123,40 @@ void release_va(uintptr_t va) {
     g_page_views.erase(page);
     if (g_owned.erase(page) || g_zombie.erase(page)) g_free.push_back(page);
 }
+// GPU views. A title reserves the same amount of 64 KB-page address space twice: once readable,
+// once PAGE_NOACCESS | PAGE_GRAPHICS_NOACCESS. It maps physical pages only into the first and
+// places GPU resources at the same offsets in the second, which on the console is the GPU's view
+// of the first (a movie's planes are decoded by the CPU into one and sampled at the other). Here
+// the second is separate, empty address space, so the layer asks where the bytes of an address
+// are (xsl_xmem_source): at the address itself when a page is mapped there, else at the same
+// offset of the readable reservation.
+struct GpuView { SIZE_T size; uintptr_t cpu; };
+std::map<uintptr_t, GpuView> g_gpu_views;                      // GPU view -> the readable reservation
+std::vector<std::pair<uintptr_t, SIZE_T>> g_cpu_reservations;   // readable ones, oldest first
+void note_reservation(uintptr_t base, SIZE_T size, DWORD protect) {
+    const bool noAccess = (protect & 0xFF) == PAGE_NOACCESS || !(protect & 0xFF);
+    if ((protect & PAGE_GRAPHICS_NOACCESS) && noAccess) {
+        for (auto it = g_cpu_reservations.rbegin(); it != g_cpu_reservations.rend(); ++it) {
+            if (it->second != size) continue;
+            bool taken = false;
+            for (auto& v : g_gpu_views) taken |= v.second.cpu == it->first;
+            if (taken) continue;
+            g_gpu_views[base] = {size, it->first};
+            XSL_INFO(CH, "reservation %p (%zu MB, no CPU access) is the GPU view of %p", (void*)base, (size_t)(size >> 20), (void*)it->first);
+            return;
+        }
+        XSL_INFO(CH, "reservation %p (%zu MB, no CPU access): no readable reservation of that size to be the GPU view of", (void*)base, (size_t)(size >> 20));
+    } else if (!noAccess) {
+        g_cpu_reservations.push_back({base, size});
+        if (size >= (1ull << 30)) XSL_INFO(CH, "reservation %p (%zu MB) readable by the CPU (protect %#lx)", (void*)base, (size_t)(size >> 20), protect);
+    } else if (size >= (1ull << 30)) {
+        XSL_INFO(CH, "reservation %p (%zu MB) with protect %#lx", (void*)base, (size_t)(size >> 20), protect);
+    }
+}
 // Make [va, va+kPage) its own placeholder (splitting the enclosing one) and map `page` there.
-bool map_one(uintptr_t va, ULONG_PTR page) {
+bool map_one_at(uintptr_t va, ULONG_PTR page);
+bool map_one(uintptr_t va, ULONG_PTR page) { return map_one_at(va, page); }
+bool map_one_at(uintptr_t va, ULONG_PTR page) {
     MEMORY_BASIC_INFORMATION mbi{};
     VirtualQuery((void*)va, &mbi, sizeof mbi);
     if (mbi.Type == MEM_MAPPED) { UnmapViewOfFile2(GetCurrentProcess(), (void*)va, MEM_PRESERVE_PLACEHOLDER); release_va(va); }
@@ -268,6 +300,7 @@ static PVOID WINAPI XMemVirtualAlloc_(PVOID base, SIZE_T size, DWORD type, ULONG
         if (p) {
             std::lock_guard<std::mutex> g(g_mu);
             g_placeholders[(uintptr_t)p] = sz;
+            note_reservation((uintptr_t)p, sz, protect);
         } else {
             XSL_ERR(CH, "placeholder reservation of %zu bytes at %p failed (%lu; type %lx, flags %llx, protect %lx)", sz, base, GetLastError(), type, flags, protect);
         }
@@ -540,12 +573,17 @@ BOOL WINAPI xsl_xmem_virtual_free(void* base, SIZE_T size, DWORD type, BOOL* res
     uintptr_t start = b & ~(uintptr_t)(kPage - 1), end;
     if (type & MEM_DECOMMIT) end = size ? (b + size + kPage - 1) & ~(uintptr_t)(kPage - 1) : it->first + it->second;
     else { start = it->first; end = it->first + it->second; if (b != it->first) return FALSE; }
-    for (auto v = g_va_page.lower_bound(start); v != g_va_page.end() && v->first < end;) {
-        uintptr_t va = v->first;
-        ++v;
+    std::vector<uintptr_t> mapped;
+    for (auto v = g_va_page.lower_bound(start); v != g_va_page.end() && v->first < end; ++v) mapped.push_back(v->first);
+    for (uintptr_t va : mapped) {
+        if (!g_va_page.count(va)) continue;
         UnmapViewOfFile2(GetCurrentProcess(), (void*)va, MEM_PRESERVE_PLACEHOLDER);
         release_va(va);
     }
+    for (auto it = g_gpu_views.begin(); it != g_gpu_views.end();)   // a released reservation takes its pairing with it
+        it = (it->first >= start && it->first < end) || (it->second.cpu >= start && it->second.cpu < end) ? g_gpu_views.erase(it) : std::next(it);
+    for (size_t k = 0; k < g_cpu_reservations.size();)
+        if (g_cpu_reservations[k].first >= start && g_cpu_reservations[k].first < end) g_cpu_reservations.erase(g_cpu_reservations.begin() + k); else k++;
     if (type & MEM_DECOMMIT) { *result = TRUE; return TRUE; }
     VirtualFree((void*)start, end - start, MEM_RELEASE | MEM_COALESCE_PLACEHOLDERS);
     *result = VirtualFree((void*)start, 0, MEM_RELEASE);
@@ -595,6 +633,17 @@ BOOL WINAPI xsl_xmem_section_of(const void* va, HANDLE* section, ULONG64* offset
     return TRUE;
 }
 
+// Where the bytes of a title address are: the address itself, or, for an address in a GPU view
+// (see g_gpu_views) with no page mapped at it, the same offset of the readable reservation.
+uintptr_t WINAPI xsl_xmem_source(uintptr_t va) {
+    std::lock_guard<std::mutex> g(g_mu);
+    auto it = g_gpu_views.upper_bound(va);
+    if (it == g_gpu_views.begin()) return va;
+    --it;
+    if (va >= it->first + it->second.size) return va;
+    if (g_va_page.count(va & ~(uintptr_t)(kPage - 1))) return va;
+    return it->second.cpu + (va - it->first);
+}
 // What xmem.dll knows about an address, without a (slow) query of the address space: 1 a physical
 // page is mapped there (base/size: that 64 KB), 2 a reservation with nothing mapped at the address
 // (base/size: the reservation), 3 GPU-visible committed memory (the allocation), 0 not known here.

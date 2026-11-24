@@ -427,6 +427,26 @@ HRESULT make_simple(Device* dev, Kind kind, PcObj pc, REFIID riid, void** out) {
 namespace {
 struct ResExtra { uint64_t trackedVa; uint64_t placedVa; uint64_t titleVa; };   // titleVa: placed on title memory at that address
 HRESULT D3DAPI Res_Map(ID3D12Resource* r, UINT sub, const D3D12_RANGE* range, void** out) {
+    if (out && sub == 0) {
+        // A texture placed on title memory is that memory: the title gets its address (a movie
+        // decoder is handed it and fills the planes there), or, for an address in a GPU view of
+        // the title's CPU memory, the CPU side of it. The texture is kept in step from there.
+        auto* te = ex<ID3D12Resource2, ResExtra>((ID3D12Resource2*)r);
+        if (te->titleVa) {
+            D3D12_RESOURCE_DESC td{};
+            pc::res_desc(pc_of(r), &td);
+            if (td.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER) {
+                typedef uintptr_t(WINAPI * Fn)(uintptr_t);
+                static Fn src = [] { HMODULE m = GetModuleHandleW(L"xmem.dll"); return m ? (Fn)GetProcAddress(m, "xsl_xmem_source") : nullptr; }();
+                *out = (void*)(src ? src((uintptr_t)te->titleVa) : (uintptr_t)te->titleVa);
+                static volatile long n = 0;
+                if (InterlockedIncrement(&n) <= 4)
+                    XSL_INFO(CH, "Map of a texture placed on title memory at %llx (%llux%u format %d): that memory, at %p", (unsigned long long)te->titleVa,
+                             (unsigned long long)td.Width, td.Height, (int)td.Format, *out);
+                return S_OK;
+            }
+        }
+    }
     HRESULT hr = pc::res_map(pc_of(r), sub, range, out);
     if (SUCCEEDED(hr) && out) detile_mapped(pc_of(r), pc::map_shadow_base(pc_of(r)));   // a texture's CPU copy
     if (FAILED(hr) && out) {
@@ -451,7 +471,8 @@ HRESULT D3DAPI Res_Map(ID3D12Resource* r, UINT sub, const D3D12_RANGE* range, vo
     return hr;
 }
 void D3DAPI Res_Unmap(ID3D12Resource* r, UINT sub, const D3D12_RANGE* range) {
-    if (mapped_buffer_known(pc_of(r))) return;   // never mapped on the PC side (an Unmap there removes the device)
+    if (mapped_buffer_known(pc_of(r))) return;
+    if (ex<ID3D12Resource2, ResExtra>((ID3D12Resource2*)r)->titleVa && !pc::map_shadow_base(pc_of(r))) return;   // Map gave the title memory itself   // never mapped on the PC side (an Unmap there removes the device)
     pc::res_unmap(pc_of(r), sub, range);
     detile_unmapped(pc_of(r));
 }
@@ -921,6 +942,7 @@ void D3DAPI L_IASetIndexBuffer(ID3D12GraphicsCommandList* l, const D3D12_INDEX_B
 void D3DAPI L_DrawInstanced(ID3D12GraphicsCommandList* l, UINT a, UINT b, UINT c, UINT d) {
     if (null_graphics()) return;
     if (draw_dump_now()) XSL_INFO(CH, "draw dump: list %p Draw(%u vertices, %u instances, first %u), topology %d%s", (void*)l, a, b, c, lx(l)->topology, lx(l)->placeholderPso ? " (skipped)" : "");
+    if (draw_dump_now()) XSL_INFO(CH, "draw dump: list %p   pipeline %s", (void*)l, pc::list_pso_name(LPC(l)).c_str());
     if (lx(l)->placeholderPso) { placeholder_skip(lx(l)->placeholderWhy); return; }
     if (lx(l)->topology == D3D_PRIMITIVE_TOPOLOGY_QUADLIST) {
         D3D12_INDEX_BUFFER_VIEW q = quad_ib(hdr(l)->device);

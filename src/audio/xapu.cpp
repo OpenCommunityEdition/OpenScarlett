@@ -28,7 +28,31 @@ struct XAPU {
 };
 
 extern "C" {
+// A title's audio mixer sleeps a few milliseconds per block of a few milliseconds (the console's
+// timer is that fine). At the Windows default of 15.6 ms most blocks come late and the sound
+// stutters, so the timer is set to 1 ms for the process, also when the window is in the background
+// (Windows 11 otherwise ignores the request for windows it throttles).
+static void fine_timer() {
+    static bool done = false;
+    if (done) return;
+    done = true;
+    struct { ULONG Version, ControlMask, StateMask; } pt{1, 0x4 /* IGNORE_TIMER_RESOLUTION */, 0};
+    if (auto set = (BOOL(WINAPI*)(HANDLE, int, void*, DWORD))GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "SetProcessInformation"))
+        set(GetCurrentProcess(), 4 /* ProcessPowerThrottling */, &pt, sizeof pt);
+    // The finest period the system offers (0.5 ms as a rule), in 100 ns units.
+    HMODULE nt = GetModuleHandleW(L"ntdll.dll");
+    auto query = (LONG(WINAPI*)(ULONG*, ULONG*, ULONG*))GetProcAddress(nt, "NtQueryTimerResolution");
+    auto set = (LONG(WINAPI*)(ULONG, BOOLEAN, ULONG*))GetProcAddress(nt, "NtSetTimerResolution");
+    ULONG coarsest = 0, finest = 0, was = 0, now = 0;
+    if (query && set && query(&coarsest, &finest, &was) >= 0 && finest && set(finest, TRUE, &now) >= 0)
+        XSL_INFO(CH, "timer resolution %.2f ms for the title's audio threads (was %.2f ms)", now / 10000.0, was / 10000.0);
+    else if (HMODULE mm = LoadLibraryW(L"winmm.dll")) {
+        if (auto begin = (UINT(WINAPI*)(UINT))GetProcAddress(mm, "timeBeginPeriod")) begin(1);
+        XSL_INFO(CH, "timer resolution 1 ms for the title's audio threads");
+    }
+}
 STDAPI XApuConnect(XApuConnectInputParameters* params, XApuConnectOutputParameters* data, XApuHandle* handle) {
+    fine_timer();
     if (!params || !data || !handle || !params->maxStreamCount || params->maxStreamCount > 500) return E_INVALIDARG;
     auto* x = new XAPU;
     x->in = *params;

@@ -80,6 +80,16 @@ bool unified_lookup(Device* dev, uint64_t va, UnifiedRef* out) {
     return true;
 }
 
+// The reverse: the zero-copy buffer a PC GPU address lies in (a title that asked a resource of
+// its unified memory for its address works with PC addresses from then on).
+bool unified_from_gpu(uint64_t gpu, UnifiedRef* out) {
+    std::lock_guard<std::mutex> g(g_mu);
+    for (auto& [base, im] : g_imported)
+        if (im.res && gpu >= im.gpu && gpu < im.gpu + im.size) { *out = {im.res, gpu - im.gpu, gpu}; return true; }
+    for (auto& [h, im] : g_sections)
+        if (im.res && gpu >= im.gpu && gpu < im.gpu + im.size) { *out = {im.res, gpu - im.gpu, gpu}; return true; }
+    return false;
+}
 uint64_t gpu_va(Device* dev, uint64_t va) {
     UnifiedRef r;
     if (unified_lookup(dev, va, &r)) return r.gpu;

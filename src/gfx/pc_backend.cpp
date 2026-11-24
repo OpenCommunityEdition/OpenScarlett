@@ -3926,7 +3926,9 @@ HRESULT_T res_map(PcObj r, uint32_t sub, const void* range, void** out) {
         UINT64 alloc = dev->GetResourceAllocationInfo(0, 1, &d).SizeInBytes;
         dev->Release();
         uint64_t size = (std::max<uint64_t>(total, alloc) * 2 + 0xFFFF) & ~0xFFFFull;
-        void* base = VirtualAlloc(nullptr, size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+        // Write-watched: a title may keep the mapping for good and write through it every frame
+        // (movie planes its decoder fills), so writes are what tells that the texture changed.
+        void* base = VirtualAlloc(nullptr, size, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE);
         if (!base) return E_OUTOFMEMORY;
         MapShadow sh{base, size, {}};
         for (auto& f : fp) sh.offsets.push_back(f.Offset * 2);
@@ -3939,6 +3941,24 @@ HRESULT_T res_map(PcObj r, uint32_t sub, const void* range, void** out) {
     const MapShadow& sh = it->second;
     *out = (uint8_t*)sh.base + (sub < sh.offsets.size() ? sh.offsets[sub] : 0);
     return S_OK;
+}
+// Whether the title wrote into a mapped texture's CPU copy since the last call.
+bool map_shadow_written(PcObj r) {
+    void* base = nullptr;
+    uint64_t size = 0;
+    {
+        std::lock_guard<std::mutex> l(g_shadow_lock);
+        auto it = g_shadows.find(r);
+        if (it == g_shadows.end()) return false;
+        base = it->second.base;
+        size = it->second.size;
+    }
+    void* pages[4];
+    ULONG_PTR n = 4;
+    DWORD gran = 0;
+    if (GetWriteWatch(0, base, (SIZE_T)size, pages, &n, &gran) != 0 || !n) return false;
+    ResetWriteWatch(base, (SIZE_T)size);
+    return true;
 }
 void res_unmap(PcObj r, uint32_t sub, const void* range) {
     {
@@ -4432,6 +4452,18 @@ static void check_rs(PcObj l, const char* what) {
     as<ID3D12PipelineState>(t->second.pso)->GetPrivateData(WKPDID_D3DDebugObjectNameW, &sz, name);
     XSL_WARN(CH, "%s: %s pipeline %ls made with root signature %p, list has %p bound", what, p->second.second ? "compute" : "graphics", name,
              p->second.first, bound);
+}
+// The name of the pipeline a list has selected ("xsl <shader keys>" for translated ones), for dumps.
+std::string list_pso_name(PcObj l) {
+    PcObj pso = nullptr;
+    { std::lock_guard<std::mutex> g(g_cs_mu); auto it = g_cs_shadow.find(l); if (it != g_cs_shadow.end()) pso = it->second.pso; }
+    if (!pso) return "(none)";
+    wchar_t name[160] = L"";
+    UINT n = sizeof name;
+    if (FAILED(as<ID3D12PipelineState>(pso)->GetPrivateData(WKPDID_D3DDebugObjectNameW, &n, name))) return "(unnamed)";
+    std::string out;
+    for (const wchar_t* p = name; *p; p++) out += (char)*p;
+    return out;
 }
 void list_set_pso(PcObj l, PcObj pso) {
     { std::lock_guard<std::mutex> g(g_cs_mu); g_cs_shadow[l].pso = pso; }

@@ -44,4 +44,5 @@ EXPORTS
     xsl_xmem_page_unview
     xsl_xmem_alias_page
     xsl_xmem_kind
+    xsl_xmem_source
     xsl_xmem_section_of

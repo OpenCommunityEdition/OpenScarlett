@@ -1327,19 +1327,37 @@ HRESULT D3DAPI D_ScheduleFrameEventX(ID3D12Device* d, D3D12XBOX_FRAME_EVENT_TYPE
     dev_extra(d)->nextOriginQpc = 0;
     return S_OK;
 }
-HRESULT D3DAPI D_WaitFrameEventX(ID3D12Device* d, D3D12XBOX_FRAME_EVENT_TYPE, UINT timeoutMs, D3D12XBOX_WAIT_FRAME_OBJECT_LIST*,
+HRESULT D3DAPI D_WaitFrameEventX(ID3D12Device* d, D3D12XBOX_FRAME_EVENT_TYPE type, UINT timeoutMs, D3D12XBOX_WAIT_FRAME_OBJECT_LIST*,
                                  D3D12XBOX_WAIT_FRAME_EVENT_FLAGS, D3D12XBOX_FRAME_PIPELINE_TOKEN* token) {
     DeviceExtra* e = dev_extra(d);
-    int64_t period = qpc_freq() * e->frameLengthUs / 1000000;
+    static std::mutex clockMu;   // the origin clock is shared by the title's threads
+    const int64_t period = qpc_freq() * e->frameLengthUs / 1000000;
     int64_t now = qpc_now();
     const int64_t waitCall = now;
-    if (e->nextOriginQpc == 0 || now - e->nextOriginQpc > 4 * period) e->nextOriginQpc = now;  // (re)start or resync after a stall
-    while ((now = qpc_now()) < e->nextOriginQpc) {
-        int64_t ms = (e->nextOriginQpc - now) * 1000 / qpc_freq();
+    int64_t target;
+    {
+        std::lock_guard<std::mutex> g(clockMu);
+        // (Re)start, or resync after a stall, or when the clock has run ahead of real time.
+        if (e->nextOriginQpc == 0 || now - e->nextOriginQpc > 4 * period || e->nextOriginQpc - now > 2 * period) e->nextOriginQpc = now;
+        target = e->nextOriginQpc;
+    }
+    // A wait with a zero timeout only collects what is due (a title takes its frame token that way
+    // and paces itself on the flip event); any other wait ends at the next origin, or at its
+    // timeout. No wait is longer than two intervals.
+    int64_t limit = now + 2 * period;
+    if (timeoutMs != 0xFFFFFFFFu) limit = std::min<int64_t>(limit, now + (int64_t)timeoutMs * qpc_freq() / 1000);
+    if (target > limit) target = limit;
+    while ((now = qpc_now()) < target) {
+        int64_t ms = (target - now) * 1000 / qpc_freq();
         Sleep(ms > 1 ? (DWORD)(ms - 1) : 0);
     }
-    int64_t signal = e->nextOriginQpc;
-    e->nextOriginQpc += period;
+    if (type != D3D12XBOX_FRAME_EVENT_ORIGIN) return S_OK;   // a flip or vblank of a frame already scheduled: its token stays
+    int64_t signal;
+    {
+        std::lock_guard<std::mutex> g(clockMu);
+        signal = std::min(e->nextOriginQpc, now);
+        if (now >= e->nextOriginQpc) e->nextOriginQpc += period;   // this origin is taken
+    }
     uint64_t t = ++e->frameToken;
     if (token) *token = t;
     std::lock_guard<std::mutex> g(g_frames_mu);
