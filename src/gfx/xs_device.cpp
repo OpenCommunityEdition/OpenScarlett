@@ -527,6 +527,16 @@ void pso_wait_ready_impl(void* obj) {
 // driver's compiler) and dispatches a few hundred.
 // For a pipeline built ahead the creating thread waits a little, so that the usual case hands back
 // a finished pipeline: what it has left of waitMs (XSL_PSO_ASYNC_MS, default 300) in this second.
+// Thread-group sizes of the title's compute pipelines, by pipeline object (kept: a few bytes each).
+static std::mutex g_tg_mu;
+static std::unordered_map<const void*, std::array<uint32_t, 3>> g_tg;
+static bool pso_thread_group_impl(const void* titlePipeline, uint32_t out[3]) {
+    std::lock_guard<std::mutex> g(g_tg_mu);
+    auto it = g_tg.find(titlePipeline);
+    if (it == g_tg.end()) return false;
+    for (int k = 0; k < 3; k++) out[k] = it->second[k];
+    return true;
+}
 static HRESULT compute_pso_pending(ID3D12Device* d, const D3D12_COMPUTE_PIPELINE_STATE_DESC& x, REFIID riid, void** out, DWORD waitMs) {
     HRESULT hr = make_simple(DEV(d), Kind::Pso, nullptr, riid, out);
     if (FAILED(hr) || !out || !*out) return hr;
@@ -564,6 +574,13 @@ static HRESULT compute_pso_pending(ID3D12Device* d, const D3D12_COMPUTE_PIPELINE
         job->key = h ? h : 1;
     }
     { std::lock_guard<std::mutex> g(g_pending_mu); g_pending[obj] = job; }
+    {   // its thread-group size, for dispatches that give thread counts (DispatchX)
+        uint32_t tg[3];
+        if (pc::shader_thread_group(code->data(), code->size(), tg)) {
+            std::lock_guard<std::mutex> g(g_tg_mu);
+            g_tg[obj] = {tg[0], tg[1], tg[2]};
+        }
+    }
     if (pso_dump_log()) XSL_INFO(CH, "pipeline object %p: compute, shader %016llx (%zu bytes)", obj, (unsigned long long)pc::shader_cache_key(code->data(), code->size()), code->size());
     if (pso_lazy() && !pso_used_before(job->key)) return S_OK;
     pso_pool_run([job] { pending_run(job); });
@@ -2359,6 +2376,7 @@ bool rt_dispatch(PcObj list, const void* so, const uint64_t* tables, const D3D12
 }
 void console_memory_release(PcObj r) { console_memory_release_impl(r); }
 void pso_wait_ready(void* titlePipeline) { pso_wait_ready_impl(titlePipeline); }
+bool pso_thread_group(const void* titlePipeline, uint32_t out[3]) { return pso_thread_group_impl(titlePipeline, out); }
 // The memory a resource took from the title's allocator, if any.
 void* console_memory_peek(PcObj r) {
     std::lock_guard<std::mutex> g(g_cm_mu);

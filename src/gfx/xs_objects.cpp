@@ -1006,8 +1006,8 @@ void D3DAPI L_Dispatch(ID3D12GraphicsCommandList* l, UINT x, UINT y, UINT z) {
 }
 // DispatchX: a dispatch with console options. Only one changes what runs: with
 // USE_THREAD_DIMENSIONS the counts are threads, not groups, in each dimension, and the console
-// launches no thread past them. A PC dispatch is whole groups; the group size is not known here,
-// so that form is logged and dispatched as given (too many groups; no title seen uses it yet).
+// launches no thread past them. A PC dispatch is whole groups: the counts are divided by the
+// pipeline's thread-group size, rounded up.
 void D3DAPI L_DispatchX(ID3D12GraphicsCommandList* l, UINT x, UINT y, UINT z, D3D12XBOX_DISPATCH_FLAGS flags) {
     {   // each pipeline's first few dispatches of this kind, with what was asked for (60 lines at most)
         static std::mutex mu;
@@ -1027,8 +1027,18 @@ void D3DAPI L_DispatchX(ID3D12GraphicsCommandList* l, UINT x, UINT y, UINT z, D3
         }
     }
     if (flags & D3D12XBOX_DISPATCH_FLAG_USE_THREAD_DIMENSIONS) {
-        static volatile long w = 0;
-        if (InterlockedIncrement(&w) == 1) XSL_WARN(CH, "DispatchX with thread dimensions (%u, %u, %u): dispatched as groups", x, y, z);
+        // The counts are threads: the groups that hold them are dispatched. The threads of the
+        // last group past the count run too (the console launches none of them); the programs
+        // seen with this flag compare their thread number with a count of their own first.
+        uint32_t tg[3];
+        if (pso_thread_group(lx(l)->psoObj, tg)) {
+            x = (x + tg[0] - 1) / tg[0];
+            y = (y + tg[1] - 1) / tg[1];
+            z = (z + tg[2] - 1) / tg[2];
+        } else {
+            static volatile long w = 0;
+            if (InterlockedIncrement(&w) == 1) XSL_WARN(CH, "DispatchX with thread counts (%u, %u, %u) on a pipeline whose thread-group size is not known: dispatched as groups", x, y, z);
+        }
     }
     L_Dispatch(l, x, y, z);
 }

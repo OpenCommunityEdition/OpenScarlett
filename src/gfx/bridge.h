@@ -274,6 +274,7 @@ bool sanitize_container(const void* in, size_t inSize, void** out, size_t* outSi
 bool native_translate(const void* in, size_t inSize, void** out, size_t* outSize);
 int shader_cache_state(const void* in, size_t n, char stage[8]);   // tools/shaderwarm: -1 not console code, 0 not cached, 1 cached
 uint64_t shader_cache_key(const void* in, size_t n);               // the cache key (0: not console code the translator takes)
+bool shader_thread_group(const void* in, size_t n, uint32_t out[3]);   // a console compute program's thread-group size
 int shader_translates(const void* in, size_t n);                  // tools/shaderwarm --purge: translation only (1 yes, 0 no, -1 not console code)
 bool shader_cache_drop(const void* in, size_t n);                 // ... and the removal of a cached translation
 void set_fallback_root_signature(const void* blob, size_t n);   // pipeline's root signature for containers without one (0: none)

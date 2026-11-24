@@ -367,6 +367,14 @@ uint64_t shader_cache_key(const void* in, size_t n) {
     bool fallbackRs = false, meshKind = false;
     return shader_key(c, in, n, &fallbackRs, &meshKind);
 }
+// The thread-group size of a console compute program (false: not one the translator reads).
+bool shader_thread_group(const void* in, size_t n, uint32_t out[3]) {
+    gpucode::Container c;
+    gpucode::Meta m;
+    if (!gpucode::read_container(in, n, c) || !c.has_native || c.kind != gpucode::ProgramKind::CS || !gpucode::parse_meta(c, m)) return false;
+    for (int k = 0; k < 3; k++) out[k] = m.numthreads[k] ? m.numthreads[k] : 1;
+    return true;
+}
 // Removes a shader's cached translation (the warm-up tool's --purge). False: there was none.
 bool shader_cache_drop(const void* in, size_t n) {
     gpucode::Container c;
