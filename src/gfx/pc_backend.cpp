@@ -123,11 +123,13 @@ bool env_on(const char* name) {
 
 // XSL_D3D12_DRED=1: device-removed extended data (automatic breadcrumbs, page faults), logged once
 // when the device is found removed.
+static void prof_report_now();
 void report_device_removed(ID3D12Device* dev) {
     xsl::log_arm(false);
     static volatile long once = 0;
     if (!dev || InterlockedExchange(&once, 1)) return;
     XSL_ERR(CH, "device removed: reason %08lx", dev->GetDeviceRemovedReason());
+    prof_report_now();   // (a profiled frame's times, when the device went before their report)
     ID3D12DeviceRemovedExtendedData* dred = nullptr;
     if (FAILED(dev->QueryInterface(IID_PPV_ARGS(&dred)))) return;
     ID3D12DeviceRemovedExtendedData1* dred1 = nullptr;
@@ -5196,7 +5198,7 @@ static void trace_draw_target(PcObj l, uint32_t n) {
         } else XSL_INFO(CH, "pso %s: draws with no render target 0 bound", tn.c_str());
     }
 }
-static int32_t prof_begin(PcObj l);
+static int32_t prof_begin(PcObj l, char kind = '?', uint32_t a = 0, uint32_t b = 0, uint32_t c = 0);
 static void prof_end(PcObj l, int32_t q);
 // Work of an unusual size (a count read from memory the layer does not fill in yet hangs the GPU):
 // the first few are logged with the pipeline's shaders.
@@ -5237,20 +5239,31 @@ static bool trace_dispatch_size(PcObj l, const char* how, uint32_t x, uint32_t y
     if (match && name) *name = nm;
     return match;
 }
-// XSL_GPU_PROFILE=<present>: GPU time of every draw, dispatch and indirect execute recorded during
-// the frame before that present, summed per pipeline and logged a few presents later.
+// XSL_GPU_PROFILE=<present>: GPU time of every draw, dispatch and indirect execute recorded from
+// the frame before that present on, while the queries last (32,768 operations): per frame the sum,
+// the pipelines that took most and the slowest single operations, logged when the queries are used
+// up, 40 presents after the start, or when the device is removed (then with the operation the GPU
+// had begun and not finished: what hung it).
+// XSL_GPU_PROFILE=slow: from the first present (past the 300th) that took over 250 ms;
+// XSL_GPU_PROFILE=t<seconds>: from the first present that many seconds after start-up.
+struct GpuProfOp { uint32_t q; PcObj pso; char kind; uint32_t a, b, c; uint64_t present; };   // first query, pipeline, what, frame
 struct GpuProf {
     std::mutex mu;
     ID3D12QueryHeap* heap = nullptr;
     ID3D12Resource* rb = nullptr;
+    ID3D12CommandQueue* queue = nullptr;   // (for its timestamp frequency)
     uint32_t next = 0;
-    std::vector<std::pair<uint32_t, PcObj>> ops;   // first query, pipeline
+    std::vector<GpuProfOp> ops;
     bool done = false;
 } g_prof;
 constexpr uint32_t kProfQueries = 1u << 16;
 // XSL_GPU_PROFILE=slow: the frame after the first present (past the 300th) that took over 250 ms.
 std::atomic<uint64_t> g_prof_at{0};
 static bool prof_slow() { static bool v = [] { char b[16]; return GetEnvironmentVariableA("XSL_GPU_PROFILE", b, sizeof b) && !strcmp(b, "slow"); }(); return v; }
+static double prof_after() {   // seconds after start-up (0: not asked for)
+    static double v = [] { char b[16]; return GetEnvironmentVariableA("XSL_GPU_PROFILE", b, sizeof b) && b[0] == 't' ? atof(b + 1) : 0.0; }();
+    return v;
+}
 static uint64_t prof_at() {
     static uint64_t fixed = [] { char b[16]; return GetEnvironmentVariableA("XSL_GPU_PROFILE", b, sizeof b) ? _strtoui64(b, nullptr, 10) : 0ull; }();
     return fixed ? fixed : g_prof_at.load();
@@ -5282,6 +5295,16 @@ static void prof_slow_check(uint64_t present) {
         periodStart = present;
         worst = 0;
     }
+    if (prof_after() > 0 && !g_prof_at.load()) {
+        FILETIME c, e, k, u, n;
+        GetProcessTimes(GetCurrentProcess(), &c, &e, &k, &u);
+        GetSystemTimeAsFileTime(&n);
+        const double up = double(((uint64_t)n.dwHighDateTime << 32 | n.dwLowDateTime) - ((uint64_t)c.dwHighDateTime << 32 | c.dwLowDateTime)) / 1e7;
+        if (up >= prof_after()) {
+            g_prof_at = present + 2;
+            XSL_INFO(CH, "%.1f s after start-up: GPU times from present %llu on", up, (unsigned long long)(present + 2));
+        }
+    }
     if (!prof_slow() || g_prof_at.load()) return;
     slowRun = ms > 250 ? slowRun + 1 : 0;
     if (present > 300 && slowRun >= 3) {
@@ -5289,9 +5312,9 @@ static void prof_slow_check(uint64_t present) {
         XSL_INFO(CH, "presents up to %llu took over 250 ms each: profiling present %llu", (unsigned long long)present, (unsigned long long)(present + 2));
     }
 }
-static int32_t prof_begin(PcObj l) {
+static int32_t prof_begin(PcObj l, char kind, uint32_t a, uint32_t b, uint32_t c) {
     uint64_t at = prof_at();
-    if (!at || g_wr_present.load() + 1 != at || !g_main_device) return -1;
+    if (!at || g_wr_present.load() + 1 < at || !g_main_device || g_prof.done) return -1;
     std::lock_guard<std::mutex> g(g_prof.mu);
     if (!g_prof.heap) {
         D3D12_QUERY_HEAP_DESC qd{D3D12_QUERY_HEAP_TYPE_TIMESTAMP, kProfQueries, 0};
@@ -5311,54 +5334,91 @@ static int32_t prof_begin(PcObj l) {
     g_prof.next += 2;
     PcObj pso = nullptr;
     { std::lock_guard<std::mutex> g2(g_cs_mu); auto it = g_cs_shadow.find(l); if (it != g_cs_shadow.end()) pso = it->second.pso; }
-    g_prof.ops.push_back({q, pso});
+    g_prof.ops.push_back({q, pso, kind, a, b, c, g_wr_present.load() + 1});
     L->EndQuery(g_prof.heap, D3D12_QUERY_TYPE_TIMESTAMP, q);
+    L->ResolveQueryData(g_prof.heap, D3D12_QUERY_TYPE_TIMESTAMP, q, 1, g_prof.rb, q * 8ull);   // (at once: an operation that hangs leaves its start)
     return (int32_t)q;
 }
 static void prof_end(PcObj l, int32_t q) {
     if (q < 0) return;
     L->EndQuery(g_prof.heap, D3D12_QUERY_TYPE_TIMESTAMP, q + 1);
-    L->ResolveQueryData(g_prof.heap, D3D12_QUERY_TYPE_TIMESTAMP, q, 2, g_prof.rb, q * 8ull);
+    L->ResolveQueryData(g_prof.heap, D3D12_QUERY_TYPE_TIMESTAMP, q + 1, 1, g_prof.rb, (q + 1) * 8ull);
 }
-static void prof_report(ID3D12CommandQueue* queue) {
+static void prof_report(ID3D12CommandQueue* queue, bool now = false) {
     uint64_t at = prof_at();
-    if (!at || g_prof.done || g_wr_present.load() < at + 8) return;
+    if (queue) g_prof.queue = queue;
+    if (!at || g_prof.done) return;
     std::lock_guard<std::mutex> g(g_prof.mu);
+    if (!g_prof.rb || !g_prof.queue || g_prof.ops.empty()) return;
+    const uint64_t present = g_wr_present.load();
+    const bool full = g_prof.next + 2 > kProfQueries;
+    if (!now && !(full && present >= g_prof.ops.back().present + 4) && present < at + 40) return;
     g_prof.done = true;
-    if (!g_prof.rb) return;
     uint64_t freq = 0;
-    queue->GetTimestampFrequency(&freq);
+    g_prof.queue->GetTimestampFrequency(&freq);
     uint64_t* t = nullptr;
     D3D12_RANGE r{0, g_prof.next * 8ull};
     if (FAILED(g_prof.rb->Map(0, &r, (void**)&t)) || !freq) return;
-    std::map<PcObj, std::pair<double, uint32_t>> per;
-    double total = 0;
-    for (auto& [q, pso] : g_prof.ops) {
-        if (t[q + 1] < t[q]) continue;
-        double us = double(t[q + 1] - t[q]) * 1e6 / double(freq);
-        per[pso].first += us;
-        per[pso].second++;
-        total += us;
+    auto name_of = [](PcObj pso, wchar_t* name, UINT bytes) {
+        wcscpy(name, L"(none)");
+        if (pso) as<ID3D12PipelineState>(pso)->GetPrivateData(WKPDID_D3DDebugObjectNameW, &bytes, name);
+    };
+    for (size_t i0 = 0; i0 < g_prof.ops.size();) {   // frame by frame
+        size_t i1 = i0;
+        while (i1 < g_prof.ops.size() && g_prof.ops[i1].present == g_prof.ops[i0].present) i1++;
+        std::map<PcObj, std::pair<double, uint32_t>> per;
+        std::vector<std::pair<double, size_t>> single;
+        double total = 0;
+        uint32_t unreached = 0;
+        uint64_t first = 0, last = 0;
+        for (size_t i = i0; i < i1; i++) {
+            const GpuProfOp& o = g_prof.ops[i];
+            if (!t[o.q]) { unreached++; continue; }   // (the GPU did not get there)
+            if (!first || t[o.q] < first) first = t[o.q];
+            last = std::max(last, std::max(t[o.q], t[o.q + 1]));
+            if (!t[o.q + 1]) {   // begun and not finished
+                wchar_t name[128];
+                name_of(o.pso, name, sizeof name);
+                XSL_INFO(CH, "GPU profile: present %llu, operation %zu of the frame was begun and not finished: %c %u x %u x %u: %ls", (unsigned long long)o.present,
+                         i - i0, o.kind, o.a, o.b, o.c, name);
+                continue;
+            }
+            if (t[o.q + 1] < t[o.q]) continue;
+            double us = double(t[o.q + 1] - t[o.q]) * 1e6 / double(freq);
+            per[o.pso].first += us;
+            per[o.pso].second++;
+            single.push_back({us, i});
+            total += us;
+        }
+        std::vector<std::pair<double, PcObj>> v;
+        for (auto& [p, e] : per) v.push_back({e.first, p});
+        std::sort(v.rbegin(), v.rend());
+        std::sort(single.rbegin(), single.rend());
+        XSL_INFO(CH, "GPU profile of present %llu: %zu operations (%u the GPU did not reach), %.1f ms in them, %.1f ms from the first to the last", (unsigned long long)g_prof.ops[i0].present,
+                 i1 - i0, unreached, total / 1000.0, double(last - first) * 1e3 / double(freq));
+        for (size_t i = 0; i < v.size() && i < 10; i++) {
+            wchar_t name[128];
+            name_of(v[i].second, name, sizeof name);
+            XSL_INFO(CH, "  %9.1f us in %4u ops: %ls", v[i].first, per[v[i].second].second, name);
+        }
+        for (size_t i = 0; i < single.size() && i < 8; i++) {
+            const GpuProfOp& o = g_prof.ops[single[i].second];
+            wchar_t name[128];
+            name_of(o.pso, name, sizeof name);
+            XSL_INFO(CH, "  single: %9.1f us, %c %u x %u x %u: %ls", single[i].first, o.kind, o.a, o.b, o.c, name);
+        }
+        i0 = i1;
     }
     g_prof.rb->Unmap(0, nullptr);
-    std::vector<std::pair<double, PcObj>> v;
-    for (auto& [p, e] : per) v.push_back({e.first, p});
-    std::sort(v.rbegin(), v.rend());
-    XSL_INFO(CH, "GPU profile of present %llu: %zu operations, %.1f ms in total", (unsigned long long)at, g_prof.ops.size(), total / 1000.0);
-    for (size_t i = 0; i < v.size() && i < 25; i++) {
-        wchar_t name[128] = L"(none)";
-        UINT sz = sizeof name;
-        if (v[i].second) as<ID3D12PipelineState>(v[i].second)->GetPrivateData(WKPDID_D3DDebugObjectNameW, &sz, name);
-        XSL_INFO(CH, "  %9.1f us in %4u ops: %ls", v[i].first, per[v[i].second].second, name);
-    }
 }
+static void prof_report_now() { prof_report(nullptr, true); }
 void list_dispatch(PcObj l, uint32_t x, uint32_t y, uint32_t z) {
     root_ensure(l, true);
     note_big(l, "Dispatch", (uint64_t)x * y * z * 64, x, y, z);
     trace_dispatch_size(l, "Dispatch", x, y, z, nullptr);
     note_dispatch(l);
     note_reads(l, true);
-    int32_t pq = prof_begin(l);
+    int32_t pq = prof_begin(l, 'D', x, y, z);
     L->Dispatch(x, y, z);
     prof_end(l, pq);
 }
@@ -5439,7 +5499,7 @@ void list_dispatch_mesh(PcObj l, uint32_t x, uint32_t y, uint32_t z) {
         if (x > 65535 || y > 65535 || z > 65535 || total > (1u << 22)) return;
     }
     ID3D12GraphicsCommandList6* l6 = nullptr;
-    int32_t pq = prof_begin(l);
+    int32_t pq = prof_begin(l, 'M', x, y, z);
     if (SUCCEEDED(L->QueryInterface(IID_PPV_ARGS(&l6)))) { l6->DispatchMesh(x, y, z); l6->Release(); }
     prof_end(l, pq);
 }
@@ -5646,7 +5706,7 @@ static bool fixed_indirect(PcObj l, PcObj sig, uint32_t max, PcObj args, uint64_
         barrier(g_arg_ring.res, uav, ind);
         restore_compute_state(l);
     } else barrier(g_arg_ring.res, D3D12_RESOURCE_STATE_COPY_DEST, ind);
-    int32_t pq = prof_begin(l);
+    int32_t pq = prof_begin(l, 'I', max, 0, 0);
     L->ExecuteIndirect(as<ID3D12CommandSignature>(sig), max, g_arg_ring.res, off, as<ID3D12Resource>(cnt), co);
     prof_end(l, pq);
     barrier(g_arg_ring.res, ind, D3D12_RESOURCE_STATE_COPY_DEST);
@@ -5691,7 +5751,7 @@ void list_execute_indirect(PcObj l, PcObj sig, uint32_t max, PcObj args, uint64_
     uint32_t stride = fix_stride ? fix_stride : guarded ? gs.stride : 0;
     if (stride && fixed_indirect(l, sig, max, args, ao, cnt, co, stride, fix_stride != 0, guarded ? &gs : nullptr)) return;
     if (g_info) check_rs(l, "ExecuteIndirect");
-    int32_t pq = prof_begin(l);
+    int32_t pq = prof_begin(l, 'I', max, 0, 0);
     L->ExecuteIndirect(as<ID3D12CommandSignature>(sig), max, as<ID3D12Resource>(args), ao, as<ID3D12Resource>(cnt), co);
     prof_end(l, pq);
 }
