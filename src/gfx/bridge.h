@@ -138,6 +138,7 @@ uint32_t global_view_virtual_size();   // view slots numbered for title heaps (t
 bool gm_active();                      // translated shaders may use global memory          // first global-heap slot reserved for it (UINT32_MAX: none)   // console D3D12_RESOURCE_STATES -> PC
 using FillSubresource = bool (*)(void* ctx, uint32_t sub, void* dst, uint32_t rowPitch, uint32_t rows, uint32_t depth);
 HRESULT_T upload_texture(PcObj dev, PcObj q, PcObj dst, uint32_t state, FillSubresource fill, void* ctx);
+HRESULT_T upload_buffer(PcObj dev, PcObj q, PcObj dst, uint64_t offset, const void* data, uint64_t size);
 void get_copyable_footprints(PcObj dev, const void* desc, uint32_t first, uint32_t num, uint64_t base,
                              void* layouts, uint32_t* rows, uint64_t* rowSizes, uint64_t* total);
 void get_resource_allocation_info(PcObj dev, uint32_t mask, uint32_t n, const void* descs, void* out);
@@ -239,6 +240,7 @@ HRESULT_T null_present(void* hwnd);  // null graphics: no scan-out, the FPS titl
 // Unified memory: wrap a host allocation (VirtualAlloc'd, 64 KB aligned) as a GPU buffer without
 // copying (OpenExistingHeapFromAddress + placed buffer). Returns the buffer and its GPU VA.
 HRESULT_T import_host_memory(PcObj dev, void* base, uint64_t size, PcObj* res, uint64_t* gpuVa);
+HRESULT_T import_file_mapping(PcObj dev, void* section, uint64_t size, PcObj* res, uint64_t* gpuVa);
 // Write the GPU timestamp counter into `res` at `offset` once prior work completes.
 void list_write_timestamp(PcObj dev, PcObj l, PcObj res, uint64_t offset);
 // Query heaps: types are PC D3D12_QUERY_HEAP_TYPE / D3D12_QUERY_TYPE values.

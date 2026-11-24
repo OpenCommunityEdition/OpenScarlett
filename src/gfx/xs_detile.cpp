@@ -44,7 +44,8 @@ struct XgComputer {
 // XG_RESOURCE_DESC has the layout of D3D12_RESOURCE_DESC (xg_xs.h); the console desc is passed as is.
 using CreateComputer = HRESULT(__cdecl*)(const void* desc, XgComputer** out);
 
-struct Entry { uint64_t va; D3D12_RESOURCE_DESC desc; uint32_t state; bool queued = false, done = false; uint64_t size = 0, hash = 0; bool mapped = false; };
+struct Entry { uint64_t va; D3D12_RESOURCE_DESC desc; uint32_t state; bool queued = false, done = false; uint64_t size = 0, hash = 0; bool mapped = false;
+               bool pending = false; };   // pending: its memory was not readable when it was first needed (pages mapped later)
 std::map<PcObj, std::pair<D3D12_RESOURCE_DESC, uint32_t>> g_descs;   // console descriptions of textures the title may map
 std::mutex g_mu;
 std::map<PcObj, Entry> g_tex;
@@ -81,6 +82,26 @@ bool content_hash_guarded(uint64_t va, uint64_t size, uint64_t* out) {
     return true;
 }
 
+// A private copy of title memory (false: not all of it is readable), and its hash as
+// content_hash_guarded computes it. Texels are converted from the copy: the title may unmap or
+// remap page-mapped memory at any moment, and a fault while reading it would reach the title's
+// own crash handler.
+bool copy_guarded(uint64_t va, uint64_t size, std::vector<uint8_t>& out, uint64_t* hash) {
+    out.resize((size_t)size + 65536);   // slack: readers of block formats may look a little past the end
+    const size_t piece = 1u << 20;
+    uint64_t h = 0x9e3779b97f4a7c15ull;
+    for (uint64_t at = 0; at < size; at += piece) {
+        const size_t n = (size_t)std::min<uint64_t>(piece, size - at);
+        SIZE_T got = 0;
+        if (!ReadProcessMemory(GetCurrentProcess(), (const void*)(uintptr_t)(va + at), out.data() + at, n, &got) || got != n) return false;
+        const uint64_t* p = (const uint64_t*)(out.data() + at);
+        for (size_t i = 0, k = n / 8; i < k; i++) h = (h ^ p[i]) * 0x100000001b3ull + (h >> 29);
+    }
+    memset(out.data() + size, 0, 65536);
+    *hash = h;
+    return true;
+}
+
 CreateComputer xg() {
     static CreateComputer f = [] {
         HMODULE m = GetModuleHandleA("xg_xs.dll");
@@ -95,8 +116,14 @@ CreateComputer xg() {
 struct FillCtx { XgComputer* c; uint64_t va; UINT64 size; };
 bool fill(void* ctx, uint32_t sub, void* dst, uint32_t rowPitch, uint32_t rows, uint32_t depth) {
     auto* f = static_cast<FillCtx*>(ctx);
-    return SUCCEEDED(f->c->CopyFromSubresource(dst, 0, sub, 0, (const void*)(uintptr_t)f->va, rowPitch, rowPitch * rows));
     (void)depth;
+    // The title may unmap the pages while they are read (page-mapped memory): the texture is then
+    // tried again later.
+    __try {
+        return SUCCEEDED(f->c->CopyFromSubresource(dst, 0, sub, 0, (const void*)(uintptr_t)f->va, rowPitch, rowPitch * rows));
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
 }
 }  // namespace
 
@@ -153,8 +180,53 @@ void detile_unmapped(PcObj pcRes) {
     it->second.done = false;
     g_queue.push_back(pcRes);
 }
+namespace {
+struct MappedBuffer { void* mem; uint64_t size; uint64_t hash; bool fresh; };
+std::map<PcObj, MappedBuffer> g_mapped_buffers;
+}  // namespace
+void mapped_buffer_add(PcObj pcRes, void* mem, uint64_t size) {
+    std::lock_guard<std::mutex> g(g_mu);
+    if (g_mapped_buffers.count(pcRes)) return;
+    g_mapped_buffers[pcRes] = {mem, size, 0, true};
+    static volatile long n = 0;
+    if (InterlockedIncrement(&n) <= 4)
+        XSL_INFO(CH, "Map of a %llu-byte buffer in video memory: the title writes into the resource's console memory at %p, copied to the buffer when it changes",
+                 (unsigned long long)size, mem);
+}
+bool mapped_buffer_known(PcObj pcRes) {
+    std::lock_guard<std::mutex> g(g_mu);
+    return g_mapped_buffers.count(pcRes) != 0;
+}
+void mapped_buffer_forget(PcObj pcRes) {
+    std::lock_guard<std::mutex> g(g_mu);
+    g_mapped_buffers.erase(pcRes);
+}
+// Copies the mapped buffers whose bytes changed (called under g_mu's absence, before submissions).
+static void mapped_buffers_sync(PcObj pcDevice, PcObj pcQueue) {
+    std::vector<std::pair<PcObj, MappedBuffer>> all;
+    {
+        std::lock_guard<std::mutex> g(g_mu);
+        if (g_mapped_buffers.empty()) return;
+        all.assign(g_mapped_buffers.begin(), g_mapped_buffers.end());
+    }
+    static thread_local std::vector<uint8_t> copy;
+    for (auto& [r, b] : all) {
+        uint64_t h = 0;
+        if (!copy_guarded((uint64_t)(uintptr_t)b.mem, b.size, copy, &h)) continue;   // not readable now
+        if (!b.fresh && h == b.hash) continue;
+        {
+            std::lock_guard<std::mutex> g(g_mu);
+            auto it = g_mapped_buffers.find(r);
+            if (it == g_mapped_buffers.end()) continue;   // released meanwhile
+            it->second.hash = h;
+            it->second.fresh = false;
+        }
+        pc::upload_buffer(pcDevice, pcQueue, r, 0, copy.data(), b.size);
+    }
+}
 void detile_forget(PcObj pcRes) {
     std::lock_guard<std::mutex> g(g_mu);
+    g_mapped_buffers.erase(pcRes);
     g_descs.erase(pcRes);
     g_tex.erase(pcRes);
     for (auto& q : g_queue) if (q == pcRes) q = nullptr;
@@ -168,6 +240,7 @@ void detile_view_created(PcObj pcRes) {
 }
 
 void detile_flush(PcObj pcDevice, PcObj pcQueue) {
+    mapped_buffers_sync(pcDevice, pcQueue);
     std::vector<std::pair<PcObj, Entry>> work;
     {
         std::lock_guard<std::mutex> g(g_mu);
@@ -186,22 +259,35 @@ void detile_flush(PcObj pcDevice, PcObj pcQueue) {
                 if (e.done && e.size && (e.size <= budget || budget == kCheckBudget) && !e.mapped) {
                     budget -= std::min(budget, e.size);
                     uint64_t now = 0;
-                    if (!content_hash_guarded(e.va, e.size, &now)) e.size = 0;   // the title released the memory: stop checking
+                    if (!content_hash_guarded(e.va, e.size, &now)) { if (!e.pending) e.size = 0; }   // the title released the memory: stop checking
                     else {
                         g_stat[0] += e.size;
-                        if (now != e.hash) { g_stat[1]++; e.done = false; e.queued = true; g_queue.push_back(it->first); }
+                        if (now != e.hash || e.pending) { g_stat[1]++; e.done = false; e.queued = true; g_queue.push_back(it->first); }
                     }
                 }
                 ++it;
             }
         }
         if (g_queue.empty()) return;
-        for (PcObj r : g_queue) {
+        // Up to 16 MB of console texels a submission (a title that streams in thousands of
+        // textures at once otherwise spends tens of seconds in one submission, long enough for
+        // its own watchdog to end it); the rest wait for the next one, drawn empty until then.
+        const uint64_t kUploadBudget = 16ull << 20;
+        uint64_t taken = 0;
+        size_t used = 0;
+        for (; used < g_queue.size() && taken < kUploadBudget; used++) {
+            PcObj r = g_queue[used];
             if (!r) continue;
             auto it = g_tex.find(r);
-            if (it != g_tex.end() && !it->second.done) { it->second.done = true; it->second.queued = false; work.push_back(*it); }
+            if (it == g_tex.end() || it->second.done) continue;
+            it->second.done = true;
+            it->second.queued = false;
+            work.push_back(*it);
+            uint64_t sz = it->second.size, al = 0;
+            if (!sz) console_resource_size(&it->second.desc, &sz, &al);
+            taken += sz ? sz : 65536;
         }
-        g_queue.clear();
+        g_queue.erase(g_queue.begin(), g_queue.begin() + used);
     }
     CreateComputer create = xg();
     if (!create) return;
@@ -216,17 +302,29 @@ void detile_flush(PcObj pcDevice, PcObj pcQueue) {
             continue;
         }
         FillCtx ctx{c, e.va, c->GetResourceSizeBytes()};
-        bool readable = committed(e.va, ctx.size);
+        bool readable = true;
         // Hash before reading: texels the title writes during or after the upload (e.g. glyphs a
         // font cache adds) then differ from the hash and are uploaded at a later check. Hashing
         // afterwards recorded such writes as uploaded and left them out for good.
         uint64_t hash = 0;
-        if (readable && !content_hash_guarded(e.va, ctx.size, &hash)) readable = false;
+        static thread_local std::vector<uint8_t> copy;
+        if (!copy_guarded(e.va, ctx.size, copy, &hash)) readable = false;
+        else ctx.va = (uint64_t)(uintptr_t)copy.data();
         if (readable) hr = pc::upload_texture(pcDevice, pcQueue, r, e.state, fill, &ctx);
         g_stat[2]++;
         g_stat[3] += ctx.size;
         if (!e.size) g_stat[4]++;
         c->Release();
+        if (!readable || hr == E_FAIL) {   // pages not mapped there (yet, or no longer): looked at again by the content check
+            std::lock_guard<std::mutex> g(g_mu);
+            auto it = g_tex.find(r);
+            if (it != g_tex.end()) { it->second.size = ctx.size; it->second.pending = true; }
+            static volatile long np = 0;
+            if (InterlockedIncrement(&np) <= 3)
+                XSL_INFO(CH, "texture at %llx (%llux%u format %d): its memory is not there yet, uploaded once it is", (unsigned long long)e.va,
+                         (unsigned long long)e.desc.Width, e.desc.Height, (int)e.desc.Format);
+            continue;
+        }
         if (!readable || FAILED(hr)) {
             if (InterlockedIncrement(&failed) <= 5)
                 XSL_WARN(CH, "texture at %llx (%llux%u format %d): %s %08lx", (unsigned long long)e.va, (unsigned long long)e.desc.Width, e.desc.Height,
@@ -236,7 +334,7 @@ void detile_flush(PcObj pcDevice, PcObj pcQueue) {
         {
             std::lock_guard<std::mutex> g(g_mu);
             auto it = g_tex.find(r);
-            if (it != g_tex.end()) { it->second.size = ctx.size; it->second.hash = hash; }
+            if (it != g_tex.end()) { it->second.size = ctx.size; it->second.hash = hash; it->second.pending = false; }
         }
         if (InterlockedIncrement(&logged) <= 5 || log_enabled(CH, Level::Trace))
             XSL_INFO(CH, "texture at %llx (%llux%ux%u, %u mips, format %d, layout %#x, %llu bytes): detiled and uploaded", (unsigned long long)e.va,

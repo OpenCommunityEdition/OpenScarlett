@@ -220,6 +220,15 @@ void dump(uint64_t key, const void* in, size_t n, const std::string& hlsl, const
     write_file(w + L".hlsl", t.data(), t.size());
 }
 
+// The root signature a dumped shader was translated against, when it is not its own (<key>.rs).
+void dump_rs(uint64_t key, const void* rs, size_t n) {
+    static const char* d = getenv("XSL_DUMP_SHADERS");
+    if (!d || !*d) return;
+    char base[600];
+    snprintf(base, sizeof base, "%s\\%016llx.rs", d, (unsigned long long)key);
+    write_file(std::wstring(base, base + strlen(base)), rs, n);
+}
+
 std::mutex g_lock;
 std::map<uint64_t, std::string> g_failed;   // shader key -> why it is not translated
 thread_local bool t_untranslated = false;   // a shader without DXIL could not be translated
@@ -287,12 +296,16 @@ bool native_translate(const void* in, size_t n, void** out, size_t* outSize) {
     const bool fallbackRs = !c.part("RTS0") && !t_fallback_rs.empty();
     if (fallbackRs) key = fnv(t_fallback_rs.data(), t_fallback_rs.size(), key);   // translated against the pipeline's root signature
     if (const char* g = getenv("XSL_LOOP_GUARD"); g && *g) key = fnv(g, strlen(g), key);   // changes the output
+    const bool meshKind = c.kind == gpucode::ProgramKind::MS || c.kind == gpucode::ProgramKind::AS;
+    if (meshKind) key = fnv("mg1", 3, key);   // mesh stages: small step limit (below)
     if (getenv("XSL_NO_BARRIER_SYNC")) key = fnv("nb", 2, key);
     if (const char* sk = getenv("XSL_SKIP_SHADERS"); sk && *sk) {   // debugging: these keys become placeholders
         char k[20];
         snprintf(k, sizeof k, "%016llx", (unsigned long long)key);
         if (strstr(sk, k)) {
             XSL_INFO(CH, "shader %s skipped (XSL_SKIP_SHADERS)", k);
+            dump(key, in, n, "", "skipped");
+            if (fallbackRs) dump_rs(key, t_fallback_rs.data(), t_fallback_rs.size());
             t_untranslated = !c.has_bitcode;
             return false;
         }
@@ -348,6 +361,9 @@ bool native_translate(const void* in, size_t n, void** out, size_t* outSize) {
         // 32-lane PC waves run console wave64 code two lanes per thread; without shader model 6.6
         // the wave size cannot be requested, so that needs a GPU whose waves are always 32 lanes.
         o.wave_size_attr = g_host_sm66;
+        // Mesh stages loop over small tables (lights, bones); with input a missing pass did not
+        // produce, a loop bound is anything and millions of steps per thread reset the GPU.
+        if (meshKind) o.loop_guard_barrier = 1u << 14;
         if (const char* g = getenv("XSL_LOOP_GUARD"); g && *g) o.loop_guard = o.loop_guard_barrier = (unsigned)strtoul(g, nullptr, 0);
         if (getenv("XSL_NO_BARRIER_SYNC")) o.barrier_sync = false;
         {   // global memory follows the backend's switches (pc::gm_active)
@@ -379,6 +395,8 @@ bool native_translate(const void* in, size_t n, void** out, size_t* outSize) {
         if (!compile(r.hlsl, r.profile, dxil, log)) {
             XSL_ERR(CH, "shader %016llx: translated HLSL does not compile:\n%s", (unsigned long long)key, log.c_str());
             dump(key, in, n, r.hlsl, "");
+            if (fallbackRs) dump_rs(key, t_fallback_rs.data(), t_fallback_rs.size());
+        if (fallbackRs) dump_rs(key, t_fallback_rs.data(), t_fallback_rs.size());
             std::lock_guard<std::mutex> g(g_lock);
             g_failed[key] = "translated HLSL does not compile";
             t_untranslated = !c.has_bitcode;
@@ -387,6 +405,7 @@ bool native_translate(const void* in, size_t n, void** out, size_t* outSize) {
         }
         dxil = with_root_signature(dxil, c);
         dump(key, in, n, r.hlsl, "");
+        if (fallbackRs) dump_rs(key, t_fallback_rs.data(), t_fallback_rs.size());
         if (!cpath.empty()) write_file(cpath, dxil.data(), dxil.size());
         XSL_INFO(CH, "shader %016llx (%s, wave%u): translated to %s (%zu bytes of code: %lu ms, %zu bytes of HLSL compiled in %lu ms)", (unsigned long long)key,
                  gpucode::kind_name(c.kind), r.wave_size, r.profile.c_str(), n, tick1 - tick0, r.hlsl.size(), GetTickCount() - tick1);

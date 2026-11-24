@@ -14,7 +14,8 @@ namespace xsl {
 namespace {
 struct Config {
     Level def = Level::Info;
-    std::string spec;
+    std::string spec, armedSpec;   // armedSpec: XSL_LOG_ARMED, in force between log_arm(true) and log_arm(false)
+    volatile bool armed = false;
     FILE* file = nullptr;
     std::mutex mu;
     Config() {
@@ -27,11 +28,13 @@ struct Config {
             return Level::Info;
         };
         if (!spec.empty() && spec.find('=') == std::string::npos) def = parse(spec.c_str());
+        if (GetEnvironmentVariableA("XSL_LOG_ARMED", buf, sizeof buf)) armedSpec = buf;
         if (GetEnvironmentVariableA("XSL_LOG_FILE", buf, sizeof buf)) file = fopen(buf, "a");
     }
     Level level_for(const char* ch) {
         // "gfx=trace,rt=warn" — first match wins.
         std::string key = std::string(ch) + "=";
+        const std::string& spec = armed ? armedSpec : this->spec;
         auto p = spec.find(key);
         if (p == std::string::npos) return def;
         std::string v = spec.substr(p + key.size(), spec.find(',', p) - p - key.size());
@@ -46,6 +49,7 @@ const char* kLevel[] = {"err", "warn", "info", "trace"};
 }  // namespace
 
 bool log_enabled(const char* channel, Level level) { return level <= cfg().level_for(channel); }
+void log_arm(bool on) { if (!cfg().armedSpec.empty()) cfg().armed = on; }
 
 void logv(const char* channel, Level level, const char* fmt, va_list ap) {
     if (!log_enabled(channel, level)) return;

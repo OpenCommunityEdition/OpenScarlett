@@ -169,7 +169,24 @@ void* reserve_va(void* base, SIZE_T size, ULONG type, ULONG protect, ULONGLONG f
         ep.Pointer = &req;
         n = 1;
     }
-    void* p = VirtualAlloc2(GetCurrentProcess(), base, size, type, protect, n ? &ep : nullptr, n);
+    void* p = nullptr;
+    if (!base && !n) {
+        // Console addresses fit in 40 bits and console code relies on it (the GDK's acceleration
+        // structure builder refuses others). Windows hands out addresses above 1 TB by default, so
+        // title memory is asked for between 512 GB and 1 TB: below the limit, and clear of the
+        // addresses PC GPU memory gets (which titles hold side by side with their own).
+        MEM_ADDRESS_REQUIREMENTS lowReq{};
+        lowReq.LowestStartingAddress = (void*)0x8000000000ull;
+        lowReq.HighestEndingAddress = (void*)0xFFFFFFFFFFull;
+        MEM_EXTENDED_PARAMETER lowEp{};
+        lowEp.Type = MemExtendedParameterAddressRequirements;
+        lowEp.Pointer = &lowReq;
+        p = VirtualAlloc2(GetCurrentProcess(), nullptr, size, type, protect, &lowEp, 1);
+        if (p) return p;
+        static volatile long warned = 0;
+        if (InterlockedIncrement(&warned) <= 3) XSL_WARN(CH, "no room below 1 TB for %zu bytes (%lu); placing them anywhere", size, GetLastError());
+    }
+    p = VirtualAlloc2(GetCurrentProcess(), base, size, type, protect, n ? &ep : nullptr, n);
     if (!p && n) {
         XSL_WARN(CH, "no room below 4 GB for %zu bytes of 32-bit graphics memory (%lu); placing it anywhere", size, GetLastError());
         p = VirtualAlloc2(GetCurrentProcess(), base, size, type, protect, nullptr, 0);
@@ -370,9 +387,11 @@ PVOID WINAPI XMemAllocDefault(SIZE_T size, ULONGLONG attributes) {
         SIZE_T gran = a.s.PageSize == XALLOC_PAGESIZE_2MB ? 2 * 1024 * 1024 : kPage;
         if (align > gran) gran = align;
         // VirtualAlloc returns 64 KB-aligned memory; larger alignment needs an over-reservation.
-        if (gran <= kPage) return VirtualAlloc(nullptr, size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+        if (gran <= kPage) return reserve_va(nullptr, size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE, 0);
         MEM_ADDRESS_REQUIREMENTS req{};
         req.Alignment = gran;
+        req.LowestStartingAddress = (void*)0x8000000000ull;
+        req.HighestEndingAddress = (void*)0xFFFFFFFFFFull;
         MEM_EXTENDED_PARAMETER ep{};
         ep.Type = MemExtendedParameterAddressRequirements;
         ep.Pointer = &req;
@@ -532,6 +551,65 @@ BOOL WINAPI xsl_xmem_virtual_free(void* base, SIZE_T size, DWORD type, BOOL* res
     *result = VirtualFree((void*)start, 0, MEM_RELEASE);
     g_placeholders.erase(it);
     return TRUE;
+}
+
+// Layer-private exports for GPU page mapping (d3d12_xs.dll). A title maps pages of a pool it
+// wrote with the CPU into GPU address space it reserved; on the console the GPU then reads those
+// bytes at the new address. Here the physical page behind `src` is mapped at `dst` as well, so the
+// GPU address holds the same bytes for the layer to read. src null: dst is unmapped again.
+BOOL WINAPI xsl_xmem_alias_page(void* dst, const void* src) {
+    std::lock_guard<std::mutex> g(g_mu);
+    const uintptr_t d = (uintptr_t)dst & ~(uintptr_t)(kPage - 1);
+    if (!in_placeholder(d) || in_private_graphics(d)) return FALSE;
+    if (!src) {
+        if (g_va_page.count(d)) map_one(d, (ULONG_PTR)-1);
+        return TRUE;
+    }
+    auto it = g_va_page.find((uintptr_t)src & ~(uintptr_t)(kPage - 1));
+    if (it == g_va_page.end()) return FALSE;
+    const ULONG_PTR page = it->second;
+    auto cur = g_va_page.find(d);
+    if (cur != g_va_page.end() && cur->second == page) return TRUE;
+    return map_one(d, page) ? TRUE : FALSE;
+}
+// The section holding the physical page mapped at `va`, the offset of `va` in it, and how many
+// bytes from `va` on lie in that section in address order (the following addresses map the
+// following pages).
+BOOL WINAPI xsl_xmem_section_of(const void* va, HANDLE* section, ULONG64* offset, ULONG64* sectionBytes, ULONG64* run) {
+    std::lock_guard<std::mutex> g(g_mu);
+    const uintptr_t a = (uintptr_t)va, base = a & ~(uintptr_t)(kPage - 1);
+    auto it = g_va_page.find(base);
+    if (it == g_va_page.end()) return FALSE;
+    const ULONG_PTR page = it->second;
+    *section = g_chunks[page / kPagesPerChunk];
+    *offset = (ULONG64)(page % kPagesPerChunk) * kPage + (a - base);
+    *sectionBytes = (ULONG64)kPage * kPagesPerChunk;
+    ULONG64 n = kPage - (a - base);
+    uintptr_t nextVa = base + kPage;
+    ULONG_PTR nextPage = page + 1;
+    for (auto nx = std::next(it); nx != g_va_page.end() && nx->first == nextVa && nx->second == nextPage && nextPage % kPagesPerChunk; ++nx, nextVa += kPage, nextPage++) {
+        n += kPage;
+        if (n >= (64ull << 20)) break;   // enough for any caller
+    }
+    *run = n;
+    return TRUE;
+}
+
+// What xmem.dll knows about an address, without a (slow) query of the address space: 1 a physical
+// page is mapped there (base/size: that 64 KB), 2 a reservation with nothing mapped at the address
+// (base/size: the reservation), 3 GPU-visible committed memory (the allocation), 0 not known here.
+int WINAPI xsl_xmem_kind(const void* va, void** base, SIZE_T* size) {
+    std::lock_guard<std::mutex> g(g_mu);
+    const uintptr_t a = (uintptr_t)va, pg = a & ~(uintptr_t)(kPage - 1);
+    if (g_va_page.count(pg)) { *base = (void*)pg; *size = kPage; return 1; }
+    {
+        auto it = g_graphics.upper_bound(a);
+        if (it != g_graphics.begin()) { --it; if (a < it->first + it->second) { *base = (void*)it->first; *size = it->second; return 3; } }
+    }
+    if (in_private_graphics(a)) return 0;
+    auto it = g_placeholders.upper_bound(a);
+    if (it != g_placeholders.begin()) { --it; if (a < it->first + it->second) { *base = (void*)it->first; *size = it->second; return 2; } }
+    return 0;
 }
 
 // Layer-private export: the GPU-visible allocation containing `address`, if any.

@@ -193,6 +193,8 @@ bool desc_view_attach(uint32_t first, uint32_t count, void* mem);
 // Placeholder pipelines (no PC pipeline; their work is skipped): why, for the log of skipped work.
 void placeholder_note(void* titleObject, const char* why);
 void pso_wait_ready(void* titlePipeline);   // a pipeline still being built is built (or awaited) now
+void* console_memory_peek(PcObj pcResource);   // from the title's allocator only (nullptr: none)
+void* console_memory_ensure(PcObj pcResource); // ... taken now when the resource has none
 void* console_memory_of(PcObj pcResource);     // the XMemAlloc memory a committed resource holds, if any
 void console_memory_release(PcObj pcResource);   // XMemAlloc memory a committed resource held (see xs_device.cpp)   // slots whose bytes live in title memory
 void desc_view_detach(uint32_t first);
@@ -224,6 +226,7 @@ void desc_sync();
 HRESULT make_rtv_dsv_shadow_heap(Device* dev, PcObj pch, const D3D12_DESCRIPTOR_HEAP_DESC* d, uint64_t shadow, REFIID riid, void** out);
 
 // GPU page mapping (xs_pagemap.cpp).
+void resource_set_title_va(void* resource, uint64_t va);   // CreatePlacedResourceX on committed title memory
 void resource_set_placed(void* resource, uint64_t va);  // CreatePlacedResourceX on reserved address space
 void pagemap_forget(uint64_t va, PcObj res);
 HRESULT D3DAPI D_RegisterPagePoolX(ID3D12Device* d, D3D12_GPU_VIRTUAL_ADDRESS va, UINT pageCount, HANDLE* out);

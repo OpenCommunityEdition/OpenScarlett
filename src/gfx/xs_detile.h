@@ -12,6 +12,12 @@ void detile_view_created(PcObj pcRes);
 void detile_note_desc(PcObj pcRes, const void* consoleDesc, uint32_t initialState);
 void detile_mapped(PcObj pcRes, void* copy);
 void detile_unmapped(PcObj pcRes);
+// Buffers in video memory the title maps: it writes into the console memory the resource holds
+// (the address a console hands out); the bytes are copied to the PC buffer when they changed, at
+// unmap and before each submission.
+void mapped_buffer_add(PcObj pcRes, void* consoleMemory, uint64_t size);
+void mapped_buffer_forget(PcObj pcRes);
+bool mapped_buffer_known(PcObj pcRes);   // Map handed out console memory: the PC buffer is not mapped
 void detile_flush(PcObj pcDevice, PcObj pcQueue);
 void detile_stats(uint64_t out[6]);   // since the last call: checked bytes, changed, uploads, uploaded bytes, first uploads; textures known
 // Bytes and base alignment the console gives a resource (xg_xs.dll for textures); false without xg.

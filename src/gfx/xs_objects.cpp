@@ -425,12 +425,33 @@ HRESULT make_simple(Device* dev, Kind kind, PcObj pc, REFIID riid, void** out) {
 // Resource
 // ============================================================================================
 namespace {
+struct ResExtra { uint64_t trackedVa; uint64_t placedVa; uint64_t titleVa; };   // titleVa: placed on title memory at that address
 HRESULT D3DAPI Res_Map(ID3D12Resource* r, UINT sub, const D3D12_RANGE* range, void** out) {
     HRESULT hr = pc::res_map(pc_of(r), sub, range, out);
     if (SUCCEEDED(hr) && out) detile_mapped(pc_of(r), pc::map_shadow_base(pc_of(r)));   // a texture's CPU copy
+    if (FAILED(hr) && out) {
+        // A buffer in video memory: on the console the title would get the memory the resource took
+        // from its allocator (and may check that the address is its own). It gets that memory.
+        D3D12_RESOURCE_DESC d{};
+        pc::res_desc(pc_of(r), &d);
+        auto* e = ex<ID3D12Resource2, ResExtra>((ID3D12Resource2*)r);
+        if (d.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER && e->titleVa && mapped_buffer_known(pc_of(r))) {   // placed on title memory: that memory
+            *out = (void*)e->titleVa;
+            return S_OK;
+        }
+        void* cm = d.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER ? console_memory_ensure(pc_of(r)) : nullptr;
+        if (cm) {
+            mapped_buffer_add(pc_of(r), cm, d.Width);
+            *out = cm;
+            return S_OK;
+        }
+        static volatile long n = 0;
+        if (InterlockedIncrement(&n) <= 5) XSL_WARN(CH, "Map of a resource in video memory failed %08lx (dim %d, %llu wide)", hr, d.Dimension, (unsigned long long)d.Width);
+    }
     return hr;
 }
 void D3DAPI Res_Unmap(ID3D12Resource* r, UINT sub, const D3D12_RANGE* range) {
+    if (mapped_buffer_known(pc_of(r))) return;   // never mapped on the PC side (an Unmap there removes the device)
     pc::res_unmap(pc_of(r), sub, range);
     detile_unmapped(pc_of(r));
 }
@@ -441,6 +462,9 @@ void D3DAPI Res_GetDesc(ID3D12Resource* r, D3D12_RESOURCE_DESC* d) { pc::res_des
 D3D12_GPU_VIRTUAL_ADDRESS D3DAPI Res_GetGPUVirtualAddress(ID3D12Resource* r) {
     uint64_t va = pc::res_gpu_va(pc_of(r));
     if (va) return va;
+    auto* e = ex<ID3D12Resource2, ResExtra>((ID3D12Resource2*)r);
+    if (e->titleVa) return e->titleVa;     // a texture placed on the title's own memory: that memory
+    if (e->placedVa) return e->placedVa;
     void* cm = console_memory_of(pc_of(r));
     static volatile long n = 0;
     if (InterlockedIncrement(&n) <= 3)
@@ -454,7 +478,6 @@ HRESULT D3DAPI Res_GetHeapProperties(ID3D12Resource*, D3D12_HEAP_PROPERTIES* p, 
 }
 D3D12Resource2_Function_Table g_res_tbl;
 std::once_flag g_res_once;
-struct ResExtra { uint64_t trackedVa; uint64_t placedVa; };
 void Res_Destroy(IGraphicsUnknown* self) {
     auto* e = ex<ID3D12Resource2, ResExtra>((ID3D12Resource2*)self);
     if (e->trackedVa) cbv_untrack(e->trackedVa);
@@ -465,6 +488,7 @@ void Res_Destroy(IGraphicsUnknown* self) {
 }  // namespace
 
 void resource_set_placed(void* resource, uint64_t va) { ex<ID3D12Resource2, ResExtra>((ID3D12Resource2*)resource)->placedVa = va; }
+void resource_set_title_va(void* resource, uint64_t va) { ex<ID3D12Resource2, ResExtra>((ID3D12Resource2*)resource)->titleVa = va; }
 // Diagnostics: XSL_DBG_PRESENT_RES=k presents the k-th render-target texture created (0-based)
 // instead of the title's plane, to look at intermediate passes.
 std::vector<PcObj> g_dbg_targets;
@@ -798,8 +822,28 @@ void D3DAPI L_RSSetScissorRects(ID3D12GraphicsCommandList* l, UINT n, const D3D1
 // XSL_DRAW_DUMP=<present> (diagnostics): the draws of the frame before that present, with the first
 // bytes of the vertex buffers they use.
 static bool draw_dump_now() {
-    static uint64_t at = [] { char b[16]; return GetEnvironmentVariableA("XSL_DRAW_DUMP", b, sizeof b) ? _strtoui64(b, nullptr, 10) : 0ull; }();
-    return at && pc::present_count() + 1 == at;
+    // <present> or <first>-<last>
+    static uint64_t last = 0;
+    static uint64_t at = [] {
+        char b[32];
+        if (!GetEnvironmentVariableA("XSL_DRAW_DUMP", b, sizeof b)) return 0ull;
+        char* e = nullptr;
+        uint64_t f = _strtoui64(b, &e, 10);
+        last = e && *e == '-' ? _strtoui64(e + 1, nullptr, 10) : f;
+        return f;
+    }();
+    const uint64_t p = pc::present_count() + 1;
+    return at && p >= at && p <= last;
+}
+// The first bytes at a title address, when the CPU can read them (draw dump).
+static std::string dump_bytes(uint64_t a, size_t n = 48) {
+    uint32_t w[16] = {};
+    SIZE_T got = 0;
+    if (n > sizeof w) n = sizeof w;
+    if (!a || !ReadProcessMemory(GetCurrentProcess(), (const void*)(uintptr_t)a, w, n, &got) || got != n) return " (not CPU-readable)";
+    std::string t;
+    for (size_t k = 0; k < n / 4; k++) { char b[16]; snprintf(b, sizeof b, " %08x", w[k]); t += b; }
+    return t;
 }
 void D3DAPI L_SetGfxRootSig(ID3D12GraphicsCommandList* l, ID3D12RootSignature* rs) {
     XSL_TRACE("gfx.cmd", "list %p RootSig %p", (void*)l, (void*)rs);
@@ -946,6 +990,8 @@ void D3DAPI L_SetGfxRootTable(ID3D12GraphicsCommandList* l, UINT i, D3D12_GPU_DE
             char b[96];
             snprintf(b, sizeof b, " | %08x %08x %08x %08x %08x %08x %08x %08x", w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7]);
             t += b;
+            const uint64_t at = w[0] | (uint64_t)w[1] << 32;   // a buffer view starts with its address
+            if (at > 0x10000) t += " [" + dump_bytes(at, 32) + " ]";
         }
         XSL_INFO(CH, "draw dump: list %p root table %u at view slot %llu:%s", (void*)l, i, (unsigned long long)((h.ptr - desc_view_gpu_start(0)) / 32), t.c_str());
     }
@@ -982,11 +1028,18 @@ void D3DAPI L_SetComputeRootCbv(ID3D12GraphicsCommandList* l, UINT i, D3D12_GPU_
     pc::list_compute_root_cbv(LPC(l), i, cbv_fix_root(hdr(l)->device, a));
 }
 // Root SRVs/UAVs may address GPU-visible title memory (XMem graphics allocations).
-void D3DAPI L_SetGfxRootSrv(ID3D12GraphicsCommandList* l, UINT i, D3D12_GPU_VIRTUAL_ADDRESS a) { pc::list_gfx_root_srv(LPC(l), i, gpu_va(hdr(l)->device, a)); }
+void D3DAPI L_SetGfxRootSrv(ID3D12GraphicsCommandList* l, UINT i, D3D12_GPU_VIRTUAL_ADDRESS a) {
+    const uint64_t t = gpu_va(hdr(l)->device, a);
+    if (draw_dump_now()) XSL_INFO(CH, "draw dump: list %p root SRV %u at %llx (PC %llx):%s", (void*)l, i, (unsigned long long)a, (unsigned long long)t, dump_bytes(a).c_str());
+    pc::list_gfx_root_srv(LPC(l), i, t);
+}
 void D3DAPI L_SetComputeRootSrv(ID3D12GraphicsCommandList* l, UINT i, D3D12_GPU_VIRTUAL_ADDRESS a) { pc::list_compute_root_srv(LPC(l), i, gpu_va(hdr(l)->device, a)); }
 void D3DAPI L_SetGfxRootUav(ID3D12GraphicsCommandList* l, UINT i, D3D12_GPU_VIRTUAL_ADDRESS a) { pc::list_gfx_root_uav(LPC(l), i, gpu_va(hdr(l)->device, a)); }
 void D3DAPI L_SetComputeRootUav(ID3D12GraphicsCommandList* l, UINT i, D3D12_GPU_VIRTUAL_ADDRESS a) { pc::list_compute_root_uav(LPC(l), i, gpu_va(hdr(l)->device, a)); }
-void D3DAPI L_SetGfxRoot32(ID3D12GraphicsCommandList* l, UINT i, UINT n, const void* d, UINT o) { pc::list_gfx_root_constants(LPC(l), i, n, d, o); }
+void D3DAPI L_SetGfxRoot32(ID3D12GraphicsCommandList* l, UINT i, UINT n, const void* d, UINT o) {
+    if (draw_dump_now() && d && n) XSL_INFO(CH, "draw dump: list %p root constants %u (+%u, %u): %08x %08x", (void*)l, i, o, n, ((const uint32_t*)d)[0], n > 1 ? ((const uint32_t*)d)[1] : 0);
+    pc::list_gfx_root_constants(LPC(l), i, n, d, o);
+}
 void D3DAPI L_SetGfxRoot32One(ID3D12GraphicsCommandList* l, UINT i, UINT v, UINT o) { pc::list_gfx_root_constants(LPC(l), i, 1, &v, o); }
 void D3DAPI L_SetComputeRoot32(ID3D12GraphicsCommandList* l, UINT i, UINT n, const void* d, UINT o) { pc::list_compute_root_constants(LPC(l), i, n, d, o); }
 void D3DAPI L_SetComputeRoot32One(ID3D12GraphicsCommandList* l, UINT i, UINT v, UINT o) { pc::list_compute_root_constants(LPC(l), i, 1, &v, o); }
@@ -1377,7 +1430,66 @@ void D3DAPI L_CopyRtAs(ID3D12GraphicsCommandList4* l4, D3D12_GPU_VIRTUAL_ADDRESS
 }
 void D3DAPI L_DepthBoundsX(ID3D12GraphicsCommandList* l, FLOAT lo, FLOAT hi) { pc::list_depth_bounds(LPC(l), lo, hi); }
 void D3DAPI L_DepthBounds(ID3D12GraphicsCommandList1* l, FLOAT lo, FLOAT hi) { pc::list_depth_bounds(LPC((ID3D12GraphicsCommandList*)l), lo, hi); }
+// Memory from the list's command allocator, valid until the allocator is reset: titles (and the
+// GDK's acceleration structure builder) put data for the GPU there and name it by address. It
+// comes from GPU-visible title memory (unified memory), handed out in order from 4 MB blocks that
+// are used again after 64 of them (far longer than any allocator stays unreset).
+// The PC buffer and offset behind a title address: GPU-visible title memory, a buffer the title
+// placed, or page-mapped pool memory.
+static bool resolve_memory(Device* dev, uint64_t va, PcObj* res, uint64_t* off) {
+    UnifiedRef u;
+    if (unified_lookup(dev, va, &u)) { *res = u.res; *off = u.offset; return true; }
+    uint64_t avail = 0;
+    if (pc::gm_resolve(va, res, off, &avail) && *res) return true;
+    uint64_t run = 0;
+    if (section_lookup(dev, va, &u, &run)) { *res = u.res; *off = u.offset; return true; }
+    return false;
+}
+// A copy between two GPU addresses on the list's timeline.
+void D3DAPI L_CopyMemoryToMemoryX(ID3D12GraphicsCommandList* l, D3D12_GPU_VIRTUAL_ADDRESS dst, D3D12_GPU_VIRTUAL_ADDRESS src, UINT64 n, D3D12XBOX_COPY_FLAGS) {
+    Device* dev = hdr(l)->device;
+    PcObj dr = nullptr, sr = nullptr;
+    uint64_t doff = 0, soff = 0;
+    const bool ok = n && resolve_memory(dev, dst, &dr, &doff) && resolve_memory(dev, src, &sr, &soff);
+    static volatile long shown = 0;
+    if (InterlockedIncrement(&shown) <= 6 || !ok) {
+        static volatile long w = 0;
+        if (ok || InterlockedIncrement(&w) <= 6)
+            XSL_INFO(CH, "CopyMemoryToMemoryX %llx -> %llx (%llu bytes)%s", (unsigned long long)src, (unsigned long long)dst, (unsigned long long)n, ok ? "" : ": memory not addressable, skipped");
+    }
+    if (ok && !null_graphics()) pc::list_copy_buffer_region(LPC(l), dr, doff, sr, soff, n);
+}
+void* D3DAPI L_AllocateFromCommandAllocatorX(ID3D12GraphicsCommandList8*, UINT size, UINT align) {
+    static std::mutex mu;
+    static std::vector<uint8_t*> blocks;
+    static size_t cur = 0, used = 0;
+    constexpr size_t kBlock = 4u << 20, kBlocks = 64;
+    if (!align) align = 16;
+    if (size > kBlock) {
+        static volatile long n = 0;
+        if (InterlockedIncrement(&n) <= 3) XSL_WARN(CH, "AllocateFromCommandAllocatorX(%u bytes): more than a block, refused", size);
+        return nullptr;
+    }
+    std::lock_guard<std::mutex> g(mu);
+    size_t at = (used + align - 1) / align * align;
+    if (blocks.empty() || at + size > kBlock) {
+        if (!blocks.empty()) cur = (cur + 1) % kBlocks;
+        if (cur >= blocks.size()) {
+            typedef PVOID(WINAPI * VAlloc)(PVOID, SIZE_T, DWORD, ULONGLONG, DWORD);
+            static auto va = [] { HMODULE m = GetModuleHandleW(L"xmem.dll"); return m ? (VAlloc)GetProcAddress(m, "XMemVirtualAlloc") : nullptr; }();
+            void* p = va ? va(nullptr, kBlock, MEM_COMMIT | MEM_RESERVE, 0x3ull, PAGE_READWRITE) : nullptr;   // XMEM_GRAPHICS
+            if (!p) p = VirtualAlloc(nullptr, kBlock, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+            if (!p) return nullptr;
+            blocks.push_back((uint8_t*)p);
+            if (blocks.size() == 1) XSL_INFO(CH, "AllocateFromCommandAllocatorX: memory from GPU-visible blocks (first at %p)", p);
+        }
+        at = 0;
+    }
+    used = at + size;
+    return blocks[cur] + at;
+}
 void D3DAPI L_DispatchMesh(ID3D12GraphicsCommandList6* l, UINT x, UINT y, UINT z) {
+    if (draw_dump_now()) XSL_INFO(CH, "draw dump: list %p DispatchMesh(%u, %u, %u)%s", (void*)l, x, y, z, lx((ID3D12GraphicsCommandList*)l)->placeholderPso ? " (placeholder pipeline: skipped)" : "");
     if (!null_graphics() && !lx((ID3D12GraphicsCommandList*)l)->placeholderPso) pc::list_dispatch_mesh(pc_of(l), x, y, z);
 }
 
@@ -1478,6 +1590,8 @@ HRESULT make_list(Device* dev, PcObj pcl, D3D12_COMMAND_LIST_TYPE t, REFIID riid
         g->ClearUnorderedAccessViewFloat = L_ClearUAVFloat;
         g->DiscardResource = L_DiscardResource;
         ((D3D12GraphicsCommandList6_Function_Table*)&g_list_tbl)->DispatchMesh = L_DispatchMesh;
+        g_list_tbl.AllocateFromCommandAllocatorX = L_AllocateFromCommandAllocatorX;
+        g->CopyMemoryToMemoryX = L_CopyMemoryToMemoryX;
         ((D3D12GraphicsCommandList6_Function_Table*)&g_list_tbl)->ResetX = L_ResetX;
         {
             auto* t4 = (D3D12GraphicsCommandList4_Function_Table*)&g_list_tbl;

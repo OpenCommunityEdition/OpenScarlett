@@ -253,7 +253,7 @@ HRESULT D3DAPI D_CreateGraphicsPipelineState(ID3D12Device* d, const D3D12_GRAPHI
 // becomes the real pipeline when the compile ends.
 // A few worker threads for pipeline compiles (a thread per pipeline ran dozens of multi-GB driver
 // compiles at once and creations failed with E_OUTOFMEMORY). XSL_PSO_THREADS (default 3).
-static void pso_pool_run(std::function<void()> job) {
+static void pso_pool_run(std::function<void()> job, bool first = false) {
     static std::mutex mu;
     static std::condition_variable cv;
     static std::deque<std::function<void()>> q;
@@ -271,7 +271,7 @@ static void pso_pool_run(std::function<void()> job) {
                 }
             }).detach();
     });
-    { std::lock_guard<std::mutex> g(mu); q.push_back(std::move(job)); }
+    { std::lock_guard<std::mutex> g(mu); if (first) q.push_front(std::move(job)); else q.push_back(std::move(job)); }
     cv.notify_one();
 }
 struct AsyncPso {
@@ -420,9 +420,32 @@ void pso_wait_ready_impl(void* obj) {
         if (it == g_pending.end()) return;
         j = it->second;
     }
-    pending_run(j);
+    if (j->state.load() == 2) return;
+    // A list wants a pipeline that is not built yet. Building it here can take the driver (and
+    // the shader compiler before it) many seconds, and a title that loads hundreds of pipelines
+    // then stops presenting long enough for its own watchdog to end it. The list waits a little
+    // (XSL_PSO_WAIT_MS per second of each thread, default 400; 0: until it is built); past that the
+    // pipeline counts as not there yet (its draws are skipped) and is built before the others.
+    static const DWORD perSecond = [] { char b[16]; return GetEnvironmentVariableA("XSL_PSO_WAIT_MS", b, sizeof b) ? (DWORD)atoi(b) : 400u; }();
+    if (!perSecond) {
+        pending_run(j);
+        std::unique_lock<std::mutex> g(j->mu);
+        j->cv.wait(g, [&] { return j->state.load() == 2; });
+        return;
+    }
+    if (j->state.load() == 0) pso_pool_run([j] { pending_run(j); }, true);
+    static thread_local ULONGLONG winStart = 0;
+    static thread_local DWORD waited = 0;
+    const ULONGLONG now = GetTickCount64();
+    if (now - winStart >= 1000) { winStart = now; waited = 0; }
+    if (waited >= perSecond) {
+        static volatile long n = 0;
+        if (InterlockedIncrement(&n) == 1) XSL_INFO(CH, "pipelines still being built when a list selects them are skipped until they are ready (waits are limited to %lu ms a second)", perSecond);
+        return;
+    }
     std::unique_lock<std::mutex> g(j->mu);
-    j->cv.wait(g, [&] { return j->state.load() == 2; });
+    j->cv.wait_for(g, std::chrono::milliseconds(perSecond - waited), [&] { return j->state.load() == 2; });
+    waited += (DWORD)(GetTickCount64() - now);
 }
 HRESULT D3DAPI D_CreatePipelineState(ID3D12Device2* d, const D3D12_PIPELINE_STATE_STREAM_DESC* desc, REFIID riid, void** out) {
     if (null_graphics()) return make_simple(DEV(d), Kind::Pso, nullptr, riid, out);
@@ -2161,6 +2184,21 @@ bool rt_dispatch(PcObj list, const void* so, const uint64_t* tables, const D3D12
 }
 void console_memory_release(PcObj r) { console_memory_release_impl(r); }
 void pso_wait_ready(void* titlePipeline) { pso_wait_ready_impl(titlePipeline); }
+// The memory a resource took from the title's allocator, if any.
+void* console_memory_peek(PcObj r) {
+    std::lock_guard<std::mutex> g(g_cm_mu);
+    auto it = g_cm.find(r);
+    return it == g_cm.end() || it->second.second == kShadowMemory ? nullptr : it->second.first;
+}
+// Like console_memory_peek, but a resource without such memory takes it now (a buffer the title
+// maps after it was created another way).
+void* console_memory_ensure(PcObj r) {
+    if (void* p = console_memory_peek(r)) return p;
+    D3D12_RESOURCE_DESC rd{};
+    pc::res_desc(r, &rd);
+    console_memory_take(r, &rd);
+    return console_memory_peek(r);
+}
 // The console memory of a resource; a resource without any gets plain memory of its console size
 // (a title asked for the address of a texture: it means to read or write texels there).
 void* console_memory_of(PcObj r) {

@@ -63,6 +63,15 @@ struct EiInfo { std::wstring list; void* res; uint64_t off; };
 std::vector<EiInfo> g_ei_info;   // per slot, CPU side
 }  // namespace
 void report_device_removed(ID3D12Device* dev);
+// Diagnostics: the first queue-level call after which the device is seen removed (an invalid call
+// removes it without any failing HRESULT at the call itself).
+static void removed_after(const char* what, uint64_t a = 0, uint64_t b = 0, uint64_t c = 0) {
+    static volatile long seen = 0;
+    if (seen || !g_main_device) return;
+    HRESULT r = g_main_device->GetDeviceRemovedReason();
+    if (r == S_OK || InterlockedExchange(&seen, 1)) return;
+    XSL_ERR(CH, "device first seen removed (%08lx) after %s (%llx %llx %llx)", r, what, (unsigned long long)a, (unsigned long long)b, (unsigned long long)c);
+}
 namespace {
 bool g_dred = false;
 // With DRED on: per command list, the pipeline names marked so far (DRED's own breadcrumb contexts
@@ -111,6 +120,7 @@ bool env_on(const char* name) {
 // XSL_D3D12_DRED=1: device-removed extended data (automatic breadcrumbs, page faults), logged once
 // when the device is found removed.
 void report_device_removed(ID3D12Device* dev) {
+    xsl::log_arm(false);
     static volatile long once = 0;
     if (!dev || InterlockedExchange(&once, 1)) return;
     XSL_ERR(CH, "device removed: reason %08lx", dev->GetDeviceRemovedReason());
@@ -305,6 +315,15 @@ static void log_thread_stacks(const char* when) {
     auto* dos = (const IMAGE_DOS_HEADER*)exe;
     auto* nt = (const IMAGE_NT_HEADERS*)((const uint8_t*)exe + dos->e_lfanew);
     const uintptr_t lo = (uintptr_t)exe, hi = lo + nt->OptionalHeader.SizeOfImage;
+    // ... and into this module (shown as L+offset): what the layer is doing for the title.
+    HMODULE self = nullptr;
+    GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCSTR)&log_thread_stacks, &self);
+    uintptr_t slo = 0, shi = 0;
+    if (self) {
+        auto* sd = (const IMAGE_DOS_HEADER*)self;
+        auto* sn = (const IMAGE_NT_HEADERS*)((const uint8_t*)self + sd->e_lfanew);
+        slo = (uintptr_t)self; shi = slo + sn->OptionalHeader.SizeOfImage;
+    }
     HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
     if (snap == INVALID_HANDLE_VALUE) return;
     THREADENTRY32 te{sizeof te};
@@ -330,8 +349,18 @@ static void log_thread_stacks(const char* when) {
                 int frames = 0;
                 if (VirtualQuery((void*)c.Rsp, &mbi, sizeof mbi)) {
                     const uintptr_t end = (uintptr_t)mbi.BaseAddress + mbi.RegionSize;
-                    for (uintptr_t p = c.Rsp & ~7ull; p + 8 <= end && frames < 14; p += 8) {
+                    for (uintptr_t p = c.Rsp & ~7ull; p + 8 <= end && frames < 18; p += 8) {
                         uintptr_t v = *(const uintptr_t*)p;
+                        if (v >= slo + 0x1000 && v < shi) {
+                            const uint8_t* q = (const uint8_t*)v;
+                            if (q[-5] == 0xE8 || (q[-2] == 0xFF && ((q[-1] >> 3) & 7) == 2) || (q[-3] == 0xFF && ((q[-2] >> 3) & 7) == 2) ||
+                                (q[-6] == 0xFF && ((q[-5] >> 3) & 7) == 2)) {
+                                snprintf(b, sizeof b, " L+%llx", (unsigned long long)(v - slo));
+                                t += b;
+                                frames++;
+                            }
+                            continue;
+                        }
                         if (v < lo + 0x1000 || v >= hi) continue;
                         const uint8_t* q = (const uint8_t*)v;   // a return address follows a call
                         bool call = q[-5] == 0xE8 || (q[-2] == 0xFF && ((q[-1] >> 3) & 7) == 2) || (q[-3] == 0xFF && ((q[-2] >> 3) & 7) == 2) ||
@@ -489,13 +518,25 @@ static LONG CALLBACK note_exception(EXCEPTION_POINTERS* e) {
     DWORD c = e->ExceptionRecord->ExceptionCode;
     crash_dump(e);
     if (c == 0xC00000FD) return EXCEPTION_CONTINUE_SEARCH;   // stack overflow: no stack left to log with
-    static bool log_av = env_on("XSL_LOG_AV");   // access violations too (titles probe memory; noisy)
-    if (c == 0xC0000005 && !log_av) return EXCEPTION_CONTINUE_SEARCH;
-    if (c == 0x406D1388 || c == 0x40010006 || c == 0x4001000A || c == 0xE06D7363 || c == 0x80000003 || c == 0x80000004 ||
+    if (c == 0x406D1388 || c == 0x40010006 || c == 0x4001000A || c == 0xE06D7363 || c == 0x80000004 ||
         c == 0xE0434352 || c == 0x40080201 || c == 0x4000001F)
         return EXCEPTION_CONTINUE_SEARCH;
-    static volatile long n = 0;
-    if (InterlockedIncrement(&n) > 12) return EXCEPTION_CONTINUE_SEARCH;
+    if (c == 0xC0000005 || c == 0x80000003) {
+        // Access violations and breakpoints: titles probe memory and handle these themselves, so
+        // each code address is reported once (the last one before a silent exit is the crash).
+        static std::atomic<void*> seen[24];
+        void* at = e->ExceptionRecord->ExceptionAddress;
+        bool fresh = false;
+        for (auto& sl : seen) {
+            void* cur = sl.load();
+            if (cur == at) break;
+            if (!cur) { void* z = nullptr; if (sl.compare_exchange_strong(z, at)) { fresh = true; break; } if (z == at) break; }
+        }
+        if (!fresh) return EXCEPTION_CONTINUE_SEARCH;
+    } else {
+        static volatile long n = 0;
+        if (InterlockedIncrement(&n) > 12) return EXCEPTION_CONTINUE_SEARCH;
+    }
     void* frames[24];
     USHORT k = RtlCaptureStackBackTrace(0, 24, frames, nullptr);
     std::string t;
@@ -510,8 +551,9 @@ static LONG CALLBACK note_exception(EXCEPTION_POINTERS* e) {
             t += buf;
         } else t += " ?";
     }
-    XSL_ERR(CH, "exception %08lx (%lu parameters%s%llx):%s", c, e->ExceptionRecord->NumberParameters,
-            e->ExceptionRecord->NumberParameters ? ", first " : "", e->ExceptionRecord->NumberParameters ? (unsigned long long)e->ExceptionRecord->ExceptionInformation[0] : 0ull, t.c_str());
+    XSL_ERR(CH, "exception %08lx (%lu parameters%s%llx, address %llx):%s", c, e->ExceptionRecord->NumberParameters,
+            e->ExceptionRecord->NumberParameters ? ", first " : "", e->ExceptionRecord->NumberParameters ? (unsigned long long)e->ExceptionRecord->ExceptionInformation[0] : 0ull,
+            (unsigned long long)(e->ExceptionRecord->NumberParameters > 1 ? e->ExceptionRecord->ExceptionInformation[1] : 0), t.c_str());
     if (c == 0x87d) dump_debug_messages();   // the debug layer's break: show the message behind it
     return EXCEPTION_CONTINUE_SEARCH;
 }
@@ -2491,6 +2533,31 @@ static bool gm_extend_root_signature(const void* blob, size_t size, std::vector<
     ds->Release();
     return ok;
 }
+// The parameter types of the root signatures made here. A title sets root arguments for the
+// signature it has in mind; the one bound on the PC list may be another pipeline's (bound lazily),
+// and an argument for a parameter it does not have, or of another type, crashes the driver.
+std::mutex g_rs_par_mu;
+std::unordered_map<PcObj, std::vector<uint8_t>> g_rs_params;
+static void note_rs_params(PcObj rs, const void* blob, size_t size) {
+    ID3D12VersionedRootSignatureDeserializer* ds = nullptr;
+    if (FAILED(D3D12CreateVersionedRootSignatureDeserializer(blob, size, IID_PPV_ARGS(&ds)))) return;
+    const D3D12_VERSIONED_ROOT_SIGNATURE_DESC* d = nullptr;
+    std::vector<uint8_t> kinds;
+    if (SUCCEEDED(ds->GetRootSignatureDescAtVersion(D3D_ROOT_SIGNATURE_VERSION_1_1, &d)) && d)
+        for (UINT i = 0; i < d->Desc_1_1.NumParameters; i++) kinds.push_back((uint8_t)d->Desc_1_1.pParameters[i].ParameterType);
+    ds->Release();
+    std::lock_guard<std::mutex> g(g_rs_par_mu);
+    g_rs_params[rs] = std::move(kinds);
+}
+// kind: 0 table, 1 CBV, 2 SRV, 3 UAV, 4 constants (root-argument kinds of the lazy binding).
+static bool rs_param_ok(PcObj rs, uint32_t i, int kind) {
+    static const uint8_t want[5] = {D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE, D3D12_ROOT_PARAMETER_TYPE_CBV, D3D12_ROOT_PARAMETER_TYPE_SRV, D3D12_ROOT_PARAMETER_TYPE_UAV,
+                                    D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS};
+    std::lock_guard<std::mutex> g(g_rs_par_mu);
+    auto it = g_rs_params.find(rs);
+    if (it == g_rs_params.end()) return true;   // not made here: as the title set it
+    return i < it->second.size() && it->second[i] == want[kind];
+}
 HRESULT_T create_root_signature(PcObj dev, const void* blob, size_t size, PcObj* out) { return create_root_signature_ex(dev, blob, size, out, false); }
 HRESULT_T create_root_signature_ex(PcObj dev, const void* blob, size_t size, PcObj* out, bool heaps) {
     void* clean = nullptr;
@@ -2509,6 +2576,7 @@ HRESULT_T create_root_signature_ex(PcObj dev, const void* blob, size_t size, PcO
         extended = false;
         hr = as<ID3D12Device>(dev)->CreateRootSignature(0, use, useSize, IID_PPV_ARGS(reinterpret_cast<ID3D12RootSignature**>(out)));
     }
+    if (SUCCEEDED(hr)) note_rs_params(*out, extended ? ext.data() : use, extended ? ext.size() : useSize);
     if (owned) free_container(clean);
     if (FAILED(hr)) XSL_ERR(CH, "CreateRootSignature failed %08lx (blob %zu bytes)", hr, size);
     if (SUCCEEDED(hr) && extended) { std::lock_guard<std::mutex> g(g_gm_mu); g_rs_gm[*out] = gmIndex | (heaps ? kRsHeaps : 0u); }
@@ -2519,8 +2587,10 @@ HRESULT_T create_root_signature_ex(PcObj dev, const void* blob, size_t size, PcO
     return hr;
 }
 std::atomic<uint64_t> g_gm_bind_stats[4];   // bound, root signature without table, global heap not set, no heap yet
+static bool root_is_bound(PcObj l, bool compute, PcObj rs);
 static void gm_bind(PcObj l, PcObj rs, bool compute) {
     if (!gm_enabled() || !g_gv || !rs) return;
+    if (!root_is_bound(l, compute, rs)) return;   // another signature is on the list now: bound with this one later
     uint32_t idx;
     PcObj samp = nullptr;
     {
@@ -2828,6 +2898,31 @@ HRESULT_T import_host_memory(PcObj dev, void* base, uint64_t size, PcObj* res, u
     hr = as<ID3D12Device>(dev)->CreatePlacedResource(heap, 0, &rd, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&r));
     heap->Release();  // the placed resource keeps the heap alive
     if (FAILED(hr)) return logged(hr, "CreatePlacedResource(host memory)");
+    *res = r;
+    *gpuVa = r->GetGPUVirtualAddress();
+    return S_OK;
+}
+
+// The same for memory that is a section (file mapping): a buffer over the whole section.
+HRESULT_T import_file_mapping(PcObj dev, void* section, uint64_t size, PcObj* res, uint64_t* gpuVa) {
+    ID3D12Device3* d3 = nullptr;
+    HRESULT hr = as<ID3D12Device>(dev)->QueryInterface(IID_PPV_ARGS(&d3));
+    if (FAILED(hr)) return logged(hr, "QueryInterface(ID3D12Device3)");
+    ID3D12Heap* heap = nullptr;
+    hr = d3->OpenExistingHeapFromFileMapping((HANDLE)section, IID_PPV_ARGS(&heap));
+    d3->Release();
+    if (FAILED(hr)) return logged(hr, "OpenExistingHeapFromFileMapping");
+    D3D12_RESOURCE_DESC rd{};
+    rd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    rd.Width = size;
+    rd.Height = rd.DepthOrArraySize = rd.MipLevels = 1;
+    rd.SampleDesc.Count = 1;
+    rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    rd.Flags = D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER;
+    ID3D12Resource* r = nullptr;
+    hr = as<ID3D12Device>(dev)->CreatePlacedResource(heap, 0, &rd, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&r));
+    heap->Release();
+    if (FAILED(hr)) return logged(hr, "CreatePlacedResource(section)");
     *res = r;
     *gpuVa = r->GetGPUVirtualAddress();
     return S_OK;
@@ -3157,6 +3252,12 @@ HRESULT_T create_reserved_resource(PcObj dev, const void* desc, uint32_t state, 
     }
     HRESULT hr = logged(as<ID3D12Device>(dev)->CreateReservedResource(&d, depth_state(d, pc_state(state)), cv,
                                                                      IID_PPV_ARGS(reinterpret_cast<ID3D12Resource**>(out))), "CreateReservedResource");
+    if (FAILED(hr)) {
+        static volatile long n = 0;
+        if (InterlockedIncrement(&n) <= 40)
+            XSL_ERR(CH, "CreateReservedResource failed %08lx (dim %d %llux%ux%u mips %u fmt %d flags %x samples %u state %x)", hr, d.Dimension,
+                    (unsigned long long)d.Width, d.Height, d.DepthOrArraySize, d.MipLevels, d.Format, d.Flags, d.SampleDesc.Count, state);
+    }
     if (SUCCEEDED(hr) && remap) {
         std::lock_guard<std::mutex> g(g_remap_mu);
         g_remapped.insert(*reinterpret_cast<ID3D12Resource**>(out));
@@ -3219,6 +3320,7 @@ void queue_map_tiles(PcObj q, PcObj res, uint32_t n, const TileCoord* tiles, PcO
     }
     as<ID3D12CommandQueue>(q)->UpdateTileMappings(as<ID3D12Resource>(res), n, coords.data(), sizes.data(), as<ID3D12Heap>(heap), n, flags.data(),
                                                   heap ? offsets.data() : nullptr, counts.data(), D3D12_TILE_MAPPING_FLAG_NONE);
+    removed_after("UpdateTileMappings");
 }
 HRESULT_T create_heap(PcObj dev, const void* desc, PcObj* out) {
     D3D12_HEAP_DESC d = *static_cast<const D3D12_HEAP_DESC*>(desc);
@@ -3397,10 +3499,30 @@ void create_rtv(PcObj dev, PcObj res, const void* desc, uint64_t h) {
         }
     }
     as<ID3D12Device>(dev)->CreateRenderTargetView(as<ID3D12Resource>(res), vd, cpu(h));
+    removed_after("CreateRenderTargetView", (uint64_t)res);
 }
 void create_dsv(PcObj dev, PcObj res, const void* desc, uint64_t h) {
     D3D12_DEPTH_STENCIL_VIEW_DESC t;
     as<ID3D12Device>(dev)->CreateDepthStencilView(as<ID3D12Resource>(res), view_fix(res, desc, t), cpu(h));
+    removed_after("CreateDepthStencilView", (uint64_t)res);
+}
+UINT format_bytes_of(DXGI_FORMAT f);
+// A buffer view reaching past its resource is an invalid call that removes a PC device (the
+// console accepts it). Returns the element size; first/count are brought inside the buffer.
+static bool clamp_buffer_view(ID3D12Resource* res, DXGI_FORMAT fmt, UINT stride, UINT64& first, UINT& count, const char* kind) {
+    const UINT64 width = res->GetDesc().Width;
+    UINT64 es = stride ? stride : (fmt == DXGI_FORMAT_UNKNOWN || fmt == DXGI_FORMAT_R32_TYPELESS) ? 4 : format_bytes_of(fmt);
+    if (!es) es = 4;
+    const UINT64 room = width / es;
+    if (first < room && count && first + count <= room) return false;
+    static volatile long n = 0;
+    if (InterlockedIncrement(&n) <= 12)
+        XSL_WARN(CH, "buffer %s past its resource: first %llu count %u of %llu-byte elements on %llu bytes (format %d): brought inside the buffer",
+                 kind, (unsigned long long)first, count, (unsigned long long)es, (unsigned long long)width, (int)fmt);
+    if (first >= room) first = 0;
+    if (!count || first + count > room) count = (UINT)std::min<UINT64>(room - first, UINT_MAX);
+    if (!count) count = 1;
+    return true;
 }
 void create_srv(PcObj dev, PcObj res, const void* desc, uint64_t h) {
     if (trace_writers() || (trace_rtvs() && res && as<ID3D12Resource>(res)->GetDesc().Dimension == D3D12_RESOURCE_DIMENSION_BUFFER)) {
@@ -3466,7 +3588,13 @@ void create_srv(PcObj dev, PcObj res, const void* desc, uint64_t h) {
             if (c.NumCubes == 0 || c.NumCubes > room) { c.NumCubes = room; vd = &clamped; }
         }
     }
+    D3D12_SHADER_RESOURCE_VIEW_DESC inBuf;
+    if (vd && res && vd->ViewDimension == D3D12_SRV_DIMENSION_BUFFER && as<ID3D12Resource>(res)->GetDesc().Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
+        inBuf = *vd;
+        if (clamp_buffer_view(as<ID3D12Resource>(res), inBuf.Format, inBuf.Buffer.StructureByteStride, inBuf.Buffer.FirstElement, inBuf.Buffer.NumElements, "SRV")) vd = &inBuf;
+    }
     as<ID3D12Device>(dev)->CreateShaderResourceView(as<ID3D12Resource>(res), vd, cpu(h));
+    removed_after("CreateShaderResourceView", (uint64_t)res, vd ? (uint64_t)vd->Format | ((uint64_t)vd->ViewDimension << 32) : 0, vd ? vd->Texture2D.MostDetailedMip | ((uint64_t)vd->Texture2D.MipLevels << 32) : 0);
 }
 struct FormatSize;
 UINT format_bytes_of(DXGI_FORMAT f);
@@ -3515,7 +3643,13 @@ void create_uav(PcObj dev, PcObj res, PcObj counter, const void* desc, uint64_t 
                          vd ? vd->Texture2D.MipSlice : 0, vd ? vd->Texture2D.PlaneSlice : 0);
         }
     }
+    D3D12_UNORDERED_ACCESS_VIEW_DESC inBuf;
+    if (vd && res && vd->ViewDimension == D3D12_UAV_DIMENSION_BUFFER && as<ID3D12Resource>(res)->GetDesc().Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
+        inBuf = *vd;
+        if (clamp_buffer_view(as<ID3D12Resource>(res), inBuf.Format, inBuf.Buffer.StructureByteStride, inBuf.Buffer.FirstElement, inBuf.Buffer.NumElements, "UAV")) vd = &inBuf;
+    }
     as<ID3D12Device>(dev)->CreateUnorderedAccessView(as<ID3D12Resource>(res), as<ID3D12Resource>(counter), vd, cpu(h));
+    removed_after("CreateUnorderedAccessView", (uint64_t)res, vd ? (uint64_t)vd->Format | ((uint64_t)vd->ViewDimension << 32) : 0, vd ? vd->Buffer.FirstElement : 0);
 }
 void create_cbv(PcObj dev, const void* desc, uint64_t h) {
     if (trace_writers() && desc) {
@@ -3547,9 +3681,11 @@ void create_cbv(PcObj dev, const void* desc, uint64_t h) {
         p = &d;
     }
     as<ID3D12Device>(dev)->CreateConstantBufferView(p, cpu(h));
+    removed_after("CreateConstantBufferView", p ? p->BufferLocation : 0, p ? p->SizeInBytes : 0);
 }
 void create_sampler(PcObj dev, const void* desc, uint64_t h) {
     as<ID3D12Device>(dev)->CreateSampler(static_cast<const D3D12_SAMPLER_DESC*>(desc), cpu(h));
+    removed_after("CreateSampler");
 }
 void copy_descriptors_simple(PcObj dev, uint32_t n, uint64_t dst, uint64_t src, int type) {
     if (type > 3) type = D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER;
@@ -3583,6 +3719,7 @@ void copy_descriptors_simple(PcObj dev, uint32_t n, uint64_t dst, uint64_t src, 
         }
     }
     as<ID3D12Device>(dev)->CopyDescriptorsSimple(n, cpu(dst), cpu(src), (D3D12_DESCRIPTOR_HEAP_TYPE)type);
+    removed_after("CopyDescriptorsSimple", n, type);
 }
 namespace {
 struct UploadJob { ID3D12Resource* buf; ID3D12CommandAllocator* alloc; ID3D12GraphicsCommandList* list; ID3D12Fence* fence; };
@@ -3598,6 +3735,41 @@ void reap_uploads(bool all) {
 }
 }  // namespace
 uint32_t pc_state_of(uint32_t consoleState) { return (uint32_t)pc_state(consoleState); }
+// Bytes into a buffer in video memory, through an upload buffer on the queue (before the lists the
+// title submits next). The buffer's state is left to the implicit promotion of buffers.
+HRESULT_T upload_buffer(PcObj devObj, PcObj qObj, PcObj dstObj, uint64_t offset, const void* data, uint64_t size) {
+    auto* dev = as<ID3D12Device>(devObj);
+    auto* q = as<ID3D12CommandQueue>(qObj);
+    auto* dst = as<ID3D12Resource>(dstObj);
+    if (!size) return S_OK;
+    D3D12_HEAP_PROPERTIES hp{D3D12_HEAP_TYPE_UPLOAD};
+    D3D12_RESOURCE_DESC bd{};
+    bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    bd.Width = size;
+    bd.Height = bd.DepthOrArraySize = bd.MipLevels = 1;
+    bd.SampleDesc.Count = 1;
+    bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    UploadJob j{};
+    HRESULT hr = dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&j.buf));
+    if (FAILED(hr)) return hr;
+    uint8_t* p = nullptr;
+    if (FAILED(hr = j.buf->Map(0, nullptr, (void**)&p))) { j.buf->Release(); return hr; }
+    memcpy(p, data, (size_t)size);
+    j.buf->Unmap(0, nullptr);
+    dev->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&j.alloc));
+    dev->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, j.alloc, nullptr, IID_PPV_ARGS(&j.list));
+    dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&j.fence));
+    j.list->CopyBufferRegion(dst, offset, j.buf, 0, size);
+    j.list->Close();
+    ID3D12CommandList* ls[] = {j.list};
+    q->ExecuteCommandLists(1, ls);
+    removed_after("an internal upload/copy list");
+    q->Signal(j.fence, 1);
+    std::lock_guard<std::mutex> g(g_up_mu);
+    reap_uploads(false);
+    g_up_jobs.push_back(j);
+    return S_OK;
+}
 HRESULT_T upload_texture(PcObj devObj, PcObj qObj, PcObj dstObj, uint32_t state, FillSubresource fill, void* ctx) {
     auto* dev = as<ID3D12Device>(devObj);
     auto* q = as<ID3D12CommandQueue>(qObj);
@@ -3648,6 +3820,7 @@ HRESULT_T upload_texture(PcObj devObj, PcObj qObj, PcObj dstObj, uint32_t state,
     j.list->Close();
     ID3D12CommandList* ls[] = {j.list};
     q->ExecuteCommandLists(1, ls);
+    removed_after("an internal upload/copy list");
     q->Signal(j.fence, 1);
     std::lock_guard<std::mutex> g(g_up_mu);
     reap_uploads(false);
@@ -3717,6 +3890,7 @@ HRESULT_T res_map(PcObj r, uint32_t sub, const void* range, void** out) {
         tryMap = SUCCEEDED(res->GetHeapProperties(&hp, nullptr)) && hp.Type == D3D12_HEAP_TYPE_CUSTOM && hp.CPUPageProperty != D3D12_CPU_PAGE_PROPERTY_NOT_AVAILABLE;
     }
     HRESULT hr = tryMap ? res->Map(sub, static_cast<const D3D12_RANGE*>(range), out) : E_INVALIDARG;
+    removed_after("Map", (uint64_t)r, sub, (uint64_t)hr);
     if (SUCCEEDED(hr) && out && *out && trace_writers() && res->GetDesc().Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
         std::lock_guard<std::mutex> g(g_wr_mu);
         g_mapped[res->GetGPUVirtualAddress()] = {res->GetDesc().Width, (uint8_t*)*out};
@@ -3724,10 +3898,7 @@ HRESULT_T res_map(PcObj r, uint32_t sub, const void* range, void** out) {
     if (SUCCEEDED(hr) || !out) return hr;
     D3D12_RESOURCE_DESC d = res->GetDesc();
     if (d.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
-        static volatile long n = 0;
-        if (InterlockedIncrement(&n) <= 5)
-            XSL_WARN(CH, "Map of a %llu-byte buffer in video memory failed (XSL_MAPPABLE_DEFAULT=1 puts DEFAULT buffers in mappable memory)", (unsigned long long)d.Width);
-        return logged(hr, "Map");
+        return hr;   // the caller hands out the resource's console memory instead
     }
     std::lock_guard<std::mutex> l(g_shadow_lock);
     auto it = g_shadows.find(r);
@@ -3762,6 +3933,7 @@ void res_unmap(PcObj r, uint32_t sub, const void* range) {
         if (g_shadows.count(r)) return;
     }
     as<ID3D12Resource>(r)->Unmap(sub, static_cast<const D3D12_RANGE*>(range));
+    removed_after("Unmap", (uint64_t)r, sub);
 }
 void res_desc(PcObj r, void* out) { *static_cast<D3D12_RESOURCE_DESC*>(out) = as<ID3D12Resource>(r)->GetDesc(); }
 uint64_t res_gpu_va(PcObj r) { return as<ID3D12Resource>(r)->GetGPUVirtualAddress(); }
@@ -4135,6 +4307,7 @@ static void root_ensure(PcObj l, bool compute) {
     gm_bind(l, b.bound, compute);
     for (auto& [i, v] : b.params) {
         D3D12_GPU_DESCRIPTOR_HANDLE h{v.second};
+        if (!rs_param_ok(b.bound, i, v.first)) continue;   // an argument for another signature
         if (compute) switch (v.first) {
             case 0: L2->SetComputeRootDescriptorTable(i, h); break;
             case 1: L2->SetComputeRootConstantBufferView(i, v.second); break;
@@ -4148,9 +4321,17 @@ static void root_ensure(PcObj l, bool compute) {
         }
     }
     for (auto& [i, c] : b.consts) {
+        if (!rs_param_ok(b.bound, i, 4)) continue;
         if (compute) L2->SetComputeRoot32BitConstants(i, (UINT)c.size(), c.data(), 0);
         else L2->SetGraphicsRoot32BitConstants(i, (UINT)c.size(), c.data(), 0);
     }
+}
+// With lazily bound root signatures: whether rs is the one on the list for that bind point.
+static bool root_is_bound(PcObj l, bool compute, PcObj rs) {
+    if (!g_own_rs_any) return true;
+    std::lock_guard<std::mutex> g(g_bind_mu);
+    auto it = g_root_bind.find(l);
+    return it != g_root_bind.end() && it->second[compute].bound == rs;
 }
 // Records a root argument; true when the list has the right root signature for it now.
 static bool root_arg(PcObj l, bool compute, uint32_t i, int kind, uint64_t v) {
@@ -4158,7 +4339,7 @@ static bool root_arg(PcObj l, bool compute, uint32_t i, int kind, uint64_t v) {
     std::lock_guard<std::mutex> g(g_bind_mu);
     auto& b = g_root_bind[l][compute];
     b.params[i] = {kind, v};
-    return b.bound && b.bound == (b.own ? b.own : b.title);
+    return b.bound && b.bound == (b.own ? b.own : b.title) && rs_param_ok(b.bound, i, kind);
 }
 static bool root_consts(PcObj l, bool compute, uint32_t i, uint32_t n, const void* d, uint32_t o) {
     if (!g_own_rs_any) return true;
@@ -4167,7 +4348,7 @@ static bool root_consts(PcObj l, bool compute, uint32_t i, uint32_t n, const voi
     auto& c = b.consts[i];
     if (c.size() < o + n) c.resize(o + n);
     memcpy(c.data() + o, d, n * 4ull);
-    return b.bound && b.bound == (b.own ? b.own : b.title);
+    return b.bound && b.bound == (b.own ? b.own : b.title) && rs_param_ok(b.bound, i, 4);
 }
 // The title's root signature for a bind point; true when it is to be bound at once (no pipeline
 // with a root signature of its own exists).
@@ -4182,6 +4363,11 @@ static bool root_title(PcObj l, bool compute, PcObj rs) {
 // Layer passes that put their own state on a title list call this: the bind point is bound again
 // before the title's next work.
 static void root_lost(PcObj l, bool compute) {
+    if (gm_enabled()) {   // the global-memory table is bound again with the root signature, not onto the layer's own
+        std::lock_guard<std::mutex> g(g_gm_mu);
+        auto it = g_list_gm_rs.find(l);
+        if (it != g_list_gm_rs.end()) (compute ? it->second.second : it->second.first) = nullptr;
+    }
     if (!g_own_rs_any) return;
     std::lock_guard<std::mutex> g(g_bind_mu);
     g_root_bind[l][compute].bound = nullptr;
@@ -4554,6 +4740,17 @@ static void note_dispatch(PcObj l, bool compute) {
 void list_dispatch_mesh(PcObj l, uint32_t x, uint32_t y, uint32_t z) {
     root_ensure(l, false);
     if (!g_caps.meshShaders) return;
+    {
+        static volatile long n = 0;
+        static volatile long biggest = 0;
+        const uint64_t total = (uint64_t)x * y * z;
+        long big = biggest;
+        if (InterlockedIncrement(&n) <= 12 || (total > (uint64_t)big && InterlockedCompareExchange(&biggest, (long)std::min<uint64_t>(total, 0x7fffffff), big) == big))
+            XSL_INFO(CH, "DispatchMesh %u x %u x %u", x, y, z);
+        // More than 2^22 groups, or 2^16 in one dimension, is not a valid dispatch (PC limit); it
+        // comes from counts a missing pass did not produce.
+        if (x > 65535 || y > 65535 || z > 65535 || total > (1u << 22)) return;
+    }
     ID3D12GraphicsCommandList6* l6 = nullptr;
     int32_t pq = prof_begin(l);
     if (SUCCEEDED(L->QueryInterface(IID_PPV_ARGS(&l6)))) { l6->DispatchMesh(x, y, z); l6->Release(); }
@@ -4689,6 +4886,7 @@ static bool guard_init(ID3D12Device* dev) {
     if (FAILED(dev->CreateComputePipelineState(&pd, IID_PPV_ARGS(&g_guard.pso)))) return false;
     g_guard.failed = false;
     XSL_INFO(CH, "indirect arguments are checked before use (dispatches over 65535 groups, draws of 2^28+ items become empty)");
+    xsl::log_arm(true);
     return true;
 }
 // Scratch ring for rewritten indirect arguments (default heap, COPY_DEST between uses).
@@ -5077,7 +5275,7 @@ bool stage_footprint(ID3D12GraphicsCommandList* l, D3D12_TEXTURE_COPY_LOCATION* 
     if (bytes > StageRing::kSegment) return false;
     void* mapped = nullptr;
     D3D12_RANGE none{0, 0};
-    if (FAILED(buf->Map(0, &none, &mapped))) return false;  // not CPU-visible
+    if (FAILED(buf->Map(0, &none, &mapped))) { removed_after("a stage Map probe", (uint64_t)buf); return false; }  // not CPU-visible
     std::lock_guard<std::mutex> g(g_stage.mu);
     if (!g_stage.res) {
         ID3D12Device* dev = nullptr;
@@ -5184,6 +5382,7 @@ void queue_execute(PcObj q, uint32_t n, PcObj* lists) {
             XSL_INFO(CH, "plane op: queue %p executes list %p%s", (void*)q, (void*)lists[i], g_plane_lists.count(lists[i]) ? " (wrote the plane)" : "");
     }
     as<ID3D12CommandQueue>(q)->ExecuteCommandLists(n, reinterpret_cast<ID3D12CommandList* const*>(lists));
+    removed_after("the title's ExecuteCommandLists");
 }
 // Last GPU-side wait and signal per queue (hang diagnostics: dump_queue_state).
 struct QueueLast { PcObj waitFence = nullptr, sigFence = nullptr; uint64_t waitValue = 0, sigValue = 0, waits = 0, sigs = 0; };
@@ -5246,7 +5445,9 @@ size_t blob_size(PcObj b) { return as<ID3DBlob>(b)->GetBufferSize(); }
 void* buffer_try_map(PcObj res) {
     void* p = nullptr;
     D3D12_RANGE none{0, 0};
-    return SUCCEEDED(as<ID3D12Resource>(res)->Map(0, &none, &p)) ? p : nullptr;
+    HRESULT hr = as<ID3D12Resource>(res)->Map(0, &none, &p);
+    removed_after("a buffer Map probe", (uint64_t)res, (uint64_t)hr);
+    return SUCCEEDED(hr) ? p : nullptr;
 }
 HRESULT_T pso_cached_blob(PcObj pso, PcObj* blob) {
     return as<ID3D12PipelineState>(pso)->GetCachedBlob(reinterpret_cast<ID3DBlob**>(blob));
@@ -5307,6 +5508,7 @@ void capture_plane(ID3D12Device* dev, ID3D12CommandQueue* q, ID3D12Resource* res
     l->Close();
     ID3D12CommandList* ls[] = {l};
     q->ExecuteCommandLists(1, ls);
+    removed_after("an internal upload/copy list");
     HANDLE e = CreateEventW(nullptr, FALSE, FALSE, nullptr);
     q->Signal(f, 1);
     f->SetEventOnCompletion(1, e);
@@ -5795,6 +5997,7 @@ HRESULT_T present(PcObj devObj, PcObj queueObj, PcObj resObj, void* hwndPtr, uin
     s.list->Close();
     ID3D12CommandList* lists[] = {s.list};
     q->ExecuteCommandLists(1, lists);
+    removed_after("an internal present list");
     {
         // XSL_CAPTURE=<path.bmp>[@start[+count[/step]]]: dump presented frames (count > 1 adds _<frame>;
         // with a step, every step-th frame from start, count frames in all).
@@ -5947,6 +6150,7 @@ HRESULT_T present(PcObj devObj, PcObj queueObj, PcObj resObj, void* hwndPtr, uin
     }
     bb->Release();
     hr = s.sc->Present(sync, 0);
+    removed_after("Present");
     g_stage_frames++;
     update_fps_title(hwnd);
     q->Signal(s.fence, ++s.fenceValue);

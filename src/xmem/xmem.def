@@ -42,3 +42,6 @@ EXPORTS
     xsl_xmem_virtual_free
     xsl_xmem_page_view
     xsl_xmem_page_unview
+    xsl_xmem_alias_page
+    xsl_xmem_kind
+    xsl_xmem_section_of

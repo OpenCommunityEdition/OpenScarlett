@@ -22,7 +22,42 @@ PFN_find find_fn() {
 struct Imported { uint64_t size; PcObj res; uint64_t gpu; };
 std::mutex g_mu;
 std::map<uintptr_t, Imported> g_imported;
+// Physical pages (sections of xmem.dll) mapped in title address space: pool pages, and the GPU
+// addresses they are page-mapped to. Each section is one zero-copy buffer.
+typedef BOOL(WINAPI* PFN_section)(const void*, HANDLE*, ULONG64*, ULONG64*, ULONG64*);
+PFN_section section_fn() {
+    static PFN_section f = [] {
+        HMODULE m = GetModuleHandleW(L"xmem.dll");
+        return m ? (PFN_section)GetProcAddress(m, "xsl_xmem_section_of") : nullptr;
+    }();
+    return f;
+}
+std::map<HANDLE, Imported> g_sections;
 }  // namespace
+
+bool section_lookup(Device* dev, uint64_t va, UnifiedRef* out, uint64_t* run) {
+    PFN_section f = section_fn();
+    HANDLE s = nullptr;
+    ULONG64 off = 0, bytes = 0, n = 0;
+    if (!f || !f((const void*)va, &s, &off, &bytes, &n)) return false;
+    std::lock_guard<std::mutex> g(g_mu);
+    auto it = g_sections.find(s);
+    if (it == g_sections.end()) {
+        Imported im{bytes, nullptr, 0};
+        HRESULT hr = pc::import_file_mapping(dev_extra(dev)->pcDevice, s, bytes, &im.res, &im.gpu);
+        static volatile long shown = 0;
+        if (InterlockedIncrement(&shown) <= 4)
+            XSL_INFO(CH, "physical-page section %p (%llu MB): %s %llx", (void*)s, (unsigned long long)(bytes >> 20), SUCCEEDED(hr) ? "visible to the GPU at" : "import failed",
+                     (unsigned long long)(SUCCEEDED(hr) ? im.gpu : (uint64_t)(uint32_t)hr));
+        it = g_sections.insert({s, im}).first;   // a failed import is remembered too
+    }
+    if (!it->second.res) return false;
+    out->res = it->second.res;
+    out->offset = off;
+    out->gpu = it->second.gpu + off;
+    if (run) *run = n;
+    return true;
+}
 
 bool unified_lookup(Device* dev, uint64_t va, UnifiedRef* out) {
     PFN_find f = find_fn();
@@ -46,7 +81,20 @@ bool unified_lookup(Device* dev, uint64_t va, UnifiedRef* out) {
 
 uint64_t gpu_va(Device* dev, uint64_t va) {
     UnifiedRef r;
-    return unified_lookup(dev, va, &r) ? r.gpu : va;
+    if (unified_lookup(dev, va, &r)) return r.gpu;
+    if (va < (1ull << 32)) return va;
+    // A buffer the title placed at that address (GPU-written ones have PC memory of their own).
+    PcObj res = nullptr;
+    uint64_t off = 0, avail = 0;
+    if (pc::gm_resolve(va, &res, &off, &avail) && res) {
+        const uint64_t base = pc::res_gpu_va(res);
+        if (base && base + off != va) return base + off;
+        if (base) return va;
+    }
+    // Page-mapped pool memory: the bytes the title wrote, in the section's buffer.
+    uint64_t run = 0;
+    if (section_lookup(dev, va, &r, &run)) return r.gpu;
+    return va;
 }
 
 }  // namespace xs

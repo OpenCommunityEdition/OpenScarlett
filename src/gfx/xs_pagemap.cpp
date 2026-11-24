@@ -45,6 +45,30 @@ std::map<uint64_t, Placed*> g_placed;    // placed VA -> resource
 std::map<uint64_t, PageMap> g_pages;     // page VA -> current mapping (for resources placed later)
 uint64_t g_max_extent = 0;               // largest placed extent: bounds the backwards search
 
+// The CPU side of a page mapping: the pool page's bytes become readable at the GPU address too
+// (xmem.dll maps the same physical page there), which is where the layer reads placed textures
+// and buffers from. XSL_PAGE_ALIAS=0 turns it off (GPU-only page mappings as before).
+typedef BOOL(WINAPI* PFN_alias)(void*, const void*);
+PFN_alias alias_fn() {
+    static PFN_alias f = [] {
+        char b[4];
+        if (GetEnvironmentVariableA("XSL_PAGE_ALIAS", b, 4) && b[0] == '0') return (PFN_alias) nullptr;
+        HMODULE m = GetModuleHandleW(L"xmem.dll");
+        return m ? (PFN_alias)GetProcAddress(m, "xsl_xmem_alias_page") : nullptr;
+    }();
+    return f;
+}
+volatile long g_aliased = 0, g_alias_failed = 0;
+void alias_page(uint64_t gpuVa, const Pool* pool, uint32_t index) {
+    PFN_alias f = alias_fn();
+    if (!f) return;
+    if (f((void*)gpuVa, pool ? (const void*)(pool->va + (uint64_t)index * kPage) : nullptr)) {
+        if (pool && InterlockedIncrement(&g_aliased) == 1)
+            XSL_INFO(CH, "page mappings: pool pages are mapped at their GPU addresses for the CPU too (placed textures and buffers are read there)");
+    } else if (InterlockedIncrement(&g_alias_failed) <= 3)
+        XSL_WARN(CH, "page mapping at %llx: the pool page cannot be mapped there for the CPU (contents stay on the pool's side)", (unsigned long long)gpuVa);
+}
+
 uint64_t reservation_extent(uint64_t va) {
     MEMORY_BASIC_INFORMATION mbi{};
     if (!VirtualQuery((const void*)va, &mbi, sizeof mbi)) return 0;
@@ -106,10 +130,22 @@ HRESULT map_ranges(PcObj queue, uint64_t dest, UINT rangeCount, const D3D12XBOX_
                 default: return E_INVALIDARG;
             }
             if (m.pool && (!pool || m.index >= pool->pages)) return E_INVALIDARG;
+            if (m.pool) {
+                static volatile long shown = 0, total = 0;
+                long t = InterlockedIncrement(&total);
+                if (InterlockedIncrement(&shown) <= 24 || t % 20000 == 0) {
+                    uint32_t w[4] = {};
+                    SIZE_T got = 0;
+                    bool ok = ReadProcessMemory(GetCurrentProcess(), (const void*)(pool->va + (uint64_t)m.index * pageBytes), w, sizeof w, &got) && got == sizeof w;
+                    XSL_INFO(CH, "page mapping #%ld: GPU %llx <- pool page %u (%u in range %u/%u, type %d)%s %08x %08x %08x %08x", t, (unsigned long long)va, m.index, i, r, rangeCount,
+                             (int)rg.RangeType, ok ? ", bytes there:" : ", pool memory not readable", w[0], w[1], w[2], w[3]);
+                }
+            }
             for (uint32_t k = 0; k < tilesPerPage; k++) {
                 PageMap sub = m.pool ? PageMap{m.pool, m.index * tilesPerPage + k} : m;
                 if (sub.pool) g_pages[va + k * kPage] = sub;
                 else g_pages.erase(va + k * kPage);
+                alias_page(va + k * kPage, sub.pool, sub.index);
             }
             apply_page(pending, va, m, tilesPerPage);
         }
@@ -132,7 +168,16 @@ HRESULT D3DAPI D_RegisterPagePoolX(ID3D12Device* d, D3D12_GPU_VIRTUAL_ADDRESS va
     std::lock_guard<std::mutex> g(g_mu);
     g_pools[va] = pool;
     static volatile long n = 0;
-    if (InterlockedIncrement(&n) <= 3) XSL_INFO(CH, "page pool %llx: %u pages backed by a PC heap", (unsigned long long)va, pageCount);
+    if (InterlockedIncrement(&n) <= 3) {
+        MEMORY_BASIC_INFORMATION mbi{};
+        VirtualQuery((const void*)va, &mbi, sizeof mbi);
+        ULONG_PTR cnt = 4;
+        void* addrs[4];
+        DWORD gran = 0;
+        UINT ww = GetWriteWatch(0, (void*)va, 0x10000, addrs, &cnt, &gran);
+        XSL_INFO(CH, "page pool %llx: %u pages backed by a PC heap (title memory: state %lx type %lx protect %lx, allocation %p, region %zu bytes, write watch %s)",
+                 (unsigned long long)va, pageCount, mbi.State, mbi.Type, mbi.Protect, mbi.AllocationBase, (size_t)mbi.RegionSize, ww == 0 ? "available" : "not available");
+    }
     *out = (HANDLE)pool;
     return S_OK;
 }
@@ -152,8 +197,22 @@ HRESULT D3DAPI D_UnregisterPagePoolX(ID3D12Device*, HANDLE h) {
 HRESULT D3DAPI D_CreatePlacedResourceX(ID3D12Device* d, D3D12_GPU_VIRTUAL_ADDRESS va, const D3D12_RESOURCE_DESC* desc, D3D12_RESOURCE_STATES st,
                                        const D3D12_CLEAR_VALUE* cv, REFIID riid, void** out) {
     DeviceExtra* de = dev_extra(d);
+    // What lies at the address: from xmem.dll's own records where it knows (a query of a title's
+    // address space takes milliseconds, and titles place tens of thousands of resources).
     MEMORY_BASIC_INFORMATION mbi{};
-    VirtualQuery((const void*)va, &mbi, sizeof mbi);
+    uint64_t knownExtent = 0;
+    {
+        typedef int(WINAPI * PFN_kind)(const void*, void**, SIZE_T*);
+        static PFN_kind kind = [] { HMODULE m = GetModuleHandleW(L"xmem.dll"); return m ? (PFN_kind)GetProcAddress(m, "xsl_xmem_kind") : nullptr; }();
+        void* kb = nullptr;
+        SIZE_T ks = 0;
+        switch (kind && va ? kind((const void*)va, &kb, &ks) : 0) {
+            case 1: mbi.State = MEM_COMMIT; mbi.Type = MEM_MAPPED; break;
+            case 2: mbi.State = MEM_RESERVE; mbi.Type = MEM_PRIVATE; knownExtent = (uint64_t)(uintptr_t)kb + ks - va; break;
+            case 3: mbi.State = MEM_COMMIT; mbi.Type = MEM_PRIVATE; break;
+            default: VirtualQuery((const void*)va, &mbi, sizeof mbi); break;
+        }
+    }
     if (getenv("XSL_TRACE_VIDEO_PLANES") && desc && (desc->Format == DXGI_FORMAT_R8_UNORM || desc->Format == DXGI_FORMAT_R8G8_UNORM) && desc->Width >= 1024)
         XSL_INFO(CH, "placed X fmt %d %llux%u at %llx (%s)", (int)desc->Format, (unsigned long long)desc->Width, desc->Height, (unsigned long long)va,
                  mbi.State == MEM_COMMIT ? "committed" : "reserved");
@@ -171,26 +230,64 @@ HRESULT D3DAPI D_CreatePlacedResourceX(ID3D12Device* d, D3D12_GPU_VIRTUAL_ADDRES
         note_plane_alias(r, va);
         return make_resource((Device*)d, r, riid, out);
     }
-    if (mbi.State == MEM_COMMIT || forceCommitted) {
-        // Placed on committed title memory: contents the CPU writes there are not shared with the
-        // PC resource yet (that needs console-tiling conversion); GPU-produced contents work.
+    const bool isBuffer = desc && desc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER;
+    const bool gpuWritten = desc && (desc->Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS));
+    // A texture the CPU fills (streamed data), placed on address space whose pages come from a
+    // pool: its texels are read at its address once the pages are mapped (they may not be yet).
+    const bool cpuTexture = desc && !isBuffer && !gpuWritten && desc->SampleDesc.Count <= 1 && alias_fn() && mbi.State != MEM_FREE;
+    if (mbi.State == MEM_COMMIT || forceCommitted || cpuTexture) {
+        // Placed on title memory the CPU can write: the PC resource is a separate one. A texture's
+        // texels are converted from the console layout and uploaded when they change; a buffer's
+        // bytes are copied when they change.
         static volatile long n = 0;
         if (InterlockedIncrement(&n) <= 3)
-            XSL_WARN(CH, "CreatePlacedResourceX on committed memory %llx: using a separate PC resource (CPU-written contents not shared)",
-                     (unsigned long long)va);
+            XSL_INFO(CH, "CreatePlacedResourceX on title memory %llx (%s): a PC resource of its own, filled from that memory",
+                     (unsigned long long)va, mbi.State == MEM_COMMIT ? "committed" : "pages not mapped yet");
         D3D12_HEAP_PROPERTIES hp{D3D12_HEAP_TYPE_DEFAULT};
         PcObj r = nullptr;
         HRESULT hr = pc::create_committed_resource(de->pcDevice, &hp, 0, desc, st, cv, &r);
         if (FAILED(hr)) return hr;
+        if (isBuffer && mbi.Type == MEM_MAPPED) {
+            pc::gm_register(r, va, desc->Width, 0);   // addresses in it name this buffer
+            if (!gpuWritten) mapped_buffer_add(r, (void*)va, desc->Width);
+        }
         detile_register(r, va, desc, pc::pc_state_of(st));
-        return make_resource((Device*)d, r, riid, out);
+        hr = make_resource((Device*)d, r, riid, out);
+        if (SUCCEEDED(hr) && out && *out) resource_set_title_va(*out, va);
+        return hr;
+    }
+    if (desc && desc->Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D) {
+        // A PC reserved resource cannot be one-dimensional: such a texture gets memory of its own
+        // (the pages the title maps at its address do not reach it).
+        static volatile long n = 0;
+        if (InterlockedIncrement(&n) <= 2)
+            XSL_WARN(CH, "CreatePlacedResourceX of a 1-D texture (%llu wide, format %d) on reserved address space: own memory, page contents not shared",
+                     (unsigned long long)desc->Width, (int)desc->Format);
+        D3D12_HEAP_PROPERTIES hp{D3D12_HEAP_TYPE_DEFAULT};
+        PcObj r1 = nullptr;
+        HRESULT hr1 = pc::create_committed_resource(de->pcDevice, &hp, 0, desc, st, cv, &r1);
+        if (FAILED(hr1)) return hr1;
+        hr1 = make_resource((Device*)d, r1, riid, out);
+        if (SUCCEEDED(hr1) && out && *out) resource_set_title_va(*out, va);
+        return hr1;
+    }
+    {
+        static volatile long bufs = 0, texs = 0;
+        static volatile LONG64 bufBytes = 0;
+        const bool buf = desc && desc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER;
+        long nb = buf ? InterlockedIncrement(&bufs) : bufs, nt = buf ? texs : InterlockedIncrement(&texs);
+        if (buf) InterlockedAdd64(&bufBytes, (LONG64)desc->Width);
+        if ((buf && (nb <= 12 || nb % 2000 == 0)) || (!buf && (nt <= 6 || nt % 5000 == 0)))
+            XSL_INFO(CH, "placed on reserved address space at %llx: %s %llux%u format %d flags %x (%ld buffers of %lld bytes, %ld textures so far)", (unsigned long long)va,
+                     buf ? "buffer" : "texture", desc ? (unsigned long long)desc->Width : 0ull, desc ? desc->Height : 0, desc ? (int)desc->Format : 0, desc ? (unsigned)desc->Flags : 0,
+                     nb, (long long)bufBytes, nt);
     }
     PcObj r = nullptr;
     HRESULT hr = pc::create_reserved_resource(de->pcDevice, desc, st, cv, &r);
     if (FAILED(hr)) return hr;
     detile_note_desc(r, desc, pc::pc_state_of(st));   // should the title map it
-    auto* p = new Placed{va, reservation_extent(va), r, pc::resource_tiles(de->pcDevice, r)};
-    if (!p->extent) p->extent = p->tiles.size() * kPage;
+    auto* p = new Placed{va, knownExtent ? knownExtent : reservation_extent(va), r, pc::resource_tiles(de->pcDevice, r)};
+    if (!p->extent || p->extent > p->tiles.size() * kPage) p->extent = p->tiles.size() * kPage;   // what the resource covers
     if (p->tiles.size() * kPage > p->extent) {
         static volatile long n = 0;
         if (InterlockedIncrement(&n) <= 3)
@@ -200,6 +297,7 @@ HRESULT D3DAPI D_CreatePlacedResourceX(ID3D12Device* d, D3D12_GPU_VIRTUAL_ADDRES
     hr = make_resource((Device*)d, r, riid, out);
     if (FAILED(hr)) { delete p; return hr; }
     resource_set_placed(*out, va);
+    if (isBuffer) pc::gm_register(r, va, desc->Width, 0);   // addresses in it name this buffer
     // Register, and apply pages the title mapped at this address before placing the resource
     // (grouped by pool: UpdateTileMappings takes one heap per call).
     std::map<const Pool*, Pending> byPool;

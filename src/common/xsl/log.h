@@ -10,6 +10,9 @@ enum class Level : int { Error = 0, Warn = 1, Info = 2, Trace = 3 };
 // Channel is a short subsystem tag ("gfx", "rt", "input", ...). The level
 // threshold comes from XSL_LOG (e.g. "info" or "gfx=trace,rt=warn").
 bool log_enabled(const char* channel, Level level);
+// XSL_LOG_ARMED=<spec> (diagnostics): the spec that replaces XSL_LOG from an event the layer picks
+// (a call trace of the moments before a failure, without tracing the minutes before it).
+void log_arm(bool on);
 void logv(const char* channel, Level level, const char* fmt, va_list ap);
 void log(const char* channel, Level level, const char* fmt, ...);
 [[noreturn]] void fatal(const char* channel, const char* fmt, ...);
