@@ -65,9 +65,12 @@ std::vector<EiInfo> g_ei_info;   // per slot, CPU side
 void report_device_removed(ID3D12Device* dev);
 // Diagnostics: the first queue-level call after which the device is seen removed (an invalid call
 // removes it without any failing HRESULT at the call itself).
+// XSL_REMOVED_TRACE=1 turns it on: the check takes the device's lock, and on every view a title
+// creates that holds up its render threads (one stopped presenting for good).
 static void removed_after(const char* what, uint64_t a = 0, uint64_t b = 0, uint64_t c = 0) {
     static volatile long seen = 0;
-    if (seen || !g_main_device) return;
+    static const bool on = [] { char e[4]; return GetEnvironmentVariableA("XSL_REMOVED_TRACE", e, 4) && e[0] == '1'; }();
+    if (!on || seen || !g_main_device) return;
     HRESULT r = g_main_device->GetDeviceRemovedReason();
     if (r == S_OK || InterlockedExchange(&seen, 1)) return;
     XSL_ERR(CH, "device first seen removed (%08lx) after %s (%llx %llx %llx)", r, what, (unsigned long long)a, (unsigned long long)b, (unsigned long long)c);
@@ -349,7 +352,7 @@ static void log_thread_stacks(const char* when) {
                 int frames = 0;
                 if (VirtualQuery((void*)c.Rsp, &mbi, sizeof mbi)) {
                     const uintptr_t end = (uintptr_t)mbi.BaseAddress + mbi.RegionSize;
-                    for (uintptr_t p = c.Rsp & ~7ull; p + 8 <= end && frames < 18; p += 8) {
+                    for (uintptr_t p = c.Rsp & ~7ull; p + 8 <= end && frames < 56; p += 8) {
                         uintptr_t v = *(const uintptr_t*)p;
                         if (v >= slo + 0x1000 && v < shi) {
                             const uint8_t* q = (const uint8_t*)v;
@@ -2719,8 +2722,13 @@ HRESULT_T create_compute_pso(PcObj dev, const void* desc, PcObj* out) {
     d.NodeMask = 0;
     auto** pso = reinterpret_cast<ID3D12PipelineState**>(out);
     uint64_t key = pso_hash(pso_hash(1469598103934665603ull, "cs1", 3), d.CS.pShaderBytecode, d.CS.BytecodeLength);
+    const ULONGLONG t0c = GetTickCount64();
     HRESULT hr = cached_pso(key, d.CachedPSO.pCachedBlob, d.CachedPSO.CachedBlobSizeInBytes, pso,
                             [&] { return as<ID3D12Device>(dev)->CreateComputePipelineState(&d, IID_PPV_ARGS(pso)); });
+    if (const ULONGLONG dt = GetTickCount64() - t0c; dt >= 5000) {
+        static volatile long shown = 0;
+        if (InterlockedIncrement(&shown) <= 40) XSL_WARN(CH, "CreateComputePipelineState took %llu ms in the driver (shaders %s)", (unsigned long long)dt, translated_keys());
+    }
     if (FAILED(hr)) { dump_debug_messages(); XSL_ERR(CH, "CreateComputePipelineState failed %08lx (translated shaders: %s)", hr, translated_keys()); }
     if (SUCCEEDED(hr)) name_translated(*out);
     if (hr == DXGI_ERROR_DEVICE_REMOVED) report_device_removed(as<ID3D12Device>(dev));
@@ -2818,8 +2826,13 @@ HRESULT_T create_pso_stream(PcObj dev, void* stream, size_t size, PcObj* out) {
     ID3D12Device2* d2 = nullptr;
     HRESULT hr = as<ID3D12Device>(dev)->QueryInterface(IID_PPV_ARGS(&d2));
     if (SUCCEEDED(hr)) {
+        const ULONGLONG t0 = GetTickCount64();
         hr = d2->CreatePipelineState(&d, IID_PPV_ARGS(reinterpret_cast<ID3D12PipelineState**>(out)));
         d2->Release();
+        if (const ULONGLONG dt = GetTickCount64() - t0; dt >= 5000) {
+            static volatile long shown = 0;
+            if (InterlockedIncrement(&shown) <= 40) XSL_WARN(CH, "CreatePipelineState took %llu ms in the driver (shaders %s)", (unsigned long long)dt, translated_keys());
+        }
     }
     if (FAILED(hr)) {
         dump_debug_messages();
@@ -4432,7 +4445,15 @@ void list_set_pso(PcObj l, PcObj pso) {
     }
     if (trace_writers()) { std::lock_guard<std::mutex> g(g_wr_mu); g_wr_pso[l] = pso; }
     if (g_info) { std::lock_guard<std::mutex> g(g_rs_mu); g_list_rs[l].pso = pso; }
+    const ULONGLONG t0 = GetTickCount64();
     L->SetPipelineState(as<ID3D12PipelineState>(pso));
+    if (const ULONGLONG dt = GetTickCount64() - t0; dt >= 500 && pso) {   // the driver made the list wait (a compile it had put off)
+        wchar_t nm[128] = L"";
+        UINT nn = sizeof nm;
+        as<ID3D12PipelineState>(pso)->GetPrivateData(WKPDID_D3DDebugObjectNameW, &nn, nm);
+        static volatile long shown = 0;
+        if (InterlockedIncrement(&shown) <= 20) XSL_WARN(CH, "SetPipelineState took %llu ms in the driver (pipeline %ls)", (unsigned long long)dt, nm);
+    }
     if (g_dred && pso) {   // breadcrumb context: which pipeline the following work uses
         wchar_t name[128];
         UINT n = sizeof name;

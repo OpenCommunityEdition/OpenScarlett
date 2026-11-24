@@ -44,11 +44,12 @@ bool section_lookup(Device* dev, uint64_t va, UnifiedRef* out, uint64_t* run) {
     auto it = g_sections.find(s);
     if (it == g_sections.end()) {
         Imported im{bytes, nullptr, 0};
+        const ULONGLONG t0 = GetTickCount64();
         HRESULT hr = pc::import_file_mapping(dev_extra(dev)->pcDevice, s, bytes, &im.res, &im.gpu);
         static volatile long shown = 0;
-        if (InterlockedIncrement(&shown) <= 4)
-            XSL_INFO(CH, "physical-page section %p (%llu MB): %s %llx", (void*)s, (unsigned long long)(bytes >> 20), SUCCEEDED(hr) ? "visible to the GPU at" : "import failed",
-                     (unsigned long long)(SUCCEEDED(hr) ? im.gpu : (uint64_t)(uint32_t)hr));
+        if (InterlockedIncrement(&shown) <= 40)
+            XSL_INFO(CH, "physical-page section %p (%llu MB): %s %llx (%llu ms)", (void*)s, (unsigned long long)(bytes >> 20), SUCCEEDED(hr) ? "visible to the GPU at" : "import failed",
+                     (unsigned long long)(SUCCEEDED(hr) ? im.gpu : (uint64_t)(uint32_t)hr), (unsigned long long)(GetTickCount64() - t0));
         it = g_sections.insert({s, im}).first;   // a failed import is remembered too
     }
     if (!it->second.res) return false;
