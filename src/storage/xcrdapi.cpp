@@ -167,6 +167,11 @@ struct Command {
     ID3D12Fence* fence = nullptr;
     UINT64 value = 0;
     HANDLE event = nullptr;
+    // Destination page numbers copied at enqueue (the title's array may live on its stack and be
+    // gone by the time the request runs). dstPagesFrom is the title's array when it is not on the
+    // enqueuing thread's stack: entries that were still 0 at enqueue are read from it again later.
+    std::vector<ULONG_PTR> dstPages;
+    const ULONG_PTR* dstPagesFrom = nullptr;
 };
 
 class Queue final : public ComObject<IDStorageQueueX2> {
@@ -201,6 +206,17 @@ public:
         if (r->Options.SourceType == DSTORAGE_REQUEST_SOURCE_FILE && r->File) {
             c.file = static_cast<File*>(r->File);
             c.file->AddRef();
+        }
+        // XSL_DS_LATE=0: the title's page array is read when the request runs, as before
+        static const bool late = [] { char b[4]; return !(GetEnvironmentVariableA("XSL_DS_LATE", b, 4) && b[0] == '0'); }();
+        if (late && r->Options.DestinationIsPhysicalPages && r->DestinationPageArray && r->DestinationSize) {
+            size_t n = ((size_t)r->DestinationPageOffset + r->DestinationSize + kPage - 1) / kPage;
+            c.dstPages.assign(r->DestinationPageArray, r->DestinationPageArray + n);
+            // An array on this thread's stack is complete now and its memory gets reused, so it is
+            // never read again; any other array is the title's own table and may be filled later.
+            auto* tib = (NT_TIB*)NtCurrentTeb();
+            auto* p = (void*)r->DestinationPageArray;
+            if (p < tib->StackLimit || p >= tib->StackBase) c.dstPagesFrom = r->DestinationPageArray;
         }
         record(c, true);
     }
@@ -331,7 +347,28 @@ private:
                  (unsigned long long)r.Options.AsUINT64, r.IntermediateSize, r.Name ? r.Name : "-", hr, head);
     }
 
-    HRESULT execute(const DSTORAGE_REQUEST& r, File* file) {
+    // Destination pages that were 0 at enqueue: the title fills some table entries after it
+    // enqueues, so read those entries from its table again. The read goes through
+    // ReadProcessMemory, which reports an unreadable address instead of faulting. The worker can
+    // get here before the title has stored the entry, so it retries for a short time.
+    static void late_pages(Command& c) {
+        if (!c.dstPagesFrom) return;
+        for (int attempt = 0; attempt < 20; attempt++) {
+            bool missing = false;
+            for (size_t i = 0; i < c.dstPages.size(); i++) {
+                if (c.dstPages[i]) continue;
+                ULONG_PTR v = 0;
+                SIZE_T got = 0;
+                if (ReadProcessMemory(GetCurrentProcess(), c.dstPagesFrom + i, &v, sizeof v, &got) && got == sizeof v && v) c.dstPages[i] = v;
+                else missing = true;
+            }
+            if (!missing) return;
+            Sleep(1);
+        }
+    }
+
+    // dstPages: the page numbers to use for a physical-page destination (null: the request's own array).
+    HRESULT execute(const DSTORAGE_REQUEST& r, File* file, const ULONG_PTR* dstPages = nullptr) {
         const auto& o = r.Options;
         if (o.BcpackMode != DSTORAGE_BCPACK_MODE_NONE && !bcpack()) return E_DSTORAGE_INVALID_BCPACK_MODE;
         if (o.SwizzleMode != DSTORAGE_SWIZZLE_MODE_NONE) return E_DSTORAGE_INVALID_SWIZZLE_MODE;
@@ -386,7 +423,7 @@ private:
             memcpy(out, in, r.SourceSize);
         }
         if (o.DestinationIsPhysicalPages &&
-            !pages().copy(r.DestinationPageArray, r.DestinationPageOffset, staged.data(), staged.size(), true))
+            !pages().copy(dstPages ? dstPages : r.DestinationPageArray, r.DestinationPageOffset, staged.data(), staged.size(), true))
             return E_DSTORAGE_ACCESS_VIOLATION;
         return S_OK;
     }
@@ -404,7 +441,8 @@ private:
             }
             switch (c.type) {
                 case DSTORAGE_COMMAND_TYPE_REQUEST: {
-                    HRESULT hr = execute(c.request, c.file);
+                    late_pages(c);
+                    HRESULT hr = execute(c.request, c.file, c.dstPages.empty() ? nullptr : c.dstPages.data());
                     trace_request(c, hr);
                     if (FAILED(hr)) {
                         if (SUCCEEDED(batch)) batch = hr;

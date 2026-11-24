@@ -1164,6 +1164,40 @@ void D3DAPI L_Write64BOP(ID3D12GraphicsCommandList* l, D3D12_GPU_VIRTUAL_ADDRESS
 void D3DAPI L_Write32BOP(ID3D12GraphicsCommandList* l, D3D12_GPU_VIRTUAL_ADDRESS va, UINT v, D3D12XBOX_FLUSH, D3D12XBOX_WRITE_VALUE_BOP_FLAGS) {
     pc::list_write_immediate(LPC(l), gpu_va(hdr(l)->device, va), v, true);
 }
+// Top-of-pipe value writes: stored at this point of the list's timeline, low dword then high.
+void D3DAPI L_Write64TOP(ID3D12GraphicsCommandList* l, D3D12_GPU_VIRTUAL_ADDRESS va, UINT64 v, D3D12XBOX_WRITE_VALUE_TOP_FLAGS flags) {
+    Device* dev = hdr(l)->device;
+    if (flags & (D3D12XBOX_WRITE_VALUE_TOP_FLAG_GPU_TIMESTAMP | D3D12XBOX_WRITE_VALUE_TOP_FLAG_SYSTEM_TIMESTAMP)) {
+        // A timestamp instead of the given value: resolve a timestamp query into the destination.
+        UnifiedRef r;
+        if (unified_lookup(dev, va, &r)) pc::list_write_timestamp(dev_extra(dev)->pcDevice, LPC(l), r.res, r.offset);
+        else XSL_WARN(CH, "timestamp write to %llx: not in GPU-visible title memory", (unsigned long long)va);
+        return;
+    }
+    uint64_t g = gpu_va(dev, va);
+    const uint64_t a[2] = {g, g + 4};
+    const uint32_t vals[2] = {(uint32_t)v, (uint32_t)(v >> 32)};
+    pc::list_write_immediate(LPC(l), 2, a, vals);
+}
+void D3DAPI L_Write32TOP(ID3D12GraphicsCommandList* l, D3D12_GPU_VIRTUAL_ADDRESS va, UINT v, D3D12XBOX_WRITE_VALUE_TOP_FLAGS) {
+    const uint64_t a = gpu_va(hdr(l)->device, va);
+    const uint32_t val = v;
+    pc::list_write_immediate(LPC(l), 1, &a, &val);
+}
+// The console GPU can stall its command stream until a memory value passes a comparison. PC lists
+// have nothing like it, so the wait is skipped (logged once) and the list carries on.
+void D3DAPI L_Wait64(ID3D12GraphicsCommandList* l, D3D12_GPU_VIRTUAL_ADDRESS va, D3D12_COMPARISON_FUNC f, UINT64 ref, D3D12XBOX_WAIT_FLAGS flags) {
+    static volatile long n = 0;
+    if (InterlockedIncrement(&n) == 1)
+        XSL_INFO(CH, "Wait64BitValueX on list %p skipped (no PC equivalent): address %llx, comparison %d, reference %llx, flags %#x", (void*)l,
+                 (unsigned long long)va, (int)f, (unsigned long long)ref, (unsigned)flags);
+}
+void D3DAPI L_Wait32(ID3D12GraphicsCommandList* l, D3D12_GPU_VIRTUAL_ADDRESS va, D3D12_COMPARISON_FUNC f, UINT ref, UINT mask, D3D12XBOX_WAIT_FLAGS flags) {
+    static volatile long n = 0;
+    if (InterlockedIncrement(&n) == 1)
+        XSL_INFO(CH, "Wait32BitValueX on list %p skipped (no PC equivalent): address %llx, comparison %d, reference %x, mask %x, flags %#x", (void*)l,
+                 (unsigned long long)va, (int)f, ref, mask, (unsigned)flags);
+}
 void D3DAPI L_FlushPipelineX(ID3D12GraphicsCommandList* l, D3D12XBOX_FLUSH, D3D12_GPU_VIRTUAL_ADDRESS, SIZE_T) {
     D3D12_RESOURCE_BARRIER b{};
     b.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;  // global UAV barrier: the closest PC flush
@@ -1603,6 +1637,10 @@ HRESULT make_list(Device* dev, PcObj pcl, D3D12_COMMAND_LIST_TYPE t, REFIID riid
         g->KickoffX = L_KickoffX;
         g->Write64BitValueBottomOfPipeX = L_Write64BOP;
         g->Write32BitValueBottomOfPipeX = L_Write32BOP;
+        g->Write64BitValueTopOfPipeX = L_Write64TOP;
+        g->Write32BitValueTopOfPipeX = L_Write32TOP;
+        g->Wait64BitValueX = L_Wait64;
+        g->Wait32BitValueX = L_Wait32;
         g->FlushPipelineX = L_FlushPipelineX;
         g->ExecuteIndirect = L_ExecuteIndirect;
         g->BeginQuery = L_BeginQuery;
