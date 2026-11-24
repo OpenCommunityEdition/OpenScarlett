@@ -12,7 +12,7 @@
 //   hang     sleep <seconds> with everything referenced: for ending it from outside (taskkill /F)
 // Run it with the committed memory of the system read before and after (\Memory\Committed Bytes).
 //
-// Measured on Windows 10 19045 with an RTX 5090 (driver 32.0.15): a section imported as a file
+// Measured on Windows 10 19044.7663 with an RTX 5090 (driver 591.59): a section imported as a file
 // mapping stays committed after the process, however it ends and even when everything was
 // released first (512 MB of 512 each time); the same sections imported by address do not.
 #include <windows.h>
