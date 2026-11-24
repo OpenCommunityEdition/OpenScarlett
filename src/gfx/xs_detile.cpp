@@ -158,13 +158,23 @@ uint32_t block_bytes(DXGI_FORMAT f) {
         return 16;
     return 0;
 }
-// Separable layouts. In most console layouts the place of element (x, y) of a level (a texel, or
-// a 4x4 block of a compressed format) is base + (X[x] ^ Y[y]) or base + X[x] + Y[y]: the bits of
-// x and of y are spread over the offset independently. The two tables are asked from the layout
-// library once (width + height questions), checked against it at scattered elements, and kept
-// for every texture of the same shape; converting is then two table reads per element instead of
-// the library's own slow walk.
-struct Sep { bool ok = false, add = false; uint64_t base = 0; uint32_t w = 0, h = 0, el = 0; std::vector<uint64_t> X, Y; };   // w, h in elements; X, Y from base
+// Separable layouts. A console layout places a level in blocks (4 KB, 64 KB, ...): the blocks follow
+// each other by rows, and inside a block the bits of x and of y are spread over the offset
+// independently. So with X[x] the offset of element (x, 0), Y[y] that of (0, y) and O that of
+// (0, 0) (an element is a texel, or a 4x4 block of a compressed format), the offset of (x, y) is
+//     (X[x] + Y[y] - O above the block size)  +  (X[x] ^ Y[y] ^ O below it)
+// for one block size: 1 for plain rows (all sum), the whole level when it is one block (all
+// xor). The two tables are asked from the layout library once (width + height questions), the
+// block size is the smallest one that agrees with the library at a few hundred scattered
+// elements, and the result is kept for every texture of the same shape; converting is then two
+// table reads per element instead of the library's own slow walk.
+struct Sep {
+    bool ok = false;
+    uint32_t w = 0, h = 0, el = 0;        // elements across and down, bytes of one
+    unsigned shift = 0;                   // log2 of the block size
+    uint64_t oh = 0, ol = 0;              // O above and below the block size
+    std::vector<uint64_t> XH, YH, XL, YL;
+};
 using SepKey = std::tuple<uint64_t, uint32_t, uint32_t, int, int, uint32_t, uint32_t>;   // width, height, levels, format, layout, flags, level
 std::mutex g_sep_mu;
 std::map<SepKey, std::shared_ptr<const Sep>> g_sep;
@@ -186,70 +196,92 @@ std::shared_ptr<const Sep> separable(XgComputer* c, const D3D12_RESOURCE_DESC& d
     t->h = (mh + step - 1) / step;
     t->el = el;
     UINT32 bit = 0;
-    // (The library is asked in texels: a block is named by its top left texel.)
-    auto at = [&](uint64_t x, uint32_t y) { bit = 0; return c->GetTexelElementOffsetBytes(0, mip, x * step, y * step, 0, 0, &bit); };
-    t->base = at(0, 0);
-    bool ok = bit == 0 && t->base < resSize && mw < (1u << 16) && mh < (1u << 16);
-    uint64_t mx = 0, my = 0;
+    // (The library counts in elements: for a compressed format x and y number the 4x4 blocks.)
+    auto at = [&](uint64_t x, uint32_t y) { bit = 0; return c->GetTexelElementOffsetBytes(0, mip, x, y, 0, 0, &bit); };
+    const uint64_t O = at(0, 0);
+    bool ok = bit == 0 && O < resSize && mw < (1u << 16) && mh < (1u << 16);
+    std::vector<uint64_t> X, Y;
     if (ok) {
-        t->X.resize(t->w);
-        t->Y.resize(t->h);
-        for (uint32_t x = 0; x < t->w && ok; x++) {
-            const uint64_t v = at(x, 0);
-            if (v < t->base || (v - t->base) % el || bit) ok = false;
-            t->X[x] = v - t->base;
-            mx = std::max(mx, t->X[x]);
+        X.resize(t->w);
+        Y.resize(t->h);
+        for (uint32_t x = 0; x < t->w && ok; x++) { X[x] = at(x, 0); ok = !bit && X[x] + el <= resSize; }
+        for (uint32_t y = 0; y < t->h && ok; y++) { Y[y] = at(0, y); ok = !bit && Y[y] + el <= resSize; }
+    }
+    // Neighbours are different elements.
+    if (ok && ((t->w > 1 && X[1] == O) || (t->h > 1 && Y[1] == O))) ok = false;
+    struct Probe { uint32_t x, y; uint64_t v; };
+    std::vector<Probe> probes;
+    if (ok) {
+        uint32_t r = 0x2545f491u + (uint32_t)d.Width * 131u + d.Height * 31u + mip;
+        for (int k = 0; k < 260 && ok; k++) {
+            r = r * 2654435761u + 0x3c6ef35fu;
+            uint32_t x = (r >> 9) % t->w;
+            r = r * 2654435761u + 0x3c6ef35fu;
+            uint32_t y = (r >> 9) % t->h;
+            if (k == 0) { x = t->w - 1; y = t->h - 1; }   // some fixed ones: the far corner, two edges, next to the origin
+            if (k == 1) { x = t->w / 2; y = t->h - 1; }
+            if (k == 2) { x = t->w - 1; y = t->h / 2; }
+            if (k == 3) { x = t->w > 1; y = t->h > 1; }
+            const uint64_t v = at(x, y);
+            if (bit || v + el > resSize) ok = false;
+            probes.push_back({x, y, v});
         }
-        for (uint32_t y = 0; y < t->h && ok; y++) {
-            const uint64_t v = at(0, y);
-            if (v < t->base || (v - t->base) % el || bit) ok = false;
-            t->Y[y] = v - t->base;
-            my = std::max(my, t->Y[y]);
+    }
+    int found = -1;
+    for (unsigned sh = 0; ok && sh <= 40 && found < 0; sh++) {
+        const uint64_t m = (1ull << sh) - 1;
+        bool all = true;
+        for (auto& p : probes) {
+            const uint64_t want = (X[p.x] & ~m) + (Y[p.y] & ~m) - (O & ~m) + ((X[p.x] & m) ^ (Y[p.y] & m) ^ (O & m));
+            if (want != p.v) { all = false; break; }
+        }
+        if (all) found = (int)sh;
+    }
+    t->ok = found >= 0;
+    if (t->ok) {
+        t->shift = (unsigned)found;
+        const uint64_t m = (1ull << found) - 1;
+        t->oh = O & ~m;
+        t->ol = O & m;
+        t->XH.resize(t->w); t->XL.resize(t->w); t->YH.resize(t->h); t->YL.resize(t->h);
+        for (uint32_t x = 0; x < t->w; x++) { t->XH[x] = X[x] & ~m; t->XL[x] = X[x] & m; }
+        for (uint32_t y = 0; y < t->h; y++) { t->YH[y] = Y[y] & ~m; t->YL[y] = Y[y] & m; }
+    }
+    static volatile long shown[2] = {0, 0};
+    if (InterlockedIncrement(&shown[t->ok ? 1 : 0]) <= 10) {
+        if (t->ok) XSL_INFO(CH, "layout of %llux%u format %d layout %#x level %u of %u (%u-byte elements): converted by two tables (blocks of %llu bytes)", (unsigned long long)d.Width, d.Height,
+                            (int)d.Format, (unsigned)d.Layout, mip, (unsigned)d.MipLevels, el, 1ull << found);
+        else XSL_INFO(CH, "layout of %llux%u format %d layout %#x level %u of %u (%u-byte elements): not two tables, converted by the layout library", (unsigned long long)d.Width,
+                      d.Height, (int)d.Format, (unsigned)d.Layout, mip, (unsigned)d.MipLevels, el);
+    }
+    // XSL_LAYOUT_DUMP=1 (diagnostics): the offsets of every element of small levels that are not
+    // converted by tables, a row per line.
+    static const bool dump = [] { char b[4]; return GetEnvironmentVariableA("XSL_LAYOUT_DUMP", b, 4) && b[0] == '1'; }();
+    static volatile long dumped = 0;
+    if (dump && !t->ok && t->w <= 32 && t->h <= 32 && t->w * t->h >= 16 && InterlockedIncrement(&dumped) <= 6) {
+        for (uint32_t y = 0; y < t->h; y++) {
+            std::string row;
+            for (uint32_t x = 0; x < t->w; x++) { char b[24]; snprintf(b, sizeof b, " %5llx", (unsigned long long)at(x, y)); row += b; }
+            XSL_INFO(CH, "layout dump %llux%u format %d level %u row %2u:%s", (unsigned long long)d.Width, d.Height, (int)d.Format, mip, y, row.c_str());
         }
     }
-    // No element may lie outside the resource (x ^ y is never above x + y), and neighbours are
-    // different elements.
-    ok = ok && mx < resSize && my < resSize && t->base + mx + my + el <= resSize;
-    if (ok && ((t->w > 1 && !t->X[1]) || (t->h > 1 && !t->Y[1]))) ok = false;
-    // A compressed format: the library must really count in texels (the last texel of the first
-    // block lies in that block), else the tables hold every fourth block.
-    if (ok && step == 4) {
-        if (mw >= 4 && c->GetTexelElementOffsetBytes(0, mip, 3, 0, 0, 0, &bit) != t->base) ok = false;
-        if (mh >= 4 && c->GetTexelElementOffsetBytes(0, mip, 0, 3, 0, 0, &bit) != t->base) ok = false;
-    }
-    bool byXor = ok, byAdd = ok;
-    uint32_t r = 0x2545f491u + (uint32_t)d.Width * 131u + d.Height * 31u + mip;
-    for (int k = 0; k < 67 && (byXor || byAdd); k++) {
-        r = r * 2654435761u + 0x3c6ef35fu;
-        uint32_t x = (r >> 9) % t->w;
-        r = r * 2654435761u + 0x3c6ef35fu;
-        uint32_t y = (r >> 9) % t->h;
-        if (k == 64) { x = t->w - 1; y = t->h - 1; }   // and three fixed ones: the far corner, ...
-        if (k == 65) { x = t->w / 2; y = t->h - 1; }
-        if (k == 66) { x = t->w - 1; y = t->h / 2; }
-        const uint64_t v = at(x, y) - t->base;
-        if (bit) byXor = byAdd = false;
-        if (v != (t->X[x] ^ t->Y[y])) byXor = false;
-        if (v != t->X[x] + t->Y[y]) byAdd = false;
-    }
-    t->ok = byXor || byAdd;
-    t->add = !byXor;
-    static volatile long n = 0;
-    if (InterlockedIncrement(&n) <= 12)
-        XSL_INFO(CH, "layout of %llux%u format %d layout %#x level %u (%u-byte elements): %s", (unsigned long long)d.Width, d.Height, (int)d.Format, (unsigned)d.Layout, mip, el,
-                 !t->ok ? "not separable, converted by the layout library" : t->add ? "separable (sum of two tables), converted by table" : "separable (xor of two tables), converted by table");
     std::lock_guard<std::mutex> g(g_sep_mu);
     g_sep[key] = t;
     return t->ok ? t : nullptr;
 }
-template <size_t N> void sep_copy(const Sep& t, const uint8_t* src, uint8_t* dst, uint32_t rowPitch) {
-    const uint64_t* X = t.X.data();
+// (False when an element would lie outside the resource: the level is then left to the library.)
+template <size_t N> bool sep_copy(const Sep& t, const uint8_t* src, uint64_t srcSize, uint8_t* dst, uint32_t rowPitch) {
+    const uint64_t *XH = t.XH.data(), *XL = t.XL.data();
     for (uint32_t y = 0; y < t.h; y++) {
         uint8_t* d = dst + (size_t)y * rowPitch;
-        const uint64_t yy = t.Y[y];
-        if (t.add) for (uint32_t x = 0; x < t.w; x++) memcpy(d + (size_t)x * N, src + X[x] + yy, N);
-        else for (uint32_t x = 0; x < t.w; x++) memcpy(d + (size_t)x * N, src + (X[x] ^ yy), N);
+        const uint64_t yh = t.YH[y] - t.oh, yl = t.YL[y] ^ t.ol;
+        for (uint32_t x = 0; x < t.w; x++) {
+            const uint64_t off = XH[x] + yh + (XL[x] ^ yl);
+            if (off + N > srcSize) return false;
+            memcpy(d + (size_t)x * N, src + off, N);
+        }
     }
+    return true;
 }
 // One level by the tables (false: this level is left to the layout library).
 bool fill_separable(const FillCtx* f, uint32_t sub, void* dst, uint32_t rowPitch, uint32_t rows) {
@@ -258,16 +290,15 @@ bool fill_separable(const FillCtx* f, uint32_t sub, void* dst, uint32_t rowPitch
     // (One plane, one slice: the subresource number is the level.)
     auto t = separable(f->c, *f->desc, sub, f->size);
     if (!t || t->h != rows || (uint64_t)t->w * t->el > rowPitch) return false;
-    const uint8_t* src = (const uint8_t*)(uintptr_t)f->va + t->base;
+    const uint8_t* src = (const uint8_t*)(uintptr_t)f->va;
     switch (t->el) {
-        case 1: sep_copy<1>(*t, src, (uint8_t*)dst, rowPitch); break;
-        case 2: sep_copy<2>(*t, src, (uint8_t*)dst, rowPitch); break;
-        case 4: sep_copy<4>(*t, src, (uint8_t*)dst, rowPitch); break;
-        case 8: sep_copy<8>(*t, src, (uint8_t*)dst, rowPitch); break;
-        case 16: sep_copy<16>(*t, src, (uint8_t*)dst, rowPitch); break;
+        case 1: return sep_copy<1>(*t, src, f->size, (uint8_t*)dst, rowPitch);
+        case 2: return sep_copy<2>(*t, src, f->size, (uint8_t*)dst, rowPitch);
+        case 4: return sep_copy<4>(*t, src, f->size, (uint8_t*)dst, rowPitch);
+        case 8: return sep_copy<8>(*t, src, f->size, (uint8_t*)dst, rowPitch);
+        case 16: return sep_copy<16>(*t, src, f->size, (uint8_t*)dst, rowPitch);
         default: return false;
     }
-    return true;
 }
 std::atomic<uint64_t> g_time[4];   // microseconds: layout object, reading the memory, conversion, the rest of the upload
 uint64_t now_us() { static LARGE_INTEGER f = [] { LARGE_INTEGER x; QueryPerformanceFrequency(&x); return x; }(); LARGE_INTEGER t; QueryPerformanceCounter(&t); return (uint64_t)(t.QuadPart * 1000000 / f.QuadPart); }

@@ -413,6 +413,11 @@ static HRESULT stream_pso_create(PcObj dev, StreamPso& s, PcObj* pso) {
         memcpy(s.pcs.data() + s.at[i], &bc, sizeof bc);
     }
     *pso = nullptr;
+    if (pc::had_untranslated()) {   // console code is never handed to the PC runtime (pc::create_compute_pso)
+        pc::set_fallback_root_signature(nullptr, 0);
+        for (void* o : owned) pc::free_container(o);
+        return E_FAIL;
+    }
     {   // XSL_RECT_GS=0 keeps rectangle lists as single triangles
         static const bool rectGs = [] { char b[4]; return !(GetEnvironmentVariableA("XSL_RECT_GS", b, 4) && b[0] == '0'); }();
         const void* gs = nullptr;

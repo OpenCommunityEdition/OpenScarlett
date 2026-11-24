@@ -310,6 +310,195 @@ static void trap_arm(HANDLE th) {
     for (int i = 0; i < g_ntrap; i++) { *dr[i] = g_trap[i]; c.Dr7 |= 1ull << (2 * i); c.Dr7 &= ~(0xFull << (16 + 4 * i)); }
     SetThreadContext(th, &c);
 }
+// The call stack of a suspended thread, innermost first: its program counter and the return
+// addresses its unwind tables give. Nothing here allocates or takes a lock of ours, because the
+// suspended thread may hold the heap's lock.
+static int unwind_suspended(HANDLE th, uintptr_t* pcs, int max) {
+    alignas(16) CONTEXT c;
+    memset(&c, 0, sizeof c);
+    c.ContextFlags = CONTEXT_FULL;
+    if (!GetThreadContext(th, &c)) return 0;
+    MEMORY_BASIC_INFORMATION mbi{};
+    if (!VirtualQuery((void*)c.Rsp, &mbi, sizeof mbi) || mbi.State != MEM_COMMIT) return 0;
+    const uintptr_t stackLo = (uintptr_t)mbi.BaseAddress, stackHi = stackLo + mbi.RegionSize;
+    int n = 0;
+    while (n < max && c.Rip > 0x10000) {
+        pcs[n++] = (uintptr_t)c.Rip;
+        if (c.Rsp < stackLo || c.Rsp + 8 > stackHi) break;
+        const DWORD64 before = c.Rsp;
+        DWORD64 base = 0;
+        PRUNTIME_FUNCTION fn = RtlLookupFunctionEntry(c.Rip, &base, nullptr);
+        if (!fn) {   // a leaf function: its return address is at the stack pointer
+            c.Rip = *(const DWORD64*)c.Rsp;
+            c.Rsp += 8;
+        } else {
+            void* handler = nullptr;
+            DWORD64 frame = 0;
+            RtlVirtualUnwind(UNW_FLAG_NHANDLER, base, c.Rip, fn, &c, &handler, &frame, nullptr);
+        }
+        if (c.Rsp <= before) break;   // no progress: not a stack the tables describe
+    }
+    return n;
+}
+// A code address as text: L+offset in this module, the bare offset in the title's image,
+// module+offset elsewhere. (Takes the loader lock: never while a thread is suspended.)
+static std::string code_address(uintptr_t pc) {
+    static const HMODULE exe = GetModuleHandleW(nullptr);
+    static const HMODULE self = [] {
+        HMODULE m = nullptr;
+        GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCSTR)&unwind_suspended, &m);
+        return m;
+    }();
+    char b[96];
+    HMODULE m = nullptr;
+    if (!GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCSTR)pc, &m) || !m) {
+        snprintf(b, sizeof b, "?%llx", (unsigned long long)pc);
+        return b;
+    }
+    const unsigned long long off = pc - (uintptr_t)m;
+    if (m == self) snprintf(b, sizeof b, "L+%llx", off);
+    else if (m == exe) snprintf(b, sizeof b, "%llx", off);
+    else {
+        char name[MAX_PATH] = "?";
+        GetModuleFileNameA(m, name, MAX_PATH);
+        const char* bn = strrchr(name, '\\');
+        snprintf(b, sizeof b, "%.24s+%llx", bn ? bn + 1 : name, off);
+    }
+    return b;
+}
+std::atomic<DWORD> g_present_tid{0};   // the thread that presented last
+// XSL_PROFILE=<from>-<to>[:<period ms>] (diagnostics): between those seconds after start-up every
+// thread of the process is sampled (default every 20 ms) and, at the end, the stacks each thread
+// was seen in most are logged with their share: where a title's threads spend a stall. Threads
+// that only wait in the title's own code are counted, not listed.
+static void profile_run(unsigned from, unsigned to, unsigned period) {
+    struct Stack { uint32_t count = 0; int n = 0; uintptr_t pc[24]; };
+    const ULONGLONG t0 = GetTickCount64();
+    Sleep(from * 1000);
+    HMODULE self = nullptr;
+    GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCSTR)&unwind_suspended, &self);
+    uintptr_t slo = (uintptr_t)self, shi = slo;
+    if (self) {
+        auto* sd = (const IMAGE_DOS_HEADER*)self;
+        shi = slo + ((const IMAGE_NT_HEADERS*)((const uint8_t*)self + sd->e_lfanew))->OptionalHeader.SizeOfImage;
+    }
+    std::map<DWORD, std::unordered_map<uint64_t, Stack>> seen;
+    std::vector<std::pair<DWORD, HANDLE>> threads;
+    ULONGLONG listed = 0;
+    uint32_t rounds = 0;
+    while (GetTickCount64() - t0 < (ULONGLONG)to * 1000) {
+        if (GetTickCount64() - listed >= 1000) {   // the threads there are now
+            listed = GetTickCount64();
+            for (auto& t : threads) CloseHandle(t.second);
+            threads.clear();
+            HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+            if (snap != INVALID_HANDLE_VALUE) {
+                THREADENTRY32 te{sizeof te};
+                for (BOOL ok = Thread32First(snap, &te); ok; ok = Thread32Next(snap, &te)) {
+                    if (te.th32OwnerProcessID != GetCurrentProcessId() || te.th32ThreadID == GetCurrentThreadId()) continue;
+                    if (HANDLE th = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION, FALSE, te.th32ThreadID))
+                        threads.emplace_back(te.th32ThreadID, th);
+                }
+                CloseHandle(snap);
+            }
+        }
+        for (auto& t : threads) {
+            uintptr_t pcs[24];
+            if (SuspendThread(t.second) == (DWORD)-1) continue;
+            const int n = unwind_suspended(t.second, pcs, 24);
+            ResumeThread(t.second);
+            if (!n) continue;
+            uint64_t h = 1469598103934665603ull;
+            for (int i = 0; i < n; i++) h = (h ^ pcs[i]) * 1099511628211ull;
+            Stack& s = seen[t.first][h];
+            if (!s.count) { s.n = n; memcpy(s.pc, pcs, n * sizeof *pcs); }
+            s.count++;
+        }
+        rounds++;
+        Sleep(period);
+    }
+    for (auto& t : threads) CloseHandle(t.second);
+    const HMODULE exe = GetModuleHandleW(nullptr);
+    const uintptr_t elo = (uintptr_t)exe;
+    const uintptr_t ehi = elo + ((const IMAGE_NT_HEADERS*)((const uint8_t*)exe + ((const IMAGE_DOS_HEADER*)exe)->e_lfanew))->OptionalHeader.SizeOfImage;
+    const HMODULE sysmods[] = {GetModuleHandleW(L"ntdll.dll"), GetModuleHandleW(L"KERNELBASE.dll"), GetModuleHandleW(L"KERNEL32.DLL"), GetModuleHandleW(L"win32u.dll"),
+                               GetModuleHandleW(L"user32.dll")};
+    // A stack that waits in a system call (the two bytes before the program counter are the
+    // syscall instruction) and holds only frames of the system and of the title: the title's own
+    // wait, as an idle worker's.
+    auto own_wait = [&](const Stack& st) {
+        const uint8_t* q = (const uint8_t*)st.pc[0];
+        if (!(q[-2] == 0x0F && q[-1] == 0x05)) return false;
+        for (int i = 0; i < st.n; i++) {
+            if (st.pc[i] >= elo && st.pc[i] < ehi) continue;
+            HMODULE m = nullptr;
+            if (!GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCSTR)st.pc[i], &m)) return false;
+            if (std::find(std::begin(sysmods), std::end(sysmods), m) == std::end(sysmods)) return false;
+        }
+        return true;
+    };
+    auto text = [&](const Stack& st) {
+        std::string t;
+        for (int k = 0; k < st.n; k++) { t += ' '; t += code_address(st.pc[k]); }
+        return t;
+    };
+    XSL_INFO(CH, "profile %u-%u s: %u rounds, %zu threads (the title presents on thread %lu)", from, to, rounds, seen.size(), (unsigned long)g_present_tid.load());
+    std::map<std::string, std::pair<uint32_t, uint32_t>> waits;   // the title's own waits: stack -> threads, samples
+    for (auto& th : seen) {
+        uint32_t busy = 0, total = 0;
+        std::vector<const Stack*> v;
+        for (auto& kv : th.second) {
+            total += kv.second.count;
+            if (own_wait(kv.second)) continue;
+            busy += kv.second.count;
+            v.push_back(&kv.second);
+        }
+        const bool presents = th.first == g_present_tid.load();
+        if (!presents && busy * 50 < rounds) {   // under 2 % outside its own waits: counted with the others that wait alike
+            const Stack* top = nullptr;
+            for (auto& kv : th.second) if (!top || kv.second.count > top->count) top = &kv.second;
+            if (top) { auto& w = waits[text(*top)]; w.first++; w.second += top->count; }
+            continue;
+        }
+        if (presents) { v.clear(); for (auto& kv : th.second) v.push_back(&kv.second); }   // the presenting thread: its waits too
+        std::sort(v.begin(), v.end(), [](const Stack* a, const Stack* b) { return a->count > b->count; });
+        XSL_INFO(CH, "profile: thread %lu%s: %u of %u samples outside its own waits", (unsigned long)th.first, presents ? " (presents)" : "", busy, total);
+        // A busy thread is seldom seen twice in one stack: also where its samples are by the module
+        // of the innermost frame, by the innermost frame of the layer and by that of the title.
+        std::map<std::string, uint32_t> by[3];
+        for (const Stack* st : v) {
+            std::string leaf = code_address(st->pc[0]);
+            if (size_t plus = leaf.find('+'); plus != std::string::npos && leaf[0] != 'L') leaf.resize(plus);
+            else if (leaf[0] == 'L') leaf = "layer";
+            else leaf = "title";
+            by[0][leaf] += st->count;
+            bool l = false, e = false;
+            for (int k = 0; k < st->n && !(l && e); k++) {
+                if (!l && st->pc[k] >= slo && st->pc[k] < shi) { l = true; by[1][code_address(st->pc[k])] += st->count; }
+                if (!e && st->pc[k] >= elo && st->pc[k] < ehi) { e = true; by[2][code_address(st->pc[k])] += st->count; }
+            }
+        }
+        static const char* const what[3] = {"innermost module", "innermost layer frame", "innermost title frame"};
+        for (int w = 0; w < 3; w++) {
+            std::vector<std::pair<uint32_t, std::string>> r;
+            for (auto& kv : by[w]) r.emplace_back(kv.second, kv.first);
+            std::sort(r.rbegin(), r.rend());
+            std::string t;
+            for (size_t i = 0; i < r.size() && i < 10; i++) { char c[96]; snprintf(c, sizeof c, " %s=%u", r[i].second.c_str(), r[i].first); t += c; }
+            if (!t.empty()) XSL_INFO(CH, "profile: thread %lu: by %s:%s", (unsigned long)th.first, what[w], t.c_str());
+        }
+        for (size_t i = 0; i < v.size() && i < 14; i++)
+            XSL_INFO(CH, "profile: thread %lu: %u (%u %%):%s", (unsigned long)th.first, v[i]->count, v[i]->count * 100 / rounds, text(*v[i]).c_str());
+    }
+    for (auto& w : waits) XSL_INFO(CH, "profile: waits: %u threads (%u samples):%s", w.second.first, w.second.second, w.first.c_str());
+}
+static void profile_start() {
+    char b[64];
+    if (!GetEnvironmentVariableA("XSL_PROFILE", b, sizeof b) || !b[0]) return;
+    unsigned from = 0, to = 0, period = 20;
+    if (sscanf(b, "%u-%u:%u", &from, &to, &period) < 2 || to <= from) return;
+    std::thread([=] { profile_run(from, to, period ? period : 20); }).detach();
+}
 // XSL_STACKS=<seconds>[,<seconds>...] (diagnostics): at those times after start-up, the stack of
 // every thread of the title is logged as the return addresses into the title's image found on it
 // (what a title that shows nothing is waiting for).
@@ -596,6 +785,7 @@ static void select_agility_runtime() {
 }
 HRESULT_T create_device(PcObj* out) {
     select_agility_runtime();
+    { static bool once = false; if (!once) { once = true; profile_start(); } }
     if (env_on("XSL_D3D12_DRED") || env_on("XSL_D3D12_DEBUG")) {
         static bool once = false;
         if (!once) { once = true; AddVectoredExceptionHandler(1, note_exception); trap_start(); stacks_start(); }
@@ -2640,6 +2830,9 @@ struct ShaderFix {
 };
 }  // namespace
 
+// XSL_PSO_TIMES=1 (diagnostics): every creation and selection of a pipeline that takes 20 ms or
+// more is logged with the pipeline's address.
+static bool pso_times() { static const bool on = env_on("XSL_PSO_TIMES"); return on; }
 void name_translated(PcObj pso) {   // PC pipelines made from translated shaders are named after them
     const char* k = translated_keys();
     if (!pso || !*k) return;
@@ -2668,12 +2861,16 @@ static HRESULT cached_pso(uint64_t key, const void*& cachedPtr, SIZE_T& cachedSi
     if (!path.empty() && read_all(path, blob)) {
         cachedPtr = blob.data();
         cachedSize = blob.size();
+        const ULONGLONG t0 = GetTickCount64();
         HRESULT hr = create();
         cachedPtr = nullptr;
         cachedSize = 0;
+        if (pso_times()) XSL_INFO(CH, "pso %p: created from its stored blob (%zu bytes) in %llu ms: %08lx", SUCCEEDED(hr) ? (void*)*out : nullptr, blob.size(), (unsigned long long)(GetTickCount64() - t0), hr);
         if (SUCCEEDED(hr)) return hr;
     }
+    const ULONGLONG t1 = GetTickCount64();
     HRESULT hr = create();
+    if (pso_times()) XSL_INFO(CH, "pso %p: created by the driver in %llu ms: %08lx", SUCCEEDED(hr) ? (void*)*out : nullptr, (unsigned long long)(GetTickCount64() - t1), hr);
     if (SUCCEEDED(hr) && !path.empty() && *out) {
         ID3DBlob* cb = nullptr;
         if (SUCCEEDED((*out)->GetCachedBlob(&cb)) && cb) { write_all(path, cb->GetBufferPointer(), cb->GetBufferSize()); cb->Release(); }
@@ -2686,6 +2883,7 @@ HRESULT_T create_graphics_pso(PcObj dev, const void* desc, PcObj* out) {
         if (DXGI_FORMAT sf = stand_in(d.RTVFormats[i]); sf != DXGI_FORMAT_UNKNOWN) d.RTVFormats[i] = sf;
     ShaderFix fx;
     fx.fix(d.VS, 0); fx.fix(d.PS, 1); fx.fix(d.DS, 2); fx.fix(d.HS, 3); fx.fix(d.GS, 4);
+    if (had_untranslated()) return E_FAIL;   // console code the PC runtime cannot take (see create_compute_pso)
     d.Flags = (D3D12_PIPELINE_STATE_FLAGS)(d.Flags & D3D12_PIPELINE_STATE_FLAG_TOOL_DEBUG);
     d.CachedPSO = {};
     d.NodeMask = 0;
@@ -2717,6 +2915,11 @@ HRESULT_T create_compute_pso(PcObj dev, const void* desc, PcObj* out) {
     D3D12_COMPUTE_PIPELINE_STATE_DESC d = *static_cast<const D3D12_COMPUTE_PIPELINE_STATE_DESC*>(desc);
     ShaderFix fx;
     fx.fix(d.CS, 0);
+    // A console program that did not translate is never handed to the PC runtime: the GPU driver's
+    // compiler faults on such a container (it catches the fault and reports "out of memory", but
+    // a thousand of those per run are not harmless: the driver's heap was seen corrupted after).
+    // The caller makes a placeholder pipeline, as it does for the failure the runtime would report.
+    if (had_untranslated()) return E_FAIL;
     d.Flags = D3D12_PIPELINE_STATE_FLAG_NONE;
     d.CachedPSO = {};
     d.NodeMask = 0;
@@ -2729,8 +2932,47 @@ HRESULT_T create_compute_pso(PcObj dev, const void* desc, PcObj* out) {
         static volatile long shown = 0;
         if (InterlockedIncrement(&shown) <= 40) XSL_WARN(CH, "CreateComputePipelineState took %llu ms in the driver (shaders %s)", (unsigned long long)dt, translated_keys());
     }
-    if (FAILED(hr)) { dump_debug_messages(); XSL_ERR(CH, "CreateComputePipelineState failed %08lx (translated shaders: %s)", hr, translated_keys()); }
+    if (FAILED(hr)) {
+        dump_debug_messages();
+        XSL_ERR(CH, "CreateComputePipelineState failed %08lx (translated shaders: %s)", hr, translated_keys());
+        // What the PC runtime was given, for a pipeline that is not a translated console program:
+        // the container's parts, and the container itself with XSL_DUMP_SHADERS.
+        static volatile long shown = 0;
+        const uint8_t* c = (const uint8_t*)d.CS.pShaderBytecode;
+        const size_t n = d.CS.BytecodeLength;
+        if (!*translated_keys() && !had_untranslated() && c && n >= 32 && InterlockedIncrement(&shown) <= 12) {
+            std::string parts;
+            uint32_t count = 0;
+            memcpy(&count, c + 28, 4);
+            for (uint32_t i = 0; !memcmp(c, "DXBC", 4) && i < count && 32 + 4ull * (i + 1) <= n; i++) {
+                uint32_t off = 0, sz = 0;
+                memcpy(&off, c + 32 + 4 * i, 4);
+                if (off + 8ull > n) break;
+                memcpy(&sz, c + off + 4, 4);
+                char t[40];
+                snprintf(t, sizeof t, " %.4s(%u)", (const char*)c + off, sz);
+                parts += t;
+            }
+            const uint64_t h = pso_hash(1469598103934665603ull, c, n);
+            XSL_ERR(CH, "  its shader: %zu bytes, starts %02x %02x %02x %02x, parts:%s, hash %016llx, root signature %p", n, c[0], c[1], c[2], c[3], parts.c_str(),
+                    (unsigned long long)h, (void*)d.pRootSignature);
+            if (const char* dir = getenv("XSL_DUMP_SHADERS"); dir && *dir) {
+                char path[600];
+                snprintf(path, sizeof path, "%s\\failed_cs_%016llx.cso", dir, (unsigned long long)h);
+                if (FILE* f = fopen(path, "wb")) { fwrite(c, 1, n, f); fclose(f); }
+            }
+        }
+    }
     if (SUCCEEDED(hr)) name_translated(*out);
+    if (SUCCEEDED(hr) && pso_times()) {
+        const uint64_t h = pso_hash(1469598103934665603ull, d.CS.pShaderBytecode, d.CS.BytecodeLength);
+        XSL_INFO(CH, "pso %p: compute shader %016llx of %zu bytes (%s)", *out, (unsigned long long)h, (size_t)d.CS.BytecodeLength, *translated_keys() ? translated_keys() : "the title's DXIL");
+        if (const char* dir = getenv("XSL_DUMP_SHADERS"); dir && *dir && !*translated_keys()) {
+            char path[600];
+            snprintf(path, sizeof path, "%s\\title_cs_%016llx.cso", dir, (unsigned long long)h);
+            if (FILE* f = fopen(path, "wb")) { fwrite(d.CS.pShaderBytecode, 1, d.CS.BytecodeLength, f); fclose(f); }
+        }
+    }
     if (hr == DXGI_ERROR_DEVICE_REMOVED) report_device_removed(as<ID3D12Device>(dev));
     return hr;
 }
@@ -3748,32 +3990,59 @@ void reap_uploads(bool all) {
 }
 // One reusable uploader per queue. Creating an upload buffer, an allocator, a list and a fence for
 // every upload can each wait hundreds of milliseconds on the video memory manager while a title
-// streams textures, so these are made once: a mapped upload buffer filled from the front (begun
-// again at 0 once the fence shows every earlier copy has run), four allocators (one is reset only
-// when the copies recorded with it have run), one list and one fence that counts up.
-struct Uploader {
-    ID3D12Device* dev = nullptr;
+// streams textures, so these are kept: mapped upload buffers ("chunks") filled from the front, each
+// with an allocator of its own, one list and one fence that counts up. A chunk is used again from
+// its start once the fence shows that every copy recorded from it has run. Nothing here waits
+// for the queue: the uploads run before the lists the title submits next, and those may be held
+// back by a wait of the title's own that only this thread's return ends (a 500 ms wait here, per
+// upload, was most of a 4 s frame). When no chunk is free another is made, up to a limit past
+// which an upload goes the one-off way.
+struct UpChunk {
     ID3D12Resource* buf = nullptr;
     uint8_t* map = nullptr;
     uint64_t size = 0, head = 0;   // head: the first byte no upload in flight uses
-    ID3D12CommandAllocator* alloc[4] = {};
-    uint64_t allocUse[4] = {};     // the fence value of each allocator's last use
+    ID3D12CommandAllocator* alloc = nullptr;
+    uint64_t lastUse = 0;          // the fence value of the last upload recorded from it
+};
+struct Uploader {
+    ID3D12Device* dev = nullptr;
+    std::vector<UpChunk> chunks;
+    size_t cur = 0;                // the chunk being filled
     ID3D12GraphicsCommandList* list = nullptr;
     ID3D12Fence* fence = nullptr;
     uint64_t value = 0;            // the last value signalled
-    HANDLE ev = nullptr;
     bool bad = false;              // could not be made: every upload goes the one-off way
+    // (what up_begin hands out for the upload being recorded)
+    ID3D12Resource* buf = nullptr;
+    uint8_t* map = nullptr;
 };
 std::map<ID3D12CommandQueue*, Uploader> g_uploaders;   // under g_up_mu
-constexpr uint64_t kUploaderBytes = 64ull << 20;
-// Waits (half a second at most) until the queue has run the uploads up to fence value v.
-bool up_wait(Uploader& u, uint64_t v) {
-    if (u.fence->GetCompletedValue() >= v) return true;
-    if (!u.ev || FAILED(u.fence->SetEventOnCompletion(v, u.ev))) return false;
-    return WaitForSingleObject(u.ev, 500) == WAIT_OBJECT_0 && u.fence->GetCompletedValue() >= v;
+constexpr uint64_t kUpChunkBytes = 64ull << 20;
+constexpr size_t kUpChunkLimit = 48;   // 3 GB of upload buffers in flight at most
+static bool up_new_chunk(Uploader& u, uint64_t bytes) {
+    UpChunk c;
+    D3D12_HEAP_PROPERTIES hp{D3D12_HEAP_TYPE_UPLOAD};
+    D3D12_RESOURCE_DESC bd{};
+    bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    bd.Width = std::max(kUpChunkBytes, (bytes + 0xffffull) & ~0xffffull);
+    bd.Height = bd.DepthOrArraySize = bd.MipLevels = 1;
+    bd.SampleDesc.Count = 1;
+    bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    D3D12_RANGE none{0, 0};   // nothing is read back through the mapping
+    bool ok = SUCCEEDED(u.dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&c.buf))) &&
+              SUCCEEDED(c.buf->Map(0, &none, (void**)&c.map)) && c.map &&
+              SUCCEEDED(u.dev->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&c.alloc)));
+    if (!ok) {
+        if (c.alloc) c.alloc->Release();
+        if (c.buf) c.buf->Release();
+        return false;
+    }
+    c.size = bd.Width;
+    u.chunks.push_back(c);
+    return true;
 }
-// Room for `bytes` in the queue's uploader (at *base, a multiple of 512) and its list reset on
-// allocator *slot. Null: the caller uses the one-off path. Called under g_up_mu.
+// Room for `bytes` in the queue's uploader (at *base of u->buf / u->map, a multiple of 512) and its
+// list reset for recording. Null: the caller uses the one-off path. Called under g_up_mu.
 Uploader* up_begin(ID3D12Device* dev, ID3D12CommandQueue* q, uint64_t bytes, uint64_t* base, int* slot) {
     // XSL_UPLOADER=0: every upload makes its own buffer, allocator and list, as before
     static const bool off = [] { char b[4]; return GetEnvironmentVariableA("XSL_UPLOADER", b, 4) && b[0] == '0'; }();
@@ -3784,47 +4053,48 @@ Uploader* up_begin(ID3D12Device* dev, ID3D12CommandQueue* q, uint64_t bytes, uin
         // First use. (A new device and queue at an old address: the old objects are left alone,
         // their device may be gone.)
         u = Uploader{};
-        D3D12_HEAP_PROPERTIES hp{D3D12_HEAP_TYPE_UPLOAD};
-        D3D12_RESOURCE_DESC bd{};
-        bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-        bd.Width = kUploaderBytes;
-        bd.Height = bd.DepthOrArraySize = bd.MipLevels = 1;
-        bd.SampleDesc.Count = 1;
-        bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-        D3D12_RANGE none{0, 0};   // nothing is read back through the mapping
-        bool ok = SUCCEEDED(dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&u.buf))) &&
-                  SUCCEEDED(u.buf->Map(0, &none, (void**)&u.map)) && u.map;
-        for (auto& a : u.alloc) ok = ok && SUCCEEDED(dev->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&a)));
-        ok = ok && SUCCEEDED(dev->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, u.alloc[0], nullptr, IID_PPV_ARGS(&u.list))) && SUCCEEDED(u.list->Close());
+        u.dev = dev;
+        bool ok = up_new_chunk(u, 0);
+        ok = ok && SUCCEEDED(dev->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, u.chunks[0].alloc, nullptr, IID_PPV_ARGS(&u.list))) && SUCCEEDED(u.list->Close());
         ok = ok && SUCCEEDED(dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&u.fence)));
         if (!ok) {
             if (u.list) u.list->Release();
-            for (auto& a : u.alloc) if (a) a->Release();
             if (u.fence) u.fence->Release();
-            if (u.buf) u.buf->Release();
+            for (auto& c : u.chunks) { c.alloc->Release(); c.buf->Release(); }
             u = Uploader{};
             u.bad = true;
             return nullptr;
         }
-        u.ev = CreateEventW(nullptr, FALSE, FALSE, nullptr);
-        u.size = kUploaderBytes;
-        u.dev = dev;
     }
-    if (bytes > u.size) return nullptr;
     const uint64_t done = u.fence->GetCompletedValue();
-    if (done >= u.value) u.head = 0;   // every earlier upload has been copied: the whole buffer is free
-    uint64_t at = (u.head + 511) & ~511ull;
-    if (at + bytes > u.size) {   // no room behind the uploads in flight: wait for them
-        if (!up_wait(u, u.value)) return nullptr;
-        at = 0;
+    auto fits = [&](UpChunk& c) {
+        if (done >= c.lastUse && c.head) {   // every copy from it has run: the whole chunk, and its allocator, are free
+            if (FAILED(c.alloc->Reset())) return false;
+            c.head = 0;
+        }
+        return ((c.head + 511) & ~511ull) + bytes <= c.size;
+    };
+    size_t k = u.cur;
+    if (!fits(u.chunks[k])) {
+        k = u.chunks.size();
+        for (size_t i = 0; i < u.chunks.size() && k == u.chunks.size(); i++)
+            if (i != u.cur && fits(u.chunks[i])) k = i;
+        if (k == u.chunks.size()) {
+            if (u.chunks.size() >= kUpChunkLimit || !up_new_chunk(u, bytes)) return nullptr;
+            static volatile long n = 0;
+            const long made = InterlockedIncrement(&n);
+            if (made == 1 || made % 8 == 0) XSL_INFO(CH, "upload buffers in use on a queue: %zu (%llu MB the newest)", u.chunks.size(), (unsigned long long)(u.chunks.back().size >> 20));
+        }
     }
-    int k = 0;
-    for (int i = 1; i < 4; i++) if (u.allocUse[i] < u.allocUse[k]) k = i;   // the one unused for longest
-    if (u.allocUse[k] > done && !up_wait(u, u.allocUse[k])) return nullptr;
-    if (FAILED(u.alloc[k]->Reset()) || FAILED(u.list->Reset(u.alloc[k], nullptr))) return nullptr;
-    u.head = at + bytes;
+    UpChunk& c = u.chunks[k];
+    if (FAILED(u.list->Reset(c.alloc, nullptr))) return nullptr;
+    const uint64_t at = (c.head + 511) & ~511ull;
+    c.head = at + bytes;
+    u.cur = k;
+    u.buf = c.buf;
+    u.map = c.map;
     *base = at;
-    *slot = k;
+    *slot = (int)k;
     return &u;
 }
 // Runs what was recorded on the queue (before the lists the title submits next) and marks it
@@ -3835,7 +4105,7 @@ void up_end(Uploader& u, ID3D12CommandQueue* q, int slot) {
     q->ExecuteCommandLists(1, ls);
     removed_after("an internal upload/copy list");
     q->Signal(u.fence, ++u.value);
-    u.allocUse[slot] = u.value;
+    u.chunks[(size_t)slot].lastUse = u.value;
 }
 // The copies of a texture upload: every subresource from its footprint in `buf` (fp offsets are
 // from `base`), between the barriers its state needs.
@@ -4600,6 +4870,7 @@ void list_set_pso(PcObj l, PcObj pso) {
     if (g_info) { std::lock_guard<std::mutex> g(g_rs_mu); g_list_rs[l].pso = pso; }
     const ULONGLONG t0 = GetTickCount64();
     L->SetPipelineState(as<ID3D12PipelineState>(pso));
+    if (const ULONGLONG dt = GetTickCount64() - t0; dt >= 20 && pso && pso_times()) XSL_INFO(CH, "pso %p: selected on list %p in %llu ms", pso, l, (unsigned long long)(GetTickCount64() - t0));
     if (const ULONGLONG dt = GetTickCount64() - t0; dt >= 500 && pso) {   // the driver made the list wait (a compile it had put off)
         wchar_t nm[128] = L"";
         UINT nn = sizeof nm;
@@ -6203,6 +6474,7 @@ HRESULT_T present(PcObj devObj, PcObj queueObj, PcObj resObj, void* hwndPtr, uin
         if (trace_writers()) { std::lock_guard<std::mutex> g(g_wr_mu); g_planes.insert((PcObj)res); }
         if (trace_writers() && plane_ops_now()) { XSL_INFO(CH, "plane op: present %llu of %p on queue %p", (unsigned long long)g_present_count, (void*)res, (void*)q); report_aliases((PcObj)res); }
         g_wr_present = g_present_count;
+        g_present_tid = GetCurrentThreadId();
         if (trace_writers() && g_ei_map) {   // traced indirect dispatches: their arguments, once the GPU has written them
             std::lock_guard<std::mutex> g(g_wr_mu);
             for (size_t i = 0; i < g_ei_trace.size();) {
