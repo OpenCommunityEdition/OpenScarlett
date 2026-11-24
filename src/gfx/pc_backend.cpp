@@ -3746,6 +3746,117 @@ void reap_uploads(bool all) {
         g_up_jobs.erase(g_up_jobs.begin() + i);
     }
 }
+// One reusable uploader per queue. Creating an upload buffer, an allocator, a list and a fence for
+// every upload can each wait hundreds of milliseconds on the video memory manager while a title
+// streams textures, so these are made once: a mapped upload buffer filled from the front (begun
+// again at 0 once the fence shows every earlier copy has run), four allocators (one is reset only
+// when the copies recorded with it have run), one list and one fence that counts up.
+struct Uploader {
+    ID3D12Device* dev = nullptr;
+    ID3D12Resource* buf = nullptr;
+    uint8_t* map = nullptr;
+    uint64_t size = 0, head = 0;   // head: the first byte no upload in flight uses
+    ID3D12CommandAllocator* alloc[4] = {};
+    uint64_t allocUse[4] = {};     // the fence value of each allocator's last use
+    ID3D12GraphicsCommandList* list = nullptr;
+    ID3D12Fence* fence = nullptr;
+    uint64_t value = 0;            // the last value signalled
+    HANDLE ev = nullptr;
+    bool bad = false;              // could not be made: every upload goes the one-off way
+};
+std::map<ID3D12CommandQueue*, Uploader> g_uploaders;   // under g_up_mu
+constexpr uint64_t kUploaderBytes = 64ull << 20;
+// Waits (half a second at most) until the queue has run the uploads up to fence value v.
+bool up_wait(Uploader& u, uint64_t v) {
+    if (u.fence->GetCompletedValue() >= v) return true;
+    if (!u.ev || FAILED(u.fence->SetEventOnCompletion(v, u.ev))) return false;
+    return WaitForSingleObject(u.ev, 500) == WAIT_OBJECT_0 && u.fence->GetCompletedValue() >= v;
+}
+// Room for `bytes` in the queue's uploader (at *base, a multiple of 512) and its list reset on
+// allocator *slot. Null: the caller uses the one-off path. Called under g_up_mu.
+Uploader* up_begin(ID3D12Device* dev, ID3D12CommandQueue* q, uint64_t bytes, uint64_t* base, int* slot) {
+    // XSL_UPLOADER=0: every upload makes its own buffer, allocator and list, as before
+    static const bool off = [] { char b[4]; return GetEnvironmentVariableA("XSL_UPLOADER", b, 4) && b[0] == '0'; }();
+    if (off) return nullptr;
+    Uploader& u = g_uploaders[q];
+    if (u.bad) return nullptr;
+    if (u.dev != dev) {
+        // First use. (A new device and queue at an old address: the old objects are left alone,
+        // their device may be gone.)
+        u = Uploader{};
+        D3D12_HEAP_PROPERTIES hp{D3D12_HEAP_TYPE_UPLOAD};
+        D3D12_RESOURCE_DESC bd{};
+        bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        bd.Width = kUploaderBytes;
+        bd.Height = bd.DepthOrArraySize = bd.MipLevels = 1;
+        bd.SampleDesc.Count = 1;
+        bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        D3D12_RANGE none{0, 0};   // nothing is read back through the mapping
+        bool ok = SUCCEEDED(dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&u.buf))) &&
+                  SUCCEEDED(u.buf->Map(0, &none, (void**)&u.map)) && u.map;
+        for (auto& a : u.alloc) ok = ok && SUCCEEDED(dev->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&a)));
+        ok = ok && SUCCEEDED(dev->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, u.alloc[0], nullptr, IID_PPV_ARGS(&u.list))) && SUCCEEDED(u.list->Close());
+        ok = ok && SUCCEEDED(dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&u.fence)));
+        if (!ok) {
+            if (u.list) u.list->Release();
+            for (auto& a : u.alloc) if (a) a->Release();
+            if (u.fence) u.fence->Release();
+            if (u.buf) u.buf->Release();
+            u = Uploader{};
+            u.bad = true;
+            return nullptr;
+        }
+        u.ev = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        u.size = kUploaderBytes;
+        u.dev = dev;
+    }
+    if (bytes > u.size) return nullptr;
+    const uint64_t done = u.fence->GetCompletedValue();
+    if (done >= u.value) u.head = 0;   // every earlier upload has been copied: the whole buffer is free
+    uint64_t at = (u.head + 511) & ~511ull;
+    if (at + bytes > u.size) {   // no room behind the uploads in flight: wait for them
+        if (!up_wait(u, u.value)) return nullptr;
+        at = 0;
+    }
+    int k = 0;
+    for (int i = 1; i < 4; i++) if (u.allocUse[i] < u.allocUse[k]) k = i;   // the one unused for longest
+    if (u.allocUse[k] > done && !up_wait(u, u.allocUse[k])) return nullptr;
+    if (FAILED(u.alloc[k]->Reset()) || FAILED(u.list->Reset(u.alloc[k], nullptr))) return nullptr;
+    u.head = at + bytes;
+    *base = at;
+    *slot = k;
+    return &u;
+}
+// Runs what was recorded on the queue (before the lists the title submits next) and marks it
+// with the next fence value.
+void up_end(Uploader& u, ID3D12CommandQueue* q, int slot) {
+    u.list->Close();
+    ID3D12CommandList* ls[] = {u.list};
+    q->ExecuteCommandLists(1, ls);
+    removed_after("an internal upload/copy list");
+    q->Signal(u.fence, ++u.value);
+    u.allocUse[slot] = u.value;
+}
+// The copies of a texture upload: every subresource from its footprint in `buf` (fp offsets are
+// from `base`), between the barriers its state needs.
+void record_texture_copies(ID3D12GraphicsCommandList* list, ID3D12Resource* dst, ID3D12Resource* buf, uint64_t base, D3D12_RESOURCE_STATES st,
+                           const std::vector<D3D12_PLACED_SUBRESOURCE_FOOTPRINT>& fp) {
+    // COMMON textures are promoted to COPY_DEST by the copy (and decay back afterwards).
+    bool barrier = st != D3D12_RESOURCE_STATE_COMMON && st != D3D12_RESOURCE_STATE_COPY_DEST;
+    D3D12_RESOURCE_BARRIER b{};
+    b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    b.Transition = {dst, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, st, D3D12_RESOURCE_STATE_COPY_DEST};
+    if (barrier) list->ResourceBarrier(1, &b);
+    for (UINT s = 0; s < (UINT)fp.size(); s++) {
+        D3D12_TEXTURE_COPY_LOCATION d{dst, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, {}};
+        d.SubresourceIndex = s;
+        D3D12_TEXTURE_COPY_LOCATION sr{buf, D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, {}};
+        sr.PlacedFootprint = fp[s];
+        sr.PlacedFootprint.Offset += base;
+        list->CopyTextureRegion(&d, 0, 0, 0, &sr, nullptr);
+    }
+    if (barrier) { std::swap(b.Transition.StateBefore, b.Transition.StateAfter); list->ResourceBarrier(1, &b); }
+}
 }  // namespace
 uint32_t pc_state_of(uint32_t consoleState) { return (uint32_t)pc_state(consoleState); }
 // Bytes into a buffer in video memory, through an upload buffer on the queue (before the lists the
@@ -3755,6 +3866,17 @@ HRESULT_T upload_buffer(PcObj devObj, PcObj qObj, PcObj dstObj, uint64_t offset,
     auto* q = as<ID3D12CommandQueue>(qObj);
     auto* dst = as<ID3D12Resource>(dstObj);
     if (!size) return S_OK;
+    {   // The queue's reusable uploader; what it cannot take goes the one-off way below.
+        std::lock_guard<std::mutex> g(g_up_mu);
+        uint64_t base = 0;
+        int slot = 0;
+        if (Uploader* u = up_begin(dev, q, size, &base, &slot)) {
+            memcpy(u->map + base, data, (size_t)size);
+            u->list->CopyBufferRegion(dst, offset, u->buf, base, size);
+            up_end(*u, q, slot);
+            return S_OK;
+        }
+    }
     D3D12_HEAP_PROPERTIES hp{D3D12_HEAP_TYPE_UPLOAD};
     D3D12_RESOURCE_DESC bd{};
     bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
@@ -3796,6 +3918,19 @@ HRESULT_T upload_texture(PcObj devObj, PcObj qObj, PcObj dstObj, uint32_t state,
     UINT64 total = 0;
     dev->GetCopyableFootprints(&rd, 0, subs, 0, fp.data(), rows.data(), rowBytes.data(), &total);
     if (!total || total == UINT64_MAX) return E_INVALIDARG;
+    {   // The queue's reusable uploader; what it cannot take goes the one-off way below.
+        std::lock_guard<std::mutex> g(g_up_mu);
+        uint64_t base = 0;
+        int slot = 0;
+        if (Uploader* u = up_begin(dev, q, total, &base, &slot)) {
+            bool ok = true;
+            for (UINT s = 0; s < subs && ok; s++) ok = fill(ctx, s, u->map + base + fp[s].Offset, fp[s].Footprint.RowPitch, rows[s], fp[s].Footprint.Depth);
+            if (!ok) { u->list->Close(); return E_FAIL; }   // (nothing recorded; the list must be closed before its next reset)
+            record_texture_copies(u->list, dst, u->buf, base, (D3D12_RESOURCE_STATES)state, fp);
+            up_end(*u, q, slot);
+            return S_OK;
+        }
+    }
     D3D12_HEAP_PROPERTIES hp{D3D12_HEAP_TYPE_UPLOAD};
     D3D12_RESOURCE_DESC bd{};
     bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
@@ -3815,21 +3950,7 @@ HRESULT_T upload_texture(PcObj devObj, PcObj qObj, PcObj dstObj, uint32_t state,
     dev->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&j.alloc));
     dev->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, j.alloc, nullptr, IID_PPV_ARGS(&j.list));
     dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&j.fence));
-    auto st = (D3D12_RESOURCE_STATES)state;
-    // COMMON textures are promoted to COPY_DEST by the copy (and decay back afterwards).
-    bool barrier = st != D3D12_RESOURCE_STATE_COMMON && st != D3D12_RESOURCE_STATE_COPY_DEST;
-    D3D12_RESOURCE_BARRIER b{};
-    b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-    b.Transition = {dst, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, st, D3D12_RESOURCE_STATE_COPY_DEST};
-    if (barrier) j.list->ResourceBarrier(1, &b);
-    for (UINT s = 0; s < subs; s++) {
-        D3D12_TEXTURE_COPY_LOCATION d{dst, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, {}};
-        d.SubresourceIndex = s;
-        D3D12_TEXTURE_COPY_LOCATION sr{j.buf, D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, {}};
-        sr.PlacedFootprint = fp[s];
-        j.list->CopyTextureRegion(&d, 0, 0, 0, &sr, nullptr);
-    }
-    if (barrier) { std::swap(b.Transition.StateBefore, b.Transition.StateAfter); j.list->ResourceBarrier(1, &b); }
+    record_texture_copies(j.list, dst, j.buf, 0, (D3D12_RESOURCE_STATES)state, fp);
     j.list->Close();
     ID3D12CommandList* ls[] = {j.list};
     q->ExecuteCommandLists(1, ls);

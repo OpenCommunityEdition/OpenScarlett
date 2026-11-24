@@ -16,6 +16,8 @@
 #include <iterator>
 #include <atomic>
 #include <map>
+#include <memory>
+#include <tuple>
 #include <set>
 #include <mutex>
 #include <algorithm>
@@ -118,7 +120,8 @@ CreateComputer xg() {
     return f;
 }
 
-struct FillCtx { XgComputer* c; uint64_t va; UINT64 size; int64_t rowBytes = 0; uint64_t rowBase = 0; uint32_t texelRow = 0; };
+struct FillCtx { XgComputer* c; uint64_t va; UINT64 size; int64_t rowBytes = 0; uint64_t rowBase = 0; uint32_t texelRow = 0;
+                 const D3D12_RESOURCE_DESC* desc = nullptr; };   // desc: the console description (for the separable layouts)
 // Bytes per texel of the formats whose console layout may be plain rows (0: not one of them).
 uint32_t plain_texel_bytes(DXGI_FORMAT f) {
     switch (f) {
@@ -147,6 +150,125 @@ int64_t plain_rows(XgComputer* c, const D3D12_RESOURCE_DESC& d, uint64_t* base) 
     *base = b;
     return (int64_t)pitch;
 }
+// Bytes of one 4x4 block of the block-compressed formats (0: not one of them).
+uint32_t block_bytes(DXGI_FORMAT f) {
+    if ((f >= DXGI_FORMAT_BC1_TYPELESS && f <= DXGI_FORMAT_BC1_UNORM_SRGB) || (f >= DXGI_FORMAT_BC4_TYPELESS && f <= DXGI_FORMAT_BC4_SNORM)) return 8;
+    if ((f >= DXGI_FORMAT_BC2_TYPELESS && f <= DXGI_FORMAT_BC3_UNORM_SRGB) || (f >= DXGI_FORMAT_BC5_TYPELESS && f <= DXGI_FORMAT_BC5_SNORM) ||
+        (f >= DXGI_FORMAT_BC6H_TYPELESS && f <= DXGI_FORMAT_BC7_UNORM_SRGB))
+        return 16;
+    return 0;
+}
+// Separable layouts. In most console layouts the place of element (x, y) of a level (a texel, or
+// a 4x4 block of a compressed format) is base + (X[x] ^ Y[y]) or base + X[x] + Y[y]: the bits of
+// x and of y are spread over the offset independently. The two tables are asked from the layout
+// library once (width + height questions), checked against it at scattered elements, and kept
+// for every texture of the same shape; converting is then two table reads per element instead of
+// the library's own slow walk.
+struct Sep { bool ok = false, add = false; uint64_t base = 0; uint32_t w = 0, h = 0, el = 0; std::vector<uint64_t> X, Y; };   // w, h in elements; X, Y from base
+using SepKey = std::tuple<uint64_t, uint32_t, uint32_t, int, int, uint32_t, uint32_t>;   // width, height, levels, format, layout, flags, level
+std::mutex g_sep_mu;
+std::map<SepKey, std::shared_ptr<const Sep>> g_sep;
+std::shared_ptr<const Sep> separable(XgComputer* c, const D3D12_RESOURCE_DESC& d, uint32_t mip, uint64_t resSize) {
+    if (d.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || d.DepthOrArraySize != 1 || d.SampleDesc.Count > 1 || mip >= d.MipLevels) return nullptr;
+    uint32_t el = plain_texel_bytes(d.Format), step = 1;
+    if (!el) { el = block_bytes(d.Format); step = 4; }
+    if (!el) return nullptr;
+    const SepKey key{d.Width, d.Height, d.MipLevels, (int)d.Format, (int)d.Layout, (uint32_t)d.Flags, mip};
+    {
+        std::lock_guard<std::mutex> g(g_sep_mu);
+        auto it = g_sep.find(key);
+        if (it != g_sep.end()) return it->second->ok ? it->second : nullptr;
+    }
+    auto t = std::make_shared<Sep>();
+    const uint64_t mw = std::max<uint64_t>(1, d.Width >> mip);
+    const uint32_t mh = std::max<uint32_t>(1, d.Height >> mip);
+    t->w = (uint32_t)((mw + step - 1) / step);
+    t->h = (mh + step - 1) / step;
+    t->el = el;
+    UINT32 bit = 0;
+    // (The library is asked in texels: a block is named by its top left texel.)
+    auto at = [&](uint64_t x, uint32_t y) { bit = 0; return c->GetTexelElementOffsetBytes(0, mip, x * step, y * step, 0, 0, &bit); };
+    t->base = at(0, 0);
+    bool ok = bit == 0 && t->base < resSize && mw < (1u << 16) && mh < (1u << 16);
+    uint64_t mx = 0, my = 0;
+    if (ok) {
+        t->X.resize(t->w);
+        t->Y.resize(t->h);
+        for (uint32_t x = 0; x < t->w && ok; x++) {
+            const uint64_t v = at(x, 0);
+            if (v < t->base || (v - t->base) % el || bit) ok = false;
+            t->X[x] = v - t->base;
+            mx = std::max(mx, t->X[x]);
+        }
+        for (uint32_t y = 0; y < t->h && ok; y++) {
+            const uint64_t v = at(0, y);
+            if (v < t->base || (v - t->base) % el || bit) ok = false;
+            t->Y[y] = v - t->base;
+            my = std::max(my, t->Y[y]);
+        }
+    }
+    // No element may lie outside the resource (x ^ y is never above x + y), and neighbours are
+    // different elements.
+    ok = ok && mx < resSize && my < resSize && t->base + mx + my + el <= resSize;
+    if (ok && ((t->w > 1 && !t->X[1]) || (t->h > 1 && !t->Y[1]))) ok = false;
+    // A compressed format: the library must really count in texels (the last texel of the first
+    // block lies in that block), else the tables hold every fourth block.
+    if (ok && step == 4) {
+        if (mw >= 4 && c->GetTexelElementOffsetBytes(0, mip, 3, 0, 0, 0, &bit) != t->base) ok = false;
+        if (mh >= 4 && c->GetTexelElementOffsetBytes(0, mip, 0, 3, 0, 0, &bit) != t->base) ok = false;
+    }
+    bool byXor = ok, byAdd = ok;
+    uint32_t r = 0x2545f491u + (uint32_t)d.Width * 131u + d.Height * 31u + mip;
+    for (int k = 0; k < 67 && (byXor || byAdd); k++) {
+        r = r * 2654435761u + 0x3c6ef35fu;
+        uint32_t x = (r >> 9) % t->w;
+        r = r * 2654435761u + 0x3c6ef35fu;
+        uint32_t y = (r >> 9) % t->h;
+        if (k == 64) { x = t->w - 1; y = t->h - 1; }   // and three fixed ones: the far corner, ...
+        if (k == 65) { x = t->w / 2; y = t->h - 1; }
+        if (k == 66) { x = t->w - 1; y = t->h / 2; }
+        const uint64_t v = at(x, y) - t->base;
+        if (bit) byXor = byAdd = false;
+        if (v != (t->X[x] ^ t->Y[y])) byXor = false;
+        if (v != t->X[x] + t->Y[y]) byAdd = false;
+    }
+    t->ok = byXor || byAdd;
+    t->add = !byXor;
+    static volatile long n = 0;
+    if (InterlockedIncrement(&n) <= 12)
+        XSL_INFO(CH, "layout of %llux%u format %d layout %#x level %u (%u-byte elements): %s", (unsigned long long)d.Width, d.Height, (int)d.Format, (unsigned)d.Layout, mip, el,
+                 !t->ok ? "not separable, converted by the layout library" : t->add ? "separable (sum of two tables), converted by table" : "separable (xor of two tables), converted by table");
+    std::lock_guard<std::mutex> g(g_sep_mu);
+    g_sep[key] = t;
+    return t->ok ? t : nullptr;
+}
+template <size_t N> void sep_copy(const Sep& t, const uint8_t* src, uint8_t* dst, uint32_t rowPitch) {
+    const uint64_t* X = t.X.data();
+    for (uint32_t y = 0; y < t.h; y++) {
+        uint8_t* d = dst + (size_t)y * rowPitch;
+        const uint64_t yy = t.Y[y];
+        if (t.add) for (uint32_t x = 0; x < t.w; x++) memcpy(d + (size_t)x * N, src + X[x] + yy, N);
+        else for (uint32_t x = 0; x < t.w; x++) memcpy(d + (size_t)x * N, src + (X[x] ^ yy), N);
+    }
+}
+// One level by the tables (false: this level is left to the layout library).
+bool fill_separable(const FillCtx* f, uint32_t sub, void* dst, uint32_t rowPitch, uint32_t rows) {
+    static const bool on = [] { char b[4]; return !(GetEnvironmentVariableA("XSL_DETILE_TABLES", b, 4) && b[0] == '0'); }();
+    if (!on || !f->desc) return false;
+    // (One plane, one slice: the subresource number is the level.)
+    auto t = separable(f->c, *f->desc, sub, f->size);
+    if (!t || t->h != rows || (uint64_t)t->w * t->el > rowPitch) return false;
+    const uint8_t* src = (const uint8_t*)(uintptr_t)f->va + t->base;
+    switch (t->el) {
+        case 1: sep_copy<1>(*t, src, (uint8_t*)dst, rowPitch); break;
+        case 2: sep_copy<2>(*t, src, (uint8_t*)dst, rowPitch); break;
+        case 4: sep_copy<4>(*t, src, (uint8_t*)dst, rowPitch); break;
+        case 8: sep_copy<8>(*t, src, (uint8_t*)dst, rowPitch); break;
+        case 16: sep_copy<16>(*t, src, (uint8_t*)dst, rowPitch); break;
+        default: return false;
+    }
+    return true;
+}
 std::atomic<uint64_t> g_time[4];   // microseconds: layout object, reading the memory, conversion, the rest of the upload
 uint64_t now_us() { static LARGE_INTEGER f = [] { LARGE_INTEGER x; QueryPerformanceFrequency(&x); return x; }(); LARGE_INTEGER t; QueryPerformanceCounter(&t); return (uint64_t)(t.QuadPart * 1000000 / f.QuadPart); }
 bool fill(void* ctx, uint32_t sub, void* dst, uint32_t rowPitch, uint32_t rows, uint32_t depth) {
@@ -160,6 +282,10 @@ bool fill(void* ctx, uint32_t sub, void* dst, uint32_t rowPitch, uint32_t rows, 
         const size_t n = std::min<size_t>({(size_t)rowPitch, (size_t)f->rowBytes, (size_t)f->texelRow});
         const uint8_t* src = (const uint8_t*)(uintptr_t)f->va + f->rowBase;
         for (uint32_t y = 0; y < rows; y++) memcpy((uint8_t*)dst + (size_t)y * rowPitch, src + (size_t)y * f->rowBytes, n);
+        g_time[2] += now_us() - t0;
+        return true;
+    }
+    if (fill_separable(f, sub, dst, rowPitch, rows)) {
         g_time[2] += now_us() - t0;
         return true;
     }
@@ -205,7 +331,7 @@ bool sample_hash(uint64_t va, uint64_t size, uint64_t* out) {
     constexpr size_t kPiece = 4096, kPieces = 12;
     uint64_t buf[kPiece / 8];
     uint64_t h = 0x9e3779b97f4a7c15ull;
-    if (size < kPiece * kPieces) return false;
+    if (size < kPiece * kPieces) return content_hash_guarded(va, size, out);   // small (a glyph cache): all of it
     for (size_t k = 0; k < kPieces; k++) {
         const uint64_t at = ((size - kPiece) / (kPieces - 1) * k) & ~7ull;
         SIZE_T got = 0;
@@ -219,13 +345,21 @@ bool sample_hash(uint64_t va, uint64_t size, uint64_t* out) {
 void detile_register(PcObj pcRes, uint64_t va, const void* consoleDesc, uint32_t initialState) {
     auto* d = static_cast<const D3D12_RESOURCE_DESC*>(consoleDesc);
     if (!d || d->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER || d->Dimension == D3D12_RESOURCE_DIMENSION_UNKNOWN) return;
-    if (d->Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL)) return;   // GPU-written
+    // A small one-channel 8-bit texture that may also be a render target: a title keeps glyph
+    // caches like that and fills them from the CPU.
+    const bool one8 = d->Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && d->MipLevels == 1 && d->DepthOrArraySize == 1 &&
+                      (d->Format == DXGI_FORMAT_R8_UNORM || d->Format == DXGI_FORMAT_A8_UNORM);
+    const bool glyphs = one8 && (d->Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET) && !(d->Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL) && d->Width <= 512 &&
+                        d->Height <= 512;
+    if ((d->Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL)) && !glyphs) return;   // GPU-written
     if (d->SampleDesc.Count > 1) return;
     std::lock_guard<std::mutex> g(g_mu);
     g_tex[pcRes] = {va, *d, initialState};
     // A plane of a movie: one level of 8-bit luma or chroma that a decoder rewrites every frame.
-    if (d->Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && d->MipLevels == 1 && d->DepthOrArraySize == 1 &&
-        (d->Format == DXGI_FORMAT_R8_UNORM || d->Format == DXGI_FORMAT_R8G8_UNORM) && d->Width >= 256 && d->Height >= 128)
+    // The same check at every submission serves glyph atlases and caches the CPU adds glyphs to:
+    // the new glyphs are uploaded at once instead of when the round-robin check comes by.
+    if (glyphs || (d->Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && d->MipLevels == 1 && d->DepthOrArraySize == 1 &&
+                   (d->Format == DXGI_FORMAT_R8_UNORM || d->Format == DXGI_FORMAT_R8G8_UNORM || d->Format == DXGI_FORMAT_A8_UNORM) && d->Width >= 256 && d->Height >= 128))
         g_planes.insert(pcRes);
 }
 
@@ -442,6 +576,7 @@ void detile_flush(PcObj pcDevice, PcObj pcQueue) {
                          (unsigned long long)e.desc.Width, e.desc.Height, (int)e.desc.Format, (long long)e.rowBytes);
         }
         ctx.rowBytes = e.rowBytes;
+        ctx.desc = &e.desc;
         ctx.rowBase = e.rowBase;
         ctx.texelRow = (uint32_t)(e.desc.Width * plain_texel_bytes(e.desc.Format));
         bool readable = true;
