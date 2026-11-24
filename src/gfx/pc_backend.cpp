@@ -3221,6 +3221,83 @@ void trace_pso_stream(const void* stream, size_t size) {
     XSL_INFO(CH, "pso %s:%s", translated_keys(), out.c_str());
 }
 }  // namespace
+static bool own_rs_blob(PcObj rs, std::vector<uint8_t>* out);
+// What a pipeline stream describes, as a key for its stored blob: the shaders' bytes, the root
+// signature's serialized form (one made from a shader's description), the input elements and the
+// state as it stands. false: the stream holds something this does not know (it is not stored).
+static bool stream_key(const void* stream, size_t size, uint64_t* key) {
+    const uint8_t* p = (const uint8_t*)stream;
+    uint64_t h = pso_hash(1469598103934665603ull, "stream1", 7);
+    for (size_t o = 0; o + 4 <= size;) {
+        const auto t = *(const D3D12_PIPELINE_STATE_SUBOBJECT_TYPE*)(p + o);
+        size_t n = 0;
+        h = pso_hash(h, &t, sizeof t);
+#define payload_of(T) (n = sizeof(StreamSub<T>), h = pso_hash(h, &((const StreamSub<T>*)(p + o))->v, sizeof(T)))
+        switch (t) {
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE: {
+            n = sizeof(StreamSub<void*>);
+            std::vector<uint8_t> b;
+            if (own_rs_blob(((const StreamSub<void*>*)(p + o))->v, &b)) h = pso_hash(h, b.data(), b.size());
+            break;
+        }
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS: case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS: case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DS:
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_HS: case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_GS: case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CS:
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS: case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS: {
+            n = sizeof(StreamSub<D3D12_SHADER_BYTECODE>);
+            auto& bc = ((const StreamSub<D3D12_SHADER_BYTECODE>*)(p + o))->v;
+            h = pso_hash(h, &bc.BytecodeLength, sizeof bc.BytecodeLength);
+            if (bc.pShaderBytecode && bc.BytecodeLength) h = pso_hash(h, bc.pShaderBytecode, bc.BytecodeLength);
+            break;
+        }
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_INPUT_LAYOUT: {
+            n = sizeof(StreamSub<D3D12_INPUT_LAYOUT_DESC>);
+            auto& il = ((const StreamSub<D3D12_INPUT_LAYOUT_DESC>*)(p + o))->v;
+            for (UINT k = 0; k < il.NumElements && il.pInputElementDescs; k++) {
+                const D3D12_INPUT_ELEMENT_DESC& e = il.pInputElementDescs[k];
+                if (e.SemanticName) h = pso_hash(h, e.SemanticName, strlen(e.SemanticName));
+                h = pso_hash(h, &e.SemanticIndex, (const uint8_t*)(&e + 1) - (const uint8_t*)&e.SemanticIndex);
+            }
+            break;
+        }
+        // (Field by field where a description has padding: a title's stream holds whatever was there.)
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND: {
+            n = sizeof(StreamSub<D3D12_BLEND_DESC>);
+            auto& b = ((const StreamSub<D3D12_BLEND_DESC>*)(p + o))->v;
+            uint32_t w[2 + 8 * 10] = {(uint32_t)b.AlphaToCoverageEnable, (uint32_t)b.IndependentBlendEnable};
+            for (int k = 0; k < 8; k++) {
+                auto& r = b.RenderTarget[k];
+                const uint32_t f[10] = {(uint32_t)r.BlendEnable, (uint32_t)r.LogicOpEnable, (uint32_t)r.SrcBlend, (uint32_t)r.DestBlend, (uint32_t)r.BlendOp,
+                                        (uint32_t)r.SrcBlendAlpha, (uint32_t)r.DestBlendAlpha, (uint32_t)r.BlendOpAlpha, (uint32_t)r.LogicOp, (uint32_t)r.RenderTargetWriteMask};
+                memcpy(w + 2 + k * 10, f, sizeof f);
+            }
+            h = pso_hash(h, w, sizeof w);
+            break;
+        }
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL: {
+            n = sizeof(StreamSub<D3D12_DEPTH_STENCIL_DESC>);
+            auto& d = ((const StreamSub<D3D12_DEPTH_STENCIL_DESC>*)(p + o))->v;
+            const uint32_t w[14] = {(uint32_t)d.DepthEnable, (uint32_t)d.DepthWriteMask, (uint32_t)d.DepthFunc, (uint32_t)d.StencilEnable, d.StencilReadMask, d.StencilWriteMask,
+                                    (uint32_t)d.FrontFace.StencilFailOp, (uint32_t)d.FrontFace.StencilDepthFailOp, (uint32_t)d.FrontFace.StencilPassOp, (uint32_t)d.FrontFace.StencilFunc,
+                                    (uint32_t)d.BackFace.StencilFailOp, (uint32_t)d.BackFace.StencilDepthFailOp, (uint32_t)d.BackFace.StencilPassOp, (uint32_t)d.BackFace.StencilFunc};
+            h = pso_hash(h, w, sizeof w);
+            break;
+        }
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK: payload_of(UINT); break;
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER: payload_of(D3D12_RASTERIZER_DESC); break;
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_IB_STRIP_CUT_VALUE: payload_of(UINT); break;
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY: payload_of(UINT); break;
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS: payload_of(D3D12_RT_FORMAT_ARRAY); break;
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL_FORMAT: payload_of(DXGI_FORMAT); break;
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_DESC: payload_of(DXGI_SAMPLE_DESC); break;
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_NODE_MASK: payload_of(UINT); break;
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_FLAGS: payload_of(D3D12_PIPELINE_STATE_FLAGS); break;
+        default: return false;   // (a stream output, a cached blob of the title's, view instancing, anything newer)
+        }
+        o += n;
+    }
+    *key = h;
+    return true;
+}
 HRESULT_T create_pso_stream(PcObj dev, void* stream, size_t size, PcObj* out) {
     *out = nullptr;
     if (getenv("XSL_TRACE_WRITERS") && pso_traced()) trace_pso_stream(stream, size);
@@ -3229,9 +3306,35 @@ HRESULT_T create_pso_stream(PcObj dev, void* stream, size_t size, PcObj* out) {
     if (driver_refused(translated_keys())) return E_FAIL;
     DriverCall inDriver(translated_keys());
     HRESULT hr = as<ID3D12Device>(dev)->QueryInterface(IID_PPV_ARGS(&d2));
+    // The driver's compiled form of the pipeline is kept beside the shader cache and handed back
+    // on later runs: a scene's mesh pipelines take the driver's compiler 5 to 45 s each, and a
+    // title asks for a thousand of them again at every start.
+    uint64_t key = 0;
+    std::wstring path;
+    if (SUCCEEDED(hr) && pso_cache_on() && stream_key(stream, size, &key)) path = pso_cache_path(key);
+    std::vector<uint8_t> blob;
+    if (SUCCEEDED(hr) && !path.empty() && read_all(path, blob) && !blob.empty()) {
+        std::vector<uint8_t> with((size + 7) & ~(size_t)7);
+        memcpy(with.data(), stream, size);
+        StreamSub<D3D12_CACHED_PIPELINE_STATE> c{};
+        c.t = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CACHED_PSO;
+        c.v = {blob.data(), blob.size()};
+        with.insert(with.end(), (const uint8_t*)&c, (const uint8_t*)&c + sizeof c);
+        D3D12_PIPELINE_STATE_STREAM_DESC dc{with.size(), with.data()};
+        const ULONGLONG t0 = GetTickCount64();
+        HRESULT hc = d2->CreatePipelineState(&dc, IID_PPV_ARGS(reinterpret_cast<ID3D12PipelineState**>(out)));
+        if (pso_times()) XSL_INFO(CH, "pso %p (stream): created from its stored blob (%zu bytes) in %llu ms: %08lx", SUCCEEDED(hc) ? *out : nullptr, blob.size(),
+                                  (unsigned long long)(GetTickCount64() - t0), hc);
+        if (SUCCEEDED(hc)) { d2->Release(); return hc; }
+        *out = nullptr;   // (another driver, or another pipeline under the same key: compiled anew and stored again)
+    }
     if (SUCCEEDED(hr)) {
         const ULONGLONG t0 = GetTickCount64();
         hr = d2->CreatePipelineState(&d, IID_PPV_ARGS(reinterpret_cast<ID3D12PipelineState**>(out)));
+        if (SUCCEEDED(hr) && !path.empty() && *out) {
+            ID3DBlob* cb = nullptr;
+            if (SUCCEEDED(as<ID3D12PipelineState>(*out)->GetCachedBlob(&cb)) && cb) { write_all(path, cb->GetBufferPointer(), cb->GetBufferSize()); cb->Release(); }
+        }
         d2->Release();
         if (const ULONGLONG dt = GetTickCount64() - t0; dt >= 5000) {
             static volatile long shown = 0;
@@ -4669,8 +4772,15 @@ static std::mutex g_rtd_mu;
 static std::vector<RtDump> g_rtd;
 static std::map<PcObj, std::vector<ID3D12Resource*>> g_rtd_bound;   // list -> colour targets bound now
 static unsigned g_rtd_pass = 0;
+// (XSL_RT_DUMP=t<seconds>: the first frame presented that long after start-up.)
+std::atomic<uint64_t> g_rtd_at{0};
+static double rt_dump_after() {
+    static const double v = [] { char b[16]; return GetEnvironmentVariableA("XSL_RT_DUMP", b, sizeof b) && b[0] == 't' ? atof(b + 1) : 0.0; }();
+    return v;
+}
 static bool rt_dump_now() {
-    static const uint64_t at = env_u64("XSL_RT_DUMP");
+    static const uint64_t fixed = env_u64("XSL_RT_DUMP");
+    const uint64_t at = fixed ? fixed : g_rtd_at.load();
     return at && g_wr_present.load() + 1 == at;
 }
 static void rt_dump_pass_end(PcObj l) {
@@ -4714,7 +4824,8 @@ void list_om_set_render_targets(PcObj l, uint32_t n, const uint64_t* rtvs, int s
     D3D12_CPU_DESCRIPTOR_HANDLE r[8];
     uint32_t cnt = single ? (n ? 1 : 0) : n;
     for (uint32_t i = 0; i < cnt && i < 8; i++) r[i] = cpu(rtvs[i]);
-    if (env_u64("XSL_RT_DUMP")) {
+    static const bool rtDumpOn = getenv("XSL_RT_DUMP") != nullptr;
+    if (rtDumpOn) {
         rt_dump_pass_end(l);
         if (rt_dump_now()) {
             std::lock_guard<std::mutex> g(g_wr_mu);
@@ -4885,6 +4996,17 @@ bool decode_compact_rs(const uint8_t* a, const uint8_t* end, CompactRs& o, size_
                     r.RegisterSpace = space;
                     r.Flags = D3D12_DESCRIPTOR_RANGE_FLAG_DESCRIPTORS_VOLATILE;
                     r.OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
+                    // Registers that follow each other in the list and in number are one range: a
+                    // shader that indexes them as an array needs a single range to cover it.
+                    if (!o.ranges[i].empty()) {
+                        D3D12_DESCRIPTOR_RANGE1& last = o.ranges[i].back();
+                        if (last.RangeType == r.RangeType && last.RegisterSpace == r.RegisterSpace && last.BaseShaderRegister + last.NumDescriptors == r.BaseShaderRegister) {
+                            last.NumDescriptors++;
+                            have -= bits;
+                            acc &= (1ull << have) - 1;
+                            continue;
+                        }
+                    }
                     o.ranges[i].push_back(r);
                     have -= bits;
                     acc &= (1ull << have) - 1;
@@ -5070,6 +5192,12 @@ PcObj own_root_signature(PcObj dev, const void* const* code, const size_t* size,
     }
     if (it->second.first && blob) *blob = it->second.second;
     return it->second.first;
+}
+static bool own_rs_blob(PcObj rs, std::vector<uint8_t>* out) {
+    std::lock_guard<std::mutex> g(g_own_mu);
+    for (auto& [desc, v] : g_own_rs)
+        if (v.first == rs) { *out = v.second; return true; }
+    return false;
 }
 void note_pso_own_rs(PcObj pso, PcObj rs, bool compute) {
     if (!pso || (!rs && !g_own_rs_any)) return;
@@ -5429,6 +5557,16 @@ static void prof_slow_check(uint64_t present) {
         period = now;
         periodStart = present;
         worst = 0;
+    }
+    if (rt_dump_after() > 0 && !g_rtd_at.load()) {
+        FILETIME c, e, k, u, n;
+        GetProcessTimes(GetCurrentProcess(), &c, &e, &k, &u);
+        GetSystemTimeAsFileTime(&n);
+        const double up = double(((uint64_t)n.dwHighDateTime << 32 | n.dwLowDateTime) - ((uint64_t)c.dwHighDateTime << 32 | c.dwLowDateTime)) / 1e7;
+        if (up >= rt_dump_after()) {
+            g_rtd_at = present + 2;
+            XSL_INFO(CH, "%.1f s after start-up: render targets of present %llu are written out", up, (unsigned long long)(present + 2));
+        }
     }
     if (prof_after() > 0 && !g_prof_at.load()) {
         FILETIME c, e, k, u, n;

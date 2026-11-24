@@ -298,7 +298,7 @@ static PsoPool g_pso_pool, g_pso_compile_pool, g_pso_giant_pool;
 // One worker for pipelines with a translation of a megabyte and more: the compiler takes minutes
 // for each (a title has a handful, all asked for while it starts), and with them in the compile
 // pool every one of its workers was held for the whole run while a thousand pipelines waited.
-static void pso_giant_pool_run(std::function<void()> job) { g_pso_giant_pool.run(std::move(job), false, "XSL_GIANT_THREADS", 1, true); }
+static void pso_giant_pool_run(std::function<void()> job, bool first = false) { g_pso_giant_pool.run(std::move(job), first, "XSL_GIANT_THREADS", 1, true); }
 static void pso_pool_run(std::function<void()> job, bool first = false) {
     g_pso_pool.run(std::move(job), first, "XSL_PSO_THREADS", std::min(8u, std::max(3u, std::thread::hardware_concurrency() / 2)), false);
 }
@@ -466,6 +466,11 @@ struct PendingPso {
     std::function<bool()> build; // true: a shader needs compiling, to be called again where compiles run
     bool handedOn = false;       // its build went to the second set of workers (nobody should wait for it)
     uint64_t key = 0;            // hash of the pipeline's shaders (the list of pipelines a run used)
+    // A pipeline a list has asked for goes before the ones built ahead because an earlier run
+    // used them (a thousand, tens of seconds each, at every start: the first screen's own
+    // pipelines waited behind them).
+    std::atomic<bool> wanted{false}, busy{false};
+    std::atomic<int> level{0};   // which workers have it: 0 pipeline, 1 compile, 2 large translations
 };
 // Lazy pipelines. A title creates tens of thousands of pipelines while it loads and draws with a
 // few hundred. Building them all keeps the driver's compiler busy for minutes (lists that select
@@ -511,19 +516,27 @@ static std::unordered_map<void*, std::shared_ptr<PendingPso>> g_pending;
 static void pending_run(const std::shared_ptr<PendingPso>& j, int level = 0) {
     int queued = 0;
     if (!level && !j->state.compare_exchange_strong(queued, 1)) return;   // another thread has it
+    if (level && (j->state.load() == 2 || j->level.load() != level || j->busy.exchange(true))) return;   // (queued twice: once as it came, once when a list asked)
     pc::defer_compiles(level == 0);
     pc::defer_giants(level == 1);
     const bool again = j->build();
     pc::defer_compiles(false);
     pc::defer_giants(false);
-    if (again && level == 0) {   // (first in line: a pipeline is built when a list wants it, or was used by an earlier run)
+    if (again && level == 0) {
         { std::lock_guard<std::mutex> g(j->mu); j->handedOn = true; }
         j->cv.notify_all();
-        pso_compile_pool_run([j] { pending_run(j, 1); }, true);
+        j->level = 1;
+        pso_compile_pool_run([j] { pending_run(j, 1); }, j->wanted.load());
         return;
     }
-    if (again && level == 1) { pso_giant_pool_run([j] { pending_run(j, 2); }); return; }
+    if (again && level == 1) {
+        j->level = 2;
+        j->busy = false;
+        pso_giant_pool_run([j] { pending_run(j, 2); }, j->wanted.load());
+        return;
+    }
     { std::lock_guard<std::mutex> g(j->mu); j->state = 2; }
+    j->busy = false;
     j->cv.notify_all();
 }
 void pso_wait_ready_impl(void* obj) {
@@ -548,7 +561,14 @@ void pso_wait_ready_impl(void* obj) {
         j->cv.wait(g, [&] { return j->state.load() == 2; });
         return;
     }
-    if (j->state.load() == 0) pso_pool_run([j] { pending_run(j); }, true);
+    if (!j->wanted.exchange(true)) {
+        if (j->state.load() == 0) pso_pool_run([j] { pending_run(j); }, true);
+        else if (j->state.load() == 1 && !j->busy.load()) {   // waiting among the ones built ahead: to the front
+            const int lv = j->level.load();
+            if (lv == 1) pso_compile_pool_run([j] { pending_run(j, 1); }, true);
+            else if (lv == 2) pso_giant_pool_run([j] { pending_run(j, 2); }, true);
+        }
+    }
     static thread_local ULONGLONG winStart = 0;
     static thread_local DWORD waited = 0;
     const ULONGLONG now = GetTickCount64();
