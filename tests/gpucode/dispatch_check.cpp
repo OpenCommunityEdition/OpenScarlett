@@ -226,7 +226,7 @@ int main(int argc, char** argv) {
     uint32_t* m = nullptr;
     srand(1);
     // (one, big, nan: every dword the float 1.0, 1000.0 or a NaN: loop bounds a program takes from its data)
-    const uint32_t same = fill == "one" ? 0x3f800000u : fill == "big" ? 0x447a0000u : fill == "nan" ? 0x7fc00000u : 0u;
+    const uint32_t same = fill == "one" ? 0x3f800000u : fill == "big" ? 0x447a0000u : fill == "nan" ? 0x7fc00000u : fill == "all" ? 0xffffffffu : 0u;
     auto pattern = [&](uint32_t i) { return same ? same : fill == "zero" ? 0u : fill == "rand" ? (uint32_t)rand() * 2654435761u : i; };
     up->Map(0, nullptr, (void**)&m);
     for (uint64_t i = 0; i < kBig / 4; i++) m[i] = pattern((uint32_t)i);

@@ -123,6 +123,8 @@ bool list_rays(PcObj l, const std::vector<RtRun>& runs, const RtRaysArgs& args);
 bool is_rays_signature(PcObj sig);
 void note_rays_skipped(int why);   // counted in the frame-rate log (0 no pipeline, 1 start program building, 2 failed, 3 a reached program building, 4 indirect)
 uint64_t present_count();
+void res_heap_props(PcObj r, void* heapProps);   // D3D12_HEAP_PROPERTIES of a resource
+uint64_t gm_title_of_gpu(uint64_t gpuVa);   // diagnostics: the title address of a registered buffer's memory at a PC GPU address (0: none)
 // XSL_TABLE_CHECK=1 (diagnostics): the layer's descriptor memory answers what a title slot holds.
 void table_note_stage(PcObj pso, const void* code, size_t size);   // a stage of a graphics pipeline (its translated container)
 void table_forget(PcObj pso);

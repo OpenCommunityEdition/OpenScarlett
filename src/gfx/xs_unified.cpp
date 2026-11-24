@@ -90,6 +90,36 @@ bool unified_from_gpu(uint64_t gpu, UnifiedRef* out) {
         if (im.res && gpu >= im.gpu && gpu < im.gpu + im.size) { *out = {im.res, gpu - im.gpu, gpu}; return true; }
     return false;
 }
+// Diagnostics: n bytes of zero-copy memory at a PC GPU address (unified memory, or a physical-page
+// section, read through a view of its own).
+bool unified_read_gpu(uint64_t gpu, void* dst, size_t n) {
+    HANDLE section = nullptr;
+    uint64_t off = 0;
+    {
+        std::lock_guard<std::mutex> g(g_mu);
+        for (auto& [base, im] : g_imported)
+            if (im.res && gpu >= im.gpu && gpu + n <= im.gpu + im.size) {
+                SIZE_T got = 0;
+                return ReadProcessMemory(GetCurrentProcess(), (const void*)(base + (gpu - im.gpu)), dst, n, &got) && got == n;
+            }
+        for (auto& [h, im] : g_sections)
+            if (im.res && gpu >= im.gpu && gpu + n <= im.gpu + im.size) { section = h; off = gpu - im.gpu; break; }
+    }
+    if (!section) return false;
+    const uint64_t start = off & ~0xffffull;
+    void* v = MapViewOfFile(section, FILE_MAP_READ, (DWORD)(start >> 32), (DWORD)start, (SIZE_T)(off - start + n));
+    if (!v) return false;
+    memcpy(dst, (const uint8_t*)v + (off - start), n);
+    UnmapViewOfFile(v);
+    return true;
+}
+// The CPU address of unified memory at a PC GPU address (0: none; diagnostics read through it).
+uint64_t unified_cpu_of_gpu(uint64_t gpu) {
+    std::lock_guard<std::mutex> g(g_mu);
+    for (auto& [base, im] : g_imported)
+        if (im.res && gpu >= im.gpu && gpu < im.gpu + im.size) return (uint64_t)base + (gpu - im.gpu);
+    return 0;
+}
 uint64_t gpu_va(Device* dev, uint64_t va) {
     UnifiedRef r;
     if (unified_lookup(dev, va, &r)) return r.gpu;

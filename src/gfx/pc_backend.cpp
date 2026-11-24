@@ -2533,6 +2533,21 @@ bool gm_resolve(uint64_t va, PcObj* res, uint64_t* off, uint64_t* avail) {
     if (avail) *avail = it->first + it->second.size - va;
     return true;
 }
+void res_heap_props(PcObj r, void* heapProps) {
+    D3D12_HEAP_FLAGS f;
+    *static_cast<D3D12_HEAP_PROPERTIES*>(heapProps) = {};
+    as<ID3D12Resource>(r)->GetHeapProperties(static_cast<D3D12_HEAP_PROPERTIES*>(heapProps), &f);
+}
+// Diagnostics: the title address of a registered buffer's memory at a PC GPU address (0: none).
+uint64_t gm_title_of_gpu(uint64_t gpu) {
+    std::lock_guard<std::mutex> g(g_gm_mu);
+    for (auto& [va, b] : g_gm) {
+        if (!b.res) continue;
+        const uint64_t base = b.res->GetGPUVirtualAddress() + b.resOff;
+        if (gpu >= base && gpu < base + b.size) return va + (gpu - base);
+    }
+    return 0;
+}
 // XSL_AS_DUMP=1: the first 512 bytes of serialized acceleration structures, logged a few frames later.
 namespace {
 }  // namespace
@@ -6022,6 +6037,11 @@ static bool fixed_indirect(PcObj l, PcObj sig, uint32_t max, PcObj args, uint64_
         L->ResourceBarrier(1, &ub);
         barrier(g_arg_ring.res, uav, ind);
         restore_compute_state(l);
+        // With root signatures of the pipelines' own, restoring only marks the title's as lost: it
+        // has to go back on the list here, before the dispatch this function makes. (It did not:
+        // every guarded indirect dispatch ran the title's shader with the guard's root signature
+        // and arguments, and the first one with work to do hung the GPU.)
+        root_ensure(l, true);
     } else barrier(g_arg_ring.res, D3D12_RESOURCE_STATE_COPY_DEST, ind);
     table_check(l);
     int32_t pq = prof_begin(l, 'I', max, 0, 0);

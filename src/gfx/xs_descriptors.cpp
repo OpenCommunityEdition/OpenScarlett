@@ -27,6 +27,7 @@
 #include <vector>
 
 #include "xs_cbv.h"
+#include "xs_detile.h"
 #include "xs_object.h"
 #include "xs_unified.h"
 
@@ -740,6 +741,7 @@ static int table_slot_fix(uint64_t pcGpu, uint32_t k, uint32_t want) {
 // a dispatch again outside the title with the constants it had).
 static bool table_slot_dump(uint64_t pcGpu, uint32_t k, const char* path) {
     std::vector<uint8_t> data;
+    uint64_t dumpAt = 0;
     {
         std::lock_guard<std::mutex> g(g_mu);
         if (!g_ready || pcGpu < g_pcGpu) return false;
@@ -757,10 +759,41 @@ static bool table_slot_dump(uint64_t pcGpu, uint32_t k, const char* path) {
         if (tg.magic == 0x444C5358u) { if (r.resolve(tg, &rec) && r.kind[tg.record] == 1) { a = r.src[tg.record]; bytes = w[2]; } }
         else if ((q[1] & kXboxCbvFormatMask) == (0x0002403C00000000ull & kXboxCbvFormatMask)) { a = q[0] & ((1ull << 48) - 1); bytes = (q[1] & 0xFFFFFFFFull) << 4; }
         else if (q[0] && q[0] == q[2] && w[2] && !(w[2] & 31) && w[6] == (uint32_t)(q[0] >> 6)) { a = q[0]; bytes = w[2]; }
-        if (!a || !bytes || bytes > 65536) return false;
+        static volatile long shown = 0;
+        dumpAt = a;
+        if (!a || !bytes || bytes > 65536) {
+            if (InterlockedIncrement(&shown) <= 6)
+                XSL_INFO(CH, "table dump: slot %llu names no constants (address %llx, %llu bytes; slot bytes %08x %08x %08x %08x %08x %08x %08x %08x)", (unsigned long long)t,
+                         (unsigned long long)a, (unsigned long long)bytes, w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7]);
+            return false;
+        }
         data.resize((size_t)bytes);
         SIZE_T got = 0;
-        if (!ReadProcessMemory(GetCurrentProcess(), (const void*)a, data.data(), data.size(), &got) || got != data.size()) return false;
+        if ((!ReadProcessMemory(GetCurrentProcess(), (const void*)a, data.data(), data.size(), &got) || got != data.size()) &&
+            !unified_read_gpu(a, data.data(), data.size()) && !mapped_buffer_read_gpu(a, data.data(), data.size()) &&
+            !cbv_read_gpu(a, data.data(), data.size()) &&
+            !(pc::gm_title_of_gpu(a) && ReadProcessMemory(GetCurrentProcess(), (const void*)pc::gm_title_of_gpu(a), data.data(), data.size(), &got) && got == data.size())) {   // (a view made with the memory's GPU address)
+            // A PC buffer of its own that the title maps (a custom heap): through a mapping of ours.
+            PcObj res = nullptr;
+            uint64_t off = 0, avail = 0;
+            void* m = nullptr;
+            D3D12_HEAP_PROPERTIES hp{};
+            const bool known = pc::gm_resolve(a, &res, &off, &avail) && res && avail >= bytes;
+            int heap = -1;
+            if (known) { pc::res_heap_props(res, &hp); heap = (int)hp.Type; }
+            if (known && heap != D3D12_HEAP_TYPE_DEFAULT && SUCCEEDED(pc::res_map(res, 0, nullptr, &m)) && m) memcpy(data.data(), (const uint8_t*)m + off, data.size());
+            else {
+                if (InterlockedIncrement(&shown) <= 6)
+                    XSL_INFO(CH, "table dump: slot %llu, %llu bytes at %llx cannot be read (%s, heap type %d)", (unsigned long long)t, (unsigned long long)bytes, (unsigned long long)a,
+                             known ? "a PC buffer of its own" : "no buffer known there", heap);
+                return false;
+            }
+        }
+    }
+    {
+        static volatile long said = 0;
+        if (InterlockedIncrement(&said) <= 10)
+            XSL_INFO(CH, "table dump: %s: %zu bytes, the title's address %llx, PC GPU address %llx", path, data.size(), (unsigned long long)dumpAt, (unsigned long long)gpu_va(g_dev, dumpAt));
     }
     FILE* f = fopen(path, "wb");
     if (!f) return false;

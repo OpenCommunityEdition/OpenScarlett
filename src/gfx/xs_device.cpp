@@ -1340,7 +1340,22 @@ void D3DAPI D_CreateCBV(ID3D12Device* d, const D3D12_CONSTANT_BUFFER_VIEW_DESC* 
         uint64_t a = x.BufferLocation;   // payload: the title's range (translated code reads it through global memory)
         uint32_t w[4] = {(uint32_t)a, (uint32_t)((a >> 32) & 0xffff), v->SizeInBytes, 20u << 12};
         desc_set_payload(w);
+        const uint64_t direct = x.BufferLocation;
         if (x.BufferLocation & 255) x.BufferLocation = cbv_fix_view(DEV(d), v->BufferLocation, x.BufferLocation, v->SizeInBytes);
+        {   // XSL_CBV_TRACE=<bytes> (diagnostics): constant buffer views of that size, as they are made
+            static const uint32_t want = [] { char b[16]; return GetEnvironmentVariableA("XSL_CBV_TRACE", b, sizeof b) ? (uint32_t)atoi(b) : 0u; }();
+            static volatile long n = 0;
+            if (want && v->SizeInBytes == want && InterlockedIncrement(&n) <= 12) {
+                UnifiedRef u{};
+                PcObj res = nullptr;
+                uint64_t off = 0, avail = 0;
+                const bool uni = unified_lookup(DEV(d), v->BufferLocation, &u);
+                const bool gm = pc::gm_resolve(v->BufferLocation, &res, &off, &avail);
+                XSL_INFO(CH, "constant buffer view of %u bytes at title address %llx: PC GPU address %llx%s; %s; registered buffer: %s, %llu bytes left in it; view handle %llx", v->SizeInBytes,
+                         (unsigned long long)v->BufferLocation, (unsigned long long)direct, direct != x.BufferLocation ? " (a ring copy is used)" : "",
+                         uni ? "unified memory" : "not unified memory", gm ? "yes" : "no", (unsigned long long)avail, (unsigned long long)h.ptr);
+            }
+        }
         v = &x;
     }
     desc_set_kind(1, titleAt);

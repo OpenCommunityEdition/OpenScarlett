@@ -11,4 +11,6 @@ bool section_lookup(Device* dev, uint64_t va, UnifiedRef* out, uint64_t* run);
 bool unified_from_gpu(uint64_t gpuVa, UnifiedRef* out);   // the buffer a PC GPU address of unified memory lies in
 // Translate a console GPU address (possibly a CPU address of unified memory) to a PC GPU address.
 uint64_t gpu_va(Device* dev, uint64_t va);
+bool unified_read_gpu(uint64_t gpuVa, void* dst, size_t n);   // diagnostics: bytes of zero-copy memory at a PC GPU address
+uint64_t unified_cpu_of_gpu(uint64_t gpuVa);   // the CPU address of unified memory at a PC GPU address (0: none)
 }

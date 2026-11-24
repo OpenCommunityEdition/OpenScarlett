@@ -453,6 +453,17 @@ void mapped_buffer_forget(PcObj pcRes) {
     std::lock_guard<std::mutex> g(g_mu);
     g_mapped_buffers.erase(pcRes);
 }
+// Diagnostics: n bytes of the console memory of a mapped buffer, by the PC buffer's GPU address.
+bool mapped_buffer_read_gpu(uint64_t gpu, void* dst, size_t n) {
+    std::lock_guard<std::mutex> g(g_mu);
+    for (auto& [r, b] : g_mapped_buffers) {
+        const uint64_t base = pc::res_gpu_va(r);
+        if (!base || gpu < base || gpu + n > base + b.size) continue;
+        SIZE_T got = 0;
+        return ReadProcessMemory(GetCurrentProcess(), (const uint8_t*)b.mem + (gpu - base), dst, n, &got) && got == n;
+    }
+    return false;
+}
 // Copies the mapped buffers whose bytes changed (called under g_mu's absence, before submissions).
 static void mapped_buffers_sync(PcObj pcDevice, PcObj pcQueue) {
     std::vector<std::pair<PcObj, MappedBuffer>> all;
@@ -462,10 +473,25 @@ static void mapped_buffers_sync(PcObj pcDevice, PcObj pcQueue) {
         all.assign(g_mapped_buffers.begin(), g_mapped_buffers.end());
     }
     static thread_local std::vector<uint8_t> copy;
+    // (Every ten seconds: what this costs and how often a buffer could not be read.)
+    static std::atomic<uint64_t> calls{0}, read{0}, uploaded{0}, unreadable{0}, ms{0};
+    static std::atomic<ULONGLONG> last{0};
+    const ULONGLONG t0 = GetTickCount64();
+    calls++;
+    struct Tally { ULONGLONG t0; ~Tally() {
+        ms += GetTickCount64() - t0;
+        ULONGLONG was = last.load(), now = GetTickCount64();
+        if (now - was >= 10000 && last.compare_exchange_strong(was, now))
+            XSL_INFO(CH, "mapped buffers: %llu syncs in 10 s took %llu ms (%llu MB read and hashed, %llu MB uploaded, %llu times a buffer could not be read)",
+                     (unsigned long long)calls.exchange(0), (unsigned long long)ms.exchange(0), (unsigned long long)(read.exchange(0) >> 20), (unsigned long long)(uploaded.exchange(0) >> 20),
+                     (unsigned long long)unreadable.exchange(0));
+    } } tally{t0};
     for (auto& [r, b] : all) {
         uint64_t h = 0;
-        if (!copy_guarded((uint64_t)(uintptr_t)b.mem, b.size, copy, &h)) continue;   // not readable now
+        if (!copy_guarded((uint64_t)(uintptr_t)b.mem, b.size, copy, &h)) { unreadable++; continue; }   // not readable now
+        read += b.size;
         if (!b.fresh && h == b.hash) continue;
+        uploaded += b.size;
         {
             std::lock_guard<std::mutex> g(g_mu);
             auto it = g_mapped_buffers.find(r);

@@ -165,6 +165,16 @@ static uint64_t ring_copy(Device* dev, const uint8_t* src, uint64_t n, bool guar
     return c.gpu + off;
 }
 
+// Diagnostics: n bytes of a mapped upload buffer by its GPU address.
+bool cbv_read_gpu(uint64_t gpu, void* dst, size_t n) {
+    std::lock_guard<std::mutex> g(g_mu);
+    auto it = g_upload.upper_bound(gpu);
+    if (it == g_upload.begin()) return false;
+    --it;
+    if (gpu + n > it->first + it->second.size || !it->second.cpu) return false;
+    memcpy(dst, it->second.cpu + (gpu - it->first), n);
+    return true;
+}
 void cbv_refresh() {
     std::lock_guard<std::mutex> g(g_mu);
     for (auto& p : g_pending) {

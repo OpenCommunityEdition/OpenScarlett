@@ -17,6 +17,7 @@ void detile_unmapped(PcObj pcRes);
 // unmap and before each submission.
 void mapped_buffer_add(PcObj pcRes, void* consoleMemory, uint64_t size);
 void mapped_buffer_forget(PcObj pcRes);
+bool mapped_buffer_read_gpu(uint64_t gpuVa, void* dst, size_t n);   // diagnostics: console memory of a mapped buffer by its PC GPU address
 bool mapped_buffer_known(PcObj pcRes);   // Map handed out console memory: the PC buffer is not mapped
 void detile_flush(PcObj pcDevice, PcObj pcQueue);
 void detile_stats(uint64_t out[6]);   // since the last call: checked bytes, changed, uploads, uploaded bytes, first uploads; textures known
