@@ -29,7 +29,7 @@ struct TranslateOptions {
     // with a cycle in bad data, would otherwise reset the PC's GPU). Shaders with barriers use the
     // larger limit: a wave that stops early would leave the others waiting at the barrier.
     unsigned loop_guard = 1u << 12;   // dispatcher steps (runaway loops: an invocation stops after this many)
-    unsigned loop_guard_barrier = 1u << 16;
+    unsigned loop_guard_barrier = 1u << 12;   // (was 1 << 16: 130,000 threads of one dispatch ran to it on data a skipped pass had not written, and the GPU was reset)
     bool wave_size_attr = false;
     // The packed 8-bit dot products as the shader model 6.4 intrinsics (a network pass is
     // thousands of them, and they compile much faster than shifts and multiplies).

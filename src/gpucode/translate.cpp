@@ -4821,7 +4821,7 @@ uint64_t translation_salt(const Container& c) {
     auto add = [&](const char* tag) { for (const char* p = tag; *p; p++) h = (h ^ (uint8_t)*p) * 1099511628211ull + 0x9e3779b97f4a7c15ull; };
     // 2026-11: the step limit of programs with barriers and loops went from 2^22 to 2^16, with the
     // small limit past the last barrier.
-    if (barrier && backward) add("barrier-limit-2");
+    if (barrier && backward) add("barrier-limit-3");
     // 2026-11: global stores take their data from the data field (they read v0); global atomics.
     if (global_write) add("global-write-2");
     // 2026-11: 16-bit vertex and mesh outputs are unpacked into the registers their records name

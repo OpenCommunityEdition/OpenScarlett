@@ -1009,14 +1009,22 @@ void D3DAPI L_Dispatch(ID3D12GraphicsCommandList* l, UINT x, UINT y, UINT z) {
 // launches no thread past them. A PC dispatch is whole groups; the group size is not known here,
 // so that form is logged and dispatched as given (too many groups; no title seen uses it yet).
 void D3DAPI L_DispatchX(ID3D12GraphicsCommandList* l, UINT x, UINT y, UINT z, D3D12XBOX_DISPATCH_FLAGS flags) {
-    static volatile long n = 0;
-    if (InterlockedIncrement(&n) <= 6) {
-        HMODULE m = nullptr;
-        char name[MAX_PATH] = "?";
-        if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCSTR)__builtin_return_address(0), &m) && m)
-            GetModuleFileNameA(m, name, MAX_PATH);
-        const char* bn = strrchr(name, '\\');
-        XSL_INFO(CH, "DispatchX(%u, %u, %u, flags %#x) from %s", x, y, z, (unsigned)flags, bn ? bn + 1 : name);
+    {   // each pipeline's first few dispatches of this kind, with what was asked for (60 lines at most)
+        static std::mutex mu;
+        static std::map<std::string, int> seen;
+        static int lines = 0;
+        const std::string pso = pc::list_pso_name(LPC(l));
+        std::lock_guard<std::mutex> g(mu);
+        if (lines < 60 && seen[pso]++ < 3) {
+            lines++;
+            HMODULE m = nullptr;
+            char name[MAX_PATH] = "?";
+            if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCSTR)__builtin_return_address(0), &m) && m)
+                GetModuleFileNameA(m, name, MAX_PATH);
+            const char* bn = strrchr(name, '\\');
+            XSL_INFO(CH, "DispatchX(%u, %u, %u, flags %#x%s) from %s, pipeline %s%s", x, y, z, (unsigned)flags,
+                     (flags & D3D12XBOX_DISPATCH_FLAG_USE_THREAD_DIMENSIONS) ? ": the counts are threads" : "", bn ? bn + 1 : name, pso.c_str(), dump_skipped(l).c_str());
+        }
     }
     if (flags & D3D12XBOX_DISPATCH_FLAG_USE_THREAD_DIMENSIONS) {
         static volatile long w = 0;
