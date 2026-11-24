@@ -273,6 +273,7 @@ void set_fallback_root_signature(const void* blob, size_t n) {
     t_fallback_rs.assign(d, d + n);
 }
 const std::vector<uint8_t>& fallback_root_signature() { return t_fallback_rs; }
+void note_vs_output(const void* in, size_t n, const std::string& hlsl);   // below (rectangle lists)
 bool native_translate(const void* in, size_t n, void** out, size_t* outSize) {
     if (mode() == 0) return false;
     gpucode::Container c;
@@ -374,6 +375,7 @@ bool native_translate(const void* in, size_t n, void** out, size_t* outSize) {
         const DWORD tick0 = GetTickCount();
         gpucode::TranslateResult r = gpucode::translate(c, rs, o);
         const DWORD tick1 = GetTickCount();
+        if (r.ok && c.kind == gpucode::ProgramKind::VS) note_vs_output(in, n, r.hlsl);
         if (r.ok && !ovr.empty()) r.hlsl.assign(ovr.begin(), ovr.end());
         if (!r.ok) {
             XSL_WARN(CH, "shader %016llx (%s): not translated: %s", (unsigned long long)key, gpucode::kind_name(c.kind), r.error.c_str());
@@ -469,5 +471,54 @@ bool rt_build_pipeline(const gpucode::RtLinked& l, std::vector<uint8_t>& dxil, s
 // The layer's own shaders (HLSL written here, not translated) through the same PC compiler.
 bool compile_layer_shader(const std::string& hlsl, const char* profile, std::vector<uint8_t>& out, std::string& log) {
     return compile(hlsl, profile, out, log);
+}
+// The output struct of translated vertex shaders, for the rectangle-list geometry shader
+// (rect_gs.cpp), by a hash of the console container. Shaders loaded from the cache were not
+// translated in this run: their struct comes from translating again (quick; nothing is compiled).
+static std::map<uint64_t, std::string> g_vs_out;   // under g_lock
+static std::string vs_out_text(const std::string& hlsl) {
+    size_t a = hlsl.find("struct VSOut {\n");
+    size_t e = a == std::string::npos ? a : hlsl.find("};\n", a);
+    return e == std::string::npos ? std::string() : hlsl.substr(a, e + 3 - a);
+}
+void note_vs_output(const void* in, size_t n, const std::string& hlsl) {
+    std::string t = vs_out_text(hlsl);
+    if (t.empty()) return;
+    const uint64_t h = fnv(in, n);
+    std::lock_guard<std::mutex> g(g_lock);
+    g_vs_out[h] = std::move(t);
+}
+// Call while the pipeline's fallback root signature is still set on this thread.
+bool vs_output_struct(const void* in, size_t n, std::string* text) {
+    const uint64_t h = fnv(in, n);
+    {
+        std::lock_guard<std::mutex> g(g_lock);
+        if (auto f = g_vs_out.find(h); f != g_vs_out.end()) { *text = f->second; return true; }
+    }
+    gpucode::Container c;
+    if (!gpucode::read_container(in, n, c) || !c.has_native || c.kind != gpucode::ProgramKind::VS) return false;
+    const auto* rsp = c.part("RTS0");
+    const uint8_t* rsData = rsp ? (const uint8_t*)rsp->data() : t_fallback_rs.empty() ? nullptr : t_fallback_rs.data();
+    const size_t rsSize = rsp ? rsp->size() : t_fallback_rs.size();
+    gpucode::RootSig rs;
+    std::string err;
+    if (!rsData || !gpucode::parse_root_signature(rsData, rsSize, rs, &err)) return false;
+    gpucode::TranslateOptions o;
+    gpucode::TranslateResult r = gpucode::translate(c, rs, o);
+    if (!r.ok) return false;
+    note_vs_output(in, n, r.hlsl);
+    *text = vs_out_text(r.hlsl);
+    return !text->empty();
+}
+// A layer shader through the compiler, kept in the shader cache by a hash of its text and profile.
+bool compile_layer_shader_cached(const std::string& hlsl, const char* profile, std::vector<uint8_t>& out, std::string& log) {
+    const uint64_t key = fnv(profile, strlen(profile), fnv(hlsl.data(), hlsl.size()));
+    wchar_t name[40];
+    swprintf(name, 40, L"layer_%016llx.dxil", (unsigned long long)key);
+    const std::wstring path = cache_dir().empty() ? L"" : cache_dir() + name;
+    if (!path.empty() && read_file(path, out)) return true;
+    if (!compile(hlsl, profile, out, log)) return false;
+    if (!path.empty()) write_file(path, out.data(), out.size());
+    return true;
 }
 }  // namespace pc

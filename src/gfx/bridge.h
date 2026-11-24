@@ -279,5 +279,15 @@ const char* translated_keys();   // keys of shaders translated since reset_untra
 bool had_untranslated();
 const char* untranslated_reason();   // why the first such shader since reset_untranslated() is not translated
 void free_container(void* p);
+// Rectangle lists (rect_gs.cpp): a geometry shader that turns each three-vertex rectangle of the
+// console vertex shader `vs` (its container, as the title gave it) into a four-vertex strip. The
+// DXIL stays valid for the life of the process. False: no such shader (not a translated vertex
+// shader, or it did not compile). Call before the pipeline's fallback root signature is cleared.
+bool rect_list_gs(const void* vs, size_t vsSize, const void** gsDxil, size_t* gsSize);
+bool rect_list_gs_from_struct(const std::string& vsOutStruct, const void** gsDxil, size_t* gsSize);
+// The "struct VSOut {...};" text of a translated vertex shader (native_shaders.cpp).
+bool vs_output_struct(const void* in, size_t n, std::string* text);
+// A layer shader compiled with the PC compiler, kept in the shader cache by its text and profile.
+bool compile_layer_shader_cached(const std::string& hlsl, const char* profile, std::vector<uint8_t>& out, std::string& log);
 
 }  // namespace pc

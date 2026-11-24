@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // ID3D12Device (console), D3D12XboxCreateDevice, frame events and the DXGI shims.
 #include <condition_variable>
+#include <unordered_set>
+#include <unordered_map>
 #include <deque>
 #include <thread>
 #include <array>
@@ -356,10 +358,35 @@ struct StreamPso {
     size_t rs_at = 0;
     PcObj rs = nullptr;
     bool cs = false;
-    std::vector<std::vector<uint8_t>> keepCode;
+    // Rectangle lists: a pipeline of that topology gets a generated geometry shader that adds each
+    // rectangle's fourth corner (rect), unless it has one of its own (hasGs). vs: the vertex
+    // stage's index in code[]; gsAt: where the stream's geometry stage sits (0: none).
+    bool rect = false, hasGs = false;
+    size_t vs = 8, gsAt = 0;
+    std::vector<std::shared_ptr<std::vector<uint8_t>>> keepCode;   // shared by content (see code_pool)
     std::vector<D3D12_INPUT_ELEMENT_DESC> keepElems;
     std::vector<std::string> keepNames;
 };
+// The shader containers of pipelines not built yet are kept until they are; thousands of pipelines
+// share a few thousand shaders, so one copy per content is kept.
+static std::shared_ptr<std::vector<uint8_t>> code_pool(const void* p, size_t n) {
+    static std::mutex mu;
+    static std::unordered_multimap<uint64_t, std::weak_ptr<std::vector<uint8_t>>> pool;
+    uint64_t h = 1469598103934665603ull;
+    const uint8_t* c = (const uint8_t*)p;
+    for (size_t k = 0; k < n; k++) h = (h ^ c[k]) * 1099511628211ull;
+    std::lock_guard<std::mutex> g(mu);
+    auto range = pool.equal_range(h);
+    for (auto it = range.first; it != range.second;) {
+        auto sp = it->second.lock();
+        if (!sp) { it = pool.erase(it); continue; }
+        if (sp->size() == n && !memcmp(sp->data(), p, n)) return sp;
+        ++it;
+    }
+    auto sp = std::make_shared<std::vector<uint8_t>>(c, c + n);
+    pool.emplace(h, sp);
+    return sp;
+}
 // Translation and creation (on any thread).
 static HRESULT stream_pso_create(PcObj dev, StreamPso& s, PcObj* pso) {
     std::vector<void*> owned;  // sanitized shader containers, freed after creation
@@ -386,6 +413,24 @@ static HRESULT stream_pso_create(PcObj dev, StreamPso& s, PcObj* pso) {
         memcpy(s.pcs.data() + s.at[i], &bc, sizeof bc);
     }
     *pso = nullptr;
+    {   // XSL_RECT_GS=0 keeps rectangle lists as single triangles
+        static const bool rectGs = [] { char b[4]; return !(GetEnvironmentVariableA("XSL_RECT_GS", b, 4) && b[0] == '0'); }();
+        const void* gs = nullptr;
+        size_t gn = 0;
+        if (rectGs && s.rect && !s.hasGs && s.vs < s.stages && pc::rect_list_gs(s.code[s.vs], s.size[s.vs], &gs, &gn)) {
+            D3D12_SHADER_BYTECODE bc{gs, gn};
+            if (s.gsAt && s.gsAt + sizeof bc <= s.pcs.size()) memcpy(s.pcs.data() + s.gsAt, &bc, sizeof bc);
+            else {
+                size_t start = (s.pcs.size() + 7) & ~(size_t)7;
+                s.pcs.resize(start + 8 + sizeof bc, 0);
+                uint32_t ty = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_GS;
+                memcpy(s.pcs.data() + start, &ty, 4);
+                memcpy(s.pcs.data() + start + 8, &bc, sizeof bc);
+            }
+            static volatile long n = 0;
+            if (InterlockedIncrement(&n) == 1) XSL_INFO(CH, "rectangle-list pipelines get a geometry shader that adds the fourth corner");
+        }
+    }
     HRESULT hr = pc::create_pso_stream(dev, s.pcs.data(), s.pcs.size(), pso);
     if (SUCCEEDED(hr)) { pc::note_pso_rs(*pso, s.rs, s.cs); pc::note_pso_own_rs(*pso, own, s.cs); }
     pc::set_fallback_root_signature(nullptr, 0);
@@ -402,7 +447,45 @@ struct PendingPso {
     std::condition_variable cv;
     std::atomic<int> state{0};   // 0 queued, 1 being built, 2 done
     std::function<void()> build;
+    uint64_t key = 0;            // hash of the pipeline's shaders (the list of pipelines a run used)
 };
+// Lazy pipelines. A title creates tens of thousands of pipelines while it loads and draws with a
+// few hundred. Building them all keeps the driver's compiler busy for minutes (lists that select
+// a finished pipeline then wait behind it), takes gigabytes, and delays the first frame. So a
+// pipeline is built when a list first selects it. The shaders of the pipelines a run used are
+// kept in used-pipelines.txt beside the shader cache, and a pipeline of shaders an earlier run
+// used is built ahead, at creation, as before. XSL_PSO_LAZY=0 builds everything at creation.
+static std::mutex g_used_mu;
+static std::unordered_set<uint64_t> g_used;
+static std::wstring g_used_path;
+static bool pso_lazy() {
+    static const bool on = [] {
+        char b[4];
+        if (GetEnvironmentVariableA("XSL_PSO_LAZY", b, 4) && b[0] == '0') return false;
+        wchar_t dir[MAX_PATH];
+        if (GetEnvironmentVariableW(L"XSL_SHADER_CACHE", dir, MAX_PATH)) {
+            g_used_path = std::wstring(dir) + L"\\used-pipelines.txt";
+            if (FILE* f = _wfopen(g_used_path.c_str(), L"r")) {
+                unsigned long long k;
+                while (fscanf(f, "%llx", &k) == 1) g_used.insert(k);
+                fclose(f);
+            }
+        }
+        XSL_INFO(CH, "pipelines are built when first used; %zu from earlier runs are built ahead", g_used.size());
+        return true;
+    }();
+    return on;
+}
+static bool pso_used_before(uint64_t key) {
+    std::lock_guard<std::mutex> g(g_used_mu);
+    return g_used.count(key) != 0;
+}
+static void pso_note_used(uint64_t key) {
+    if (!key) return;
+    std::lock_guard<std::mutex> g(g_used_mu);
+    if (!g_used.insert(key).second || g_used_path.empty()) return;
+    if (FILE* f = _wfopen(g_used_path.c_str(), L"a")) { fprintf(f, "%016llx\n", (unsigned long long)key); fclose(f); }
+}
 static std::mutex g_pending_mu;
 static std::unordered_map<void*, std::shared_ptr<PendingPso>> g_pending;
 static void pending_run(const std::shared_ptr<PendingPso>& j) {
@@ -420,6 +503,7 @@ void pso_wait_ready_impl(void* obj) {
         if (it == g_pending.end()) return;
         j = it->second;
     }
+    pso_note_used(j->key);
     if (j->state.load() == 2) return;
     // A list wants a pipeline that is not built yet. Building it here can take the driver (and
     // the shader compiler before it) many seconds, and a title that loads hundreds of pipelines
@@ -536,6 +620,11 @@ HRESULT D3DAPI D_CreatePipelineState(ID3D12Device2* d, const D3D12_PIPELINE_STAT
                 return E_NOTIMPL;
             }
             // (Translated after the loop, once the pipeline's root signature is known.)
+            if (type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS) sp.vs = stages;
+            if (type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_GS) {
+                sp.gsAt = align(align(pcs.size(), 8) + 4, 8);
+                sp.hasGs = bc.pShaderBytecode != nullptr;
+            }
             if (bc.pShaderBytecode && bc.BytecodeLength && stages < 8) {
                 stage_code[stages] = bc.pShaderBytecode;
                 stage_size[stages] = bc.BytecodeLength;
@@ -545,6 +634,7 @@ HRESULT D3DAPI D_CreatePipelineState(ID3D12Device2* d, const D3D12_PIPELINE_STAT
         } else if (type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY) {
             uint32_t t;
             memcpy(&t, p, 4);
+            if (t == D3D12XBOX_PRIMITIVE_TOPOLOGY_TYPE_RECT) sp.rect = true;
             if (t == D3D12XBOX_PRIMITIVE_TOPOLOGY_TYPE_QUAD || t == D3D12XBOX_PRIMITIVE_TOPOLOGY_TYPE_RECT) t = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
             emit(type, &t, 4);
         } else if (type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS) {
@@ -593,8 +683,8 @@ HRESULT D3DAPI D_CreatePipelineState(ID3D12Device2* d, const D3D12_PIPELINE_STAT
     auto st = std::make_shared<StreamPso>(std::move(sp));
     st->keepCode.reserve(st->stages);
     for (size_t i = 0; i < st->stages; i++) {
-        st->keepCode.emplace_back((const uint8_t*)st->code[i], (const uint8_t*)st->code[i] + st->size[i]);
-        st->code[i] = st->keepCode[i].data();
+        st->keepCode.push_back(code_pool(st->code[i], st->size[i]));
+        st->code[i] = st->keepCode[i]->data();
     }
     if (il_at) {
         D3D12_INPUT_LAYOUT_DESC il;
@@ -637,8 +727,17 @@ HRESULT D3DAPI D_CreatePipelineState(ID3D12Device2* d, const D3D12_PIPELINE_STAT
         { std::lock_guard<std::mutex> g(g_pending_mu); g_pending.erase(obj); }
         Release((IGraphicsUnknown*)obj);
     };
+    {   // the pipeline's key: its shaders' contents
+        uint64_t h = 1469598103934665603ull;
+        for (size_t i = 0; i < st->stages; i++) {
+            const uint8_t* c = (const uint8_t*)st->code[i];
+            for (size_t k = 0; k < st->size[i]; k += 1 + (st->size[i] > 4096 ? 7 : 0)) h = (h ^ c[k]) * 1099511628211ull;
+            h = (h ^ st->size[i]) * 1099511628211ull;
+        }
+        job->key = h ? h : 1;
+    }
     { std::lock_guard<std::mutex> g(g_pending_mu); g_pending[obj] = job; }
-    pso_pool_run([job] { pending_run(job); });
+    if (!pso_lazy() || pso_used_before(job->key)) pso_pool_run([job] { pending_run(job); });
     return S_OK;
 }
 HRESULT D3DAPI D_CreateCommandSignature(ID3D12Device* d, const D3D12_COMMAND_SIGNATURE_DESC* desc, ID3D12RootSignature* rs, REFIID riid, void** out) {
