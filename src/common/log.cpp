@@ -54,7 +54,12 @@ void log_arm(bool on) { if (!cfg().armedSpec.empty()) cfg().armed = on; }
 void logv(const char* channel, Level level, const char* fmt, va_list ap) {
     if (!log_enabled(channel, level)) return;
     char msg[2048];
-    int n = snprintf(msg, sizeof msg, "[xsl:%s:%s:%04lx] ", channel, kLevel[(int)level], GetCurrentThreadId());
+    // XSL_LOG_TIME=1: seconds since the first line, in front of each line
+    static const bool timed = [] { char b[4]; return GetEnvironmentVariableA("XSL_LOG_TIME", b, 4) && b[0] == '1'; }();
+    static const ULONGLONG t0 = GetTickCount64();
+    int n = 0;
+    if (timed) n = snprintf(msg, sizeof msg, "%7.2f ", (GetTickCount64() - t0) / 1000.0);
+    n += snprintf(msg + n, sizeof msg - n, "[xsl:%s:%s:%04lx] ", channel, kLevel[(int)level], GetCurrentThreadId());
     vsnprintf(msg + n, sizeof msg - n - 2, fmt, ap);
     strcat(msg, "\n");
     auto& c = cfg();

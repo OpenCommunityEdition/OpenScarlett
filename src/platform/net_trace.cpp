@@ -5,7 +5,7 @@
 // between hosts. Each distinct (call, endpoint) pair is logged once. Off by default; nothing is
 // changed, only observed.
 //
-// XSL_NET=off: the title is offline. Its name lookups fail (host not found), its connects and
+// The title is offline unless XSL_NET=on (also "online" or "1") is set. Its name lookups fail (host not found), its connects and
 // datagrams to anything but the loopback interface fail (network unreachable), and its WinHTTP
 // requests, and those of the HTTP libraries shipped next to it, fail to connect. Nothing leaves
 // the machine; titles handle this like a console without a network.
@@ -27,7 +27,7 @@
 namespace {
 std::mutex g_lock;
 std::set<std::string> g_seen;
-bool g_block = false;   // XSL_NET=off
+bool g_block = true;    // offline unless XSL_NET=on
 
 bool loopback(const sockaddr* a) {
     if (!a) return true;   // connected sockets (no destination given)
@@ -172,8 +172,9 @@ void install_net_trace(HMODULE m) {
         return e && *e && *e != '0';
     }();
     g_block = [] {
+        // Offline is the default: a title reaches the network only when the user asks for it.
         const char* e = getenv("XSL_NET");
-        return e && (!_stricmp(e, "off") || !_stricmp(e, "offline") || !strcmp(e, "0"));
+        return !(e && (!_stricmp(e, "on") || !_stricmp(e, "online") || !strcmp(e, "1")));
     }();
     if (on) {
         struct { const char* fn; void* p; } t[] = {
@@ -206,7 +207,7 @@ void install_net_trace(HMODULE m) {
         }
         CloseHandle(snap);
     }
-    XSL_INFO(CH, "offline (XSL_NET=off): lookups, connects, datagrams and WinHTTP requests of the title fail (%u modules)", mods);
+    XSL_INFO(CH, "offline (the default; XSL_NET=on allows the network): lookups, connects, datagrams and WinHTTP requests of the title fail (%u modules)", mods);
 }
 }  // namespace xsl::platform
 
