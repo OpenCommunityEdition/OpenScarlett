@@ -100,7 +100,8 @@ static void transition(ID3D12GraphicsCommandList* l, ID3D12Resource* r, D3D12_RE
 
 int main(int argc, char** argv) {
     if (argc < 4) {
-        fprintf(stderr, "usage: dispatch_check <translated.dxil> <original.cso> <translated.hlsl> [-g X Y] [-f zero|ramp|rand] [--ref R.dxil] [--show]\n");
+        fprintf(stderr, "usage: dispatch_check <translated.dxil> <original.cso> <translated.hlsl> [-g X Y] [-f zero|ramp|rand] [--ref R.dxil] [--show] [--rs R.rs]\n"
+                        "  --rs: the root signature (a container with an RTS0 part) for a program whose own container has none\n");
         return 2;
     }
     auto dxil = read(argv[1]), cso = read(argv[2]), hlsl = read(argv[3]);
@@ -110,7 +111,9 @@ int main(int argc, char** argv) {
     bool show = false;
     const char* expect = nullptr;
     const char* input = nullptr;
+    std::vector<char> rsFile;
     for (int i = 4; i < argc; i++) {
+        if (!strcmp(argv[i], "--rs") && i + 1 < argc) { rsFile = read(argv[++i]); continue; }
         if (!strcmp(argv[i], "-g") && i + 2 < argc) gx = atoi(argv[++i]), gy = atoi(argv[++i]);
         else if (!strcmp(argv[i], "-f") && i + 1 < argc) fill = argv[++i];
         else if (!strcmp(argv[i], "--ref") && i + 1 < argc) ref = read(argv[++i]);
@@ -124,11 +127,29 @@ int main(int argc, char** argv) {
     gpucode::Container c;
     std::string err;
     if (!gpucode::read_container(cso.data(), cso.size(), c, &err)) { printf("container: %s\n", err.c_str()); return 1; }
+    // A part of a DXBC container that the console-program reader does not take (a PC container).
+    auto part_of = [](const std::vector<char>& d, const char* fourcc) {
+        std::vector<uint8_t> out;
+        if (d.size() < 32 || memcmp(d.data(), "DXBC", 4)) return out;
+        uint32_t n = 0;
+        memcpy(&n, d.data() + 28, 4);
+        for (uint32_t i = 0; i < n && 32 + 4ull * (i + 1) <= d.size(); i++) {
+            uint32_t off = 0, len = 0;
+            memcpy(&off, d.data() + 32 + 4 * i, 4);
+            if (off + 8ull > d.size() || memcmp(d.data() + off, fourcc, 4)) continue;
+            memcpy(&len, d.data() + off + 4, 4);
+            if (off + 8ull + len <= d.size()) out.assign(d.begin() + off + 8, d.begin() + off + 8 + len);
+            break;
+        }
+        return out;
+    };
     gpucode::RootSig rs;
-    auto* rts = c.part("RTS0");
-    if (!rts || !gpucode::parse_root_signature(rts->data(), rts->size(), rs, &err)) { printf("root signature: %s\n", err.c_str()); return 1; }
+    std::vector<uint8_t> rtsOwn = rsFile.empty() ? std::vector<uint8_t>() : part_of(rsFile, "RTS0");
+    auto* rts = rsFile.empty() ? c.part("RTS0") : &rtsOwn;
+    if (!rts || rts->empty() || !gpucode::parse_root_signature(rts->data(), rts->size(), rs, &err)) { printf("root signature: %s\n", err.c_str()); return 1; }
     std::vector<gpucode::PsvResource> psv;
     if (auto* p = c.part("PSV0")) psv = gpucode::parse_psv0(*p);
+    if (psv.empty()) psv = gpucode::parse_psv0(part_of(dxil, "PSV0"));   // (what the translation declares)
 
     // From the translated HLSL: structured strides ("struct E_Rn { uint w[k]; };" and
     // "StructuredBuffer<E_Rn> Rn : register(tR, spaceS)") and texture component types.
@@ -174,7 +195,8 @@ int main(int argc, char** argv) {
     if (getenv("DEBUG_LAYER") && SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&dbg)))) dbg->EnableDebugLayer();
     CHECK(D3D12CreateDevice(nullptr, D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&g_dev)));
     ID3D12RootSignature* root = nullptr;
-    CHECK(g_dev->CreateRootSignature(0, cso.data(), cso.size(), IID_PPV_ARGS(&root)));
+    if (rsFile.empty()) CHECK(g_dev->CreateRootSignature(0, cso.data(), cso.size(), IID_PPV_ARGS(&root)));
+    else CHECK(g_dev->CreateRootSignature(0, rsFile.data(), rsFile.size(), IID_PPV_ARGS(&root)));
     auto make_pso = [&](std::vector<char>& code) {
         D3D12_COMPUTE_PIPELINE_STATE_DESC pd{};
         pd.pRootSignature = root;
@@ -257,7 +279,9 @@ int main(int argc, char** argv) {
                 D3D12_CPU_DESCRIPTOR_HANDLE h{views->GetCPUDescriptorHandleForHeapStart().ptr + (SIZE_T)slot * vinc};
                 uint64_t off = (uint64_t)(slot % 32) * (1u << 20);   // 1 MB window per slot (below the texture source)
                 if (r.type == gpucode::RangeType::CBV) {
-                    D3D12_CONSTANT_BUFFER_VIEW_DESC v{cb->GetGPUVirtualAddress() + (slot % 16) * 65536, 65536};
+                    // CB_SKEW=<bytes>: constant views that many bytes on (what an unaligned view reads)
+                    static const unsigned skew = getenv("CB_SKEW") ? (unsigned)atoi(getenv("CB_SKEW")) : 0;
+                    D3D12_CONSTANT_BUFFER_VIEW_DESC v{cb->GetGPUVirtualAddress() + (slot % 16) * 65536 + skew, 65536 - 256};
                     g_dev->CreateConstantBufferView(&v, h);
                     continue;
                 }
