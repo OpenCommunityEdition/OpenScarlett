@@ -3009,6 +3009,8 @@ static HRESULT cached_pso(uint64_t key, const void*& cachedPtr, SIZE_T& cachedSi
     }
     return hr;
 }
+void table_note_stage(PcObj pso, const void* code, size_t size);
+void table_forget(PcObj pso);
 HRESULT_T create_graphics_pso(PcObj dev, const void* desc, PcObj* out) {
     D3D12_GRAPHICS_PIPELINE_STATE_DESC d = *static_cast<const D3D12_GRAPHICS_PIPELINE_STATE_DESC*>(desc);
     for (UINT i = 0; i < 8; i++)
@@ -3042,13 +3044,14 @@ HRESULT_T create_graphics_pso(PcObj dev, const void* desc, PcObj* out) {
     for (auto* bc : {&d.VS, &d.PS, &d.DS, &d.HS, &d.GS}) translated += bc->BytecodeLength;
     HRESULT hr = cached_pso(key, d.CachedPSO.pCachedBlob, d.CachedPSO.CachedBlobSizeInBytes, pso,
                             [&] { return as<ID3D12Device>(dev)->CreateGraphicsPipelineState(&d, IID_PPV_ARGS(pso)); }, translated >= heavy_pipeline_bytes());
+    if (SUCCEEDED(hr) && *pso) { table_forget(*pso); for (auto* bc : {&d.VS, &d.PS, &d.DS, &d.HS, &d.GS}) table_note_stage(*pso, bc->pShaderBytecode, bc->BytecodeLength); }
     if (FAILED(hr) && compile_deferred()) return hr;
     if (FAILED(hr)) { dump_debug_messages(); XSL_ERR(CH, "CreateGraphicsPipelineState failed %08lx", hr); }
     if (SUCCEEDED(hr)) name_translated(*out);
     if (hr == DXGI_ERROR_DEVICE_REMOVED) report_device_removed(as<ID3D12Device>(dev));
     return hr;
 }
-static void table_check_note(PcObj pso, const void* code, size_t size);
+static void table_check_note(PcObj pso, const void* code, size_t size, bool compute = true);
 HRESULT_T create_compute_pso(PcObj dev, const void* desc, PcObj* out) {
     D3D12_COMPUTE_PIPELINE_STATE_DESC d = *static_cast<const D3D12_COMPUTE_PIPELINE_STATE_DESC*>(desc);
     ShaderFix fx;
@@ -4758,18 +4761,27 @@ void list_scissors(PcObj l, uint32_t n, const void* r) {
 struct TcRes { uint32_t type, space, lo, hi, kind; };
 struct TcRange { uint32_t param, type, base, space, num, offset; };
 std::mutex g_tc_mu;
-std::unordered_map<PcObj, std::vector<TcRes>> g_tc_pso;     // pipeline -> what its shader declares
+struct TcPso { bool compute = true; std::vector<TcRes> res; };
+std::unordered_map<PcObj, TcPso> g_tc_pso;                  // pipeline -> what its shaders declare
 std::unordered_map<PcObj, std::vector<TcRange>> g_tc_rs;    // own root signature -> its table ranges
 std::unordered_map<PcObj, int> g_tc_done;                   // pipeline -> reports made
 bool (*g_tc_read)(uint64_t, uint32_t, uint32_t*, uint32_t*, bool*) = nullptr;
 int (*g_tc_fix)(uint64_t, uint32_t, uint32_t) = nullptr;
-void set_table_slot_reader(bool (*read)(uint64_t, uint32_t, uint32_t*, uint32_t*, bool*), int (*fix)(uint64_t, uint32_t, uint32_t)) { g_tc_read = read; g_tc_fix = fix; }
+uint64_t (*g_tc_fresh)(uint64_t, uint32_t) = nullptr;
+bool (*g_tc_dump)(uint64_t, uint32_t, const char*) = nullptr;
+void set_table_slot_reader(bool (*read)(uint64_t, uint32_t, uint32_t*, uint32_t*, bool*), int (*fix)(uint64_t, uint32_t, uint32_t), uint64_t (*fresh)(uint64_t, uint32_t),
+                           bool (*dump)(uint64_t, uint32_t, const char*)) {
+    g_tc_read = read;
+    g_tc_fix = fix;
+    g_tc_fresh = fresh;
+    g_tc_dump = dump;
+}
 // The same walk puts two cases right in the PC heap unless XSL_TABLE_FIX=0 (see table_slot_fix in
 // xs_descriptors.cpp): empty slots and constant buffer views where the shader reads a buffer.
 static bool table_log_on() { static const bool on = env_on("XSL_TABLE_CHECK"); return on; }
 static bool table_check_on() { static const bool on = [] { char b[4]; return !(GetEnvironmentVariableA("XSL_TABLE_FIX", b, 4) && b[0] == '0'); }() || table_log_on(); return on; }
 static bool table_fix_on() { static const bool on = [] { char b[4]; return !(GetEnvironmentVariableA("XSL_TABLE_FIX", b, 4) && b[0] == '0'); }(); return on; }
-static void table_check_note(PcObj pso, const void* code, size_t size) {
+static void table_check_note(PcObj pso, const void* code, size_t size, bool compute) {
     const uint8_t* c = (const uint8_t*)code;
     if (!table_check_on() || !pso || !c || size < 32 || memcmp(c, "DXBC", 4)) return;
     uint32_t parts = 0;
@@ -4800,8 +4812,17 @@ static void table_check_note(PcObj pso, const void* code, size_t size) {
         break;
     }
     std::lock_guard<std::mutex> g(g_tc_mu);
-    g_tc_pso[pso] = std::move(out);
+    TcPso& e = g_tc_pso[pso];
+    e.compute = compute;
+    if (compute) e.res.clear();
+    for (auto& r : out) {   // (the stages of a graphics pipeline name many of the same registers)
+        bool have = false;
+        for (auto& x : e.res) have |= x.type == r.type && x.space == r.space && x.lo == r.lo;
+        if (!have) e.res.push_back(r);
+    }
 }
+void table_note_stage(PcObj pso, const void* code, size_t size) { table_check_note(pso, code, size, false); }
+void table_forget(PcObj pso) { std::lock_guard<std::mutex> g(g_tc_mu); g_tc_pso.erase(pso); }
 namespace {
 struct CompactRs {
     std::vector<D3D12_ROOT_PARAMETER1> params;
@@ -5295,6 +5316,7 @@ static void trace_draw_target(PcObj l, uint32_t n) {
     }
 }
 static int32_t prof_begin(PcObj l, char kind = '?', uint32_t a = 0, uint32_t b = 0, uint32_t c = 0);
+static void table_check(PcObj l);
 static void prof_end(PcObj l, int32_t q);
 // Work of an unusual size (a count read from memory the layer does not fill in yet hangs the GPU):
 // the first few are logged with the pipeline's shaders.
@@ -5306,8 +5328,8 @@ static void note_big(PcObj l, const char* what, uint64_t n, uint32_t a, uint32_t
     { std::lock_guard<std::mutex> g(g_cs_mu); auto it = g_cs_shadow.find(l); if (it != g_cs_shadow.end()) pso = it->second.pso; }
     XSL_WARN(CH, "large %s(%u, %u, %u) on list %p, pipeline %p", what, a, b, c, (void*)l, (void*)pso);
 }
-void list_draw(PcObj l, uint32_t a, uint32_t b, uint32_t c, uint32_t d) { note_big(l, "Draw", (uint64_t)a * b, a, b, c); root_ensure(l, false); trace_draw_target(l, a * b); if (getenv("XSL_TRACE_BUFFER")) note_dispatch(l, false); note_draw(l); note_reads(l, false); int32_t pq = prof_begin(l); L->DrawInstanced(a, b, c, d); prof_end(l, pq); }
-void list_draw_indexed(PcObj l, uint32_t a, uint32_t b, uint32_t c, int32_t d, uint32_t e) { note_big(l, "DrawIndexed", (uint64_t)a * b, a, b, c); root_ensure(l, false); trace_draw_target(l, a * b); if (getenv("XSL_TRACE_BUFFER")) note_dispatch(l, false); note_draw(l); note_reads(l, false); int32_t pq = prof_begin(l); L->DrawIndexedInstanced(a, b, c, d, e); prof_end(l, pq); }
+void list_draw(PcObj l, uint32_t a, uint32_t b, uint32_t c, uint32_t d) { note_big(l, "Draw", (uint64_t)a * b, a, b, c); root_ensure(l, false); table_check(l); trace_draw_target(l, a * b); if (getenv("XSL_TRACE_BUFFER")) note_dispatch(l, false); note_draw(l); note_reads(l, false); int32_t pq = prof_begin(l); L->DrawInstanced(a, b, c, d); prof_end(l, pq); }
+void list_draw_indexed(PcObj l, uint32_t a, uint32_t b, uint32_t c, int32_t d, uint32_t e) { note_big(l, "DrawIndexed", (uint64_t)a * b, a, b, c); root_ensure(l, false); table_check(l); trace_draw_target(l, a * b); if (getenv("XSL_TRACE_BUFFER")) note_dispatch(l, false); note_draw(l); note_reads(l, false); int32_t pq = prof_begin(l); L->DrawIndexedInstanced(a, b, c, d, e); prof_end(l, pq); }
 struct EiTrace { long slot; std::string name; uint64_t present; };
 static std::vector<EiTrace> g_ei_trace;   // traced indirect dispatches whose arguments are printed later
 static bool trace_dispatch_size(PcObj l, const char* how, uint32_t x, uint32_t y, uint32_t z, std::string* name) {
@@ -5515,8 +5537,10 @@ static void table_check(PcObj l) {
     PcObj pso = nullptr;
     { std::lock_guard<std::mutex> g(g_cs_mu); auto it = g_cs_shadow.find(l); if (it != g_cs_shadow.end()) pso = it->second.pso; }
     if (!pso) return;
+    bool compute = true;
+    { std::lock_guard<std::mutex> g(g_tc_mu); auto p = g_tc_pso.find(pso); if (p != g_tc_pso.end()) compute = p->second.compute; }
     RootBind b;
-    { std::lock_guard<std::mutex> g(g_bind_mu); auto it = g_root_bind.find(l); if (it == g_root_bind.end()) return; b = it->second[1]; }
+    { std::lock_guard<std::mutex> g(g_bind_mu); auto it = g_root_bind.find(l); if (it == g_root_bind.end()) return; b = it->second[compute ? 1 : 0]; }
     std::vector<TcRes> res;
     std::vector<TcRange> ranges;
     bool logIt = false;
@@ -5537,7 +5561,7 @@ static void table_check(PcObj l) {
             g_tc_done[pso] = 2;
         }
         if (p == g_tc_pso.end() || r == g_tc_rs.end()) return;
-        res = p->second;
+        res = p->second.res;
         ranges = r->second;
     }
     // PSV0: type 1 sampler, 2 constant buffer, 3..5 shader resource (typed, raw, structured), 6..9
@@ -5548,14 +5572,16 @@ static void table_check(PcObj l) {
                                        "TextureCubeArray", "typed buffer", "raw buffer", "structured buffer", "cbuffer", "sampler", "tbuffer", "acceleration structure"};
     std::string report;
     int bad = 0, checked = 0;
+    std::map<uint32_t, uint32_t> splitTables;   // parameter -> slots the shader reads of a table that runs into a page elsewhere
     // XSL_TABLE_CHECK=<part of a pipeline's name>: every resource of that pipeline, as found.
     static const std::wstring full = [] { char b[40] = ""; GetEnvironmentVariableA("XSL_TABLE_CHECK", b, sizeof b); return strlen(b) > 4 ? std::wstring(b, b + strlen(b)) : std::wstring(); }();
-    bool all = false;
-    if (logIt && !full.empty()) {
+    bool all = false, named = false;
+    if (!full.empty()) {
         wchar_t nm[128] = L"";
         UINT sz = sizeof nm;
         as<ID3D12PipelineState>(pso)->GetPrivateData(WKPDID_D3DDebugObjectNameW, &sz, nm);
-        all = wcsstr(nm, full.c_str()) != nullptr;
+        named = wcsstr(nm, full.c_str()) != nullptr;
+        all = named && logIt;
     }
     for (auto& q : res) {
         if (q.type == 1) {   // a sampler: its slot in the sampler heap must have been written
@@ -5622,11 +5648,28 @@ static void table_check(PcObj l) {
         const uint32_t at = in->offset + (q.lo - in->base);
         if (!g_tc_read(pa->second.second, at, &kind, &slot, &split)) continue;
         checked++;
+        if (auto st = splitTables.find(in->param); split || st != splitTables.end()) {
+            uint32_t& need = splitTables[in->param];
+            need = std::max(need, at + 1);
+        }
         const uint32_t want = cls == D3D12_DESCRIPTOR_RANGE_TYPE_CBV ? 1u : (cls == D3D12_DESCRIPTOR_RANGE_TYPE_SRV ? 0x10u : 0x20u) | dimOf[q.kind <= 16 ? q.kind : 0];
         if (kind >= 0x100) { if ((kind & 0xff) == want) continue; kind = 0xff; }   // (already put right by the layer)
         const bool buffer = (want & 15) == 1 && want != 1;
         const uint32_t form = q.type == 4 || q.type == 7 ? 1u : q.type == 5 || q.type >= 8 ? 2u : 0u;
         int fixed = 0;
+        // XSL_TABLE_DUMP=<folder> (with XSL_TABLE_CHECK=<pipeline>): that pipeline's constants at each
+        // dispatch, as b<register>_s<space>.bin (the last dispatch's remain).
+        if (named && g_tc_dump && cls == D3D12_DESCRIPTOR_RANGE_TYPE_CBV) {
+            static char dir[200] = "";
+            static const bool on = GetEnvironmentVariableA("XSL_TABLE_DUMP", dir, sizeof dir) != 0;
+            char path[260];
+            snprintf(path, sizeof path, "%s\\b%u_s%u.bin", dir, q.lo, q.space);
+            if (on) g_tc_dump(pa->second.second, at, path);
+        }
+        if (table_fix_on() && g_tc_fix && cls == D3D12_DESCRIPTOR_RANGE_TYPE_CBV && (kind == 1 || kind == 2)) {   // (a copy of constants at console alignment, made anew)
+            g_tc_fix(pa->second.second, at, 1);
+            if (!all) continue;
+        }
         if (table_fix_on() && g_tc_fix && q.kind && q.kind <= 16 && (kind == 0 || ((kind == 1 || kind == 2) && buffer && cls == D3D12_DESCRIPTOR_RANGE_TYPE_SRV)))
             fixed = g_tc_fix(pa->second.second, at, want | form << 8);
         if (fixed > 0 && !logIt) continue;
@@ -5648,6 +5691,29 @@ static void table_check(PcObj l) {
                  slot, what ? what : "", split ? (what ? ", and its page is not behind the table's" : "its page is not behind the table's") : "");
         if (report.size() < (all ? 12000u : 3000u)) report += line;
         bad++;
+    }
+    // A table that continues in a page which is not behind its first in the PC heap: bound from a
+    // copy made for this draw (every slot the shader reads, see table_fresh in xs_descriptors.cpp).
+    if (table_fix_on() && g_tc_fresh && !splitTables.empty()) {
+        for (auto& q : res) {   // (the last slot read, whichever resource was seen split first)
+            if (q.type < 2 || q.type > 9) continue;
+            const uint32_t cls = q.type == 2 ? D3D12_DESCRIPTOR_RANGE_TYPE_CBV : q.type <= 5 ? D3D12_DESCRIPTOR_RANGE_TYPE_SRV : D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
+            for (auto& r : ranges)
+                if (r.type == cls && r.space == q.space && q.lo >= r.base && q.lo - r.base < r.num) {
+                    auto st = splitTables.find(r.param);
+                    if (st != splitTables.end()) st->second = std::max(st->second, r.offset + (q.lo - r.base) + 1);
+                    break;
+                }
+        }
+        auto* L2 = as<ID3D12GraphicsCommandList>(l);
+        for (auto& [param, count] : splitTables) {
+            auto pa = b.params.find(param);
+            if (pa == b.params.end() || pa->second.first != 0) continue;
+            const uint64_t fresh = g_tc_fresh(pa->second.second, count);
+            if (!fresh) continue;
+            if (compute) L2->SetComputeRootDescriptorTable(param, D3D12_GPU_DESCRIPTOR_HANDLE{fresh});
+            else L2->SetGraphicsRootDescriptorTable(param, D3D12_GPU_DESCRIPTOR_HANDLE{fresh});
+        }
     }
     if (!bad || !logIt) return;
     {
@@ -5749,6 +5815,7 @@ void list_dispatch_mesh(PcObj l, uint32_t x, uint32_t y, uint32_t z) {
         if (x > 65535 || y > 65535 || z > 65535 || total > (1u << 22)) return;
     }
     ID3D12GraphicsCommandList6* l6 = nullptr;
+    table_check(l);
     int32_t pq = prof_begin(l, 'M', x, y, z);
     if (SUCCEEDED(L->QueryInterface(IID_PPV_ARGS(&l6)))) { l6->DispatchMesh(x, y, z); l6->Release(); }
     prof_end(l, pq);
@@ -6002,6 +6069,7 @@ void list_execute_indirect(PcObj l, PcObj sig, uint32_t max, PcObj args, uint64_
     uint32_t stride = fix_stride ? fix_stride : guarded ? gs.stride : 0;
     if (stride && fixed_indirect(l, sig, max, args, ao, cnt, co, stride, fix_stride != 0, guarded ? &gs : nullptr)) return;
     if (g_info) check_rs(l, "ExecuteIndirect");
+    table_check(l);
     int32_t pq = prof_begin(l, 'I', max, 0, 0);
     L->ExecuteIndirect(as<ID3D12CommandSignature>(sig), max, as<ID3D12Resource>(args), ao, as<ID3D12Resource>(cnt), co);
     prof_end(l, pq);

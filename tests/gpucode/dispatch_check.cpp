@@ -100,7 +100,7 @@ static void transition(ID3D12GraphicsCommandList* l, ID3D12Resource* r, D3D12_RE
 
 int main(int argc, char** argv) {
     if (argc < 4) {
-        fprintf(stderr, "usage: dispatch_check <translated.dxil> <original.cso> <translated.hlsl> [-g X Y] [-f zero|ramp|rand] [--ref R.dxil] [--show] [--rs R.rs]\n"
+        fprintf(stderr, "usage: dispatch_check <translated.dxil> <original.cso> <translated.hlsl> [-g X Y] [-f zero|ramp|rand|one|big|nan] [--ref R.dxil] [--show] [--rs R.rs] [--cb bN/S=FILE]...\n"
                         "  --rs: the root signature (a container with an RTS0 part) for a program whose own container has none\n");
         return 2;
     }
@@ -112,8 +112,15 @@ int main(int argc, char** argv) {
     const char* expect = nullptr;
     const char* input = nullptr;
     std::vector<char> rsFile;
+    std::map<std::string, std::vector<char>> cbFiles;   // "b3/1" -> a constant buffer's contents (--cb b3/1=file)
     for (int i = 4; i < argc; i++) {
         if (!strcmp(argv[i], "--rs") && i + 1 < argc) { rsFile = read(argv[++i]); continue; }
+        if (!strcmp(argv[i], "--cb") && i + 1 < argc) {
+            std::string a = argv[++i];
+            size_t eq = a.find('=');
+            if (eq != std::string::npos) cbFiles[a.substr(0, eq)] = read(a.substr(eq + 1).c_str());
+            continue;
+        }
         if (!strcmp(argv[i], "-g") && i + 2 < argc) gx = atoi(argv[++i]), gy = atoi(argv[++i]);
         else if (!strcmp(argv[i], "-f") && i + 1 < argc) fill = argv[++i];
         else if (!strcmp(argv[i], "--ref") && i + 1 < argc) ref = read(argv[++i]);
@@ -210,7 +217,7 @@ int main(int argc, char** argv) {
 
     // Memory: one UAV-capable buffer for every buffer view (1 MB window per descriptor slot), an
     // upload copy of its initial contents, upload memory for constants, and two textures.
-    const uint64_t kBig = 64ull << 20, kCb = 1ull << 20;
+    const uint64_t kBig = 64ull << 20, kCb = 4ull << 20;   // (64 constant buffer windows of 64 KB)
     ID3D12Resource* big = buffer(D3D12_HEAP_TYPE_DEFAULT, kBig, true, D3D12_RESOURCE_STATE_COPY_DEST);
     ID3D12Resource* up = buffer(D3D12_HEAP_TYPE_UPLOAD, kBig, false, D3D12_RESOURCE_STATE_GENERIC_READ);
     ID3D12Resource* cb = buffer(D3D12_HEAP_TYPE_UPLOAD, kCb, false, D3D12_RESOURCE_STATE_GENERIC_READ);
@@ -218,14 +225,16 @@ int main(int argc, char** argv) {
     ID3D12Resource* rb = buffer(D3D12_HEAP_TYPE_READBACK, 16, false, D3D12_RESOURCE_STATE_COPY_DEST);
     uint32_t* m = nullptr;
     srand(1);
-    auto pattern = [&](uint32_t i) { return fill == "zero" ? 0u : fill == "rand" ? (uint32_t)rand() * 2654435761u : i; };
+    // (one, big, nan: every dword the float 1.0, 1000.0 or a NaN: loop bounds a program takes from its data)
+    const uint32_t same = fill == "one" ? 0x3f800000u : fill == "big" ? 0x447a0000u : fill == "nan" ? 0x7fc00000u : 0u;
+    auto pattern = [&](uint32_t i) { return same ? same : fill == "zero" ? 0u : fill == "rand" ? (uint32_t)rand() * 2654435761u : i; };
     up->Map(0, nullptr, (void**)&m);
     for (uint64_t i = 0; i < kBig / 4; i++) m[i] = pattern((uint32_t)i);
     // The float texture's source (at 32 MB): small finite values.
     for (uint64_t i = 0; i < 256 * 256 * 4; i++) ((float*)m)[(32ull << 20) / 4 + i] = (float)((i * 37) % 1024) / 64.0f;
     up->Unmap(0, nullptr);
     cb->Map(0, nullptr, (void**)&m);
-    for (uint64_t i = 0; i < kCb / 4; i++) m[i] = fill == "zero" ? 0u : fill == "rand" ? (uint32_t)rand() : (uint32_t)(i % 64);
+    for (uint64_t i = 0; i < kCb / 4; i++) m[i] = same ? same : fill == "zero" ? 0u : fill == "rand" ? (uint32_t)rand() : (uint32_t)(i % 64);
     cb->Unmap(0, nullptr);
     ID3D12Resource* tex_u = texture(DXGI_FORMAT_R32_UINT);
     ID3D12Resource* tex_f = texture(DXGI_FORMAT_R32G32B32A32_FLOAT);
@@ -281,7 +290,15 @@ int main(int argc, char** argv) {
                 if (r.type == gpucode::RangeType::CBV) {
                     // CB_SKEW=<bytes>: constant views that many bytes on (what an unaligned view reads)
                     static const unsigned skew = getenv("CB_SKEW") ? (unsigned)atoi(getenv("CB_SKEW")) : 0;
-                    D3D12_CONSTANT_BUFFER_VIEW_DESC v{cb->GetGPUVirtualAddress() + (slot % 16) * 65536 + skew, 65536 - 256};
+                    D3D12_CONSTANT_BUFFER_VIEW_DESC v{cb->GetGPUVirtualAddress() + (slot % 64) * 65536 + skew, 65536 - 256};
+                    if (auto f = cbFiles.find("b" + std::to_string(reg) + "/" + std::to_string(r.space)); f != cbFiles.end() && !f->second.empty()) {
+                        uint8_t* cm = nullptr;   // --cb: this view's constants from a file (zeros after them)
+                        cb->Map(0, nullptr, (void**)&cm);
+                        memset(cm + (slot % 64) * 65536, 0, 65536);
+                        memcpy(cm + (slot % 64) * 65536, f->second.data(), std::min<size_t>(f->second.size(), 65536));
+                        cb->Unmap(0, nullptr);
+                        printf("  b%u space%u: %zu bytes from a file\n", reg, r.space, f->second.size());
+                    }
                     g_dev->CreateConstantBufferView(&v, h);
                     continue;
                 }

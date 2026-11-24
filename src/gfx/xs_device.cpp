@@ -260,7 +260,7 @@ HRESULT D3DAPI D_CreateGraphicsPipelineState(ID3D12Device* d, const D3D12_GRAPHI
 // driver has not compiled before (10 to 30 s per megabyte of DXIL): behind eight of either, every
 // other pipeline of a loading title waited (a start screen came after 70 s instead of 12, and two
 // thousand compute pipelines were still queued a minute into a run).
-// XSL_COMPILE_THREADS (default 2 to 6), at lower priority than the title's own threads.
+// XSL_COMPILE_THREADS (default 2 to 14), at lower priority than the title's own threads.
 struct PsoPool {
     std::mutex mu;
     std::condition_variable cv;
@@ -304,7 +304,7 @@ static void pso_pool_run(std::function<void()> job, bool first = false) {
 }
 static void pso_compile_pool_run(std::function<void()> job, bool first = false) {
     const unsigned hw = std::thread::hardware_concurrency();
-    g_pso_compile_pool.run(std::move(job), first, "XSL_COMPILE_THREADS", std::min(6u, std::max(2u, hw > 4 ? hw / 2 - 2 : 2u)), true);
+    g_pso_compile_pool.run(std::move(job), first, "XSL_COMPILE_THREADS", std::min(14u, std::max(2u, hw > 4 ? hw / 2 - 2 : 2u)), true);
 }
 // For the periodic line: what the two pools did since the last call.
 static std::string pso_pool_stats_impl() {
@@ -442,6 +442,14 @@ static HRESULT stream_pso_create(PcObj dev, StreamPso& s, PcObj* pso) {
     }
     HRESULT hr = pc::create_pso_stream(dev, s.pcs.data(), s.pcs.size(), pso);
     if (SUCCEEDED(hr)) { pc::note_pso_rs(*pso, s.rs, s.cs); pc::note_pso_own_rs(*pso, own, s.cs); }
+    if (SUCCEEDED(hr) && *pso && !s.cs) {   // what its stages declare, for the table check
+        pc::table_forget(*pso);
+        for (size_t i = 0; i < s.stages; i++) {
+            D3D12_SHADER_BYTECODE bc;
+            memcpy(&bc, s.pcs.data() + s.at[i], sizeof bc);
+            pc::table_note_stage(*pso, bc.pShaderBytecode, bc.BytecodeLength);
+        }
+    }
     pc::set_fallback_root_signature(nullptr, 0);
     for (void* o : owned) pc::free_container(o);
     return hr;

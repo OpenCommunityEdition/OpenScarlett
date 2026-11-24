@@ -52,7 +52,13 @@ struct Ring {
 } g_ring;
 // Views made since the last submission: their copies are refreshed when it happens, so constants
 // the title writes after creating the view (but before submitting) are seen.
-struct Pending { uint8_t* dst; const uint8_t* src; uint64_t n; };
+struct Pending { uint8_t* dst; const uint8_t* src; uint64_t n; bool guarded = false; };
+// Memory the title maps and unmaps itself (page-pool pages at their GPU addresses) is read through
+// the system, never directly: a fault in the layer ends in the title's own crash handler.
+bool guarded_copy(uint8_t* dst, const uint8_t* src, uint64_t n) {
+    SIZE_T got = 0;
+    return ReadProcessMemory(GetCurrentProcess(), src, dst, (SIZE_T)n, &got) && got == n;
+}
 std::vector<Pending> g_pending;
 
 bool add_chunk(Device* dev, Segment& sg) {
@@ -143,7 +149,7 @@ untracked:
 
 
 // Copies `n` bytes from `src` into this frame's ring segment; 0 if the ring is full.
-static uint64_t ring_copy(Device* dev, const uint8_t* src, uint64_t n) {
+static uint64_t ring_copy(Device* dev, const uint8_t* src, uint64_t n, bool guarded = false) {
     DeviceExtra* de = dev_extra(dev);
     uint64_t frame = de->presentCount;
     Segment& sg = g_ring.seg[frame % kSegments];
@@ -152,15 +158,19 @@ static uint64_t ring_copy(Device* dev, const uint8_t* src, uint64_t n) {
     if (sg.cur >= sg.chunks.size() && (sg.chunks.size() >= kMaxChunks || !add_chunk(dev, sg))) return 0;
     Chunk& c = sg.chunks[sg.cur];
     uint64_t off = sg.head;
-    memcpy(c.cpu + off, src, n);
-    g_pending.push_back({c.cpu + off, src, n});
+    if (!guarded) memcpy(c.cpu + off, src, n);
+    else if (!guarded_copy(c.cpu + off, src, n)) return 0;
+    g_pending.push_back({c.cpu + off, src, n, guarded});
     sg.head += (n + 255) & ~255ull;
     return c.gpu + off;
 }
 
 void cbv_refresh() {
     std::lock_guard<std::mutex> g(g_mu);
-    for (auto& p : g_pending) memcpy(p.dst, p.src, p.n);
+    for (auto& p : g_pending) {
+        if (!p.guarded) memcpy(p.dst, p.src, p.n);
+        else guarded_copy(p.dst, p.src, p.n);
+    }
     g_pending.clear();
 }
 
@@ -176,6 +186,15 @@ uint64_t cbv_fix_view(Device* dev, uint64_t title_va, uint64_t gpu, uint64_t siz
     if (unified_lookup(dev, title_va, &u)) {
         src = (const uint8_t*)(uintptr_t)title_va;
         avail = size;   // the view lies inside the allocation (the title made it)
+    }
+    bool guarded = false;
+    if (!src) {   // a page-pool page mapped at that address
+        uint64_t run = 0;
+        if (section_lookup(dev, title_va, &u, &run) && run) {
+            src = (const uint8_t*)(uintptr_t)title_va;
+            avail = run;
+            guarded = true;
+        }
     }
     std::lock_guard<std::mutex> g(g_mu);
     if (!src) {
@@ -194,7 +213,7 @@ uint64_t cbv_fix_view(Device* dev, uint64_t title_va, uint64_t gpu, uint64_t siz
         return gpu;
     }
     uint64_t n = size < avail ? size : avail;
-    uint64_t r = ring_copy(dev, src, n);
+    uint64_t r = ring_copy(dev, src, n, guarded);
     if (!r) {
         static volatile long warned = 0;
         if (InterlockedIncrement(&warned) <= 1) XSL_WARN(CH, "constant-buffer ring full; constant buffer views stay unaligned");

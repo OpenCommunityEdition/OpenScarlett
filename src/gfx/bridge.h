@@ -124,8 +124,11 @@ bool is_rays_signature(PcObj sig);
 void note_rays_skipped(int why);   // counted in the frame-rate log (0 no pipeline, 1 start program building, 2 failed, 3 a reached program building, 4 indirect)
 uint64_t present_count();
 // XSL_TABLE_CHECK=1 (diagnostics): the layer's descriptor memory answers what a title slot holds.
+void table_note_stage(PcObj pso, const void* code, size_t size);   // a stage of a graphics pipeline (its translated container)
+void table_forget(PcObj pso);
 void set_table_slot_reader(bool (*read)(uint64_t pcGpuHandle, uint32_t index, uint32_t* kind, uint32_t* titleSlot, bool* split),
-                           int (*fix)(uint64_t pcGpuHandle, uint32_t index, uint32_t want));
+                           int (*fix)(uint64_t pcGpuHandle, uint32_t index, uint32_t want), uint64_t (*fresh)(uint64_t pcGpuHandle, uint32_t count),
+                           bool (*dump)(uint64_t pcGpuHandle, uint32_t index, const char* path));
 std::string gm_describe_address(uint64_t address);   // diagnostics: registered buffers around and over an address
 int rt_warm_shard(void* pcDevice, unsigned shard, unsigned shards);   // tools/rtwarm
 void dump_queue_state();   // hang diagnostics
