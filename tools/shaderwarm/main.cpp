@@ -31,6 +31,7 @@
 // sit next to this program, as they do next to a title started with xsl-run (tools/xsl-warm
 // arranges that).
 #include <windows.h>
+#include <d3d12.h>
 #include <atomic>
 #include <algorithm>
 #include <cstdio>
@@ -55,6 +56,12 @@ struct StageCount { size_t cached = 0, made = 0, failed = 0, missing = 0; };
 std::map<std::string, StageCount> g_stages;       // the same counts per shader stage
 bool g_check = false, g_purge = false, g_dry = false;
 FILE* g_keys = nullptr;   // --keys: the list of cache keys is written here and nothing else is done
+// --pso: compute pipelines are also created, which has the GPU driver compile them (seconds to
+// minutes for large programs) and stores what it made beside the shader cache, where a title's
+// run finds it. A program the driver's compiler gives up on is noted here, not in the title.
+bool g_pso = false;
+std::atomic<size_t> g_pso_made{0}, g_pso_failed{0}, g_pso_skipped{0};
+std::atomic<uint64_t> g_pso_ms{0}, g_pso_slowest{0};
 std::wstring g_rs_dir;
 PcObj g_dev = nullptr;
 
@@ -158,13 +165,33 @@ void worker() {
             void* out = nullptr;
             size_t outSize = 0;
             if (pc::sanitize_container(code, size, &out, &outSize) && out) free(out);
-            if (pc::shader_cache_state(code, size, nullptr) == 1) { g_made++; count(&StageCount::made); }
+            if (pc::shader_cache_state(code, size, nullptr) == 1) { g_made++; count(&StageCount::made); st = 1; }
             else {
                 g_failed++;
                 count(&StageCount::failed);
                 std::string why = pc::untranslated_reason();
                 if (why.empty()) why = std::string(stage) + ": not translated";
                 fail(it.path, why);
+            }
+        }
+        if (g_pso && st == 1 && !g_check && !g_purge && !g_dry && !strcmp(stage, "CS")) {
+            // (a root signature made for the shader is the backend's, kept by its contents)
+            PcObj rs = own ? pc::own_root_signature(g_dev, &code, &size, 1, &blob) : nullptr;
+            if (!rs) g_pso_skipped++;   // it depends on its pipeline's root signature, which is not known here
+            else {
+                D3D12_COMPUTE_PIPELINE_STATE_DESC d{};
+                d.pRootSignature = (ID3D12RootSignature*)rs;
+                d.CS = {code, size};
+                pc::reset_untranslated();
+                PcObj pso = nullptr;
+                const ULONGLONG t0 = GetTickCount64();
+                const HRESULT hr = pc::create_compute_pso(g_dev, &d, &pso);
+                const uint64_t ms = GetTickCount64() - t0;
+                g_pso_ms += ms;
+                for (uint64_t cur = g_pso_slowest.load(); ms > cur && !g_pso_slowest.compare_exchange_weak(cur, ms);) {}
+                if (SUCCEEDED(hr) && pso) { pc::release(pso); g_pso_made++; }
+                else { g_pso_failed++; fail(it.path, "CS: the pipeline was not created"); }
+                if (ms >= 20000) { printf("pipeline of %ls: %llu s in the driver\n", it.path.c_str(), (unsigned long long)(ms / 1000)); fflush(stdout); }
             }
         }
         g_done++;
@@ -182,13 +209,14 @@ int wmain(int argc, wchar_t** argv) {
         else if (!wcscmp(argv[i], L"--check")) g_check = true;
         else if (!wcscmp(argv[i], L"--purge")) g_purge = true;
         else if (!wcscmp(argv[i], L"--dry")) g_dry = true;
+        else if (!wcscmp(argv[i], L"--pso")) g_pso = true;
         else if (!wcscmp(argv[i], L"--rs-dir") && i + 1 < argc) { g_rs_dir = argv[++i]; CreateDirectoryW(g_rs_dir.c_str(), nullptr); }
         else if (!wcscmp(argv[i], L"--report") && i + 1 < argc) report = argv[++i];
         else if (!wcscmp(argv[i], L"--keys") && i + 1 < argc) { g_keys = _wfopen(argv[++i], L"w"); if (!g_keys) { fprintf(stderr, "cannot write %ls\n", argv[i]); return 2; } }
         else add_path(argv[i]);
     }
     if (g_items.empty()) {
-        fprintf(stderr, "usage: xsl-shaderwarm <folder or file>... [--jobs N] [--shard K/N] [--check] [--purge] [--dry] [--report FILE] [--keys FILE]\n");
+        fprintf(stderr, "usage: xsl-shaderwarm <folder or file>... [--jobs N] [--shard K/N] [--check] [--purge] [--dry] [--pso] [--report FILE] [--keys FILE]\n");
         return 2;
     }
     // Smallest first: most of a title's shaders are in the cache within minutes, and the few
@@ -225,6 +253,9 @@ int wmain(int argc, wchar_t** argv) {
            (unsigned long long)((GetTickCount64() - t0) / 1000), g_items.size(), g_cached.load(), g_made.load(), g_failed.load(), g_other.load());
     if (g_check || g_purge) printf("  %zu not in the cache (not compiled)\n", g_needs.load());
     if (g_purge) printf("  %zu dropped from the cache\n", g_dropped.load());
+    if (g_pso)
+        printf("  compute pipelines: %zu created, %zu failed, %zu left to their pipeline's root signature (%llu s in the driver, the slowest %llu s)\n", g_pso_made.load(), g_pso_failed.load(),
+               g_pso_skipped.load(), (unsigned long long)(g_pso_ms.load() / 1000), (unsigned long long)(g_pso_slowest.load() / 1000));
     printf("\nby stage:   cached  compiled  not translated%s\n", g_check ? "  not in the cache" : "");
     for (auto& kv : g_stages) {
         printf("  %-4s %11zu %9zu %15zu", kv.first.c_str(), kv.second.cached, kv.second.made, kv.second.failed);

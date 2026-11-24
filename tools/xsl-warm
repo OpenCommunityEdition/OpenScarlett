@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: MIT
-"""xsl-warm <folder or file>... [--cache DIR] [--jobs N] [--check] [--purge] [--dry] [--report FILE] [--build DIR]
+"""xsl-warm <folder or file>... [--cache DIR] [--jobs N] [--check] [--purge] [--dry] [--pso] [--report FILE] [--build DIR]
 
 Fills the shader cache from console shader containers on disk before a title runs (Windows).
 It puts xsl-shaderwarm.exe (build it with `ninja -C build xsl-shaderwarm`) in <build>/warm together
@@ -17,6 +17,8 @@ process per job, each on its own share of the files, and adds up what they repor
     --rs-dir DIR   also write each shader's own root signature to DIR (for xsl-gpucode translate)
     --dry          translate everything without compiling: what translates, and why not the rest
                    (the "compiled" count is then the number translated)
+    --pso          also create each compute shader's pipeline: the GPU driver compiles it now
+                   (seconds to minutes for large programs) instead of during the title's run
     --report FILE  one line per shader that did not translate: file name, tab, reason
     --build DIR    the build folder (default: build next to tools)
 """
@@ -31,6 +33,7 @@ import time
 
 PROGRESS = re.compile(r"(\d+) / (\d+): (\d+) already cached, (\d+) compiled, (\d+) not translated, (\d+) not cached, (\d+) other, (\d+) dropped")
 NAMES = ("done", "files", "already cached", "compiled", "not translated", "not cached", "other", "dropped")
+PIPELINES = re.compile(r"compute pipelines: (\d+) created, (\d+) failed, (\d+) left .*?\((\d+) s in the driver, the slowest (\d+) s\)")
 
 
 def last_progress(path):
@@ -48,7 +51,7 @@ def main():
     build = pathlib.Path(__file__).resolve().parent.parent / "build"
     cache = report = rs_dir = None
     jobs = max(1, (os.cpu_count() or 4) - 2)
-    check = purge = dry = False
+    check = purge = dry = pso = False
     paths = []
     i = 0
     while i < len(args):
@@ -70,6 +73,8 @@ def main():
             purge = True; i += 1
         elif args[i] == "--dry":
             dry = True; i += 1
+        elif args[i] == "--pso":
+            pso = True; i += 1
         else:
             paths.append(os.path.abspath(args[i])); i += 1
     if not paths or os.name != "nt":
@@ -108,6 +113,8 @@ def main():
             cmd.append("--purge")
         if dry:
             cmd.append("--dry")
+        if pso:
+            cmd.append("--pso")
         if rs_dir:
             cmd += ["--rs-dir", rs_dir]
         logs.append(work / f"out.{k}.log")
@@ -131,6 +138,19 @@ def main():
     print(f"\ndone in {time.time() - start:.0f} s: {t[1]} files")
     for v, n in zip(t[2:], NAMES[2:]):
         print(f"  {v} {n}")
+    if pso:
+        made = bad = left = secs = slowest = 0
+        for p in logs:
+            try:
+                with open(p, encoding="utf-8", errors="replace") as f:
+                    m = PIPELINES.search(f.read())
+            except OSError:
+                m = None
+            if m:
+                made += int(m.group(1)); bad += int(m.group(2)); left += int(m.group(3)); secs += int(m.group(4))
+                slowest = max(slowest, int(m.group(5)))
+        print(f"  compute pipelines: {made} created, {bad} failed, {left} left to their pipeline's root signature "
+              f"({secs} s in the driver over all processes, the slowest {slowest} s)")
     rows = []
     for k in range(jobs):
         try:

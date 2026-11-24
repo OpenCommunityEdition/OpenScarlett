@@ -7,6 +7,12 @@
 #include <cstdio>
 #include <vector>
 
+// The D3D12 runtime beside the program (D3D12\D3D12Core.dll, as tools/xsl-warm stages it), when it
+// is there: translated shaders use shader model 6.6, which the Windows 10 system runtime refuses.
+extern "C" {
+__declspec(dllexport) extern const UINT D3D12SDKVersion = 620;
+__declspec(dllexport) extern const char* D3D12SDKPath = ".\\D3D12\\";
+}
 static std::vector<char> read(const char* p) {
     std::vector<char> v;
     FILE* f = fopen(p, "rb");
@@ -34,8 +40,10 @@ int main(int argc, char** argv) {
     d.pRootSignature = rs;
     d.CS = {dxil.data(), dxil.size()};
     ID3D12PipelineState* pso = nullptr;
+    const ULONGLONG t0 = GetTickCount64();
     hr = dev->CreateComputePipelineState(&d, IID_PPV_ARGS(&pso));
-    printf("CreateComputePipelineState: %08lx\n", hr);
+    printf("CreateComputePipelineState: %08lx after %.1f s (%zu bytes of shader)\n", hr, (GetTickCount64() - t0) / 1000.0, dxil.size());
+    fflush(stdout);
     ID3D12InfoQueue* q = nullptr;
     if (SUCCEEDED(dev->QueryInterface(IID_PPV_ARGS(&q)))) {
         for (UINT64 i = 0; i < q->GetNumStoredMessages(); i++) {
