@@ -5,7 +5,7 @@ namespace xs {
 // Textures placed on committed title memory: the title's CPU writes there use the console's tiled
 // layout and never reach the separate PC resource. Registered textures are converted (detiled with
 // the title's own xg_xs.dll) and uploaded before the next submission after a view is made of them.
-void detile_register(PcObj pcRes, uint64_t va, const void* consoleDesc, uint32_t initialState);
+void detile_register(PcObj pcRes, uint64_t va, const void* consoleDesc, uint32_t initialState, uint32_t skipLevels = 0);   // skipLevels: the PC texture lacks that many of the largest levels
 void detile_view_created(PcObj pcRes);
 // Textures the title maps (the console hands out their memory): the console description is noted
 // when the resource is created, the mapped copy when it is first mapped, and each unmap uploads it.

@@ -158,6 +158,7 @@ uint64_t res_gpu_va(PcObj r);
 void* map_shadow_base(PcObj r);   // the CPU copy a mapped video-memory texture got, if any
 std::string list_pso_name(PcObj l);   // the selected pipeline's name (diagnostics)
 std::string rtv_describe(uint64_t pcHandle);   // the resource behind a PC render-target handle (with XSL_DRAW_DUMP)
+void note_reduced(PcObj res, bool on);          // the texture lacks its largest console level: its views start one level later
 bool map_shadow_written(PcObj r);   // the title wrote into that copy since the last call
 
 // Allocator and command list

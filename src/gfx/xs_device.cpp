@@ -1159,7 +1159,10 @@ ID3D12Resource* placed_texture(ID3D12Device* d, const D3D12_RESOURCE_DESC* rd, u
     auto it = g_pv_tex.find(key);
     if (it != g_pv_tex.end()) return it->second;
     void* o = nullptr;
-    if (FAILED(D_CreatePlacedResourceX(d, va, rd, D3D12_RESOURCE_STATE_COMMON, nullptr, __uuidof(ID3D12Resource), &o))) {
+    placed_view_scope(true);
+    const HRESULT phr = D_CreatePlacedResourceX(d, va, rd, D3D12_RESOURCE_STATE_COMMON, nullptr, __uuidof(ID3D12Resource), &o);
+    placed_view_scope(false);
+    if (FAILED(phr)) {
         static volatile long n = 0;
         if (InterlockedIncrement(&n) <= 5)
             XSL_WARN(CH, "placed view of a %llux%u texture (format %d) at %llx: no resource", (unsigned long long)rd->Width, rd->Height, (int)rd->Format, (unsigned long long)va);

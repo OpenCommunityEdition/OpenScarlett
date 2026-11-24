@@ -505,6 +505,7 @@ void Res_Destroy(IGraphicsUnknown* self) {
     if (e->placedVa) pagemap_forget(e->placedVa, hdr(self)->pc);
     pc::gm_forget(hdr(self)->pc);
     detile_forget(hdr(self)->pc);
+    pc::note_reduced(hdr(self)->pc, false);
 }
 }  // namespace
 

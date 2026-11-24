@@ -3919,6 +3919,19 @@ static bool clamp_buffer_view(ID3D12Resource* res, DXGI_FORMAT fmt, UINT stride,
     if (!count) count = 1;
     return true;
 }
+// Textures made without their largest level (XSL_TEXTURE_SKIP_MIP): a view's level range is the
+// console texture's, one level off.
+static std::mutex g_reduced_mu;
+static std::set<PcObj> g_reduced;
+void note_reduced(PcObj res, bool on) {
+    std::lock_guard<std::mutex> g(g_reduced_mu);
+    if (on) g_reduced.insert(res);
+    else if (!g_reduced.empty()) g_reduced.erase(res);
+}
+static bool is_reduced(PcObj res) {
+    std::lock_guard<std::mutex> g(g_reduced_mu);
+    return !g_reduced.empty() && g_reduced.count(res) != 0;
+}
 void create_srv(PcObj dev, PcObj res, const void* desc, uint64_t h) {
     if (trace_writers() || (trace_rtvs() && res && as<ID3D12Resource>(res)->GetDesc().Dimension == D3D12_RESOURCE_DIMENSION_BUFFER)) {
         std::lock_guard<std::mutex> g(g_wr_mu); g_srv_res[h] = res; g_uav_res.erase(h);
@@ -3946,6 +3959,15 @@ void create_srv(PcObj dev, PcObj res, const void* desc, uint64_t h) {
     }
     // A mip range past the resource's levels (titles name "all levels" with more than there are,
     // which the console accepts) is an invalid call that removes a PC device: it is clamped.
+    D3D12_SHADER_RESOURCE_VIEW_DESC shifted;
+    if (vd && res && vd->ViewDimension == D3D12_SRV_DIMENSION_TEXTURE2D && is_reduced(res)) {
+        shifted = *vd;
+        auto& t2 = shifted.Texture2D;
+        if (t2.MostDetailedMip > 0) t2.MostDetailedMip--;
+        else if (t2.MipLevels != UINT(-1) && t2.MipLevels > 1) t2.MipLevels--;
+        t2.ResourceMinLODClamp = t2.ResourceMinLODClamp > 1.0f ? t2.ResourceMinLODClamp - 1.0f : 0.0f;
+        vd = &shifted;
+    }
     D3D12_SHADER_RESOURCE_VIEW_DESC clamped;
     if (vd && res) {
         const UINT mips = as<ID3D12Resource>(res)->GetDesc().MipLevels;

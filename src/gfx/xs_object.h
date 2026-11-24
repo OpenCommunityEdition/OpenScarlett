@@ -193,6 +193,7 @@ bool desc_view_attach(uint32_t first, uint32_t count, void* mem);
 // Placeholder pipelines (no PC pipeline; their work is skipped): why, for the log of skipped work.
 void placeholder_note(void* titleObject, const char* why);
 void pso_wait_ready(void* titlePipeline);   // a pipeline still being built is built (or awaited) now
+void placed_view_scope(bool on);            // the calling thread is placing a texture for a placed view
 bool pso_thread_group(const void* titlePipeline, uint32_t out[3]);   // a compute pipeline's console thread-group size
 void* console_memory_peek(PcObj pcResource);   // from the title's allocator only (nullptr: none)
 void* console_memory_ensure(PcObj pcResource); // ... taken now when the resource has none

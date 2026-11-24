@@ -52,7 +52,8 @@ struct Entry { uint64_t va; D3D12_RESOURCE_DESC desc; uint32_t state; bool queue
                int written = 0;       // (mapped) checks in a row that found new writes
                uint64_t sample = 0;   // (movie planes) hash of a few pieces, taken at every submission
                int64_t rowBytes = -1;  // console bytes per row when the layout is plain rows (0: it is not; -1: not looked at yet)
-               uint64_t rowBase = 0; };   // ... and where row 0 begins   // pending: its memory was not readable when it was first needed (pages mapped later)
+               uint64_t rowBase = 0;
+               uint32_t skip = 0; };   // the PC texture starts at this console level (XSL_TEXTURE_SKIP_MIP)   // ... and where row 0 begins   // pending: its memory was not readable when it was first needed (pages mapped later)
 std::map<PcObj, std::pair<D3D12_RESOURCE_DESC, uint32_t>> g_descs;   // console descriptions of textures the title may map
 std::mutex g_mu;
 std::map<PcObj, Entry> g_tex;
@@ -120,7 +121,7 @@ CreateComputer xg() {
     return f;
 }
 
-struct FillCtx { XgComputer* c; uint64_t va; UINT64 size; int64_t rowBytes = 0; uint64_t rowBase = 0; uint32_t texelRow = 0;
+struct FillCtx { XgComputer* c; uint64_t va; UINT64 size; int64_t rowBytes = 0; uint64_t rowBase = 0; uint32_t texelRow = 0; uint32_t skip = 0;
                  const D3D12_RESOURCE_DESC* desc = nullptr; };   // desc: the console description (for the separable layouts)
 // Bytes per texel of the formats whose console layout may be plain rows (0: not one of them).
 uint32_t plain_texel_bytes(DXGI_FORMAT f) {
@@ -305,6 +306,7 @@ uint64_t now_us() { static LARGE_INTEGER f = [] { LARGE_INTEGER x; QueryPerforma
 bool fill(void* ctx, uint32_t sub, void* dst, uint32_t rowPitch, uint32_t rows, uint32_t depth) {
     auto* f = static_cast<FillCtx*>(ctx);
     (void)depth;
+    sub += f->skip;   // (a one-slice 2D texture: the subresource is the level)
     // The title may unmap the pages while they are read (page-mapped memory): the texture is then
     // tried again later.
     const uint64_t t0 = now_us();
@@ -373,7 +375,7 @@ bool sample_hash(uint64_t va, uint64_t size, uint64_t* out) {
     return true;
 }
 }  // namespace
-void detile_register(PcObj pcRes, uint64_t va, const void* consoleDesc, uint32_t initialState) {
+void detile_register(PcObj pcRes, uint64_t va, const void* consoleDesc, uint32_t initialState, uint32_t skipLevels) {
     auto* d = static_cast<const D3D12_RESOURCE_DESC*>(consoleDesc);
     if (!d || d->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER || d->Dimension == D3D12_RESOURCE_DIMENSION_UNKNOWN) return;
     // A small one-channel 8-bit texture that may also be a render target: a title keeps glyph
@@ -386,6 +388,7 @@ void detile_register(PcObj pcRes, uint64_t va, const void* consoleDesc, uint32_t
     if (d->SampleDesc.Count > 1) return;
     std::lock_guard<std::mutex> g(g_mu);
     g_tex[pcRes] = {va, *d, initialState};
+    g_tex[pcRes].skip = skipLevels;
     // A plane of a movie: one level of 8-bit luma or chroma that a decoder rewrites every frame.
     // The same check at every submission serves glyph atlases and caches the CPU adds glyphs to:
     // the new glyphs are uploaded at once instead of when the round-robin check comes by.
@@ -607,6 +610,7 @@ void detile_flush(PcObj pcDevice, PcObj pcQueue) {
                          (unsigned long long)e.desc.Width, e.desc.Height, (int)e.desc.Format, (long long)e.rowBytes);
         }
         ctx.rowBytes = e.rowBytes;
+        ctx.skip = e.skip;
         ctx.desc = &e.desc;
         ctx.rowBase = e.rowBase;
         ctx.texelRow = (uint32_t)(e.desc.Width * plain_texel_bytes(e.desc.Format));

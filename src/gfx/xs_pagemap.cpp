@@ -207,6 +207,9 @@ HRESULT D3DAPI D_UnregisterPagePoolX(ID3D12Device*, HANDLE h) {
     return E_INVALIDARG;
 }
 
+// Set while the layer itself places a texture for a placed view (the title never sees the resource).
+static thread_local bool t_placed_view = false;
+void placed_view_scope(bool on) { t_placed_view = on; }
 HRESULT D3DAPI D_CreatePlacedResourceX(ID3D12Device* d, D3D12_GPU_VIRTUAL_ADDRESS va, const D3D12_RESOURCE_DESC* desc, D3D12_RESOURCE_STATES st,
                                        const D3D12_CLEAR_VALUE* cv, REFIID riid, void** out) {
     DeviceExtra* de = dev_extra(d);
@@ -258,13 +261,31 @@ HRESULT D3DAPI D_CreatePlacedResourceX(ID3D12Device* d, D3D12_GPU_VIRTUAL_ADDRES
                      (unsigned long long)va, mbi.State == MEM_COMMIT ? "committed" : "pages not mapped yet");
         D3D12_HEAP_PROPERTIES hp{D3D12_HEAP_TYPE_DEFAULT};
         PcObj r = nullptr;
-        HRESULT hr = pc::create_committed_resource(de->pcDevice, &hp, 0, desc, st, cv, &r);
+        // XSL_TEXTURE_SKIP_MIP=1: the textures behind placed views (what a title streams in) are
+        // made without their largest level, a quarter of the memory. A PC texture costs the
+        // process its size again, on top of the title's own copy; this is for running a title
+        // that does not fit otherwise, at the price of blurrier surfaces. Only one-slice 2D
+        // textures of 512 and up with more than one level, whose next level is a valid size.
+        static const bool skipMip = [] { char b[4]; return GetEnvironmentVariableA("XSL_TEXTURE_SKIP_MIP", b, 4) && b[0] == '1'; }();
+        D3D12_RESOURCE_DESC pd = desc ? *desc : D3D12_RESOURCE_DESC{};
+        uint32_t skip = 0;
+        if (skipMip && t_placed_view && cpuTexture && desc->Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && desc->DepthOrArraySize == 1 && desc->MipLevels >= 2 &&
+            desc->Width >= 512 && desc->Height >= 512 && (desc->Width / 2) % 4 == 0 && (desc->Height / 2) % 4 == 0) {
+            pd.Width = desc->Width / 2;
+            pd.Height = desc->Height / 2;
+            pd.MipLevels = desc->MipLevels - 1;
+            skip = 1;
+            static volatile long n = 0;
+            if (InterlockedIncrement(&n) == 1) XSL_WARN(CH, "XSL_TEXTURE_SKIP_MIP: streamed textures are made without their largest level");
+        }
+        HRESULT hr = pc::create_committed_resource(de->pcDevice, &hp, 0, desc ? &pd : nullptr, st, cv, &r);
         if (FAILED(hr)) return hr;
+        if (skip) pc::note_reduced(r, true);
         if (isBuffer && mbi.Type == MEM_MAPPED) {
             pc::gm_register(r, va, desc->Width, 0);   // addresses in it name this buffer
             if (!gpuWritten) mapped_buffer_add(r, (void*)va, desc->Width);
         }
-        detile_register(r, va, desc, pc::pc_state_of(st));
+        detile_register(r, va, desc, pc::pc_state_of(st), skip);
         hr = make_resource((Device*)d, r, riid, out);
         if (SUCCEEDED(hr) && out && *out) resource_set_title_va(*out, va);
         return hr;
