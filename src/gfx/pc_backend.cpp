@@ -3163,14 +3163,21 @@ HRESULT_T import_host_memory(PcObj dev, void* base, uint64_t size, PcObj* res, u
 }
 
 // The same for memory that is a section (file mapping): a buffer over the whole section.
+// The section is not imported as such (OpenExistingHeapFromFileMapping): on Windows 10 19045 with
+// an RTX 5090 a section imported that way stays committed after the process is gone, however the
+// process ends and even when the heap was released first (tests/unit/section_heap_check.cpp; two
+// days of runs of a title left 200 GB committed and nothing could allocate any more). A view of
+// the section imported by address is the same memory to the GPU and does not stay behind.
 HRESULT_T import_file_mapping(PcObj dev, void* section, uint64_t size, PcObj* res, uint64_t* gpuVa) {
     ID3D12Device3* d3 = nullptr;
     HRESULT hr = as<ID3D12Device>(dev)->QueryInterface(IID_PPV_ARGS(&d3));
     if (FAILED(hr)) return logged(hr, "QueryInterface(ID3D12Device3)");
+    void* view = MapViewOfFile((HANDLE)section, FILE_MAP_ALL_ACCESS, 0, 0, (SIZE_T)size);   // kept for the life of the process
+    if (!view) { d3->Release(); return logged(HRESULT_FROM_WIN32(GetLastError()), "MapViewOfFile(section)"); }
     ID3D12Heap* heap = nullptr;
-    hr = d3->OpenExistingHeapFromFileMapping((HANDLE)section, IID_PPV_ARGS(&heap));
+    hr = d3->OpenExistingHeapFromAddress(view, IID_PPV_ARGS(&heap));
     d3->Release();
-    if (FAILED(hr)) return logged(hr, "OpenExistingHeapFromFileMapping");
+    if (FAILED(hr)) { UnmapViewOfFile(view); return logged(hr, "OpenExistingHeapFromAddress(view of a section)"); }
     D3D12_RESOURCE_DESC rd{};
     rd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
     rd.Width = size;
