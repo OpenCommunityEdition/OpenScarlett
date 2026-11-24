@@ -251,41 +251,93 @@ HRESULT D3DAPI D_CreateGraphicsPipelineState(ID3D12Device* d, const D3D12_GRAPHI
 }
 // Compute pipelines are created on a worker: a translated shader can take the driver minutes to
 // compile (one did, on the title's submission thread, and the title stopped presenting). After
-// XSL_PSO_ASYNC_MS (default 300) the title gets a placeholder (its dispatches are skipped) that
-// becomes the real pipeline when the compile ends.
+// XSL_PSO_ASYNC_MS (default 300, counted per creating thread and second) the title gets a
+// placeholder (its dispatches are skipped) that becomes the real pipeline when the compile ends.
 // A few worker threads for pipeline compiles (a thread per pipeline ran dozens of multi-GB driver
-// compiles at once and creations failed with E_OUTOFMEMORY). XSL_PSO_THREADS (default 3).
+// compiles at once and creations failed with E_OUTOFMEMORY). XSL_PSO_THREADS (default 3 to 8).
+// A second set takes the pipelines whose shaders are not in the shader cache yet: translating and
+// compiling one takes seconds to minutes, and behind eight of those every other pipeline of a
+// loading title waited its full time-out (a start screen came after 70 s instead of 12).
+// XSL_COMPILE_THREADS (default 2 to 6), at lower priority than the title's own threads.
+struct PsoPool {
+    std::mutex mu;
+    std::condition_variable cv;
+    std::deque<std::function<void()>> q;
+    std::once_flag once;
+    void run(std::function<void()> job, bool first, const char* var, unsigned def, bool low) {
+        std::call_once(once, [&] {
+            char b[8];
+            unsigned n = GetEnvironmentVariableA(var, b, sizeof b) ? (unsigned)atoi(b) : def;
+            for (unsigned t = 0; t < std::max(1u, n); t++)
+                std::thread([this, low] {
+                    if (low) SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+                    for (;;) {
+                        std::function<void()> j;
+                        { std::unique_lock<std::mutex> u(mu); cv.wait(u, [this] { return !q.empty(); }); j = std::move(q.front()); q.pop_front(); }
+                        j();
+                    }
+                }).detach();
+        });
+        { std::lock_guard<std::mutex> g(mu); if (first) q.push_front(std::move(job)); else q.push_back(std::move(job)); }
+        cv.notify_one();
+    }
+};
 static void pso_pool_run(std::function<void()> job, bool first = false) {
-    static std::mutex mu;
-    static std::condition_variable cv;
-    static std::deque<std::function<void()>> q;
-    static std::once_flag once;
-    std::call_once(once, [] {
-        char b[8];
-        unsigned hw = std::thread::hardware_concurrency();
-        unsigned n = GetEnvironmentVariableA("XSL_PSO_THREADS", b, sizeof b) ? (unsigned)atoi(b) : std::min(8u, std::max(3u, hw / 2));
-        for (unsigned t = 0; t < std::max(1u, n); t++)
-            std::thread([] {
-                for (;;) {
-                    std::function<void()> j;
-                    { std::unique_lock<std::mutex> u(mu); cv.wait(u, [] { return !q.empty(); }); j = std::move(q.front()); q.pop_front(); }
-                    j();
-                }
-            }).detach();
-    });
-    { std::lock_guard<std::mutex> g(mu); if (first) q.push_front(std::move(job)); else q.push_back(std::move(job)); }
-    cv.notify_one();
+    static PsoPool pool;
+    pool.run(std::move(job), first, "XSL_PSO_THREADS", std::min(8u, std::max(3u, std::thread::hardware_concurrency() / 2)), false);
+}
+static void pso_compile_pool_run(std::function<void()> job, bool first = false) {
+    static PsoPool pool;
+    const unsigned hw = std::thread::hardware_concurrency();
+    pool.run(std::move(job), first, "XSL_COMPILE_THREADS", std::min(6u, std::max(2u, hw > 4 ? hw / 2 - 2 : 2u)), true);
 }
 struct AsyncPso {
     std::mutex mu;
     std::condition_variable cv;
     bool done = false, untranslated = false, late = false;
-    std::string keys;
+    bool deferred = false;   // its shader is being compiled by the second set of workers
+    std::string keys, why;   // why: the reason it became a placeholder
     HRESULT hr = E_FAIL;
     PcObj pso = nullptr;
     void* obj = nullptr;   // the placeholder handed out (late completion)
     PcObj rs = nullptr;
 };
+// One compute pipeline, on a worker. slow: on the second set (shaders are compiled); otherwise a
+// shader that needs compiling sends the pipeline there and the creating thread stops waiting.
+static void compute_pso_job(const std::shared_ptr<AsyncPso>& job, const std::shared_ptr<std::vector<uint8_t>>& code, D3D12_COMPUTE_PIPELINE_STATE_DESC x, PcObj dev, bool slow) {
+    const PcObj titleRs = (PcObj)x.pRootSignature;
+    x.CS = {code->data(), code->size()};
+    pc::reset_untranslated();
+    pc::defer_compiles(!slow);
+    PcObj pso = nullptr, own = nullptr;
+    x.pRootSignature = (ID3D12RootSignature*)pipeline_root_signature(dev, titleRs, {x.CS}, &own);
+    HRESULT hr = pc::create_compute_pso(dev, &x, &pso);
+    pc::set_fallback_root_signature(nullptr, 0);
+    const bool again = !slow && FAILED(hr) && pc::compile_deferred();
+    pc::defer_compiles(false);
+    if (again) {   // (a root signature made for the shader is the backend's, kept by its contents)
+        { std::lock_guard<std::mutex> g(job->mu); job->deferred = true; }
+        job->cv.notify_all();
+        x.pRootSignature = (ID3D12RootSignature*)titleRs;
+        pso_compile_pool_run([job, code, x, dev] { compute_pso_job(job, code, x, dev, true); });
+        return;
+    }
+    if (SUCCEEDED(hr)) { pc::note_pso_rs(pso, x.pRootSignature, true); pc::note_pso_own_rs(pso, own, true); }
+    std::unique_lock<std::mutex> g(job->mu);
+    job->hr = hr; job->pso = pso; job->untranslated = pc::had_untranslated(); job->keys = pc::translated_keys(); job->done = true;
+    if (FAILED(hr)) job->why = pc::had_untranslated() ? pc::untranslated_reason() : "rejected by the PC runtime";
+    if (job->late) {   // the title holds a placeholder: it becomes this pipeline
+        if (FAILED(hr) && job->obj) placeholder_note(job->obj, job->why.c_str());
+        if (SUCCEEDED(hr) && job->obj) {
+            hdr(job->obj)->pc = pso;
+            XSL_INFO(CH, "compute pipeline of %s ready after the title went on (placeholder replaced)", job->keys.c_str());
+        }
+        if (job->obj) Release((IGraphicsUnknown*)job->obj);
+    }
+    if (job->rs) pc::release(job->rs);
+    g.unlock();
+    job->cv.notify_all();
+}
 HRESULT D3DAPI D_CreateComputePipelineStateX(ID3D12Device* d, const D3D12_COMPUTE_PIPELINE_STATE_DESC* desc, UINT, const D3D12XBOX_EXTENDED_COMPUTE_PIPELINE_STATE_DESC*, REFIID riid,
                                              void** out) {
     if (null_graphics()) return make_simple(DEV(d), Kind::Pso, nullptr, riid, out);
@@ -306,41 +358,35 @@ HRESULT D3DAPI D_CreateComputePipelineStateX(ID3D12Device* d, const D3D12_COMPUT
     job->rs = x.pRootSignature;
     if (job->rs) pc::addref(job->rs);
     PcObj dev = DPC(d);
-    pso_pool_run([job, code, x, dev]() mutable {
-        x.CS = {code->data(), code->size()};
-        pc::reset_untranslated();
-        PcObj pso = nullptr, own = nullptr;
-        x.pRootSignature = (ID3D12RootSignature*)pipeline_root_signature(dev, (PcObj)x.pRootSignature, {x.CS}, &own);
-        HRESULT hr = pc::create_compute_pso(dev, &x, &pso);
-        pc::set_fallback_root_signature(nullptr, 0);
-        if (SUCCEEDED(hr)) { pc::note_pso_rs(pso, x.pRootSignature, true); pc::note_pso_own_rs(pso, own, true); }
-        std::unique_lock<std::mutex> g(job->mu);
-        job->hr = hr; job->pso = pso; job->untranslated = pc::had_untranslated(); job->keys = pc::translated_keys(); job->done = true;
-        if (job->late) {   // the title holds a placeholder: it becomes this pipeline
-            if (SUCCEEDED(hr) && job->obj) {
-                hdr(job->obj)->pc = pso;
-                XSL_INFO(CH, "compute pipeline of %s ready after the title went on (placeholder replaced)", job->keys.c_str());
-            }
-            if (job->obj) Release((IGraphicsUnknown*)job->obj);
-        }
-        if (job->rs) pc::release(job->rs);
-        g.unlock();
-        job->cv.notify_all();
-    });
+    pso_pool_run([job, code, x, dev] { compute_pso_job(job, code, x, dev, false); });
+    // The wait is what the creating thread has left of waitMs in this second: a title that loads
+    // creates thousands of pipelines, and while the driver compiles new ones (seconds each, all
+    // workers busy) every creation would wait its full time (a start screen came a minute late).
+    static thread_local ULONGLONG winStart = 0;
+    static thread_local DWORD waited = 0;
+    const ULONGLONG now = GetTickCount64();
+    if (now - winStart >= 1000) { winStart = now; waited = 0; }
+    const DWORD budget = waited >= waitMs ? 0 : waitMs - waited;
     std::unique_lock<std::mutex> g(job->mu);
-    if (job->cv.wait_for(g, std::chrono::milliseconds(waitMs), [&] { return job->done; })) {
+    const bool ready = job->cv.wait_for(g, std::chrono::milliseconds(budget), [&] { return job->done || job->deferred; }) && job->done;
+    waited += (DWORD)(GetTickCount64() - now);
+    if (ready) {
         HRESULT hr = job->hr;
         if (SUCCEEDED(hr)) return make_simple(DEV(d), Kind::Pso, job->pso, riid, out);
         if (!job->untranslated && job->keys.empty()) return hr;
-        return make_simple(DEV(d), Kind::Pso, nullptr, riid, out);   // placeholder (as pso_result)
+        hr = make_simple(DEV(d), Kind::Pso, nullptr, riid, out);   // placeholder (as pso_result)
+        if (SUCCEEDED(hr) && out && *out) placeholder_note(*out, job->why.c_str());
+        return hr;
     }
     HRESULT hr = make_simple(DEV(d), Kind::Pso, nullptr, riid, out);
     if (SUCCEEDED(hr) && out && *out) {
         job->late = true;
         job->obj = *out;
         AddRef((IGraphicsUnknown*)*out);
-        static volatile long n = 0;
-        if (InterlockedIncrement(&n) <= 10) XSL_WARN(CH, "compute pipeline still compiling after %lu ms: placeholder until it is ready", (unsigned long)waitMs);
+        static volatile long n = 0, nd = 0;
+        if (job->deferred) {
+            if (InterlockedIncrement(&nd) == 1) XSL_INFO(CH, "compute pipelines whose shaders are not in the shader cache are compiled in the background: placeholders until they are ready");
+        } else if (InterlockedIncrement(&n) <= 10) XSL_WARN(CH, "compute pipeline still compiling after %lu ms: placeholder until it is ready", (unsigned long)budget);
     }
     return hr;
 }
@@ -451,7 +497,7 @@ struct PendingPso {
     std::mutex mu;
     std::condition_variable cv;
     std::atomic<int> state{0};   // 0 queued, 1 being built, 2 done
-    std::function<void()> build;
+    std::function<bool()> build; // true: a shader needs compiling, to be called again where compiles run
     uint64_t key = 0;            // hash of the pipeline's shaders (the list of pipelines a run used)
 };
 // Lazy pipelines. A title creates tens of thousands of pipelines while it loads and draws with a
@@ -493,10 +539,16 @@ static void pso_note_used(uint64_t key) {
 }
 static std::mutex g_pending_mu;
 static std::unordered_map<void*, std::shared_ptr<PendingPso>> g_pending;
-static void pending_run(const std::shared_ptr<PendingPso>& j) {
+static void pending_run(const std::shared_ptr<PendingPso>& j, bool slow = false) {
     int queued = 0;
-    if (!j->state.compare_exchange_strong(queued, 1)) return;   // another thread has it
-    j->build();
+    if (!slow && !j->state.compare_exchange_strong(queued, 1)) return;   // another thread has it
+    pc::defer_compiles(!slow);
+    const bool again = j->build();
+    pc::defer_compiles(false);
+    if (again && !slow) {   // (first in line: a pipeline is built when a list wants it, or was used by an earlier run)
+        pso_compile_pool_run([j] { pending_run(j, true); }, true);
+        return;
+    }
     { std::lock_guard<std::mutex> g(j->mu); j->state = 2; }
     j->cv.notify_all();
 }
@@ -717,6 +769,7 @@ HRESULT D3DAPI D_CreatePipelineState(ID3D12Device2* d, const D3D12_PIPELINE_STAT
         pc::reset_untranslated();
         PcObj pso = nullptr;
         HRESULT hr = stream_pso_create(dev, *st, &pso);
+        if (FAILED(hr) && pc::compile_deferred()) return true;
         if (SUCCEEDED(hr)) {
             hdr(obj)->pc = pso;
         } else {
@@ -731,6 +784,7 @@ HRESULT D3DAPI D_CreatePipelineState(ID3D12Device2* d, const D3D12_PIPELINE_STAT
         if (titleRs) pc::release(titleRs);
         { std::lock_guard<std::mutex> g(g_pending_mu); g_pending.erase(obj); }
         Release((IGraphicsUnknown*)obj);
+        return false;
     };
     {   // the pipeline's key: its shaders' contents
         uint64_t h = 1469598103934665603ull;

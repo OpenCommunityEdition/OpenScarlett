@@ -983,6 +983,26 @@ void D3DAPI L_Dispatch(ID3D12GraphicsCommandList* l, UINT x, UINT y, UINT z) {
     if (lx(l)->placeholderPso) { placeholder_skip(lx(l)->placeholderWhy); return; }
     if (!null_graphics()) pc::list_dispatch(LPC(l), x, y, z);
 }
+// DispatchX: a dispatch with console options. Only one changes what runs: with
+// USE_THREAD_DIMENSIONS the counts are threads, not groups, in each dimension, and the console
+// launches no thread past them. A PC dispatch is whole groups; the group size is not known here,
+// so that form is logged and dispatched as given (too many groups; no title seen uses it yet).
+void D3DAPI L_DispatchX(ID3D12GraphicsCommandList* l, UINT x, UINT y, UINT z, D3D12XBOX_DISPATCH_FLAGS flags) {
+    static volatile long n = 0;
+    if (InterlockedIncrement(&n) <= 6) {
+        HMODULE m = nullptr;
+        char name[MAX_PATH] = "?";
+        if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCSTR)__builtin_return_address(0), &m) && m)
+            GetModuleFileNameA(m, name, MAX_PATH);
+        const char* bn = strrchr(name, '\\');
+        XSL_INFO(CH, "DispatchX(%u, %u, %u, flags %#x) from %s", x, y, z, (unsigned)flags, bn ? bn + 1 : name);
+    }
+    if (flags & D3D12XBOX_DISPATCH_FLAG_USE_THREAD_DIMENSIONS) {
+        static volatile long w = 0;
+        if (InterlockedIncrement(&w) == 1) XSL_WARN(CH, "DispatchX with thread dimensions (%u, %u, %u): dispatched as groups", x, y, z);
+    }
+    L_Dispatch(l, x, y, z);
+}
 // Console lists have no heap binding: descriptor tables address descriptors directly. The layer's
 // global view heap stays bound; the title's call only chooses the sampler heap (or a heap that did not
 // fit in the global one).
@@ -1617,6 +1637,7 @@ HRESULT make_list(Device* dev, PcObj pcl, D3D12_COMMAND_LIST_TYPE t, REFIID riid
         g->DrawInstanced = L_DrawInstanced;
         g->DrawIndexedInstanced = L_DrawIndexedInstanced;
         g->Dispatch = L_Dispatch;
+        g->DispatchX = L_DispatchX;
         g->SetDescriptorHeaps = L_SetDescriptorHeaps;
         g->SetGraphicsRootDescriptorTable = L_SetGfxRootTable;
         g->SetComputeRootDescriptorTable = L_SetComputeRootTable;
@@ -1802,8 +1823,10 @@ HRESULT D3DAPI Q_PresentX(ID3D12CommandQueue* q, UINT planes, const D3D12XBOX_PR
     release_kept();
     xsl_fixed_time_frame();
     {
-        static uint64_t presents = 0;
-        if (++presents % 100 == 0) {
+        // (By time, not by presents: a scene that takes seconds per frame reports too.)
+        static ULONGLONG last = GetTickCount64();
+        if (const ULONGLONG now = GetTickCount64(); now - last >= 10000) {
+            last = now;
             long n = InterlockedExchange(&g_skipped_work, 0);
             if (n) {
                 std::string t;
@@ -1812,7 +1835,7 @@ HRESULT D3DAPI Q_PresentX(ID3D12CommandQueue* q, UINT planes, const D3D12XBOX_PR
                     if (k) t += " [" + std::to_string(k) + ": " + why + "]";
                     k = 0;
                 }
-                XSL_INFO(CH, "placeholder pipelines skipped %ld draws/dispatches over the last 100 presents%s", n, t.c_str());
+                XSL_INFO(CH, "placeholder pipelines skipped %ld draws/dispatches over the last 10 s%s", n, t.c_str());
             }
         }
     }
