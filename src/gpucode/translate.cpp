@@ -3273,13 +3273,28 @@ bool Translator::emit_ds(const Instr& in, size_t idx) {
         bool sgn = has(k, "_i32");
         std::string val = V(in.data0);
         if (k == "sub") val = "(0u - " + val + ")";
-        line(fmt("if (kexec) { %s o_;", sgn ? "int" : "uint"));
+        if (sgn) {
+            // Group memory is declared unsigned: a signed minimum or maximum is a compare-exchange
+            // loop on it (the value only moves one way, so a thread retries at most once per other
+            // thread that got in first).
+            const bool mx = k == "max_i32";
+            line(fmt("if (kexec) { uint a_ = %s >> 2; uint o_ = lds[a_];", a.c_str()));
+            line("  [loop] for (uint k_ = 0u; k_ < 4096u; k_++) {");
+            line(fmt("    uint n_ = (int(%s) %s int(o_)) ? %s : o_;", val.c_str(), mx ? ">" : "<", val.c_str()));
+            line("    if (n_ == o_) break;");
+            line("    uint p_; InterlockedCompareExchange(lds[a_], o_, n_, p_);");
+            line("    if (p_ == o_) break;");
+            line("    o_ = p_;");
+            line("  }");
+            if (rtn) line(fmt("  %s = o_;", V(in.dst).c_str()));
+            line("}");
+            return true;
+        }
+        line("if (kexec) { uint o_;");
         if (k == "cmpst") line(fmt("  InterlockedCompareExchange(lds[%s >> 2], %s, %s, o_);", a.c_str(), V(in.data0).c_str(), V(in.data1).c_str()));
-        else if (sgn) line(fmt("  { int t_; %s(ldsi[%s >> 2], int(%s), t_); o_ = t_; }", p[1], a.c_str(), val.c_str()));
         else line(fmt("  %s(lds[%s >> 2], %s, o_);", p[1], a.c_str(), val.c_str()));
         if (rtn) line(fmt("  %s = uint(o_);", V(in.dst).c_str()));
         line("}");
-        if (sgn) return fail(n + " (signed LDS atomics) not supported yet");
         return true;
     }
     return fail(fmt("%s at 0x%x not supported", in.name, in.offset));
