@@ -299,6 +299,8 @@ struct Translator {
                 leaders.insert(in.offset + 4);
             } else if (n == "s_endpgm") {
                 leaders.insert(in.offset + 4);
+            } else if (n == "s_barrier") {
+                leaders.insert(in.offset + 4);   // (code with loops stops at a barrier and goes on from the next block)
             }
         }
         for (size_t i = 0; i < ins.size(); i++)
@@ -1161,7 +1163,7 @@ struct Translator {
             unsigned d = (unsigned)std::stoul(f[1]), so = (unsigned)std::stoul(f[2]);
             const std::string& sf = f[3];
             std::string val = f.size() > 4 ? f[4] : "";
-            std::string out = "if (kexec) { uint mr_ = 0u; ";
+            std::string out = "if (kexec" + sf + ") { uint mr_ = 0u; ";   // (sf: the lane copy, as in the registers' names)
             if (mode != 'd') {   // read VGPR[src + M0]
                 out += "switch (s124 + " + std::to_string(so) + "u) { ";
                 for (unsigned k = 0; k < nv; k++) out += "case " + std::to_string(k) + "u: mr_ = v" + std::to_string(k) + sf + "; break; ";
@@ -1365,6 +1367,14 @@ struct Translator {
         return ok;
     }
     bool lane_stale = false;   // two-lane mode: L may not be the second lane's (its last users did not read it)
+    int open_block = -1;       // straight-line code with barriers: the block whose "if (reach[b]) {" is open (else -1)
+    // Loops and barriers (compute): the threads of a group take turns. Each runs until its next
+    // barrier or its end; then all of them meet (every thread makes the same calls, whatever its
+    // path, which is what a PC barrier needs), and the rounds go on until none has code left.
+    // On the console a wave at a barrier waits for the waves still running, and one that ends
+    // early or branches around the barrier keeps nobody waiting; a PC thread that does either
+    // leaves the rest of its group at the barrier for good, and the GPU is reset.
+    bool coop = false;
     // The text of one lane copy with the per-lane names made that copy's (c < 0: unchanged), and
     // whether it reads the lane number.
     static std::string lane_names(const std::string& t, int c, bool* usesLane) {
@@ -1500,6 +1510,18 @@ bool Translator::emit_salu(const Instr& in, size_t idx) {
         for (auto p : nops)
             if (n == p) return true;
         if (n == "s_barrier") {
+            // Every thread of the group has to make this call (a PC waits at it for all of them;
+            // the console only for the waves still running). In straight-line code the block's
+            // condition is closed around it, so that waves the console code sends past the
+            // barrier (those beyond a count, typically) make it too: without that the GPU was
+            // reset, the rest of their group waiting for them.
+            if (open_block >= 0 && opt.barrier_sync) {
+                line("}");
+                line("GroupMemoryBarrierWithGroupSync();");
+                line(fmt("if (reach[%d]) {", open_block));
+                return true;
+            }
+            if (coop) { line("atb_ = true;"); return true; }   // (the block ends here: see coop)
             line(opt.barrier_sync ? "GroupMemoryBarrierWithGroupSync();" : "GroupMemoryBarrier();");
             return true;
         }
@@ -3931,6 +3953,8 @@ std::string Translator::generate() {
     // hundreds of milliseconds of GPU time per dispatch.
     std::vector<bool> barrier_ahead(nb, true);
     bool barriers = false;
+    bool has_barrier = false;   // (anywhere in the program)
+    for (auto& i : ins) has_barrier |= i.name && !strcmp(i.name, "s_barrier");
     if (!loops) line(fmt("bool reach[%zu]; [unroll] for (uint i_ = 0u; i_ < %zuu; i_++) reach[i_] = false; reach[0] = true;", nb + 1, nb + 1));
     // The guard bounds the block transitions so a mistranslated loop ends the shader instead of
     // hanging the GPU (which removes the PC device).
@@ -3969,6 +3993,11 @@ std::string Translator::generate() {
             }
         }
         size_t start = opt.raw_code.empty() || !block_of.count(opt.raw_entry) ? 0 : block_of[opt.raw_entry];
+        coop = has_barrier && c.kind == ProgramKind::CS && opt.barrier_sync && !indirect && opt.raw_code.empty();
+        if (coop)
+            line(fmt("uint pc = %zuu, guard_ = 0u, guard2_ = 0u; bool atb_ = false;\n  [loop] for (uint round_ = 0u; round_ < 8192u; round_++) {\n  [loop] for (;;) {\n"
+                     "  if (pc == 0xffffffffu || atb_) break;\n  if (++guard_ > %uu) { pc = 0xffffffffu; break; }\n  [forcecase] switch (pc) {", start, opt.loop_guard_barrier));
+        else
         line(fmt("uint pc = %zuu, guard_ = 0u, guard2_ = 0u;\n  [loop] for (;;) {\n  if (++guard_ > %uu) %s\n  [forcecase] switch (pc) {", start,
                  barriers ? opt.loop_guard_barrier : opt.loop_guard, opt.raw_stats ? "{ dbg_add(5u); dbg_set2(19u, pc, guard_); RETURN; }" : "RETURN;"));
     }
@@ -3999,6 +4028,7 @@ std::string Translator::generate() {
         lane_stale = true;   // (a block is entered from several places: what L holds there is not known)
         if (!loops) line(fmt("if (reach[%zu]) {", b));
         else line(fmt("case %zuu: {", b));
+        open_block = !loops && has_barrier ? int(b) : -1;
         if (loops && barriers && !barrier_ahead[b])   // past the last barrier: the small limit (see barrier_ahead)
             line(fmt("if (++guard2_ > %uu) %s", opt.loop_guard, opt.raw_stats ? "{ dbg_add(5u); dbg_set2(19u, pc, guard_); RETURN; }" : "RETURN;"));
         jumped = false;
@@ -4009,6 +4039,7 @@ std::string Translator::generate() {
         std::string ln = last.name;
         size_t next = b + 1;
         if (jumped) line("break;");   // s_setpc / s_swappc set pc
+        else if (last.fmt == Fmt::SOPP && ln == "s_endpgm" && open_block >= 0) line("// (the end: no block follows; the thread still makes the barrier calls below)");
         else if (last.fmt == Fmt::SOPP && ln == "s_endpgm") line(opt.raw_stats ? "{ dbg_add(1u); RETURN; }" : "RETURN;");
         else if (last.fmt == Fmt::SOPP && (starts(ln, "s_branch") || starts(ln, "s_cbranch"))) {
             size_t t = block_of.count(uint32_t(int32_t(last.offset) + 4 + last.simm16 * 4)) ? block_of[uint32_t(int32_t(last.offset) + 4 + last.simm16 * 4)] : nb;
@@ -4023,7 +4054,18 @@ std::string Translator::generate() {
         }
         line("}");
     }
-    if (loops) line(opt.raw_stats ? "default: { dbg_add(2u); RETURN; }\n  }\n  }" : "default: RETURN;\n  }\n  }");
+    if (loops && coop) {
+        // The count of threads with code left is a group-shared variable (XSL_LIVE). A program
+        // whose own group memory is the 32 KB a PC allows has no room for one: there the last
+        // dword of that memory is borrowed between two more barriers (the header decides, once
+        // the size of the group memory is known: XSL_COOP_KEEP / XSL_COOP_RESTORE).
+        line("default: { pc = 0xffffffffu; break; }\n  }\n  }\n  XSL_COOP_KEEP");
+        line("if (gi_ == 0u) XSL_LIVE = 0u;\n  GroupMemoryBarrierWithGroupSync();");
+        line("if (pc != 0xffffffffu) { uint o_; InterlockedAdd(XSL_LIVE, 1u, o_); }\n  GroupMemoryBarrierWithGroupSync();");
+        line("bool none_ = XSL_LIVE == 0u;\n  XSL_COOP_RESTORE");
+        line("if (none_) break;\n  atb_ = false;\n  }\n  return;");
+    }
+    else if (loops) line(opt.raw_stats ? "default: { dbg_add(2u); RETURN; }\n  }\n  }" : "default: RETURN;\n  }\n  }");
     else line("RETURN;");
     std::swap(out, body);
     if (!err.empty()) return "";
@@ -4056,6 +4098,7 @@ std::string Translator::generate() {
         if (p.type != ParamType::Constants) continue;
         h << fmt("cbuffer RC%u : register(b%u, space%u) { uint4 RC%u_d[%u]; };\n", a.param, p.reg, p.space, a.param, (p.num32 + 3) / 4);
     }
+    unsigned ldsBytes = 0;
     if (uses_lds) {
         unsigned limit = c.kind == ProgramKind::MS ? 28672 : 32768;   // PC group-shared limits
         unsigned bytes = meta.lds_bytes() ? meta.lds_bytes() : c.kind == ProgramKind::MS && ms_lds ? std::min(limit, (ms_lds + 1023) & ~1023u) : limit;
@@ -4073,6 +4116,15 @@ std::string Translator::generate() {
         if (need > bytes && need <= limit) bytes = std::min(limit, (need + 1023) & ~1023u);
         if (bytes > limit) return fail(fmt("LDS size %u exceeds the PC group-shared limit", bytes)), "";
         h << "groupshared uint lds[" << bytes / 4 << "];\n";
+        ldsBytes = bytes;
+    }
+    if (coop) {   // (see the end of the dispatcher)
+        if (ldsBytes + 4 > 32768) {
+            const unsigned last = ldsBytes / 4 - 1;
+            h << fmt("#define XSL_LIVE lds[%uu]\n", last);
+            h << fmt("#define XSL_COOP_KEEP uint keep_ = 0u; GroupMemoryBarrierWithGroupSync(); if (gi_ == 0u) keep_ = lds[%uu];\n", last);
+            h << fmt("#define XSL_COOP_RESTORE GroupMemoryBarrierWithGroupSync(); if (gi_ == 0u) lds[%uu] = keep_; GroupMemoryBarrierWithGroupSync();\n", last);
+        } else h << "groupshared uint gs_live_;\n#define XSL_LIVE gs_live_\n#define XSL_COOP_KEEP\n#define XSL_COOP_RESTORE\n";
     }
     h << kPrelude;
     if (uses_quad) h << kQuadPrelude;
@@ -4317,7 +4369,7 @@ std::string Translator::generate() {
         // PC thread gi_ (32-lane waves) runs console threads t0 = (gi_/32)*64 + gi_%32 and t0 + 32
         // of the console group (flattened x-fastest, as the console packs waves).
         unsigned nx = meta.numthreads[0], ny = meta.numthreads[1], nt = nx * ny * meta.numthreads[2];
-        h << "#define RETURN return\n";
+        h << (coop ? "#define RETURN { pc = 0xffffffffu; break; }\n" : "#define RETURN return\n");
         h << "\n" << (opt.wave_size_attr ? "[WaveSize(32)]\n" : "") << "[numthreads(" << nt / 2 << ", 1, 1)]\n";
         h << "void main(uint3 gid_ : SV_GroupID, uint gi_ : SV_GroupIndex) {\n";
         unsigned s = meta.user_sgprs();
@@ -4334,7 +4386,7 @@ std::string Translator::generate() {
         }
         max_v = std::max(max_v, meta.tid_comps());
     } else if (c.kind == ProgramKind::CS) {
-        h << "#define RETURN return\n";
+        h << (coop ? "#define RETURN { pc = 0xffffffffu; break; }\n" : "#define RETURN return\n");
         h << "\n[numthreads(" << meta.numthreads[0] << ", " << meta.numthreads[1] << ", " << meta.numthreads[2] << ")]\n";
         h << "void main(uint3 gid_ : SV_GroupID, uint3 tid_ : SV_GroupThreadID, uint gi_ : SV_GroupIndex) {\n";
         unsigned s = meta.user_sgprs();
@@ -4821,7 +4873,10 @@ uint64_t translation_salt(const Container& c) {
     auto add = [&](const char* tag) { for (const char* p = tag; *p; p++) h = (h ^ (uint8_t)*p) * 1099511628211ull + 0x9e3779b97f4a7c15ull; };
     // 2026-11: the step limit of programs with barriers and loops went from 2^22 to 2^16, with the
     // small limit past the last barrier.
-    if (barrier && backward) add("barrier-limit-3");
+    // 2026-11: with loops the threads of a group take turns between barriers; without, every
+    // thread makes each barrier call.
+    if (barrier && backward) add("barrier-coop-1");
+    if (barrier && !backward) add("barrier-all-1");
     // 2026-11: global stores take their data from the data field (they read v0); global atomics.
     if (global_write) add("global-write-2");
     // 2026-11: 16-bit vertex and mesh outputs are unpacked into the registers their records name
