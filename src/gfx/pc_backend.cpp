@@ -705,8 +705,79 @@ static bool trap_hit(EXCEPTION_POINTERS* e) {
     }
     return true;
 }
+// Pipelines the GPU driver's compiler gives up on. It does so with a breakpoint in its own code,
+// and a breakpoint nobody handles ends the process: 27 s into one compute pipeline of a title
+// (3 MB of translated HLSL), in every run. The shaders of such a pipeline are noted beside the
+// pipeline cache (bad-pipelines.txt, one line of cache keys each) and it is not given to the
+// driver again: it stays a placeholder whose work is skipped. The breakpoint itself is stepped
+// over, which lets the compiler fail in its own way where it can; a compiler that keeps hitting
+// breakpoints has its thread parked for good (the pipeline never completes).
+static wchar_t g_bad_path[MAX_PATH] = L"";
+static std::mutex g_bad_mu;
+static std::set<std::string> g_bad;
+static thread_local const char* t_driver_keys = nullptr;   // the shaders of the pipeline this thread has in the driver
+static thread_local unsigned t_driver_breaks = 0;
+std::wstring rt_cache_dir();
+static void bad_init() {
+    static std::once_flag once;
+    std::call_once(once, [] {
+        const std::wstring p = rt_cache_dir();
+        if (p.empty() || p.size() + 24 >= MAX_PATH) return;
+        memcpy(g_bad_path, (p + L"bad-pipelines.txt").c_str(), (p.size() + 18) * sizeof(wchar_t));
+        if (FILE* f = _wfopen(g_bad_path, L"r")) {
+            char l[512];
+            while (fgets(l, sizeof l, f)) {
+                l[strcspn(l, "\r\n")] = 0;
+                if (l[0]) g_bad.insert(l);
+            }
+            fclose(f);
+        }
+        if (!g_bad.empty()) XSL_INFO(CH, "%zu pipelines the GPU driver's compiler gave up on in earlier runs stay placeholders (%ls)", g_bad.size(), g_bad_path);
+    });
+}
+static bool driver_refused(const char* keys) {
+    bad_init();
+    if (!keys || !*keys) return false;
+    std::lock_guard<std::mutex> g(g_bad_mu);
+    if (!g_bad.count(keys)) return false;
+    static volatile long n = 0;
+    if (InterlockedIncrement(&n) <= 5) XSL_INFO(CH, "pipeline of %s: the GPU driver's compiler gave up on it in an earlier run: placeholder", keys);
+    return true;
+}
+struct DriverCall {
+    explicit DriverCall(const char* keys) { bad_init(); t_driver_keys = keys && *keys ? keys : nullptr; t_driver_breaks = 0; }
+    ~DriverCall() { t_driver_keys = nullptr; }
+};
+static bool driver_break(EXCEPTION_POINTERS* e) {
+    if (e->ExceptionRecord->ExceptionCode != 0x80000003 || !t_driver_keys) return false;
+    if (t_driver_breaks++ == 0) {
+        if (g_bad_path[0]) {   // (no heap here: the thread is somewhere inside the compiler)
+            HANDLE f = CreateFileW(g_bad_path, FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_ALWAYS, 0, nullptr);
+            if (f != INVALID_HANDLE_VALUE) {
+                DWORD w = 0;
+                WriteFile(f, t_driver_keys, (DWORD)strlen(t_driver_keys), &w, nullptr);
+                WriteFile(f, "\r\n", 2, &w, nullptr);
+                CloseHandle(f);
+            }
+        }
+        HMODULE m = nullptr;
+        char name[MAX_PATH] = "?";
+        if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCSTR)e->ExceptionRecord->ExceptionAddress, &m))
+            GetModuleFileNameA(m, name, MAX_PATH);
+        const char* b = strrchr(name, '\\');
+        XSL_ERR(CH, "the GPU driver's compiler stopped at a breakpoint of its own (%s+%llx) on the pipeline of %s: noted, a placeholder from the next run on; stepping over it",
+                b ? b + 1 : name, (unsigned long long)((uint8_t*)e->ExceptionRecord->ExceptionAddress - (uint8_t*)m), t_driver_keys);
+    }
+    if (t_driver_breaks > 256) {
+        XSL_ERR(CH, "the GPU driver's compiler keeps stopping on the pipeline of %s: its thread is parked", t_driver_keys);
+        Sleep(INFINITE);
+    }
+    e->ContextRecord->Rip += 1;
+    return true;
+}
 static LONG CALLBACK note_exception(EXCEPTION_POINTERS* e) {
     if (trap_hit(e)) return EXCEPTION_CONTINUE_EXECUTION;
+    if (driver_break(e)) return EXCEPTION_CONTINUE_EXECUTION;
     DWORD c = e->ExceptionRecord->ExceptionCode;
     crash_dump(e);
     if (c == 0xC00000FD) return EXCEPTION_CONTINUE_SEARCH;   // stack overflow: no stack left to log with
@@ -2908,6 +2979,8 @@ HRESULT_T create_graphics_pso(PcObj dev, const void* desc, PcObj* out) {
         key = pso_hash(key, e.SemanticName, strlen(e.SemanticName));
         key = pso_hash(key, &e.SemanticIndex, sizeof e - offsetof(D3D12_INPUT_ELEMENT_DESC, SemanticIndex));
     }
+    if (driver_refused(translated_keys())) return E_FAIL;
+    DriverCall inDriver(translated_keys());
     HRESULT hr = cached_pso(key, d.CachedPSO.pCachedBlob, d.CachedPSO.CachedBlobSizeInBytes, pso,
                             [&] { return as<ID3D12Device>(dev)->CreateGraphicsPipelineState(&d, IID_PPV_ARGS(pso)); });
     if (FAILED(hr)) { dump_debug_messages(); XSL_ERR(CH, "CreateGraphicsPipelineState failed %08lx", hr); }
@@ -2930,6 +3003,8 @@ HRESULT_T create_compute_pso(PcObj dev, const void* desc, PcObj* out) {
     auto** pso = reinterpret_cast<ID3D12PipelineState**>(out);
     uint64_t key = pso_hash(pso_hash(1469598103934665603ull, "cs1", 3), d.CS.pShaderBytecode, d.CS.BytecodeLength);
     const ULONGLONG t0c = GetTickCount64();
+    if (driver_refused(translated_keys())) return E_FAIL;
+    DriverCall inDriver(translated_keys());
     HRESULT hr = cached_pso(key, d.CachedPSO.pCachedBlob, d.CachedPSO.CachedBlobSizeInBytes, pso,
                             [&] { return as<ID3D12Device>(dev)->CreateComputePipelineState(&d, IID_PPV_ARGS(pso)); });
     if (const ULONGLONG dt = GetTickCount64() - t0c; dt >= 5000) {
@@ -3070,6 +3145,8 @@ HRESULT_T create_pso_stream(PcObj dev, void* stream, size_t size, PcObj* out) {
     if (getenv("XSL_TRACE_WRITERS") && pso_traced()) trace_pso_stream(stream, size);
     D3D12_PIPELINE_STATE_STREAM_DESC d{size, stream};
     ID3D12Device2* d2 = nullptr;
+    if (driver_refused(translated_keys())) return E_FAIL;
+    DriverCall inDriver(translated_keys());
     HRESULT hr = as<ID3D12Device>(dev)->QueryInterface(IID_PPV_ARGS(&d2));
     if (SUCCEEDED(hr)) {
         const ULONGLONG t0 = GetTickCount64();
@@ -3188,7 +3265,7 @@ HRESULT_T import_file_mapping(PcObj dev, void* section, uint64_t size, PcObj* re
     ID3D12Resource* r = nullptr;
     hr = as<ID3D12Device>(dev)->CreatePlacedResource(heap, 0, &rd, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&r));
     heap->Release();
-    if (FAILED(hr)) return logged(hr, "CreatePlacedResource(section)");
+    if (FAILED(hr)) { UnmapViewOfFile(view); return logged(hr, "CreatePlacedResource(section)"); }
     *res = r;
     *gpuVa = r->GetGPUVirtualAddress();
     return S_OK;

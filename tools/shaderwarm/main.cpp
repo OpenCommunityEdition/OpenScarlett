@@ -54,6 +54,7 @@ std::vector<std::pair<std::wstring, std::string>> g_report;
 struct StageCount { size_t cached = 0, made = 0, failed = 0, missing = 0; };
 std::map<std::string, StageCount> g_stages;       // the same counts per shader stage
 bool g_check = false, g_purge = false, g_dry = false;
+FILE* g_keys = nullptr;   // --keys: the list of cache keys is written here and nothing else is done
 std::wstring g_rs_dir;
 PcObj g_dev = nullptr;
 
@@ -118,6 +119,15 @@ void worker() {
         }
         char stage[8];
         int st = pc::shader_cache_state(code, size, stage);
+        if (g_keys) {   // --keys: only the list
+            if (st >= 0) {
+                std::lock_guard<std::mutex> g(g_mu);
+                fprintf(g_keys, "%016llx\t%s\t%d\t%ls\n", (unsigned long long)pc::shader_cache_key(code, size), stage, st, it.path.c_str());
+                (st ? g_cached : g_needs)++;
+            } else g_other++;
+            g_done++;
+            continue;
+        }
         auto count = [&](size_t StageCount::*what) { std::lock_guard<std::mutex> g(g_mu); g_stages[stage].*what += 1; };
         if (st < 0) g_other++;
         else if (g_dry) {
@@ -174,10 +184,11 @@ int wmain(int argc, wchar_t** argv) {
         else if (!wcscmp(argv[i], L"--dry")) g_dry = true;
         else if (!wcscmp(argv[i], L"--rs-dir") && i + 1 < argc) { g_rs_dir = argv[++i]; CreateDirectoryW(g_rs_dir.c_str(), nullptr); }
         else if (!wcscmp(argv[i], L"--report") && i + 1 < argc) report = argv[++i];
+        else if (!wcscmp(argv[i], L"--keys") && i + 1 < argc) { g_keys = _wfopen(argv[++i], L"w"); if (!g_keys) { fprintf(stderr, "cannot write %ls\n", argv[i]); return 2; } }
         else add_path(argv[i]);
     }
     if (g_items.empty()) {
-        fprintf(stderr, "usage: xsl-shaderwarm <folder or file>... [--jobs N] [--shard K/N] [--check] [--purge] [--dry] [--report FILE]\n");
+        fprintf(stderr, "usage: xsl-shaderwarm <folder or file>... [--jobs N] [--shard K/N] [--check] [--purge] [--dry] [--report FILE] [--keys FILE]\n");
         return 2;
     }
     // Smallest first: most of a title's shaders are in the cache within minutes, and the few

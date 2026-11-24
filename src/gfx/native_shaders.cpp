@@ -351,6 +351,14 @@ int shader_cache_state(const void* in, size_t n, char stage[8]) {
     swprintf(name, 32, L"%016llx.dxil", (unsigned long long)key);
     return GetFileAttributesW((cache_dir() + name).c_str()) != INVALID_FILE_ATTRIBUTES ? 1 : 0;
 }
+// The key a shader's translation is cached under (the name the log gives it), 0 when the
+// container holds no console program the translator takes. For the warm-up tool's --keys.
+uint64_t shader_cache_key(const void* in, size_t n) {
+    gpucode::Container c;
+    if (mode() == 0 || !gpucode::read_container(in, n, c) || !c.has_native || (c.has_bitcode && mode() != 1 && !console_only_bitcode(c))) return 0;
+    bool fallbackRs = false, meshKind = false;
+    return shader_key(c, in, n, &fallbackRs, &meshKind);
+}
 // Removes a shader's cached translation (the warm-up tool's --purge). False: there was none.
 bool shader_cache_drop(const void* in, size_t n) {
     gpucode::Container c;
