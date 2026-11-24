@@ -4,9 +4,9 @@
 
 [Status](#project-status) | [Tested games](#tested-games) | [Getting games running](#getting-games-running) |
 [How to build](#how-to-build) | [How it works](#how-it-works) | [Want to help?](#want-to-help) |
-[Credits](#credits) | [Licence](#licence) | [Discord](https://discord.gg/bb2Z9KxuZG)
+[Credits](#credits) | [Licence](#licence) | [Discord](https://discord.gg/XygrXFn6us)
 
-[![Discord](https://img.shields.io/badge/Discord-join-5865F2?logo=discord&logoColor=white)](https://discord.gg/bb2Z9KxuZG)
+[![Discord](https://img.shields.io/badge/Discord-join-5865F2?logo=discord&logoColor=white)](https://discord.gg/XygrXFn6us)
 [![Licence: AGPL-3.0-or-later](https://img.shields.io/badge/licence-AGPL--3.0--or--later-blue)](LICENSE)
 
 **OpenScarlett** is an open-source compatibility layer for Xbox Series X|S software. It is not an
@@ -47,7 +47,7 @@ vkd3d-proton. "Scarlett" is the codename of the hardware platform the project ta
 
 Per-title details, known issues and what was fixed on the way are in
 [docs/compat.md](docs/compat.md). Report results for other games on
-[Discord](https://discord.gg/bb2Z9KxuZG) or in an issue (without game files).
+[Discord](https://discord.gg/XygrXFn6us) or in an issue (without game files).
 
 ## Getting games running
 
@@ -187,7 +187,7 @@ Open areas:
 Read [CONTRIBUTING.md](CONTRIBUTING.md) and [AGENTS.md](AGENTS.md) first. In short: no SDK files or
 text copied from them, no keys or decryption, no game files or patches, no title-specific code, and
 a provenance note for every layout taken from a binary or header. Security issues:
-[SECURITY.md](SECURITY.md). Come talk on [Discord](https://discord.gg/bb2Z9KxuZG).
+[SECURITY.md](SECURITY.md). Come talk on [Discord](https://discord.gg/XygrXFn6us).
 
 Piracy is not supported. Issues and discussions about obtaining games will be closed.
 
