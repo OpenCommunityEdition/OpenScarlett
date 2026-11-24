@@ -29,11 +29,11 @@ vkd3d-proton. "Scarlett" is the codename of the hardware platform the project ta
 | Launcher (`tools/xsl-run`, Windows and Linux) | ✅ Works |
 | Gaming Runtime (task queues, users, saves, local storage, package/system APIs) | ⚠ Core APIs work; online services stay offline |
 | Direct3D 12.X → PC Direct3D 12 (devices, queues, resources, pipelines, `PresentX`, console descriptor model, page mapping) | ✅ Works for the tested games |
-| Console GPU machine code → HLSL (compute, pixel, vertex, mesh, geometry shaders) | ✅ Works; every shader of the tested games translates |
+| Console GPU machine code → HLSL (compute, pixel, vertex, mesh, geometry shaders) | ✅ Works; every shader of Minecraft Preview and The Matrix Awakens translates, about nine in ten of the newer retail game's |
 | Ray tracing (acceleration structures, ray queries, `DispatchRays`) | ⚠ In progress: structures build, pipelines translate and light most of the scenes tested; programs are slow to prepare and some results are still wrong |
 | GameInput (gamepads incl. DualSense, keyboard, mouse) | ✅ Works |
 | DirectStorage (`XCRDAPI.dll`) | ✅ Works (zlib; BCPack through the SDK's own DLL) |
-| Audio | ❌ Not yet (a silent audio processor keeps games running) |
+| Audio | ⚠ Games that mix their sound themselves and play it through Windows are heard (a movie's sound track, for one); the console's audio processors are silent stand-ins, so sound decoded by them is missing |
 | Older GDK editions (per-edition ABI layouts) | ✅ Works with the edition files collected from your own GDK installs |
 
 ## Tested games
@@ -42,6 +42,7 @@ vkd3d-proton. "Scarlett" is the codename of the hardware platform the project ta
 |---|---|---|---|
 | Minecraft Preview | 1.18.3064.0, GXDK 220300 | Windows 10 (RTX 5090), Linux (Wine) | ✅ **Playable**: worlds are created, saved and played at ~60 FPS; no audio |
 | The Matrix Awakens: An Unreal Engine 5 Experience | GXDK 200800 | Windows 10 (RTX 5090) | ⚠ **In progress**: menus, videos and the opening chase run at ~20 FPS; real-time scenes are lit once their ray-tracing programs are prepared, with some objects still black (Lumen hardware ray tracing is incomplete); the first run spends minutes compiling shaders and has lag spikes |
+| **A newer retail game** | – | Windows 10 (RTX 5090) | 🚧 **In progress**: runs its first-boot settings and legal screens and its start screen at a steady 30 FPS; its 4K intro movie plays with sound; it then stops while it streams in the scene behind its menus (the menus themselves are not reached yet). The first frame takes about 100 s (its pipelines are rebuilt from the shader cache at every start) |
 | Microsoft's Xbox GDK samples (25, built as Series X\|S executables) | GDKX April 2026 | Linux (Intel Iris Xe) | ✅ 22 of 25 present frames with their intended image; the other 3 need a mesh-shader GPU |
 
 Per-title details, known issues and what was fixed on the way are in
