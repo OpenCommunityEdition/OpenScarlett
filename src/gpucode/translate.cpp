@@ -3249,8 +3249,35 @@ bool Translator::emit_exp(const Instr& in, size_t idx) {
 // ---- global loads: constant tables addressed relative to the program counter ----------------
 bool Translator::emit_global(const Instr& in, size_t idx) {
     std::string n = in.name;
-    bool load = starts(n, "global_load_"), store = starts(n, "global_store_");
-    if (!load && !store) return fail(fmt("%s at 0x%x not supported", in.name, in.offset));
+    bool load = starts(n, "global_load_"), store = starts(n, "global_store_"), atomic = starts(n, "global_atomic_");
+    if (!load && !store && !atomic) return fail(fmt("%s at 0x%x not supported", in.name, in.offset));
+    if (atomic) {
+        // A 32-bit atomic at a GPU address: the data register is the operand (compare-and-swap:
+        // the new value, then the value compared with), the result register gets the old value
+        // when the instruction asks for it. Integer operations map to the PC ones; float minimum
+        // and maximum have none and are a compare-and-swap loop.
+        static const struct { const char* name; unsigned op; } kOps[] = {
+            {"global_atomic_add", 1}, {"global_atomic_sub", 2}, {"global_atomic_umin", 3}, {"global_atomic_umax", 4}, {"global_atomic_smin", 5},
+            {"global_atomic_smax", 6}, {"global_atomic_and", 7}, {"global_atomic_or", 8}, {"global_atomic_xor", 9}, {"global_atomic_swap", 10}};
+        unsigned op = 0;
+        for (auto& o : kOps) if (n == o.name) op = o.op;
+        const bool fmn = n == "global_atomic_fmin", fmx = n == "global_atomic_fmax", cas = n == "global_atomic_cmpswap";
+        if (!op && !fmn && !fmx && !cas) return fail(fmt("%s at 0x%x not supported", in.name, in.offset));
+        if (!opt.global_memory && !opt.global_memory_test) return fail(fmt("%s at 0x%x: global atomics need the layer's global memory", in.name, in.offset));
+        uses_gm = true;
+        uses_gm_atomic = true;
+        std::string alo = in.saddr != src::kNull ? fmt("(%s + %s)", S(in.saddr).c_str(), V(in.vaddr).c_str()) : V(in.vaddr);
+        std::string ahi = in.saddr != src::kNull ? fmt("(%s + (%s + %s < %s ? 1u : 0u))", S(in.saddr + 1).c_str(), S(in.saddr).c_str(), V(in.vaddr).c_str(), S(in.saddr).c_str())
+                                                 : V(in.vaddr + 1);
+        line(fmt("if (kexec) { uint lo_ = %s, hi_ = %s; uint im_ = %du; uint al_ = lo_ + im_;", alo.c_str(), ahi.c_str(), in.offset_imm));
+        line(fmt("  hi_ += %s; lo_ = al_;", in.offset_imm < 0 ? "(al_ > lo_ ? 0xffffffffu : 0u)" : "(al_ < lo_ ? 1u : 0u)"));
+        if (op) line(fmt("  uint o_ = gm_atomic(lo_, hi_, %uu, %s);", op, V(in.vdata).c_str()));
+        else if (cas) line(fmt("  uint o_ = gm_cmpswap(lo_, hi_, %s, %s);", V(in.vdata + 1).c_str(), V(in.vdata).c_str()));
+        else line(fmt("  uint o_ = gm_atomic_f(lo_, hi_, %s, %s);", fmx ? "true" : "false", V(in.vdata).c_str()));
+        if (in.glc) line(fmt("  %s = o_;", V(in.dst).c_str()));
+        line("}");
+        return true;
+    }
     bool dword = has(n, "dword");
     unsigned cnt = has(n, "x4") ? 4 : has(n, "x3") ? 3 : has(n, "x2") ? 2 : 1;
     if (!dword && (store ? !(ends(n, "byte") || ends(n, "short")) : !(ends(n, "ubyte") || ends(n, "sbyte") || ends(n, "ushort") || ends(n, "sshort"))))
@@ -3283,10 +3310,10 @@ bool Translator::emit_global(const Instr& in, size_t idx) {
         line(fmt("  uint w_ = %s; uint v_ = (w_ >> ((lo_ & 3u) * 8u)) & 0x%xu;", rdw("0u").c_str(), (1u << bits) - 1));
         line(fmt("  %s = %s;", V(in.dst).c_str(), sgn ? fmt("uint(int(v_ << %uu) >> %u)", 32 - bits, 32 - bits).c_str() : "v_"));
     } else if (dword) {
-        for (unsigned k = 0; k < cnt; k++) line(fmt("  gm_store(lo_ + %uu, hi_ + (lo_ + %uu < lo_ ? 1u : 0u), %s);", 4 * k, 4 * k, V(in.data0 + k).c_str()));
+        for (unsigned k = 0; k < cnt; k++) line(fmt("  gm_store(lo_ + %uu, hi_ + (lo_ + %uu < lo_ ? 1u : 0u), %s);", 4 * k, 4 * k, V(in.vdata + k).c_str()));
     } else {
         unsigned bits = ends(n, "byte") ? 8 : 16;
-        line(fmt("  gm_store_bits(lo_, hi_, %s & 0x%xu, 0x%xu);", V(in.data0).c_str(), (1u << bits) - 1, (1u << bits) - 1));
+        line(fmt("  gm_store_bits(lo_, hi_, %s & 0x%xu, 0x%xu);", V(in.vdata).c_str(), (1u << bits) - 1, (1u << bits) - 1));
     }
     line("}");
     return true;
@@ -3634,6 +3661,9 @@ std::string Translator::generate() {
         h << "ByteAddressBuffer GMTEST : register(t1, space0);   // tests: global memory = this buffer\n"
              "uint gm_load(uint lo, uint hi) { uint n_; GMTEST.GetDimensions(n_); return hi == 0u && lo + 4u <= n_ ? GMTEST.Load(lo & ~3u) : 0u; }\n"
              "void gm_store(uint lo, uint hi, uint v) {}\n"
+             "uint gm_atomic(uint lo, uint hi, uint op, uint v) { return 0u; }\n"
+             "uint gm_cmpswap(uint lo, uint hi, uint cmp, uint v) { return 0u; }\n"
+             "uint gm_atomic_f(uint lo, uint hi, bool mx, uint v) { return 0u; }\n"
              "void gm_store_bits(uint lo, uint hi, uint v, uint mask) {}\n";
     } else if (uses_gm) {
         h << "StructuredBuffer<uint4> GMT : register(t0, space901);\n"
@@ -3696,6 +3726,26 @@ std::string Translator::generate() {
              "  case 9u: GMU[NonUniformResourceIndex(i)].InterlockedXor(a, v, o); break;\n"
              "  default: GMU[NonUniformResourceIndex(i)].InterlockedExchange(a, v, o); break;\n"
              "  }\n  return o;\n}\n"
+             "uint gm_cmpswap(uint lo, uint hi, uint cmp, uint v) {\n"
+             "  uint fy, fz, fl; bool fx = gm_find(lo, hi, fy, fz, fl);\n"
+             "  if (!fx || !(fy & 0x80000000u)) return 0u;\n"
+             "  uint o = 0u; GMU[NonUniformResourceIndex((fy >> 14) & 0x3fffu)].InterlockedCompareExchange(fz & ~3u, cmp, v, o);\n"
+             "  return o;\n}\n"
+             "// Float minimum / maximum: stored when the operand compares below / above what is there\n"
+             "// (never for a NaN). Another thread's store in between is retried; each retry sees a value\n"
+             "// nearer the operand, so a few rounds settle it.\n"
+             "uint gm_atomic_f(uint lo, uint hi, bool mx, uint v) {\n"
+             "  uint fy, fz, fl; bool fx = gm_find(lo, hi, fy, fz, fl);\n"
+             "  if (!fx || !(fy & 0x80000000u)) return 0u;\n"
+             "  uint i = (fy >> 14) & 0x3fffu, a = fz & ~3u;\n"
+             "  uint cur = GMU[NonUniformResourceIndex(i)].Load(a);\n"
+             "  for (uint k = 0u; k < 24u; k++) {\n"
+             "    bool take = mx ? asfloat(v) > asfloat(cur) : asfloat(v) < asfloat(cur);\n"
+             "    if (!take) break;\n"
+             "    uint o = 0u; GMU[NonUniformResourceIndex(i)].InterlockedCompareExchange(a, cur, v, o);\n"
+             "    if (o == cur) break;\n"
+             "    cur = o;\n"
+             "  }\n  return cur;\n}\n"
              "void gm_store_bits(uint lo, uint hi, uint v, uint mask) {   // byte/short stores: atomic clear and set\n"
              "  uint fy, fz, fl; bool fx = gm_find(lo, hi, fy, fz, fl);\n"
              "  if (!fx || !(fy & 0x80000000u)) return;\n"

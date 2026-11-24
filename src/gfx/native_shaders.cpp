@@ -274,6 +274,34 @@ void set_fallback_root_signature(const void* blob, size_t n) {
 }
 const std::vector<uint8_t>& fallback_root_signature() { return t_fallback_rs; }
 void note_vs_output(const void* in, size_t n, const std::string& hlsl);   // below (rectangle lists)
+// Whether a container's DXIL program calls the console compiler's own intrinsics (functions named
+// xbox.*, e.g. loads and stores at GPU addresses). No PC driver compiles those: one was seen to
+// accept such a pipeline and then spend 50 ms in its compiler at every selection of it, without
+// ever getting a program. Only the precompiled code of such a shader can run.
+// Function names sit in the bitcode's symbol table as 6-bit characters when they are made of
+// [a-zA-Z0-9._] only (else as bytes), at any bit offset: "xbox." is looked for both ways.
+static bool console_only_bitcode(const gpucode::Container& c) {
+    const auto* part = c.part("DXIL");
+    if (!part || part->size() < 24) return false;
+    const uint8_t* body = part->data();
+    uint32_t bcOff, bcSize;
+    memcpy(&bcOff, body + 16, 4);
+    memcpy(&bcSize, body + 20, 4);
+    if (8ull + bcOff + bcSize > part->size() || bcSize < 16) return false;
+    const uint8_t* bc = body + 8 + bcOff;
+    auto six = [](char ch) -> uint64_t { return ch >= 'a' && ch <= 'z' ? ch - 'a' : ch >= 'A' && ch <= 'Z' ? ch - 'A' + 26 : ch >= '0' && ch <= '9' ? ch - '0' + 52 : ch == '.' ? 62 : 63; };
+    const char* name = "xbox.";
+    uint64_t want = 0;
+    for (int i = 0; i < 5; i++) want |= six(name[i]) << (6 * i);
+    for (size_t i = 0; i + 8 <= bcSize; i++) {
+        if (!memcmp(bc + i, name, 5)) return true;
+        uint64_t w;
+        memcpy(&w, bc + i, 8);
+        for (int sh = 0; sh < 8; sh++)
+            if (((w >> sh) & 0x3FFFFFFFull) == want) return true;
+    }
+    return false;
+}
 // The cache key of a console shader: the translator's version, the container, the root signature
 // it is translated against when it carries none, and what else changes the output.
 static uint64_t shader_key(const gpucode::Container& c, const void* in, size_t n, bool* fallbackRs, bool* meshKind) {
@@ -292,7 +320,7 @@ static uint64_t shader_key(const gpucode::Container& c, const void* in, size_t n
 int shader_cache_state(const void* in, size_t n, char stage[8]) {
     if (stage) stage[0] = 0;
     gpucode::Container c;
-    if (mode() == 0 || !gpucode::read_container(in, n, c) || !c.has_native || (c.has_bitcode && mode() != 1)) return -1;
+    if (mode() == 0 || !gpucode::read_container(in, n, c) || !c.has_native || (c.has_bitcode && mode() != 1 && !console_only_bitcode(c))) return -1;
     if (stage) snprintf(stage, 8, "%s", gpucode::kind_name(c.kind));
     bool fallbackRs = false, meshKind = false;
     const uint64_t key = shader_key(c, in, n, &fallbackRs, &meshKind);
@@ -306,6 +334,16 @@ bool native_translate(const void* in, size_t n, void** out, size_t* outSize) {
     gpucode::Container c;
     if (!gpucode::read_container(in, n, c)) return false;
     if (!c.has_native) {
+        if (!c.has_bitcode && !c.part("DXIL") && c.part("ACCC")) {
+            // A console program in the console driver's own container (middleware ships these, with
+            // no DXIL beside them). The translator does not read it: the pipeline becomes a
+            // placeholder whose work is skipped, like any other untranslated console program.
+            static volatile long w = 0;
+            if (InterlockedIncrement(&w) <= 3) XSL_WARN(CH, "shader (%s, %zu bytes) holds a console program in a container the translator does not read (ACCC): placeholder pipeline", gpucode::kind_name(c.kind), n);
+            t_untranslated = true;
+            if (t_why.empty()) t_why = "console program in a container the translator does not read (ACCC)";
+            return false;
+        }
         if (!c.has_bitcode && c.part("DXIL")) {
             static volatile long w = 0;
             if (InterlockedIncrement(&w) <= 5)
@@ -313,9 +351,17 @@ bool native_translate(const void* in, size_t n, void** out, size_t* outSize) {
         }
         return false;
     }
-    if (c.has_bitcode && mode() != 1) return false;
+    // A container can hold a DXIL program beside the precompiled code. The DXIL is what the PC
+    // runtime gets (unless XSL_NATIVE_SHADERS=1), except when it cannot run on a PC at all.
+    const bool consoleOnly = c.has_bitcode && mode() != 1 && console_only_bitcode(c);
+    if (c.has_bitcode && mode() != 1 && !consoleOnly) return false;
+    if (consoleOnly) {
+        static volatile long w = 0;
+        if (InterlockedIncrement(&w) == 1) XSL_INFO(CH, "shaders whose DXIL calls the console compiler's intrinsics (xbox.*) run from their precompiled code");
+    }
+    const bool noFallback = !c.has_bitcode || consoleOnly;   // nothing else to run when the translation fails
     if (const char* st = getenv("XSL_NATIVE_STAGES"); st && *st && !strstr(st, gpucode::kind_name(c.kind))) {
-        t_untranslated = !c.has_bitcode;   // excluded stage: like an untranslatable shader (placeholder pipeline)
+        t_untranslated = noFallback;   // excluded stage: like an untranslatable shader (placeholder pipeline)
         static volatile long w = 0;
         if (InterlockedIncrement(&w) <= 3) XSL_INFO(CH, "%s shader excluded by XSL_NATIVE_STAGES (DXIL program: %d)", gpucode::kind_name(c.kind), (int)c.has_bitcode);
         return false;
@@ -329,14 +375,14 @@ bool native_translate(const void* in, size_t n, void** out, size_t* outSize) {
             XSL_INFO(CH, "shader %s skipped (XSL_SKIP_SHADERS)", k);
             dump(key, in, n, "", "skipped");
             if (fallbackRs) dump_rs(key, t_fallback_rs.data(), t_fallback_rs.size());
-            t_untranslated = !c.has_bitcode;
+            t_untranslated = noFallback;
             return false;
         }
     }
     {
         std::lock_guard<std::mutex> g(g_lock);
         if (auto f = g_failed.find(key); f != g_failed.end()) {
-            t_untranslated = !c.has_bitcode;
+            t_untranslated = noFallback;
             if (t_why.empty()) t_why = f->second;
             return false;
         }
@@ -376,7 +422,7 @@ bool native_translate(const void* in, size_t n, void** out, size_t* outSize) {
                      rsp ? "own" : fallbackRs ? "pipeline's" : "none", rsSize, head);
             std::lock_guard<std::mutex> g(g_lock);
             g_failed[key] = "no usable root signature";
-            t_untranslated = !c.has_bitcode;
+            t_untranslated = noFallback;
             if (t_why.empty()) t_why = "no usable root signature";
             return false;
         }
@@ -411,7 +457,7 @@ bool native_translate(const void* in, size_t n, void** out, size_t* outSize) {
             }
             std::lock_guard<std::mutex> g(g_lock);
             g_failed[key] = why;
-            t_untranslated = !c.has_bitcode;
+            t_untranslated = noFallback;
             if (t_why.empty()) t_why = why;
             return false;
         }
@@ -428,7 +474,7 @@ bool native_translate(const void* in, size_t n, void** out, size_t* outSize) {
             const std::string why = std::string(gpucode::kind_name(c.kind)) + ": translation too large for the compiler";
             std::lock_guard<std::mutex> g(g_lock);
             g_failed[key] = why;
-            t_untranslated = !c.has_bitcode;
+            t_untranslated = noFallback;
             if (t_why.empty()) t_why = why;
             return false;
         }
@@ -440,7 +486,7 @@ bool native_translate(const void* in, size_t n, void** out, size_t* outSize) {
         if (fallbackRs) dump_rs(key, t_fallback_rs.data(), t_fallback_rs.size());
             std::lock_guard<std::mutex> g(g_lock);
             g_failed[key] = "translated HLSL does not compile";
-            t_untranslated = !c.has_bitcode;
+            t_untranslated = noFallback;
             if (t_why.empty()) t_why = "translated HLSL does not compile";
             return false;
         }
