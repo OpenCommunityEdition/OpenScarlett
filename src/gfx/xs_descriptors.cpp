@@ -364,6 +364,18 @@ bool slot_blank(const uint8_t* s) {
         if (w[k]) return false;
     return true;
 }
+// The console GPU's own buffer descriptor, which titles also write into a slot themselves (16
+// bytes; what the slot's other half held stays): the address (48 bits), the element size in bytes
+// (14 bits; 0: the count is in bytes), the element count, and a dword with the format (bits 12..18)
+// whose top two bits are 0 for a buffer.
+bool native_buffer(const uint8_t* s, uint64_t* a, uint32_t* stride, uint64_t* bytes) {
+    const uint32_t* w = (const uint32_t*)s;
+    *a = w[0] | (uint64_t)(w[1] & 0xffff) << 32;
+    *stride = (w[1] >> 16) & 0x3fff;
+    *bytes = *stride ? (uint64_t)*stride * w[2] : w[2];
+    return *a && w[2] && !(w[1] >> 30) && !(w[3] >> 30) && ((w[3] >> 12) & 0x7f) && *bytes <= (1u << 28);
+}
+uint64_t g_nativeViews = 0, g_nativeNone = 0, g_undecoded = 0;
 // Decode a console buffer descriptor that an inlined CreateConstantBufferView wrote.
 bool materialize_xbox_cbv(uint32_t i, const uint64_t* q) {
     uint64_t addr, size;
@@ -390,7 +402,16 @@ bool materialize_xbox_cbv(uint32_t i, const uint64_t* q) {
         // dwords less one), or the element size (dword 5 the element count, dword 2 that less one).
         const uint64_t a = q[0];
         const bool counted = w[4] != 0x80000000u && w[4] && w[4] <= 65536 && !(w[4] & 3) && w[2] == w[5] - 1;
-        const uint32_t bytes = counted ? w[4] * w[5] : w[5], stride = counted ? 4 : bytes % 64 == 0 ? 64 : 4;
+        // (The counted form names the element size the shader's code was built with, and the PC view
+        // has to have that one: with another, what a shader reads past the view's end is not
+        // defined, and GPU-based validation names every such draw.)
+        const uint32_t bytes = counted ? w[4] * w[5] : w[5], stride = counted ? w[4] : bytes % 64 == 0 ? 64 : 4;
+        {
+            static volatile long seen[5] = {};
+            const int cls = !counted ? 0 : w[4] == 4 ? 1 : w[4] == 16 ? 2 : w[4] == 64 ? 3 : 4;
+            if (InterlockedIncrement(&seen[cls]) == 1)
+                XSL_INFO(CH, "inline buffer view, first of its kind: %s, element size %u, %u elements, %u bytes", counted ? "counted" : "raw", counted ? w[4] : stride, counted ? w[5] : bytes / stride, bytes);
+        }
         UnifiedRef u{};
         PcObj pcd = dev_extra(g_dev)->pcDevice;
         bool ok = unified_from_gpu(a, &u) || unified_lookup(g_dev, a, &u);
@@ -416,7 +437,32 @@ bool materialize_xbox_cbv(uint32_t i, const uint64_t* q) {
         publish(i);
         return true;
     } else {
-        return false;
+        // The console's own descriptor, of any element size: a view of the same bytes in dwords
+        // (the table check gives it the form a shader declares), or of nothing when no PC memory
+        // is known there. Left as it was, the PC slot held the view of whatever was there before.
+        uint64_t a = 0, bytes = 0;
+        uint32_t stride = 0;
+        if (!native_buffer((const uint8_t*)q, &a, &stride, &bytes)) return false;
+        UnifiedRef u{};
+        PcObj pcd = dev_extra(g_dev)->pcDevice;
+        bool ok = unified_from_gpu(a, &u) || unified_lookup(g_dev, a, &u);
+        uint64_t off = u.offset;
+        if (!ok) { PcObj r = nullptr; uint64_t avail = 0; ok = pc::gm_resolve(a, &r, &off, &avail) && r; u.res = r; }
+        ok = ok && !(off & 3) && bytes >= 4;
+        D3D12_SHADER_RESOURCE_VIEW_DESC sd{};
+        sd.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+        sd.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        sd.Format = DXGI_FORMAT_UNKNOWN;
+        sd.Buffer.StructureByteStride = 4;
+        sd.Buffer.NumElements = ok ? (UINT)(bytes / 4) : 1;
+        sd.Buffer.FirstElement = ok ? off / 4 : 0;
+        pc::create_srv(pcd, ok ? u.res : nullptr, &sd, mirror_cpu(i));
+        const uint64_t k = ok ? ++g_nativeViews : ++g_nativeNone;
+        if (k <= 3)
+            XSL_INFO(CH, "view slot %u holds the console's own buffer descriptor (%llu bytes in elements of %u at %llx): %s", i, (unsigned long long)bytes, stride, (unsigned long long)a,
+                     ok ? "a shader view of its PC buffer" : "no PC memory known there, a view of nothing");
+        publish(i);
+        return true;
     }
     PcObj pcdev = dev_extra(g_dev)->pcDevice;
     if (!addr) {
@@ -458,6 +504,21 @@ void snapshot_set(uint32_t i, const void* s) {
 bool g_payload_dirty = false;       // payloads written by copies since the last sync
 thread_local uint32_t t_payload[4];
 thread_local bool t_has_payload = false;
+// A slot whose bytes the layer cannot make a view of: a buffer view of no resource in the PC heap
+// (a shader that reads it gets zeros; the view the slot had before could be of a released resource,
+// and reading that took the device down). The table check changes its kind to what a shader declares.
+void slot_nothing(uint32_t i) {
+    D3D12_SHADER_RESOURCE_VIEW_DESC sd{};
+    sd.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+    sd.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    sd.Format = DXGI_FORMAT_UNKNOWN;
+    sd.Buffer.StructureByteStride = 4;
+    sd.Buffer.NumElements = 1;
+    pc::create_srv(dev_extra(g_dev)->pcDevice, nullptr, &sd, mirror_cpu(i));
+    g_undecoded++;
+    if (i / kPageSlots < g_pcPageOf.size() && g_pcPageOf[i / kPageSlots].load(std::memory_order_acquire)) publish(i);
+    else g_pgWritten[i / kPageSlots] = 1;   // (no PC page yet, and none is taken for this: it comes with the page's fill)
+}
 // Make global slot i match its shadow bytes. Caller holds g_mu.
 void materialize(uint32_t i) {
     const uint8_t* s = slot_ptr(i);
@@ -468,6 +529,9 @@ void materialize(uint32_t i) {
         if (g_rec[D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV].resolve(t, &rec)) {
             set_slot(i, rec);
         } else {
+            // (The title wrote its own descriptor over a slot whose other half still held an old
+            // tag, or the view was released: the PC slot must not keep what it had.)
+            if (!materialize_xbox_cbv(i, (const uint64_t*)s)) slot_nothing(i);
             static volatile long n = 0;
             if (InterlockedIncrement(&n) <= 6) {
                 const Records& r = g_rec[D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV];
@@ -477,7 +541,10 @@ void materialize(uint32_t i) {
             }
         }
     } else if (!materialize_xbox_cbv(i, (const uint64_t*)s)) {
-        if (!slot_blank(s)) {
+        if (slot_blank(s)) {
+            if (!slot_blank(&g_snapshot[(size_t)i * kViewSlot])) slot_nothing(i);   // (cleared by the title: the view it had goes)
+        } else {
+            slot_nothing(i);
             static volatile long n = 0;
             const uint32_t* w = (const uint32_t*)s;
             if (InterlockedIncrement(&n) <= 12)
@@ -617,7 +684,8 @@ static int table_slot_fix(uint64_t pcGpu, uint32_t k, uint32_t want) {
     const Records& r = g_rec[D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV];
     uint64_t rec;
     const bool empty = slot_blank(s);
-    const uint32_t cur = empty ? 0 : tg.magic != 0x444C5358u ? 2 : !r.resolve(tg, &rec) ? 0xfe : r.kind[tg.record];
+    uint32_t cur = empty ? 0 : tg.magic != 0x444C5358u ? 2 : !r.resolve(tg, &rec) ? 0xfe : r.kind[tg.record];
+    if (cur == 0xfe) cur = 2;   // (an old tag behind bytes the title wrote: read as console bytes)
     const uint32_t cls = want & 0x30, dim = want & 15, form = (want >> 8) & 3;
     PcObj dev = dev_extra(g_dev)->pcDevice;
     // The range a constant buffer view names: the title's address and the size.
@@ -670,6 +738,59 @@ static int table_slot_fix(uint64_t pcGpu, uint32_t k, uint32_t want) {
         nothing = ((q[1] & kXboxCbvFormatMask) == (0x0002403C00000000ull & kXboxCbvFormatMask) && !(q[0] & ((1ull << 48) - 1))) || (!q[0] && !w[2] && !q[3]);
     }
     if (nothing && cur == 2 && want == 1) return 0;   // (a constant buffer view of nothing is what the sync made of it)
+    // Console bytes that name memory, read as a buffer: a view of those bytes in the form the
+    // shader declares. Any other pairing of console bytes and a declaration, and bytes that name
+    // no PC memory, become a view of nothing of the declared kind below.
+    uint64_t nat_a = 0, nat_bytes = 0;
+    UnifiedRef nat_u{};
+    uint64_t nat_off = 0;
+    bool nat_ok = false;
+    if (!nothing && (cur == 1 || cur == 2) && dim == 1 && want != 1 && (cls == 0x10 || cls == 0x20) && !(cls == 0x10 && form == 0 && false)) {
+        const uint64_t* q = (const uint64_t*)s;
+        const uint32_t* w = (const uint32_t*)s;
+        uint32_t st = 0;
+        if (cur == 1) { nat_a = r.src[tg.record] ? r.src[tg.record] : w[0] | (uint64_t)(w[1] & 0xffff) << 32; nat_bytes = w[2]; }
+        else if ((q[1] & kXboxCbvFormatMask) == (0x0002403C00000000ull & kXboxCbvFormatMask)) { nat_a = gpu_va(g_dev, q[0] & ((1ull << 48) - 1)); nat_bytes = (q[1] & 0xFFFFFFFFull) << 4; }
+        else if (q[0] && q[0] == q[2] && w[2] && !(w[2] & 31) && w[6] == (uint32_t)(q[0] >> 6)) { nat_a = gpu_va(g_dev, q[0]); nat_bytes = w[2]; }
+        else if (q[0] && q[3] == q[0] && w[5] && !(w[5] & 3)) { nat_a = q[0]; nat_bytes = w[5]; }
+        else if (!native_buffer(s, &nat_a, &st, &nat_bytes)) nat_a = nat_bytes = 0;
+        nat_ok = nat_a && nat_bytes >= 4 && (unified_lookup(g_dev, nat_a, &nat_u) || unified_from_gpu(nat_a, &nat_u));
+        nat_off = nat_u.offset;
+        if (nat_a && nat_bytes >= 4 && !nat_ok) { PcObj res = nullptr; uint64_t avail = 0; nat_ok = pc::gm_resolve(nat_a, &res, &nat_off, &avail) && res; nat_u.res = res; }
+        if (nat_off & 3) nat_ok = false;
+        if (nat_ok && cls == 0x10) {
+            srv_buffer(nat_u.res, nat_off / 4, (uint32_t)(nat_bytes / 4));
+            publish(t);
+            g_slotFix[t] = (uint16_t)(want | 0x8000);
+            if (g_fixBuffer++ < 4)
+                XSL_INFO(CH, "view slot %u holds a constant buffer view (%llu bytes at %llx) where a shader reads a buffer: a buffer view of the same bytes takes its place", t,
+                         (unsigned long long)nat_bytes, (unsigned long long)nat_a);
+            return 2;
+        }
+        if (nat_ok && cls == 0x20) {
+            D3D12_UNORDERED_ACCESS_VIEW_DESC ud{};
+            ud.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+            ud.Format = form == 0 ? DXGI_FORMAT_R32_UINT : form == 1 ? DXGI_FORMAT_R32_TYPELESS : DXGI_FORMAT_UNKNOWN;
+            ud.Buffer.FirstElement = nat_off / 4;
+            ud.Buffer.NumElements = (UINT)(nat_bytes / 4);
+            ud.Buffer.StructureByteStride = form == 2 ? 4 : 0;
+            ud.Buffer.Flags = form == 1 ? D3D12_BUFFER_UAV_FLAG_RAW : D3D12_BUFFER_UAV_FLAG_NONE;
+            pc::create_uav(dev, nat_u.res, nullptr, &ud, mirror_cpu(t));
+            publish(t);
+            g_slotFix[t] = (uint16_t)(want | 0x8000);
+            g_fixBuffer++;
+            return 2;
+        }
+        const uint32_t* w2 = (const uint32_t*)s;
+        if (g_fixNone++ < 6)
+            XSL_WARN(CH, "view slot %u holds console bytes (%llu bytes at %llx, kind %u) where a shader reads a buffer: %s, a view of nothing takes its place (slot bytes %08x %08x %08x %08x %08x %08x %08x %08x)",
+                     t, (unsigned long long)nat_bytes, (unsigned long long)nat_a, cur, nat_a ? "no PC buffer is known at that address" : "they name no memory the layer can decode", w2[0], w2[1],
+                     w2[2], w2[3], w2[4], w2[5], w2[6], w2[7]);
+        nothing = true;
+    } else if (!nothing && cur == 2 && want != 1) {
+        g_fixNone++;
+        nothing = true;   // (console bytes where a texture or an acceleration structure is declared)
+    }
     if (nothing) {
         if (want == 1) pc::create_cbv(dev, nullptr, mirror_cpu(t));
         else if (cls == 0x10) {
@@ -1062,9 +1183,11 @@ void desc_sync() {
                      "view records: %llu made, %llu in use by slots, %llu passed over",
                  held, g_pcPageOwner.size(), tables, (unsigned long long)g_pgPlaced, (unsigned long long)g_pgEvicted, (unsigned long long)g_pgMoved,
                  (unsigned long long)g_pgNoRoom, (unsigned long long)g_pgSplit, (unsigned long long)r.next, (unsigned long long)r.pinned, (unsigned long long)r.passed);
-        XSL_INFO(CH, "tables put right for what shaders declare: %llu empty slots given views of no resource, %llu constant buffer views given buffer views, %llu left (no PC memory known), "
-                     "%llu copies of constants at console alignment made anew, %llu tables that run into a page elsewhere made afresh",
-                 (unsigned long long)g_fixNull, (unsigned long long)g_fixBuffer, (unsigned long long)g_fixNone, (unsigned long long)g_fixCbv, (unsigned long long)g_fixFresh);
+        XSL_INFO(CH, "tables put right for what shaders declare: %llu empty slots given views of no resource, %llu constant buffer views given buffer views, %llu console bytes given views of nothing, "
+                     "%llu copies of constants at console alignment made anew, %llu tables that run into a page elsewhere made afresh; "
+                     "slots with the console's own buffer descriptor: %llu given views, %llu name no PC memory; %llu slots the layer cannot decode or the title cleared given views of nothing",
+                 (unsigned long long)g_fixNull, (unsigned long long)g_fixBuffer, (unsigned long long)g_fixNone, (unsigned long long)g_fixCbv, (unsigned long long)g_fixFresh,
+                 (unsigned long long)g_nativeViews, (unsigned long long)g_nativeNone, (unsigned long long)g_undecoded);
     }
     size_t bytes = (size_t)g_viewCount * kViewSlot;
     static std::vector<void*> pages;

@@ -6436,6 +6436,12 @@ static void prof_slow_check(uint64_t present) {
         for (int k = 0; k < 5; k++) why[k] = InterlockedExchange(&g_rays_why[k], 0);
         char wb[160] = "";
         if (rs) snprintf(wb, sizeof wb, " (no pipeline %ld, start program building %ld, failed %ld, reached program building %ld, indirect %ld)", why[0], why[1], why[2], why[3], why[4]);
+        {
+            extern volatile long g_tc_differ[3];
+            const long d0 = InterlockedExchange(&g_tc_differ[0], 0), d1 = InterlockedExchange(&g_tc_differ[1], 0), d2 = InterlockedExchange(&g_tc_differ[2], 0);
+            if (d0 || d1 || d2)
+                XSL_WARN(CH, "table check: views of another kind than the shader declares, left as they are, over the last 10 s: %ld a buffer against a texture, %ld a shader view against an unordered one, %ld another dimension", d0, d1, d2);
+        }
         XSL_INFO(CH, "frame rate: %.1f presents/s (presents %llu..%llu, slowest %.0f ms)%s%s", double(present - periodStart) / ps, (unsigned long long)periodStart,
                  (unsigned long long)present, worst, (rr || rs) ? fmt_rays(rr, rs).c_str() : "", wb);
         period = now;
@@ -6582,6 +6588,7 @@ static void prof_report(ID3D12CommandQueue* queue, bool now = false) {
 }
 static void prof_report_now() { prof_report(nullptr, true); }
 // (see XSL_TABLE_CHECK above)
+volatile long g_tc_differ[3];   // views of another kind than declared, left: buffer against texture, shader view against unordered view, another dimension
 static void table_check(PcObj l) {
     if (!table_check_on() || !g_tc_read || !g_own_rs_any) return;
     PcObj pso = nullptr;
@@ -6720,8 +6727,12 @@ static void table_check(PcObj l) {
             g_tc_fix(pa->second.second, at, 1);
             if (!all) continue;
         }
-        if (table_fix_on() && g_tc_fix && q.kind && q.kind <= 16 && (kind == 0 || ((kind == 1 || kind == 2) && buffer && cls == D3D12_DESCRIPTOR_RANGE_TYPE_SRV)))
+        // Empty slots, console bytes and old tags whatever the shader declares there, and constant
+        // buffer views read as buffers: see table_slot_fix.
+        if (table_fix_on() && g_tc_fix && q.kind && q.kind <= 16 && cls != D3D12_DESCRIPTOR_RANGE_TYPE_CBV && (kind == 0 || kind == 2 || kind == 0xfe || (kind == 1 && buffer)))
             fixed = g_tc_fix(pa->second.second, at, want | form << 8);
+        if (fixed <= 0 && kind != 0 && kind != 1 && kind != 2 && kind < 0xfe && (kind & 0x7f) != want && q.kind && q.kind <= 16)
+            InterlockedIncrement(&g_tc_differ[((kind & 0x0f) == 1) != ((want & 0x0f) == 1) ? 0 : (kind & 0x30) != (want & 0x30) ? 1 : 2]);
         if (fixed > 0 && !logIt) continue;
         const char* what = nullptr;
         char held[48] = "";
@@ -6983,7 +6994,8 @@ static bool guard_init(ID3D12Device* dev) {
         "[numthreads(64, 1, 1)] void main(uint i : SV_DispatchThreadID) {\n"
         "  if (i >= count) return;\n"
         "  uint o = off + i * stride;\n"
-        "  if (kind == 0u) { uint3 g = a.Load3(o); if (any(g > 65535u)) a.Store3(o, uint3(0, 0, 0)); }\n"
+        "  if (kind == 0u) { uint3 g = a.Load3(o); uint xy = g.x * g.y;\n"
+        "    if (any(g > 65535u) || xy > 0x400000u || (xy != 0u && g.z > 0x400000u / xy)) a.Store3(o, uint3(0, 0, 0)); }\n"
         "  else { uint2 c = a.Load2(o); if (any(c >= 0x10000000u) || (c.x != 0u && c.y >= 0x10000000u / c.x)) a.Store2(o, uint2(0, 0)); }\n"
         "}\n";
     ID3DBlob *cs = nullptr, *err = nullptr;
@@ -7005,7 +7017,7 @@ static bool guard_init(ID3D12Device* dev) {
     pd.CS = {cs->GetBufferPointer(), cs->GetBufferSize()};
     if (FAILED(dev->CreateComputePipelineState(&pd, IID_PPV_ARGS(&g_guard.pso)))) return false;
     g_guard.failed = false;
-    XSL_INFO(CH, "indirect arguments are checked before use (dispatches over 65535 groups, draws of 2^28+ items become empty)");
+    XSL_INFO(CH, "indirect arguments are checked before use (dispatches of over 65535 groups in a direction or 4 million in all, draws of 2^28+ items become empty)");
     xsl::log_arm(true);
     return true;
 }
