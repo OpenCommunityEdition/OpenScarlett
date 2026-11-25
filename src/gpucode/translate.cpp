@@ -1120,6 +1120,11 @@ struct Translator {
         // wave32 code: only the low register is the mask (the high one may hold anything)
         if (e == src::kVccz) return W == 64 ? "((s106 | s107) == 0u ? 1u : 0u)" : "(s106 == 0u ? 1u : 0u)";
         if (e == src::kExecz) return W == 64 ? "((s126 | s127) == 0u ? 1u : 0u)" : "(s126 == 0u ? 1u : 0u)";
+        // Primitive-ordered pixel shading: code waits in a loop until the wave id read here has
+        // passed its own (overlapping pixels shade in submission order). A PC has no such
+        // register; the ordering is given up and the wait is made to end: successive reads step
+        // through the id space in quarters, one of which every "has it passed" compare accepts.
+        if (e == src::kPopsExitingWaveId) return "pops_next()";
         return "";
     }
     // 32-bit source bits.
@@ -1528,6 +1533,7 @@ bool Translator::emit_salu(const Instr& in, size_t idx) {
         if (n == "s_sendmsg" || n == "s_sendmsghalt") {
             // MSG_DEALLOC_VGPRS and similar hints; stage-specific messages are handled by the stage.
             if ((in.simm16 & 0xf) == 3) return true;   // MSG_GS_DONE: nothing to do for compute
+            if ((in.simm16 & 0xf) == 7) return true;   // MSG_ORDERED_PS_DONE: the end of an ordered section (see kPopsExitingWaveId)
             if ((in.simm16 & 0xf) == 9 && c.kind == ProgramKind::MS) {   // MSG_GS_ALLOC_REQ: m0 = primitives << 12 | vertices
                 line("ms_counts_ = s124;");
                 return true;
@@ -3058,8 +3064,14 @@ bool Translator::emit_mimg(const Instr& in, size_t idx) {
                 // A gather takes its offset in texels as it is (signed 6-bit x and y).
                 gatherOfs = fmt(", int2(int(%s << 26) >> 26, int(%s << 18) >> 26)", offs.c_str(), offs.c_str());
             } else {
-            if (!flat || !explicit_lod || has(n, "gather")) return fail(n + ": texel offsets not supported yet");
-            std::string mip = has(n, "_lz") ? std::string("0u") : fmt("uint(max(round(asfloat(%s)), 0.0))", lod.c_str());
+            // Without an explicit level (pixel stages): the level the sample will take, as the
+            // sampler computes it from the unshifted coordinates (a constant shift leaves the
+            // derivatives as they are).
+            if (!flat || has(n, "gather") || (!explicit_lod && c.kind != ProgramKind::PS)) return fail(n + ": texel offsets not supported yet");
+            const std::string ss0 = s >= 0 ? sn(idx, s) : dynSS;
+            std::string mip = has(n, "_lz") ? std::string("0u")
+                              : !lod.empty() ? fmt("uint(max(round(asfloat(%s)), 0.0))", lod.c_str())
+                              : fmt("uint(max(round(%s.CalculateLevelOfDetail(%s, %s%s)), 0.0))", RN.c_str(), ss0.c_str(), tc.c_str(), dim == 1 ? "" : ".xy");
             static std::atomic<unsigned> ofsSerial{0};   // one name per instruction (a resource may be sampled many times)
             std::string ofs = fmt("ofs%u_", ofsSerial.fetch_add(1));
             line(fmt("float2 %s; { uint o_ = %s; int ox_ = int(o_ << 26) >> 26, oy_ = int(o_ << 18) >> 26; uint w_, h_, d_, l_; %s.GetDimensions(%s, w_, h_, %sl_); "
@@ -3315,7 +3327,14 @@ std::string Translator::attr_at(unsigned reg, unsigned chan, const std::string& 
     const SigElem* el = nullptr;
     for (auto& e : isg)
         if (e.reg == reg && ((e.mask >> chan) & 1) && e.sysval == 0) el = &e;
-    if (!el) { fail(fmt("pixel input register %u component %u not in the input signature", reg, chan)); return "0u"; }
+    if (!el) {
+        // A component past what the signature gives the register (the stage before writes two
+        // components and the code interpolates a third it then does not use): nothing reaches it.
+        for (auto& e : isg)
+            if (e.reg == reg && e.sysval == 0) return "0u";
+        fail(fmt("pixel input register %u component %u not in the input signature", reg, chan));
+        return "0u";
+    }
     unsigned first = unsigned(__builtin_ctz(el->mask));
     std::string md = el->is_float() ? mode : "nointerpolation";
     auto m = attr_mode.find(el->reg * 4 + first);
@@ -3820,6 +3839,8 @@ const char* kPrelude = R"(
 static uint L, LG;
 static uint64_t memtime_ = 0;
 // 32x32 -> high 32 bits without 64-bit integer multiplies (some PC drivers reject those).
+static uint pops_n_ = 0u;
+uint pops_next() { uint v = pops_n_ << 30; pops_n_++; return v; }   // (see kPopsExitingWaveId)
 uint mulhi_u(uint a, uint b) {
   uint al = a & 0xffffu, ah = a >> 16, bl = b & 0xffffu, bh = b >> 16;
   uint ll = al * bl, lh = al * bh, hl = ah * bl, hh = ah * bh;
@@ -4037,15 +4058,42 @@ std::string Translator::generate() {
                 if (!live[x]) { live[x] = true; work.push_back(x); }
         }
     }
+    // Code with loops: a block that is only ever entered by falling into it (the code after a
+    // conditional branch that nothing else jumps to) is not a case of its own: it goes on in the
+    // case of the block before it. That halves the cases of the dispatch and takes most values
+    // out of the merge at its head, which is what the compilers after this spend their time on
+    // (a megabyte of translation took the HLSL compiler many minutes).
+    std::vector<bool> entered(nb, !loops);
+    if (loops) {
+        entered[0] = true;
+        if (!opt.raw_code.empty() && block_of.count(opt.raw_entry)) entered[block_of[opt.raw_entry]] = true;
+        for (uint32_t t : jump_targets)
+            if (block_of.count(t)) entered[block_of[t]] = true;
+        for (size_t b = 0; b < nb; b++) {
+            const Instr& last = ins[block_end(b) - 1];
+            const std::string ln = last.name ? last.name : "";
+            if (last.fmt == Fmt::SOPP && (starts(ln, "s_branch") || starts(ln, "s_cbranch"))) {
+                auto it = block_of.find(uint32_t(int32_t(last.offset) + 4 + last.simm16 * 4));
+                if (it != block_of.end()) entered[it->second] = true;
+            }
+            // (after a barrier the threads of the group meet: the case ends there; after the end
+            // of the program or a computed jump nothing falls through)
+            if (b + 1 < nb && (ln == "s_barrier" || ln == "s_endpgm" || ln == "s_setpc_b64" || ln == "s_swappc_b64")) entered[b + 1] = true;
+        }
+    }
+    bool inCase = false;   // (the case of an earlier block is still open: this block continues it)
     for (size_t b = 0; b < nb; b++) {
         size_t e = block_end(b);
-        if (!live[b]) continue;
+        if (!live[b]) { if (inCase) { line("RETURN;\n  }"); inCase = false; } continue; }
         lane_stale = true;   // (a block is entered from several places: what L holds there is not known)
         if (!loops) line(fmt("if (reach[%zu]) {", b));
-        else line(fmt("case %zuu: {", b));
+        else if (!inCase) line(fmt("case %zuu: {", b));
         open_block = !loops && has_barrier ? int(b) : -1;
-        if (loops && barriers && !barrier_ahead[b])   // past the last barrier: the small limit (see barrier_ahead)
+        if (loops && !inCase && barriers && !barrier_ahead[b])   // past the last barrier: the small limit (see barrier_ahead)
             line(fmt("if (++guard2_ > %uu) %s", opt.loop_guard, opt.raw_stats ? "{ dbg_add(5u); dbg_set2(19u, pc, guard_); RETURN; }" : "RETURN;"));
+        // The next block continues this case when control only falls into it.
+        const bool goesOn = loops && b + 1 < nb && live[b + 1] && !entered[b + 1];
+        inCase = false;
         jumped = false;
         for (size_t i = block_start[b]; i < e; i++)
             if (!emit(ins[i], i) && !err.empty()) break;
@@ -4061,14 +4109,18 @@ std::string Translator::generate() {
             if (starts(ln, "s_branch")) line(loops ? fmt("pc = %zuu; break;", t) : fmt("reach[%zu] = true;", t));
             else {
                 std::string cnd = branch_cond(last);
-                if (loops) line(fmt("pc = (%s) ? %zuu : %zuu; break;", cnd.c_str(), t, next));
+                if (loops && goesOn) { line(fmt("if (%s) { pc = %zuu; break; }", cnd.c_str(), t)); inCase = true; }
+                else if (loops) line(fmt("pc = (%s) ? %zuu : %zuu; break;", cnd.c_str(), t, next));
                 else line(fmt("if (%s) reach[%zu] = true; else reach[%zu] = true;", cnd.c_str(), t, next));
             }
+        } else if (loops && goesOn) {
+            inCase = true;
         } else {
             line(loops ? fmt("pc = %zuu; break;", next) : fmt("reach[%zu] = true;", next));
         }
-        line("}");
+        if (!inCase) line("}");
     }
+    if (inCase) line("RETURN;\n  }");
     if (loops && coop) {
         // The count of threads with code left is a group-shared variable (XSL_LIVE). A program
         // whose own group memory is the 32 KB a PC allows has no room for one: there the last
@@ -4874,7 +4926,7 @@ bool translate_gs_copy(const Container& c, TranslateResult& r) {
 // ---- cache key salts ---------------------------------------------------------------------------
 uint64_t translation_salt(const Container& c) {
     const std::vector<uint32_t> code = c.code();
-    bool barrier = false, backward = false, global_write = false;
+    bool barrier = false, backward = false, global_write = false, computed = false;
     for (size_t i = 0; i < code.size();) {
         Instr in;
         if (!decode(code.data(), code.size(), i, in)) break;
@@ -4882,6 +4934,7 @@ uint64_t translation_salt(const Container& c) {
         if (!in.name) continue;
         if (!strcmp(in.name, "s_barrier")) barrier = true;
         if ((starts(in.name, "s_cbranch") || !strcmp(in.name, "s_branch")) && in.simm16 < 0) backward = true;
+        if (!strcmp(in.name, "s_setpc_b64") || !strcmp(in.name, "s_swappc_b64")) computed = true;
         if (starts(in.name, "global_store_") || starts(in.name, "global_atomic_")) global_write = true;
     }
     uint64_t h = 0;
@@ -4890,6 +4943,8 @@ uint64_t translation_salt(const Container& c) {
     // small limit past the last barrier.
     // 2026-11: with loops the threads of a group take turns between barriers; without, every
     // thread makes each barrier call.
+    // 2026-11: in code with loops a block only fallen into continues the case before it.
+    if (backward || computed) add("inline-fall-1");
     if (barrier && backward) add("barrier-coop-1");
     if (barrier && !backward) add("barrier-all-1");
     // 2026-11: global stores take their data from the data field (they read v0); global atomics.
