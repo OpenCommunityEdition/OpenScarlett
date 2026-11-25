@@ -562,12 +562,21 @@ bool native_translate(const void* in, size_t n, void** out, size_t* outSize) {
         }
         std::string log;
         // A megabyte of HLSL and more (ray-tracing programs come out at five) takes the compiler
-        // many minutes at its full optimization level and seconds at the first; the GPU driver
-        // optimizes the result again anyway. (XSL_DXC_OPT, when set, decides for every size.)
+        // many minutes with its optimizer on, at any level: 1.9 MB took 1,088 s at -O1 and 24 s
+        // without (measured under Wine). Such programs are compiled without it, or a title with
+        // hundreds of them never has them at all; the GPU driver optimizes the result again
+        // anyway. XSL_DXC_GIANT_OPT=O1 (or another level) brings the optimizer back for them;
+        // XSL_DXC_OPT, when set, decides for every size.
         static const bool optSet = [] { char b[8]; return GetEnvironmentVariableA("XSL_DXC_OPT", b, sizeof b) != 0; }();
         if (r.hlsl.size() >= (256u << 10))   // (minutes for the largest: said before it starts, so a busy worker can be told by its shader)
             XSL_INFO(CH, "shader %016llx (%s): compiling %zu bytes of HLSL from %zu bytes of code", (unsigned long long)key, r.profile.c_str(), r.hlsl.size(), n);
-        if (!compile(r.hlsl, r.profile, dxil, log, !optSet && r.hlsl.size() >= (1u << 20) ? L"-O1" : nullptr)) {
+        static const std::wstring giantOpt = [] {
+            char b[8];
+            std::wstring w = L"-Od";
+            if (GetEnvironmentVariableA("XSL_DXC_GIANT_OPT", b, sizeof b) && b[0] == 'O') { w = L"-"; for (char* c = b; *c; c++) w += wchar_t(*c); }
+            return w;
+        }();
+        if (!compile(r.hlsl, r.profile, dxil, log, !optSet && r.hlsl.size() >= (1u << 20) ? giantOpt.c_str() : nullptr)) {
             XSL_ERR(CH, "shader %016llx: translated HLSL does not compile:\n%s", (unsigned long long)key, log.c_str());
             dump(key, in, n, r.hlsl, "");
             if (fallbackRs) dump_rs(key, t_fallback_rs.data(), t_fallback_rs.size());
