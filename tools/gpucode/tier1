@@ -5,9 +5,11 @@
 # PC; the reference is the same kernel (or <name>_ref.hlsl) compiled directly for PC. The output
 # directory holds both, dispatch_check.exe and run.cmd, which runs every kernel on a Windows PC and
 # compares the two (exit code 0: all match).
-# Usage: tools/gpucode/tier1 <outdir>   (needs build/ and build-native/ built)
+# Usage: tools/gpucode/tier1 <outdir> [--run]   (needs build/ and build-native/ built)
+# --run: also runs run.cmd here, under Wine with the project's vkd3d-proton build (on a GPU whose
+# waves are narrower than 32 lanes the wave64 kernels, lane_ops and wave, do not match).
 set -e
-out=${1:?usage: tier1 <outdir>}
+out=${1:?usage: tier1 <outdir> [--run]}
 root=$(cd "$(dirname "$0")/../.." && pwd)
 export WINEPREFIX=${WINEPREFIX:-$root/build/wineprefix-tools} WINEDEBUG=-all
 xdxc="$root/sdk/GXDK/bin/Scarlett/dxc.exe"
@@ -30,3 +32,8 @@ for src in "$k"/*.hlsl; do
     echo "$n: built"
 done
 printf 'echo failures: %%fails%%\r\nexit /b %%fails%%\r\n' >> "$out/run.cmd"
+if [ "$2" = "--run" ]; then
+    cp "$root/build/deps/vkd3d-proton-xsl/x64/d3d12.dll" "$root/build/deps/vkd3d-proton-xsl/x64/d3d12core.dll" "$root/build/deps/dxvk/dxvk-3.1.1/x64/dxgi.dll" "$out/"
+    cd "$out"
+    WINEDLLOVERRIDES="d3d12,d3d12core,dxgi=n" VKD3D_DEBUG=none DXVK_LOG_LEVEL=none wine cmd /c run.cmd 2>/dev/null | tr -d '\r' | grep -E "^== |match|MISMATCH|failures"
+fi

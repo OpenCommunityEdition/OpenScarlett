@@ -75,12 +75,13 @@ static ID3D12Resource* buffer(D3D12_HEAP_TYPE heap, uint64_t size, bool uav, D3D
     CHECK(g_dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, st, nullptr, IID_PPV_ARGS(&r)));
     return r;
 }
+static const unsigned kTexLevels = 9;   // 256 down to 1
 static ID3D12Resource* texture(DXGI_FORMAT f) {
     D3D12_RESOURCE_DESC td{};
     td.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
     td.Width = td.Height = 256;
     td.DepthOrArraySize = 1;
-    td.MipLevels = 1;
+    td.MipLevels = kTexLevels;   // every level has contents of its own (gathers and loads at a level)
     td.Format = f;
     td.SampleDesc.Count = 1;
     td.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
@@ -358,8 +359,8 @@ int main(int argc, char** argv) {
                     v.Format = f;
                     v.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
                     v.ViewDimension = kind == 7 ? D3D12_SRV_DIMENSION_TEXTURE2DARRAY : D3D12_SRV_DIMENSION_TEXTURE2D;
-                    if (kind == 7) v.Texture2DArray.ArraySize = 1, v.Texture2DArray.MipLevels = 1;
-                    else v.Texture2D.MipLevels = 1;
+                    if (kind == 7) v.Texture2DArray.ArraySize = 1, v.Texture2DArray.MipLevels = kTexLevels;
+                    else v.Texture2D.MipLevels = kTexLevels;
                     g_dev->CreateShaderResourceView(t, &v, h);
                 }
             }
@@ -396,13 +397,17 @@ int main(int argc, char** argv) {
         }
         first = false;
         l->CopyBufferRegion(big, 0, up, 0, kBig);
-        for (int k = 0; k < 2; k++) {
-            D3D12_TEXTURE_COPY_LOCATION dst{k ? tex_f : tex_u, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX};
-            D3D12_TEXTURE_COPY_LOCATION src{up, D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT};
-            src.PlacedFootprint.Offset = k ? (32ull << 20) : 0;
-            src.PlacedFootprint.Footprint = {k ? DXGI_FORMAT_R32G32B32A32_FLOAT : DXGI_FORMAT_R32_UINT, 256, 256, 1, k ? 4096u : 1024u};
-            l->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
-        }
+        // (each level takes the top-left of the same source, starting seven rows further down per level)
+        for (int k = 0; k < 2; k++)
+            for (unsigned lv = 0; lv < kTexLevels; lv++) {
+                D3D12_TEXTURE_COPY_LOCATION dst{k ? tex_f : tex_u, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX};
+                dst.SubresourceIndex = lv;
+                D3D12_TEXTURE_COPY_LOCATION src{up, D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT};
+                const UINT pitch = k ? 4096u : 1024u;
+                src.PlacedFootprint.Offset = (k ? (32ull << 20) : 0) + (UINT64)lv * 7 * pitch;
+                src.PlacedFootprint.Footprint = {k ? DXGI_FORMAT_R32G32B32A32_FLOAT : DXGI_FORMAT_R32_UINT, 256u >> lv, 256u >> lv, 1, pitch};
+                l->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+            }
         transition(l, big, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
         transition(l, tex_u, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
         transition(l, tex_f, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
