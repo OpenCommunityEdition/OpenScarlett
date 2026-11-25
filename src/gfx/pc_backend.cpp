@@ -139,12 +139,31 @@ bool env_on(const char* name) {
 // XSL_D3D12_DRED=1: device-removed extended data (automatic breadcrumbs, page faults), logged once
 // when the device is found removed.
 static void prof_report_now();
+// The last dispatches recorded (diagnostics): at a device removal the sizes of the newest ones
+// are logged, by list, so that the one the GPU was running can be found.
+struct RecentDispatch { void* list; void* pso; uint32_t x, y, z; char kind; };
+static RecentDispatch g_recent_dispatch[512];
+static std::atomic<uint32_t> g_recent_dispatch_n{0};
+static void note_recent_dispatch(void* l, void* pso, char kind, uint32_t x, uint32_t y, uint32_t z) {
+    g_recent_dispatch[g_recent_dispatch_n.fetch_add(1) % 512] = RecentDispatch{l, pso, x, y, z, kind};
+}
+static void dump_recent_dispatches() {
+    const uint32_t n = g_recent_dispatch_n.load();
+    for (uint32_t k = n > 96 ? n - 96 : 0; k < n; k++) {
+        const RecentDispatch& d = g_recent_dispatch[k % 512];
+        wchar_t nm[128] = L"?";
+        UINT sz = sizeof nm;
+        if (d.pso) static_cast<ID3D12PipelineState*>(d.pso)->GetPrivateData(WKPDID_D3DDebugObjectNameW, &sz, nm);
+        XSL_ERR("gfx.pc", "recent %s %u x %u x %u on list %p: %ls", d.kind == 'M' ? "DispatchMesh" : "Dispatch", d.x, d.y, d.z, d.list, nm);
+    }
+}
 void report_device_removed(ID3D12Device* dev) {
     xsl::log_arm(false);
     static volatile long once = 0;
     if (!dev || InterlockedExchange(&once, 1)) return;
     XSL_ERR(CH, "device removed: reason %08lx", dev->GetDeviceRemovedReason());
     g_removed_hung = dev->GetDeviceRemovedReason() == DXGI_ERROR_DEVICE_HUNG;
+    dump_recent_dispatches();
     prof_report_now();   // (a profiled frame's times, when the device went before their report)
     dump_debug_messages();
     ID3D12DeviceRemovedExtendedData* dred = nullptr;
@@ -6389,9 +6408,12 @@ static double prof_after() {   // seconds after start-up (0: not asked for)
     static double v = [] { char b[16]; return GetEnvironmentVariableA("XSL_GPU_PROFILE", b, sizeof b) && b[0] == 't' ? atof(b + 1) : 0.0; }();
     return v;
 }
+// XSL_GPU_PROFILE=ring: from present 300 on without end; the queries are used in two halves in turn,
+// and the report is made at a device removal only, of the operations of the last frames.
+static bool prof_ring() { static bool v = [] { char b[16]; return GetEnvironmentVariableA("XSL_GPU_PROFILE", b, sizeof b) && !strcmp(b, "ring"); }(); return v; }
 static uint64_t prof_at() {
     static uint64_t fixed = [] { char b[16]; return GetEnvironmentVariableA("XSL_GPU_PROFILE", b, sizeof b) ? _strtoui64(b, nullptr, 10) : 0ull; }();
-    return fixed ? fixed : g_prof_at.load();
+    return prof_ring() ? 300 : fixed ? fixed : g_prof_at.load();
 }
 // Also: presents per 10 s in the log (frame rate over a run), and the slowest present of each period.
 static void prof_slow_check(uint64_t present) {
@@ -6466,6 +6488,14 @@ static int32_t prof_begin(PcObj l, char kind, uint32_t a, uint32_t b, uint32_t c
         g_prof.rb->Map(0, nullptr, (void**)&g_prof.map);
         if (g_prof.queue) g_prof.queue->GetTimestampFrequency(&g_prof.freq);
     }
+    if (prof_ring() && (g_prof.next + 2 > kProfQueries || g_prof.next == kProfQueries / 2)) {
+        // The other half: its slots are cleared (the lists that still write into it are 16,384
+        // operations old), and the operations recorded in it are forgotten.
+        const uint32_t base = g_prof.next + 2 > kProfQueries ? 0 : kProfQueries / 2;
+        memset(g_prof.map + base, 0, (kProfQueries / 2) * 8ull);
+        g_prof.ops.erase(std::remove_if(g_prof.ops.begin(), g_prof.ops.end(), [base](const GpuProfOp& o) { return o.q >= base && o.q < base + kProfQueries / 2; }), g_prof.ops.end());
+        g_prof.next = base;
+    }
     if (g_prof.next + 2 > kProfQueries) return -1;
     uint32_t q = g_prof.next;
     g_prof.next += 2;
@@ -6490,7 +6520,12 @@ static void prof_report(ID3D12CommandQueue* queue, bool now = false) {
     if (!g_prof.map || g_prof.ops.empty()) return;
     const uint64_t present = g_wr_present.load();
     const bool full = g_prof.next + 2 > kProfQueries;
+    if (prof_ring() && !now) return;
     if (!now && !(full && present >= g_prof.ops.back().present + 4) && present < at + 40) return;
+    if (prof_ring()) {   // the last four frames
+        const uint64_t lastFrame = g_prof.ops.back().present;
+        g_prof.ops.erase(std::remove_if(g_prof.ops.begin(), g_prof.ops.end(), [lastFrame](const GpuProfOp& o) { return o.present + 4 <= lastFrame; }), g_prof.ops.end());
+    }
     g_prof.done = true;
     const uint64_t freq = g_prof.freq ? g_prof.freq : 1;
     const uint64_t* t = g_prof.map;
@@ -6749,6 +6784,11 @@ void list_dispatch(PcObj l, uint32_t x, uint32_t y, uint32_t z) {
     trace_dispatch_size(l, "Dispatch", x, y, z, nullptr);
     note_dispatch(l);
     note_reads(l, true);
+    {
+        PcObj pso = nullptr;
+        { std::lock_guard<std::mutex> g(g_cs_mu); auto it = g_cs_shadow.find(l); if (it != g_cs_shadow.end()) pso = it->second.pso; }
+        note_recent_dispatch(l, pso, 'D', x, y, z);
+    }
     int32_t pq = prof_begin(l, 'D', x, y, z);
     L->Dispatch(x, y, z);
     prof_end(l, pq);

@@ -736,11 +736,12 @@ struct MemWrite {
     PcObj staging = nullptr;
     uint32_t rows = 0, rowBytes = 0, pitch = 0;
 };
-struct ListPart { std::vector<ValueWait> waits; PcObj list; std::vector<MemWrite> writes; };
+struct ListPart { std::vector<ValueWait> waits; PcObj list; std::vector<MemWrite> writes; std::vector<std::pair<uint64_t, uint64_t>> notes; };
 struct ListWaits {
     std::vector<ListPart> earlier;   // the parts before the PC list being recorded, with the waits before each
     std::vector<ValueWait> gate;     // the waits before the PC list being recorded
     std::vector<MemWrite> writes;    // its writes the CPU does not see by itself, and its read-backs
+    std::vector<std::pair<uint64_t, uint64_t>> notes;   // diagnostics: every value the current part writes (address, value)
 };
 static void mem_write_drop(std::vector<MemWrite>& v) {   // (of a recording that is never run)
     for (MemWrite& w : v)
@@ -790,6 +791,7 @@ struct BackItem {
     std::function<void()> call;
     std::vector<PcObj> lists, owned, kept;   // owned: let go after they ran; kept: title lists' own PC lists, held until they ran
     std::vector<MemWrite> writes;
+    std::vector<std::pair<uint64_t, uint64_t>> notes;   // diagnostics: the values its lists write
     PcObj fence = nullptr;
     uint64_t value = 0;
 };
@@ -800,6 +802,17 @@ struct Backlog {
     uint64_t fenceNext = 0;
     std::deque<std::pair<uint64_t, std::vector<MemWrite>>> landing;   // writes of parts that were run, by the fence value after each
     ULONGLONG since = 0;                                              // when the wait at the front was first found unmet
+    // Diagnostics: what a thread is doing inside the backlog's lock, and since when (a call that
+    // does not come back holds every other thread that gives this queue work).
+    std::atomic<int> inside{0};
+    std::atomic<ULONGLONG> insideSince{0};
+    std::atomic<DWORD> insideThread{0};
+    ULONGLONG reported = 0;
+};
+struct BacklogInside {   // marks the calls made while the backlog's lock is held
+    Backlog* b;
+    BacklogInside(Backlog* b_, int what) : b(b_) { b->insideThread = GetCurrentThreadId(); b->insideSince = GetTickCount64(); b->inside = what; }
+    ~BacklogInside() { b->inside = 0; }
 };
 static std::mutex g_backlogs_mu;
 static std::vector<Backlog*> g_backlogs;
@@ -808,8 +821,10 @@ static std::vector<Backlog*> g_backlogs;
 // whose PC list still waits, the list gets a new one and the backlog keeps the old (list_unhook).
 static std::mutex g_list_pending_mu;
 static std::unordered_map<PcObj, int> g_list_pending;
+static std::atomic<ULONGLONG> g_last_present_call{0};   // (diagnostics: when the title last called PresentX)
 static std::atomic<uint64_t> g_wait_stats[5];   // waits recorded, cuts, waits a queue stood at, given up, parts run from a backlog
 static void backlog_run(Backlog* b, std::vector<PcObj>& lists, std::vector<MemWrite>& writes) {
+    BacklogInside mark(b, 1);
     if (!lists.empty()) pc::queue_execute(b->q, (uint32_t)lists.size(), lists.data());
     if (writes.empty()) return;
     if (!b->fence && FAILED(pc::create_fence(b->dev, 0, 0, &b->fence))) b->fence = nullptr;
@@ -860,11 +875,14 @@ static void backlog_pump(Backlog* b) {
             }
             g_wait_stats[4]++;
         } else if (it.kind == 2) {
+            BacklogInside mark(b, 2);
             pc::queue_signal(b->q, it.fence, it.value);
             pc::release(it.fence);
         } else if (it.kind == 4) {
+            BacklogInside mark(b, 4);
             it.call();
         } else {
+            BacklogInside mark(b, 3);
             pc::queue_wait(b->q, it.fence, it.value);
             pc::release(it.fence);
         }
@@ -882,9 +900,72 @@ static DWORD WINAPI backlog_thread(void*) {
         else Sleep(1);
         std::vector<Backlog*> all;
         { std::lock_guard<std::mutex> g(g_backlogs_mu); all = g_backlogs; }
+        // Diagnostics: a queue has stood at a wait for a second and a half: what every queue holds
+        // (waits, the values the lists behind them write, signals), the first three times.
+        {
+            static int dumps = 0;
+            static ULONGLONG last = 0;
+            const ULONGLONG now = GetTickCount64();
+            bool standing = false;
+            if (dumps < 3 && now - last >= 2500)
+                for (Backlog* b : all) {
+                    std::unique_lock<std::mutex> g(b->mu, std::try_to_lock);
+                    if (g.owns_lock() && b->since && now - b->since >= 1500) standing = true;
+                }
+            if (standing) {
+                dumps++;
+                last = now;
+                for (Backlog* b : all) {
+                    std::unique_lock<std::mutex> g(b->mu, std::try_to_lock);
+                    if (!g.owns_lock()) { XSL_WARN(CH, "standing: queue %p: in use", b->q); continue; }
+                    std::string t;
+                    size_t shown = 0;
+                    for (const BackItem& it : b->items) {
+                        if (shown++ >= 14) { t += " ..."; break; }
+                        char x[96];
+                        if (it.kind == 0) { uint64_t v = 0; wait_value(it.wait, &v); snprintf(x, sizeof x, " W(%llx %s %llx, holds %llx)", (unsigned long long)it.wait.va, it.wait.cmp == 7 ? ">=" : it.wait.cmp == 3 ? "==" : "?", (unsigned long long)it.wait.ref, (unsigned long long)v); t += x; }
+                        else if (it.kind == 1) {
+                            snprintf(x, sizeof x, " X(%zu lists", it.lists.size());
+                            t += x;
+                            for (size_t k = 0; k < it.notes.size() && k < 6; k++) { snprintf(x, sizeof x, "%s%llx=%llx", k ? "," : "; writes ", (unsigned long long)it.notes[k].first, (unsigned long long)it.notes[k].second); t += x; }
+                            t += ")";
+                        } else if (it.kind == 2) { snprintf(x, sizeof x, " S(%p=%llu)", it.fence, (unsigned long long)it.value); t += x; }
+                        else if (it.kind == 3) { snprintf(x, sizeof x, " QW(%p>=%llu, at %llu)", it.fence, (unsigned long long)it.value, (unsigned long long)pc::fence_completed(it.fence)); t += x; }
+                        else t += " P";
+                    }
+                    XSL_WARN(CH, "standing: queue %p, %zu items:%s", b->q, b->items.size(), t.c_str());
+                }
+            }
+        }
+        // Diagnostics: a title that has not presented for five seconds, and what its queues hold.
+        static ULONGLONG said = 0;
+        if (const ULONGLONG now = GetTickCount64(), last = g_last_present_call.load(); last && now - last >= 5000 && now - said >= 10000) {
+            said = now;
+            XSL_WARN(CH, "no present call for %llu ms; %zu queues have backlogs:", (unsigned long long)(now - last), all.size());
+            for (Backlog* b : all) {
+                std::unique_lock<std::mutex> g(b->mu, std::try_to_lock);
+                if (!g.owns_lock()) { XSL_WARN(CH, "  queue %p: its backlog is in use by thread %lx (doing %d for %llu ms)", b->q, b->insideThread.load(), b->inside.load(), (unsigned long long)(now - b->insideSince.load())); continue; }
+                if (b->items.empty()) { XSL_WARN(CH, "  queue %p: empty (%zu writes to land)", b->q, b->landing.size()); continue; }
+                const BackItem& f = b->items.front();
+                uint64_t v = 0;
+                if (f.kind == 0) wait_value(f.wait, &v);
+                XSL_WARN(CH, "  queue %p: %zu items, the first of kind %d (a wait for %llx: comparison %d with %llx, it holds %llx; standing %llu ms)", b->q, b->items.size(), f.kind,
+                         (unsigned long long)f.wait.va, f.wait.cmp, (unsigned long long)f.wait.ref, (unsigned long long)v, (unsigned long long)(b->since ? now - b->since : 0));
+            }
+        }
         for (Backlog* b : all) {
             std::unique_lock<std::mutex> g(b->mu, std::try_to_lock);
             if (g.owns_lock() && (!b->items.empty() || !b->landing.empty())) backlog_pump(b);
+            if (g.owns_lock()) continue;
+            // (not ours for the moment: a thread that has been inside for seconds is worth a line)
+            const int what = b->inside.load();
+            const ULONGLONG now = GetTickCount64(), since = b->insideSince.load();
+            if (what && now - since >= 3000 && now - b->reported >= 5000) {
+                b->reported = now;
+                static const char* names[5] = {"", "running lists", "signalling a fence", "a queue wait for a fence", "a present"};
+                XSL_WARN(CH, "queue %p: thread %lx has been inside its backlog for %llu ms, %s; other threads giving this queue work wait for it", b->q, b->insideThread.load(),
+                         (unsigned long long)(now - since), names[what < 5 ? what : 0]);
+            }
         }
     }
 }
@@ -977,6 +1058,7 @@ HRESULT D3DAPI L_Reset(ID3D12GraphicsCommandList* l, ID3D12CommandAllocator* a, 
         w->earlier.clear();
         w->gate.clear();
         mem_write_drop(w->writes);
+        w->notes.clear();
     }
     lx(l)->alloc = P(a);
     list_unhook(l);
@@ -1018,9 +1100,10 @@ static void list_wait(ID3D12GraphicsCommandList* l, const ValueWait& w) {
         return;
     }
     g_wait_stats[1]++;
-    e->w->earlier.push_back(ListPart{std::move(e->w->gate), pc_of(l), std::move(e->w->writes)});
+    e->w->earlier.push_back(ListPart{std::move(e->w->gate), pc_of(l), std::move(e->w->writes), std::move(e->w->notes)});
     e->w->gate.assign(1, w);
     e->w->writes.clear();
+    e->w->notes.clear();
     hdr(l)->pc = to;
     e->touched = false;
 }
@@ -1028,6 +1111,11 @@ static void list_wait(ID3D12GraphicsCommandList* l, const ValueWait& w) {
 // itself (memory that is not shared with the GPU), to be written here once the part has run.
 static void list_note_write(ID3D12GraphicsCommandList* l, uint64_t va, uint64_t value, bool wide) {
     if (!list_waits_on() || !va) return;
+    {
+        ListExtra* e0 = lx(l);
+        if (!e0->w) e0->w = new ListWaits;
+        if (e0->w->notes.size() < 64) e0->w->notes.push_back({va, value});
+    }
     UnifiedRef r;
     uint64_t run = 0;
     Device* dev = hdr(l)->device;
@@ -2197,7 +2285,7 @@ static bool queue_submit(ID3D12CommandQueue* q, UINT n, ID3D12CommandList* const
         std::vector<MemWrite> wr;
         for (UINT i = 0; i < n; i++) {
             v[i] = P(lists[i]);
-            if (ListWaits* w = ex<XList, ListExtra>((XList*)lists[i])->w) { wr.insert(wr.end(), w->writes.begin(), w->writes.end()); w->writes.clear(); }
+            if (ListWaits* w = ex<XList, ListExtra>((XList*)lists[i])->w) { wr.insert(wr.end(), w->writes.begin(), w->writes.end()); w->writes.clear(); w->notes.clear(); }
         }
         backlog_run(b, v, wr);
         return true;
@@ -2225,11 +2313,14 @@ static bool queue_submit(ID3D12CommandQueue* q, UINT n, ID3D12CommandList* const
                 cur.lists.push_back(part.list);
                 cur.owned.push_back(part.list);
                 cur.writes.insert(cur.writes.end(), part.writes.begin(), part.writes.end());
+                cur.notes.insert(cur.notes.end(), part.notes.begin(), part.notes.end());
             }
             w->earlier.clear();
             stand(w->gate);
             cur.writes.insert(cur.writes.end(), w->writes.begin(), w->writes.end());
             w->writes.clear();
+            cur.notes.insert(cur.notes.end(), w->notes.begin(), w->notes.end());
+            w->notes.clear();
         }
         // The list's own PC list waits in the backlog, held by it. The title may run the list
         // again as it is, or reset it before the queue got to it (L_Reset then gives it another).
@@ -2355,6 +2446,7 @@ void release_kept() {   // references older than 8 frames (the frame latency is 
 }
 HRESULT D3DAPI Q_PresentX(ID3D12CommandQueue* q, UINT planes, const D3D12XBOX_PRESENT_PLANE_PARAMETERS* p, const D3D12XBOX_PRESENT_PARAMETERS*) {
     if (planes == 0 || !p || !p->ResourceCount || !p->ppResources) return S_OK;  // "present blank": nothing to show yet
+    g_last_present_call = GetTickCount64();
     release_kept();
     xsl_fixed_time_frame();
     {

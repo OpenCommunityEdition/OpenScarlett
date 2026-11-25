@@ -237,7 +237,11 @@ struct WrittenBuf { PcObj res; uint64_t size; void* obj; };
 std::map<uint64_t, WrittenBuf> g_written_bufs;   // (under g_written_mu) by address
 }  // namespace
 bool written_buffer_at(uint64_t va, PcObj* res, uint64_t* off) {
-    static const bool on = [] { char b[4]; return !(GetEnvironmentVariableA("XSL_WRITTEN_BUFFERS", b, 4) && b[0] == '0'); }();
+    // Off unless XSL_WRITTEN_BUFFERS=1: in a newer title the CPU reads what the GPU writes at such
+    // addresses (values lists write, results of the ray-tracing builder), which it only sees in
+    // its own memory; with this on its render thread stopped for good. The lasting answer is the
+    // other way round: such a buffer should be the title's memory, not have a PC buffer of its own.
+    static const bool on = [] { char b[4]; return GetEnvironmentVariableA("XSL_WRITTEN_BUFFERS", b, 4) && b[0] == '1'; }();
     if (!on) return false;
     std::lock_guard<std::mutex> g(g_written_mu);
     auto it = g_written_bufs.upper_bound(va);

@@ -1537,6 +1537,13 @@ bool Translator::emit_salu(const Instr& in, size_t idx) {
                 return true;
             }
             if (coop) { line("atb_ = true;"); return true; }   // (the block ends here: see coop)
+            // A mesh or amplification program with loops: the barrier sits in a case of the
+            // dispatch, which the waves of the group reach a different number of times (or not at
+            // all, when one leaves at the step limit), and a PC then waits for good: the GPU was
+            // reset in a title's skinned-character draws. The console code syncs its waves here
+            // around the output counts, which this translation hands over after the program, behind
+            // a barrier every thread makes (see the entry point), so the wait is not needed.
+            if (c.kind == ProgramKind::MS || c.kind == ProgramKind::AS) { line("GroupMemoryBarrier();"); return true; }
             line(opt.barrier_sync ? "GroupMemoryBarrierWithGroupSync();" : "GroupMemoryBarrier();");
             return true;
         }
@@ -4075,7 +4082,7 @@ std::string Translator::generate() {
                      "  if (pc == 0xffffffffu || atb_) break;\n  if (++guard_ > %uu) { pc = 0xffffffffu; break; }\n  [forcecase] switch (pc) {", start, opt.loop_guard_barrier));
         else
         line(fmt("uint pc = %zuu, guard_ = 0u, guard2_ = 0u;\n  [loop] for (;;) {\n  if (++guard_ > %uu) %s\n  [forcecase] switch (pc) {", start,
-                 barriers ? opt.loop_guard_barrier : stage_guard(opt, c.kind), opt.raw_stats ? "{ dbg_add(5u); dbg_set2(19u, pc, guard_); RETURN; }" : "RETURN;"));
+                 barriers && c.kind == ProgramKind::CS ? opt.loop_guard_barrier : stage_guard(opt, c.kind), opt.raw_stats ? "{ dbg_add(5u); dbg_set2(19u, pc, guard_); RETURN; }" : "RETURN;"));
     }
     // Blocks not reachable from the entry (data after the last instruction) are not emitted.
     std::vector<bool> live(nb, indirect);
@@ -5008,6 +5015,8 @@ uint64_t translation_salt(const Container& c) {
     // 2026-11: smaller step limits in pixel, vertex and mesh stages (stage_guard).
     if (backward && c.kind != ProgramKind::CS) add("stage-guard-1");
     if (backward && c.kind == ProgramKind::CS && !barrier) add("cs-guard-1");
+    // 2026-11: mesh programs with loops: barriers inside the dispatch do not wait, the small step limit.
+    if (backward && barrier && (c.kind == ProgramKind::MS || c.kind == ProgramKind::AS)) add("ms-barrier-1");
     // 2026-11: a gather at a named level reads that level (it read level 0).
     if (gather_level) add("gather-level-1");
     // 2026-11: 16-bit vertex and mesh outputs are unpacked into the registers their records name
