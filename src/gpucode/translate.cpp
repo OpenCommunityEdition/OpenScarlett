@@ -99,6 +99,31 @@ struct Res {
 
 const char* kDimName[8] = {"1D", "2D", "3D", "Cube", "1DArray", "2DArray", "2DMS", "2DMSArray"};
 
+// Does the program load through the heap base pointer it is given (a descriptor at a fixed place
+// of the title's view heap)? Read off the code alone, so that the cache key can ask too: the
+// registers the pointer may be in (its argument's, as it arrives in either stage layout, and what
+// moves and additions copy it to), and a scalar load based on one of them.
+bool heap_table_loads(const Container& c) {
+    Meta m;
+    if (!parse_meta(c, m)) return false;
+    bool in[256] = {};
+    bool any = false;
+    for (auto& a : m.args)
+        if (a.kind == 5 && a.loc < 32) { in[a.loc] = in[a.loc + 8] = true; any = true; }
+    if (!any) return false;
+    const std::vector<uint32_t> code = c.code();
+    for (size_t i = 0; i < code.size();) {
+        Instr x;
+        if (!decode(code.data(), code.size(), i, x)) break;
+        i += x.len ? x.len : 1;
+        if (!x.name) continue;
+        if (!strncmp(x.name, "s_load_dword", 12)) { if (x.sbase < 256 && in[x.sbase]) return true; continue; }
+        const bool mov = !strcmp(x.name, "s_mov_b32") || !strcmp(x.name, "s_mov_b64");
+        const bool add = !strcmp(x.name, "s_add_u32") || !strcmp(x.name, "s_add_i32") || !strcmp(x.name, "s_or_b32");
+        if ((mov || add) && x.dst < 256 && ((x.src0 < 256 && in[x.src0]) || (add && x.src1 < 256 && in[x.src1]))) in[x.dst] = true;
+    }
+    return false;
+}
 struct Translator {
     const Container& c;
     const RootSig& rs;
@@ -346,6 +371,13 @@ struct Translator {
     // picking one of several descriptors by branch): the loads of a group write their offset into
     // the representative's dyn variable, and the use indexes the table range with it.
     std::set<size_t> gm_sloads;            // s_load from run-time pointers: read through global memory
+    // Loads from a descriptor table or from the heap base whose words the code uses as data (a
+    // descriptor's element size and count, an index a title keeps in a slot) or as a descriptor the
+    // analysis cannot name: read from the table's memory, whose address the layer hands over in
+    // XSL_PTRS (one dword per root parameter, the last for the heap base). They were zeros.
+    std::map<size_t, uint32_t> load_ptr;   // s_load from a table or the heap base -> its dword in XSL_PTRS
+    std::set<size_t> word_loads;           // those whose words are read from memory
+    bool ptr_words_on = false, uses_ptrs = false;
     std::set<size_t> dyn_mubuf;
     std::set<size_t> dyn_sbuf;
     bool uses_fmt_comp = false;            // fmt_comp(): typed buffer components from a run-time format
@@ -423,6 +455,17 @@ struct Translator {
         std::string n = in.name;
         auto lit = [&](uint16_t e) -> AV { return e == src::kLiteral ? AV::cst(in.literal) : sval_of(st, e); };
         auto setd = [&](uint16_t d, AV v) { if (d < kNumS) st[d] = v; };
+        // (A word loaded from a table that goes into arithmetic or a comparison is data.)
+        auto use = [&](const AV& v) { if (ptr_words_on && v.k == AV::Desc && v.e && load_ptr.count(v.e - 1)) word_loads.insert(v.e - 1); };
+        // (Vector operations: the first source is a general one, and all three of the three-source
+        // forms; the second of the others is always a vector register.)
+        if (ptr_words_on && (in.fmt == Fmt::VOP1 || in.fmt == Fmt::VOP2 || in.fmt == Fmt::VOPC) && in.src0 < kNumS) use(st[in.src0]);
+        if (ptr_words_on && (in.fmt == Fmt::VOP3 || in.fmt == Fmt::VOP3P))
+            for (uint16_t e : {in.src0, in.src1, in.src2})
+                if (e < kNumS) use(st[e]);
+        if (ptr_words_on && in.fmt == Fmt::SOPC) { use(lit(in.src0)); use(lit(in.src1)); }
+        if (ptr_words_on && in.fmt == Fmt::SOPK && starts(n, "s_cmpk") && in.dst < kNumS) use(st[in.dst]);
+        if (ptr_words_on && in.fmt == Fmt::SOP1 && n != "s_mov_b32" && n != "s_mov_b64" && n != "s_bitset1_b32" && n != "s_bitset0_b32") use(lit(in.src0));
         switch (in.fmt) {
         case Fmt::SOP1: {
             if (n == "s_mov_b32") setd(in.dst, lit(in.src0));
@@ -492,6 +535,7 @@ struct Translator {
                 setd(in.dst + 1, AV::cst(uint32_t(m >> 32)));
                 break;
             }
+            if (r.k != AV::Desc) { use(x); use(y); }
             setd(in.dst, r);
             if (wide_dst(n) || n == "s_bfe_u64" || n == "s_bfe_i64") setd(in.dst + 1, AV::top());
             break;
@@ -521,6 +565,8 @@ struct Translator {
                     uint32_t at = uint32_t(off) + (soc ? so.a : 0) + 4 * i;
                     const UserArg* a = arg_at(base.a);
                     bool dyn = base.d || !soc;
+                    if (ptr_words_on && a && a->kind == 3 && a->param < 15) load_ptr[cur_idx] = a->param;
+                    if (ptr_words_on && a && a->kind == 5) { load_ptr[cur_idx] = 15; word_loads.insert(cur_idx); }
                     if (a && a->kind == 3) {
                         v = AV{AV::Desc, a->param, base.b + at, 0, dyn ? uint32_t(cur_idx + 1) : 0};
                         if (!dyn && !base.d) v.e = uint32_t(cur_idx + 1);
@@ -574,6 +620,7 @@ struct Translator {
         }
     }
     void analyse() {
+        ptr_words_on = opt.global_memory && heap_table_loads(c);
         block_in.assign(block_start.size(), SState{});
         SState init{};
         for (unsigned i = 0; i < kNumS; i++) init[i] = AV::top();
@@ -1792,6 +1839,16 @@ bool Translator::emit_smem(const Instr& in, size_t idx) {
         if (dyn_loads.count(dk)) {
             std::string so = in.soffset == src::kNull ? std::string("0u") : rd(in.soffset, in);
             line(fmt("dyn%zu = %s + %uu + %s;", dk, S(in.sbase).c_str(), uint32_t(in.offset_imm), so.c_str()));
+        }
+        if (word_loads.count(idx)) {   // the words of the table's (or the heap's) memory, at the address the layer gives
+            uses_gm = true;
+            uses_ptrs = true;
+            const uint32_t slot = load_ptr[idx];
+            std::string so = in.soffset == src::kNull ? std::string("0u") : rd(in.soffset, in);
+            line(fmt("{ uint lo_ = XP_d[%u][%u] + (%s & ~3u) + %uu + %s, hi_ = 0u;", slot / 4, slot % 4, S(in.sbase).c_str(), uint32_t(in.offset_imm), so.c_str()));
+            { std::vector<std::string> d; for (unsigned k = 0; k < cnt; k++) d.push_back(S(in.sdata + k)); gm_read_n(d); }
+            line("}");
+            return true;
         }
         if (gm_sloads.count(idx)) {
             uses_gm = true;
@@ -4225,6 +4282,9 @@ std::string Translator::generate() {
         if (p.type != ParamType::Constants) continue;
         h << fmt("cbuffer RC%u : register(b%u, space%u) { uint4 RC%u_d[%u]; };\n", a.param, p.reg, p.space, a.param, (p.num32 + 3) / 4);
     }
+    // The addresses (in global memory) of the memory of the tables bound at root parameters 0..14,
+    // and of the title's view heap in the last dword: set by the layer before each draw.
+    if (uses_ptrs) h << "cbuffer XSL_PTRS : register(b0, space930) { uint4 XP_d[4]; };\n";
     unsigned ldsBytes = 0;
     if (uses_lds) {
         unsigned limit = c.kind == ProgramKind::MS ? 28672 : 32768;   // PC group-shared limits
@@ -4985,6 +5045,7 @@ bool translate_gs_copy(const Container& c, TranslateResult& r) {
 
 // ---- cache key salts ---------------------------------------------------------------------------
 uint64_t translation_salt(const Container& c) {
+    const bool heapLoads = heap_table_loads(c);
     const std::vector<uint32_t> code = c.code();
     bool barrier = false, backward = false, global_write = false, computed = false, gather_level = false;
     for (size_t i = 0; i < code.size();) {
@@ -5019,6 +5080,9 @@ uint64_t translation_salt(const Container& c) {
     if (backward && barrier && (c.kind == ProgramKind::MS || c.kind == ProgramKind::AS)) add("ms-barrier-1");
     // 2026-11: a gather at a named level reads that level (it read level 0).
     if (gather_level) add("gather-level-1");
+    // 2026-11: programs that load through the heap base read the words of table and heap memory
+    // (they got zeros: a title's world geometry read a meshlet count of zero everywhere).
+    if (heapLoads) add("ptr-words-1");
     // 2026-11: 16-bit vertex and mesh outputs are unpacked into the registers their records name
     // (they went out as 16-bit patterns, and a packed pair's later registers into the wrong ones).
     Meta m;

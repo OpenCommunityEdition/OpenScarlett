@@ -134,6 +134,9 @@ void table_forget(PcObj pso);
 void set_table_slot_reader(bool (*read)(uint64_t pcGpuHandle, uint32_t index, uint32_t* kind, uint32_t* titleSlot, bool* split),
                            int (*fix)(uint64_t pcGpuHandle, uint32_t index, uint32_t want), uint64_t (*fresh)(uint64_t pcGpuHandle, uint32_t count),
                            bool (*dump)(uint64_t pcGpuHandle, uint32_t index, const char* path));
+// The global-memory address of the title's descriptor memory behind a PC table handle (0: of the
+// start of its view heap): what translated code that reads a table's words is given.
+void set_table_memory_reader(uint64_t (*mem)(uint64_t pcGpuHandle));
 std::string gm_describe_address(uint64_t address);   // diagnostics: registered buffers around and over an address
 int rt_warm_shard(void* pcDevice, unsigned shard, unsigned shards);   // tools/rtwarm
 void dump_queue_state();   // hang diagnostics
@@ -266,6 +269,7 @@ HRESULT_T null_present(void* hwnd);  // null graphics: no scan-out, the FPS titl
 // Unified memory: wrap a host allocation (VirtualAlloc'd, 64 KB aligned) as a GPU buffer without
 // copying (OpenExistingHeapFromAddress + placed buffer). Returns the buffer and its GPU VA.
 HRESULT_T import_host_memory(PcObj dev, void* base, uint64_t size, PcObj* res, uint64_t* gpuVa);
+HRESULT_T import_host_buffer_at(PcObj dev, void* base, uint64_t off, uint64_t width, PcObj* res);
 HRESULT_T import_file_mapping(PcObj dev, void* section, uint64_t size, PcObj* res, uint64_t* gpuVa);
 // Write the GPU timestamp counter into `res` at `offset` once prior work completes.
 void list_write_timestamp(PcObj dev, PcObj l, PcObj res, uint64_t offset);

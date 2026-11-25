@@ -15,9 +15,11 @@
 // remembered per page and applied when it appears.
 #include <map>
 #include <mutex>
+#include <set>
 #include <vector>
 
 #include "xs_object.h"
+#include "xs_unified.h"
 #include "xs_detile.h"
 
 namespace xs {
@@ -235,7 +237,12 @@ int format_family(DXGI_FORMAT f) {
 namespace {
 struct WrittenBuf { PcObj res; uint64_t size; void* obj; };
 std::map<uint64_t, WrittenBuf> g_written_bufs;   // (under g_written_mu) by address
+std::set<PcObj> g_alias_bufs;                    // (under g_written_mu) PC buffers that lie over the title's bytes
 }  // namespace
+bool placed_alias_buffer(PcObj pcRes) {
+    std::lock_guard<std::mutex> g(g_written_mu);
+    return g_alias_bufs.count(pcRes) != 0;
+}
 bool written_buffer_at(uint64_t va, PcObj* res, uint64_t* off) {
     // Off unless XSL_WRITTEN_BUFFERS=1: in a newer title the CPU reads what the GPU writes at such
     // addresses (values lists write, results of the ray-tracing builder), which it only sees in
@@ -334,6 +341,36 @@ HRESULT D3DAPI D_CreatePlacedResourceX(ID3D12Device* d, D3D12_GPU_VIRTUAL_ADDRES
     // A texture the CPU fills (streamed data), placed on address space whose pages come from a
     // pool: its texels are read at its address once the pages are mapped (they may not be yet).
     const bool cpuTexture = desc && !isBuffer && !gpuWritten && desc->SampleDesc.Count <= 1 && alias_fn() && mbi.State != MEM_FREE;
+    // A buffer the GPU writes, placed inside one of the title's graphics allocations at a 64 KiB
+    // multiple from its start: a PC buffer over the same bytes, inside the allocation as the GPU
+    // sees it. A title keeps an arena of 174 MB like that, which its compute passes fill (culling
+    // results, the arguments of its indirect draws) and which it reads by address, through this
+    // resource and on the CPU: with a PC buffer of its own the arena was three different
+    // memories, and nine in ten of the title's indirect draws ran with a count of zero.
+    // XSL_PLACED_BUFFER_ALIAS=0: a PC buffer of its own, as before.
+    static const bool aliasBuffers = [] { char b[4]; return !(GetEnvironmentVariableA("XSL_PLACED_BUFFER_ALIAS", b, 4) && b[0] == '0'); }();
+    if (aliasBuffers && isBuffer && gpuWritten && mbi.State == MEM_COMMIT && !forceCommitted) {
+        uint64_t base = 0, size = 0;
+        PcObj r = nullptr;
+        if (unified_block(va, &base, &size) && va >= base && (va - base) % 65536 == 0 && va + desc->Width <= base + size &&
+            SUCCEEDED(pc::import_host_buffer_at(de->pcDevice, (void*)(uintptr_t)base, va - base, desc->Width, &r))) {
+            HRESULT hr = make_resource((Device*)d, r, riid, out);
+            if (SUCCEEDED(hr) && out && *out) {
+                resource_set_title_va(*out, va);
+                std::lock_guard<std::mutex> g(g_written_mu);
+                g_alias_bufs.insert(r);
+            }
+            static volatile long n = 0;
+            if (const long k = InterlockedIncrement(&n); k <= 6 || k % 500 == 0)
+                XSL_INFO(CH, "a buffer the GPU writes (%llu bytes) placed on title memory at %llx: a PC buffer over those bytes (%llu into the allocation at %llx; %ld so far)",
+                         (unsigned long long)desc->Width, (unsigned long long)va, (unsigned long long)(va - base), (unsigned long long)base, k);
+            return hr;
+        }
+        static volatile long n = 0;
+        if (const long k = InterlockedIncrement(&n); k <= 6 || k % 500 == 0)
+            XSL_INFO(CH, "a buffer the GPU writes (%llu bytes) placed on title memory at %llx cannot lie over those bytes (%s): a PC buffer of its own (%ld so far)", (unsigned long long)desc->Width,
+                     (unsigned long long)va, !base ? "not in a graphics allocation" : (va - base) % 65536 ? "not at a 64 KiB multiple from the allocation's start" : "refused", k);
+    }
     if (mbi.State == MEM_COMMIT || forceCommitted || cpuTexture) {
         // Placed on title memory the CPU can write: the PC resource is a separate one. A texture's
         // texels are converted from the console layout and uploaded when they change; a buffer's

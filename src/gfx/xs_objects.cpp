@@ -3,6 +3,7 @@
 #include <cstring>
 #include <algorithm>
 #include <windows.h>
+#include <psapi.h>
 #include <tlhelp32.h>
 #include <atomic>
 #include <deque>
@@ -218,6 +219,135 @@ void dump_thread_stacks() {
         shown++;
     }
     CloseHandle(snap);
+}
+// XSL_CPU_PROFILE=<seconds after start-up>[,<seconds to sample>] (diagnostics): where the
+// process's threads spend their time. Every 10 ms each thread that has run since the last look
+// (by its cycle count) is stopped and unwound; a sample counts for the function its thread was in
+// and for the nearest function of this DLL on its stack. Functions are module+offset of their
+// start (llvm-symbolizer names the DLL's).
+void cpu_profile_start() {
+    char b[32];
+    if (!GetEnvironmentVariableA("XSL_CPU_PROFILE", b, sizeof b)) return;
+    const double after = atof(b);
+    const char* comma = strchr(b, ',');
+    const double span = comma ? atof(comma + 1) : 10.0;
+    std::thread([after, span] {
+        Sleep((DWORD)(after * 1000));
+        HMODULE self = nullptr;
+        GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCSTR)&dump_thread_stacks, &self);
+        MODULEINFO mi{};
+        GetModuleInformation(GetCurrentProcess(), self, &mi, sizeof mi);
+        const uint64_t lo = (uint64_t)self, hi = lo + mi.SizeOfImage;
+        std::map<DWORD, ULONG64> cycles;
+        std::map<uint64_t, uint32_t> leaf, own, pair;   // function start -> samples
+        std::map<DWORD, uint32_t> perThread;
+        std::map<DWORD, std::map<uint64_t, uint32_t>> ownBy;
+        std::map<std::pair<uint64_t, uint64_t>, uint32_t> waits;   // (the system call's outermost ntdll function, its caller) for samples inside ntdll
+        MODULEINFO ni{};
+        const HMODULE nt = GetModuleHandleA("ntdll.dll");
+        GetModuleInformation(GetCurrentProcess(), nt, &ni, sizeof ni);
+        const uint64_t nlo = (uint64_t)nt, nhi = nlo + ni.SizeOfImage;
+        uint32_t total = 0, rounds = 0;
+        const DWORD me = GetCurrentThreadId(), pid = GetCurrentProcessId();
+        const ULONGLONG end = GetTickCount64() + (ULONGLONG)(span * 1000);
+        auto fn_start = [](DWORD64 pc) -> uint64_t {
+            DWORD64 base = 0;
+            PRUNTIME_FUNCTION rf = RtlLookupFunctionEntry(pc, &base, nullptr);
+            return rf ? base + rf->BeginAddress : pc;
+        };
+        while (GetTickCount64() < end) {
+            HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+            if (snap == INVALID_HANDLE_VALUE) break;
+            THREADENTRY32 te{sizeof te};
+            for (BOOL ok = Thread32First(snap, &te); ok; ok = Thread32Next(snap, &te)) {
+                if (te.th32OwnerProcessID != pid || te.th32ThreadID == me) continue;
+                HANDLE t = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION, FALSE, te.th32ThreadID);
+                if (!t) continue;
+                ULONG64 cy = 0;
+                QueryThreadCycleTime(t, &cy);
+                ULONG64& was = cycles[te.th32ThreadID];
+                const bool ran = was && cy - was > 3000000;   // (about a millisecond of the 10)
+                was = cy;
+                if (!ran || SuspendThread(t) == (DWORD)-1) { CloseHandle(t); continue; }
+                CONTEXT c{};
+                c.ContextFlags = CONTEXT_FULL;
+                DWORD64 pcs[48];
+                int n = 0;
+                if (GetThreadContext(t, &c)) {
+                    for (; n < 48 && c.Rip; n++) {
+                        pcs[n] = c.Rip;
+                        DWORD64 base = 0;
+                        PRUNTIME_FUNCTION rf = RtlLookupFunctionEntry(c.Rip, &base, nullptr);
+                        if (!rf) { c.Rip = *(DWORD64*)c.Rsp; c.Rsp += 8; continue; }
+                        void* hd = nullptr;
+                        DWORD64 est = 0;
+                        RtlVirtualUnwind(UNW_FLAG_NHANDLER, base, c.Rip, rf, &c, &hd, &est, nullptr);
+                    }
+                }
+                ResumeThread(t);
+                CloseHandle(t);
+                if (!n) continue;
+                total++;
+                perThread[te.th32ThreadID]++;
+                const uint64_t lf = fn_start(pcs[0]);
+                leaf[lf]++;
+                uint64_t o = 0;
+                for (int f = 0; f < n && !o; f++)
+                    if (pcs[f] >= lo && pcs[f] < hi) o = fn_start(pcs[f]);
+                own[o]++;
+                ownBy[te.th32ThreadID][o]++;
+                if (pcs[0] >= nlo && pcs[0] < nhi) {
+                    int f = 0;
+                    while (f + 1 < n && pcs[f + 1] >= nlo && pcs[f + 1] < nhi) f++;
+                    waits[{fn_start(pcs[f]), f + 1 < n ? fn_start(pcs[f + 1]) : 0}]++;
+                }
+            }
+            CloseHandle(snap);
+            rounds++;
+            Sleep(10);
+        }
+        auto name_of = [](uint64_t a) {
+            char name[MAX_PATH] = "?", out[320];
+            HMODULE m = nullptr;
+            if (a && GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCSTR)a, &m) && m) {
+                GetModuleFileNameA(m, name, MAX_PATH);
+                const char* bs = strrchr(name, '\\');
+                if (bs) memmove(name, bs + 1, strlen(bs + 1) + 1);
+            }
+            snprintf(out, sizeof out, "%s+%llx", a ? name : "(none)", (unsigned long long)(a - (uint64_t)m));
+            return std::string(out);
+        };
+        auto top = [&](const std::map<uint64_t, uint32_t>& m, const char* what, size_t count) {
+            std::vector<std::pair<uint32_t, uint64_t>> v;
+            for (auto& [a, k] : m) v.push_back({k, a});
+            std::sort(v.rbegin(), v.rend());
+            for (size_t i = 0; i < v.size() && i < count; i++)
+                XSL_INFO(CH, "CPU profile, %s: %5.1f %% (%u) %s", what, 100.0 * v[i].first / std::max(1u, total), v[i].first, name_of(v[i].second).c_str());
+        };
+        XSL_INFO(CH, "CPU profile: %u samples of running threads in %u rounds (%.1f threads running on average)", total, rounds, double(total) / std::max(1u, rounds));
+        top(leaf, "in function", 30);
+        top(own, "under this DLL's function", 30);
+        {
+            std::vector<std::pair<uint32_t, std::pair<uint64_t, uint64_t>>> v;
+            for (auto& [a, k] : waits) v.push_back({k, a});
+            std::sort(v.rbegin(), v.rend());
+            for (size_t i = 0; i < v.size() && i < 24; i++)
+                XSL_INFO(CH, "CPU profile, inside ntdll: %5.1f %% (%u) %s called from %s", 100.0 * v[i].first / std::max(1u, total), v[i].first, name_of(v[i].second.first).c_str(),
+                         name_of(v[i].second.second).c_str());
+        }
+        std::vector<std::pair<uint32_t, DWORD>> th;
+        for (auto& [id, k] : perThread) th.push_back({k, id});
+        std::sort(th.rbegin(), th.rend());
+        for (size_t i = 0; i < th.size() && i < 10; i++) {
+            XSL_INFO(CH, "CPU profile: thread %lx ran in %.0f %% of the rounds", th[i].second, 100.0 * th[i].first / std::max(1u, rounds));
+            std::map<uint64_t, uint32_t> m = ownBy[th[i].second];
+            std::vector<std::pair<uint32_t, uint64_t>> v;
+            for (auto& [a, k] : m) v.push_back({k, a});
+            std::sort(v.rbegin(), v.rend());
+            for (size_t k = 0; k < v.size() && k < 5; k++)
+                XSL_INFO(CH, "CPU profile:   %5.1f %% of them under %s", 100.0 * v[k].first / std::max(1u, th[i].first), name_of(v[k].second).c_str());
+        }
+    }).detach();
 }
 bool hang_watch() {
     static bool on = [] {
@@ -452,6 +582,10 @@ HRESULT D3DAPI Res_Map(ID3D12Resource* r, UINT sub, const D3D12_RANGE* range, vo
                 return S_OK;
             }
         }
+    }
+    if (out && placed_alias_buffer(pc_of(r))) {   // (the buffer is the title's memory)
+        *out = (void*)ex<ID3D12Resource2, ResExtra>((ID3D12Resource2*)r)->titleVa;
+        return S_OK;
     }
     HRESULT hr = pc::res_map(pc_of(r), sub, range, out);
     if (SUCCEEDED(hr) && out) detile_mapped(pc_of(r), pc::map_shadow_base(pc_of(r)));   // a texture's CPU copy
@@ -2447,6 +2581,7 @@ void release_kept() {   // references older than 8 frames (the frame latency is 
 HRESULT D3DAPI Q_PresentX(ID3D12CommandQueue* q, UINT planes, const D3D12XBOX_PRESENT_PLANE_PARAMETERS* p, const D3D12XBOX_PRESENT_PARAMETERS*) {
     if (planes == 0 || !p || !p->ResourceCount || !p->ppResources) return S_OK;  // "present blank": nothing to show yet
     g_last_present_call = GetTickCount64();
+    { static std::once_flag once; std::call_once(once, cpu_profile_start); }
     release_kept();
     xsl_fixed_time_frame();
     {

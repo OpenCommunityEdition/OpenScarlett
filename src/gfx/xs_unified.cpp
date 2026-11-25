@@ -60,6 +60,15 @@ bool section_lookup(Device* dev, uint64_t va, UnifiedRef* out, uint64_t* run) {
     return true;
 }
 
+bool unified_block(uint64_t va, uint64_t* base, uint64_t* size) {
+    PFN_find f = find_fn();
+    void* b = nullptr;
+    SIZE_T n = 0;
+    if (!f || !f((const void*)va, &b, &n)) return false;
+    *base = (uint64_t)(uintptr_t)b;
+    *size = n;
+    return true;
+}
 bool unified_lookup(Device* dev, uint64_t va, UnifiedRef* out) {
     PFN_find f = find_fn();
     void* base;

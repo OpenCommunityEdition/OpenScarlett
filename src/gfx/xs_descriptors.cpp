@@ -36,6 +36,7 @@ static bool table_slot_read(uint64_t pcGpu, uint32_t k, uint32_t* kind, uint32_t
 static int table_slot_fix(uint64_t pcGpu, uint32_t k, uint32_t want);
 static uint64_t table_fresh(uint64_t pcGpu, uint32_t count);
 static bool table_slot_dump(uint64_t pcGpu, uint32_t k, const char* path);
+static uint64_t table_memory(uint64_t pcGpu);
 namespace {
 constexpr uint32_t kViewSlot = 32, kRtvSlot = 112, kDsvSlot = 128;
 constexpr uint32_t kMagic = 0x444C5358;  // "XSLD"
@@ -192,6 +193,7 @@ bool ensure(Device* dev) {
     g_viewGpu = (uint8_t*)pc::gm_low_buffer(pcdev, 0, bytes, &g_viewGpuAddr);
     if (g_viewGpu) memcpy(g_viewGpu, g_view, bytes);
     pc::set_table_slot_reader(table_slot_read, table_slot_fix, table_fresh, table_slot_dump);
+    pc::set_table_memory_reader(table_memory);
     g_slotFix.assign(g_viewCount, 0);
     g_slotRing.assign(g_viewCount, 0);
     XSL_INFO(CH, "descriptor memory in console layout (32/112/128-byte slots), synced to PC descriptors at submission");
@@ -376,6 +378,18 @@ bool native_buffer(const uint8_t* s, uint64_t* a, uint32_t* stride, uint64_t* by
     return *a && w[2] && !(w[1] >> 30) && !(w[3] >> 30) && ((w[3] >> 12) & 0x7f) && *bytes <= (1u << 28);
 }
 uint64_t g_nativeViews = 0, g_nativeNone = 0, g_undecoded = 0;
+// The PC buffer and offset of an address a descriptor names: a PC GPU address of zero-copy memory,
+// a title address of unified memory, of a buffer registered in global memory, or of page-mapped
+// pool memory (in that order, as gpu_va resolves them).
+bool resolve_buffer(uint64_t a, PcObj* res, uint64_t* off) {
+    UnifiedRef u{};
+    if (unified_from_gpu(a, &u) || unified_lookup(g_dev, a, &u)) { *res = u.res; *off = u.offset; return u.res != nullptr; }
+    uint64_t avail = 0;
+    if (pc::gm_resolve(a, res, off, &avail) && *res) return true;
+    uint64_t run = 0;
+    if (section_lookup(g_dev, a, &u, &run) && u.res) { *res = u.res; *off = u.offset; return true; }
+    return false;
+}
 // Decode a console buffer descriptor that an inlined CreateConstantBufferView wrote.
 bool materialize_xbox_cbv(uint32_t i, const uint64_t* q) {
     uint64_t addr, size;
@@ -445,10 +459,16 @@ bool materialize_xbox_cbv(uint32_t i, const uint64_t* q) {
         if (!native_buffer((const uint8_t*)q, &a, &stride, &bytes)) return false;
         UnifiedRef u{};
         PcObj pcd = dev_extra(g_dev)->pcDevice;
-        bool ok = unified_from_gpu(a, &u) || unified_lookup(g_dev, a, &u);
-        uint64_t off = u.offset;
-        if (!ok) { PcObj r = nullptr; uint64_t avail = 0; ok = pc::gm_resolve(a, &r, &off, &avail) && r; u.res = r; }
+        uint64_t off = 0;
+        bool ok = resolve_buffer(a, &u.res, &off);
         ok = ok && !(off & 3) && bytes >= 4;
+        if (!ok) {
+            static volatile long said = 0;
+            const uint32_t* w = (const uint32_t*)q;
+            if (InterlockedIncrement(&said) <= 40)
+                XSL_INFO(CH, "view slot %u: no PC memory for the console buffer descriptor %08x %08x %08x %08x | %08x %08x %08x %08x (%llu bytes at %llx, offset %llx)", i, w[0], w[1], w[2], w[3],
+                         w[4], w[5], w[6], w[7], (unsigned long long)bytes, (unsigned long long)a, (unsigned long long)off);
+        }
         D3D12_SHADER_RESOURCE_VIEW_DESC sd{};
         sd.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
         sd.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
@@ -738,6 +758,9 @@ static int table_slot_fix(uint64_t pcGpu, uint32_t k, uint32_t want) {
         nothing = ((q[1] & kXboxCbvFormatMask) == (0x0002403C00000000ull & kXboxCbvFormatMask) && !(q[0] & ((1ull << 48) - 1))) || (!q[0] && !w[2] && !q[3]);
     }
     if (nothing && cur == 2 && want == 1) return 0;   // (a constant buffer view of nothing is what the sync made of it)
+    // A view of no resource of another kind than declared (a title binds its table of such views,
+    // one of each kind, where a program's table is not in use): one of the declared kind.
+    if (!nothing && cur > 2 && cur < 0xfe && (cur & 0x80) && (cur & 0x7f) != (want & 0xff) && want != 1) nothing = true;
     // Console bytes that name memory, read as a buffer: a view of those bytes in the form the
     // shader declares. Any other pairing of console bytes and a declaration, and bytes that name
     // no PC memory, become a view of nothing of the declared kind below.
@@ -754,9 +777,7 @@ static int table_slot_fix(uint64_t pcGpu, uint32_t k, uint32_t want) {
         else if (q[0] && q[0] == q[2] && w[2] && !(w[2] & 31) && w[6] == (uint32_t)(q[0] >> 6)) { nat_a = gpu_va(g_dev, q[0]); nat_bytes = w[2]; }
         else if (q[0] && q[3] == q[0] && w[5] && !(w[5] & 3)) { nat_a = q[0]; nat_bytes = w[5]; }
         else if (!native_buffer(s, &nat_a, &st, &nat_bytes)) nat_a = nat_bytes = 0;
-        nat_ok = nat_a && nat_bytes >= 4 && (unified_lookup(g_dev, nat_a, &nat_u) || unified_from_gpu(nat_a, &nat_u));
-        nat_off = nat_u.offset;
-        if (nat_a && nat_bytes >= 4 && !nat_ok) { PcObj res = nullptr; uint64_t avail = 0; nat_ok = pc::gm_resolve(nat_a, &res, &nat_off, &avail) && res; nat_u.res = res; }
+        nat_ok = nat_a && nat_bytes >= 4 && resolve_buffer(nat_a, &nat_u.res, &nat_off);
         if (nat_off & 3) nat_ok = false;
         if (nat_ok && cls == 0x10) {
             srv_buffer(nat_u.res, nat_off / 4, (uint32_t)(nat_bytes / 4));
@@ -921,6 +942,18 @@ static bool table_slot_dump(uint64_t pcGpu, uint32_t k, const char* path) {
     fwrite(data.data(), 1, data.size(), f);
     fclose(f);
     return true;
+}
+// Where translated code reads the words of the table bound at PC handle h (the title's own slot
+// bytes, in the GPU-readable copy of its descriptor memory); for 0, of the heap's first slot.
+static uint64_t table_memory(uint64_t pcGpu) {
+    std::lock_guard<std::mutex> g(g_mu);
+    if (!g_ready || !g_viewGpuAddr) return 0;
+    if (!pcGpu) return g_viewGpuAddr;
+    if (pcGpu < g_pcGpu) return 0;
+    const uint64_t p = (pcGpu - g_pcGpu) / g_pcInc;
+    if (p / kPageSlots >= g_pcPageOwner.size() || !g_pcPageOwner[p / kPageSlots]) return 0;
+    const uint64_t t = (uint64_t)(g_pcPageOwner[p / kPageSlots] - 1) * kPageSlots + p % kPageSlots;
+    return t < g_viewCount ? g_viewGpuAddr + t * kViewSlot : 0;
 }
 // The first `count` slots of the table bound at PC handle h, copied to the area for fresh tables
 // (see g_freshFirst): the PC handle to bind for the draw, or 0.

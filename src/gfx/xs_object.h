@@ -234,6 +234,7 @@ void desc_sync();
 HRESULT make_rtv_dsv_shadow_heap(Device* dev, PcObj pch, const D3D12_DESCRIPTOR_HEAP_DESC* d, uint64_t shadow, REFIID riid, void** out);
 
 // GPU page mapping (xs_pagemap.cpp).
+bool placed_alias_buffer(PcObj pcRes);   // a placed buffer that lies over the title's own bytes (no PC memory of its own)
 void resource_set_title_va(void* resource, uint64_t va);   // CreatePlacedResourceX on committed title memory
 void resource_set_placed(void* resource, uint64_t va);  // CreatePlacedResourceX on reserved address space
 void pagemap_forget(uint64_t va, PcObj res);

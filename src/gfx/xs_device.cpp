@@ -260,7 +260,29 @@ HRESULT D3DAPI D_CreateGraphicsPipelineState(ID3D12Device* d, const D3D12_GRAPHI
 // driver has not compiled before (10 to 30 s per megabyte of DXIL): behind eight of either, every
 // other pipeline of a loading title waited (a start screen came after 70 s instead of 12, and two
 // thousand compute pipelines were still queued a minute into a run).
-// XSL_COMPILE_THREADS (default 2 to 14), at lower priority than the title's own threads.
+// XSL_COMPILE_THREADS (default: one per processor), at lower priority than the title's own threads.
+// The workers at lower priority (compiles, and pipelines of large translations) are as many as the
+// machine has processors, so that a title with hundreds of such pipelines has every core at them
+// while it runs. Two things hold a worker back before it takes its next job: less than
+// XSL_COMPILE_FREE_GB (default 10) of physical memory free (a compile of a large translation and
+// the driver's own take gigabytes each, and dozens at once ended in E_OUTOFMEMORY), and another
+// worker for large translations having started within the last second (so that the first is seen
+// in that figure).
+static void low_gate(unsigned staggerMs) {
+    static const uint64_t freeWanted = [] { char b[8]; return (uint64_t)(GetEnvironmentVariableA("XSL_COMPILE_FREE_GB", b, sizeof b) ? atoi(b) : 10) << 30; }();
+    static std::mutex m;
+    static ULONGLONG last = 0;
+    for (int tries = 0;; tries++) {
+        MEMORYSTATUSEX ms{sizeof ms};
+        GlobalMemoryStatusEx(&ms);
+        {
+            std::lock_guard<std::mutex> g(m);
+            const ULONGLONG now = GetTickCount64();
+            if ((!staggerMs || now - last >= staggerMs) && (ms.ullAvailPhys >= freeWanted || tries >= 600)) { last = now; return; }
+        }
+        Sleep(250);
+    }
+}
 struct PsoPool {
     std::mutex mu;
     std::condition_variable cv;
@@ -268,6 +290,7 @@ struct PsoPool {
     std::once_flag once;
     std::atomic<uint32_t> threads{0}, busy{0}, done{0}, slowest{0};   // (for the periodic line)
     std::atomic<uint64_t> ms{0};
+    unsigned stagger = 0;   // ms between two of its workers starting a job (see low_gate)
     void run(std::function<void()> job, bool first, const char* var, unsigned def, bool low) {
         std::call_once(once, [&] {
             char b[8];
@@ -278,7 +301,9 @@ struct PsoPool {
                     if (low) SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
                     for (;;) {
                         std::function<void()> j;
-                        { std::unique_lock<std::mutex> u(mu); cv.wait(u, [this] { return !q.empty(); }); j = std::move(q.front()); q.pop_front(); }
+                        { std::unique_lock<std::mutex> u(mu); cv.wait(u, [this] { return !q.empty(); }); }
+                        if (low) low_gate(stagger);
+                        { std::unique_lock<std::mutex> u(mu); if (q.empty()) continue; j = std::move(q.front()); q.pop_front(); }
                         busy++;
                         const ULONGLONG t0 = GetTickCount64();
                         j();
@@ -295,16 +320,17 @@ struct PsoPool {
     }
 };
 static PsoPool g_pso_pool, g_pso_compile_pool, g_pso_giant_pool;
-// One worker for pipelines with a translation of a megabyte and more: the compiler takes minutes
-// for each (a title has a handful, all asked for while it starts), and with them in the compile
-// pool every one of its workers was held for the whole run while a thousand pipelines waited.
-static void pso_giant_pool_run(std::function<void()> job, bool first = false) { g_pso_giant_pool.run(std::move(job), first, "XSL_GIANT_THREADS", 1, true); }
+// Workers of their own for pipelines with a translation of a megabyte and more: the compiler and
+// the driver take minutes for each, and with them in the compile pool every one of its workers
+// was held for the whole run while a thousand pipelines waited. XSL_GIANT_THREADS (default: one
+// per processor; a newer title has hundreds of such pipelines).
+static void pso_giant_pool_run(std::function<void()> job, bool first = false) { g_pso_giant_pool.stagger = 1000; g_pso_giant_pool.run(std::move(job), first, "XSL_GIANT_THREADS", std::max(1u, std::thread::hardware_concurrency()), true); }
 static void pso_pool_run(std::function<void()> job, bool first = false) {
     g_pso_pool.run(std::move(job), first, "XSL_PSO_THREADS", std::min(8u, std::max(3u, std::thread::hardware_concurrency() / 2)), false);
 }
 static void pso_compile_pool_run(std::function<void()> job, bool first = false) {
     const unsigned hw = std::thread::hardware_concurrency();
-    g_pso_compile_pool.run(std::move(job), first, "XSL_COMPILE_THREADS", std::min(14u, std::max(2u, hw > 4 ? hw / 2 - 2 : 2u)), true);
+    g_pso_compile_pool.run(std::move(job), first, "XSL_COMPILE_THREADS", std::max(2u, hw), true);
 }
 // For the periodic line: what the two pools did since the last call.
 static std::string pso_pool_stats_impl() {
@@ -519,7 +545,17 @@ static void pending_run(const std::shared_ptr<PendingPso>& j, int level = 0) {
     if (level && (j->state.load() == 2 || j->level.load() != level || j->busy.exchange(true))) return;   // (queued twice: once as it came, once when a list asked)
     pc::defer_compiles(level == 0);
     pc::defer_giants(level == 1);
+    const ULONGLONG t0 = GetTickCount64();
+    static std::atomic<int> giantsSaid{0};
+    const bool say = level == 2 && giantsSaid.fetch_add(1) < 64;
+    if (say) XSL_INFO(CH, "giant pipeline %016llx: begun (%s)", (unsigned long long)j->key, j->wanted.load() ? "a list waits for it" : "built ahead");
     const bool again = j->build();
+    if (level == 2) {
+        static std::atomic<uint64_t> n{0}, ms{0};
+        const uint64_t took = GetTickCount64() - t0, k = n.fetch_add(1) + 1, sum = ms.fetch_add(took) + took;
+        if (say || took >= 30000 || k % 32 == 0)
+            XSL_INFO(CH, "giant pipeline %016llx: done in %llu ms (%llu so far, %llu s of work in all)", (unsigned long long)j->key, (unsigned long long)took, (unsigned long long)k, (unsigned long long)(sum / 1000));
+    }
     pc::defer_compiles(false);
     pc::defer_giants(false);
     if (again && level == 0) {

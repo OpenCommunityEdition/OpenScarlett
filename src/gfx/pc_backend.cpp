@@ -1265,6 +1265,8 @@ static bool gm_in_table(uint64_t va, uint64_t bytes) {   // caller holds g_gm_mu
     return va >= it->first && va + bytes <= it->first + it->second;
 }
 std::map<PcObj, uint32_t> g_rs_gm;              // root signature -> appended parameter index (| kRsHeaps: the heap tables follow)
+std::unordered_map<PcObj, uint32_t> g_rs_ptr;       // (under g_gm_mu) root signature -> its parameter of table addresses
+std::unordered_map<PcObj, bool> g_pso_compute;      // (under g_gm_mu) pipeline -> compute
 constexpr uint32_t kRsHeaps = 0x80000000u, kHeapTables = 2;   // the view heap's table, the sampler heap's
 std::map<PcObj, PcObj> g_list_sampler_heap;    // list -> the sampler heap the title bound
 std::map<PcObj, bool> g_list_global_heap;       // list -> the global heap is bound
@@ -2857,7 +2859,12 @@ void gm_flush(PcObj devObj) {
 // ranges all start at the heap's first descriptor): SRVs and UAVs of 2D, 2D array and 3D textures
 // in spaces 910..918 (float, uint, int each), cube SRVs in 919, 1D textures in 921..923. The other
 // holds the title's sampler heap as samplers (space 920) and as comparison samplers (925).
-static bool gm_extend_root_signature(const void* blob, size_t size, std::vector<uint8_t>& out, uint32_t* index, bool heaps) {
+// Root signatures also get 16 root constants (b0 space930, XSL_PTRS in translated code) where they
+// have room: the global-memory addresses of the memory of the tables bound at parameters 0..14,
+// and of the title's view heap. Programs that load through the heap base, or use a table's words
+// as data, read those words there (see heap_table_loads in gpucode/translate.cpp).
+constexpr uint32_t kPtrConsts = 16;
+static bool gm_extend_root_signature(const void* blob, size_t size, std::vector<uint8_t>& out, uint32_t* index, bool heaps, uint32_t* ptrIndex = nullptr) {
     ID3D12VersionedRootSignatureDeserializer* ds = nullptr;
     if (FAILED(D3D12CreateVersionedRootSignatureDeserializer(blob, size, IID_PPV_ARGS(&ds)))) return false;
     const D3D12_VERSIONED_ROOT_SIGNATURE_DESC* vd = nullptr;
@@ -2898,6 +2905,15 @@ static bool gm_extend_root_signature(const void* blob, size_t size, std::vector<
                 params.push_back(p);
                 p.DescriptorTable = {2, smps};
                 params.push_back(p);
+            }
+            if (ptrIndex) *ptrIndex = 0;
+            if (ptrIndex && cost + 1 + (heaps ? kHeapTables : 0u) + kPtrConsts <= 64) {
+                D3D12_ROOT_PARAMETER1 c{};
+                c.ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+                c.Constants = {0, 930, kPtrConsts};
+                c.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+                *ptrIndex = (uint32_t)params.size();
+                params.push_back(c);
             }
             D3D12_VERSIONED_ROOT_SIGNATURE_DESC nd{D3D_ROOT_SIGNATURE_VERSION_1_1};
             nd.Desc_1_1 = d;
@@ -2967,20 +2983,25 @@ HRESULT_T create_root_signature_ex(PcObj dev, const void* blob, size_t size, PcO
     const void* use = owned ? clean : blob;
     size_t useSize = owned ? cleanSize : size;
     std::vector<uint8_t> ext;
-    uint32_t gmIndex = 0;
+    uint32_t gmIndex = 0, ptrIndex = 0;
     static bool noRs = getenv("XSL_GM_NO_RS") != nullptr;   // bisecting: views and table only
-    bool extended = gm_enabled() && !noRs && gm_extend_root_signature(use, useSize, ext, &gmIndex, heaps);
-    if (!extended && heaps && gm_enabled() && !noRs) { heaps = false; extended = gm_extend_root_signature(use, useSize, ext, &gmIndex, false); }
+    bool extended = gm_enabled() && !noRs && gm_extend_root_signature(use, useSize, ext, &gmIndex, heaps, &ptrIndex);
+    if (!extended && heaps && gm_enabled() && !noRs) { heaps = false; extended = gm_extend_root_signature(use, useSize, ext, &gmIndex, false, &ptrIndex); }
     HRESULT hr = as<ID3D12Device>(dev)->CreateRootSignature(0, extended ? ext.data() : use, extended ? ext.size() : useSize,
                                                             IID_PPV_ARGS(reinterpret_cast<ID3D12RootSignature**>(out)));
     if (FAILED(hr) && extended) {   // fall back to the title's own layout
         extended = false;
+        ptrIndex = 0;
         hr = as<ID3D12Device>(dev)->CreateRootSignature(0, use, useSize, IID_PPV_ARGS(reinterpret_cast<ID3D12RootSignature**>(out)));
     }
     if (SUCCEEDED(hr)) note_rs_params(*out, extended ? ext.data() : use, extended ? ext.size() : useSize);
     if (owned) free_container(clean);
     if (FAILED(hr)) XSL_ERR(CH, "CreateRootSignature failed %08lx (blob %zu bytes)", hr, size);
-    if (SUCCEEDED(hr) && extended) { std::lock_guard<std::mutex> g(g_gm_mu); g_rs_gm[*out] = gmIndex | (heaps ? kRsHeaps : 0u); }
+    if (SUCCEEDED(hr) && extended) { std::lock_guard<std::mutex> g(g_gm_mu); g_rs_gm[*out] = gmIndex | (heaps ? kRsHeaps : 0u); if (ptrIndex) g_rs_ptr[*out] = ptrIndex; }
+    if (SUCCEEDED(hr) && extended && !ptrIndex) {
+        static volatile long n = 0;
+        if (InterlockedIncrement(&n) <= 5) XSL_WARN(CH, "root signature (%zu bytes) has no room for the table addresses: programs that read table words get zeros with it", size);
+    }
     if (SUCCEEDED(hr) && !extended && gm_enabled() && !noRs) {
         static volatile long n = 0;
         if (InterlockedIncrement(&n) <= 10) XSL_WARN(CH, "root signature (%zu bytes) without the global-memory table (no room, or the extended one was rejected)", size);
@@ -3545,6 +3566,41 @@ HRESULT_T import_host_memory(PcObj dev, void* base, uint64_t size, PcObj* res, u
     if (FAILED(hr)) return logged(hr, "CreatePlacedResource(host memory)");
     *res = r;
     *gpuVa = r->GetGPUVirtualAddress();
+    return S_OK;
+}
+
+// A buffer of its own inside memory imported that way, at a 64 KiB multiple from its base: the
+// same bytes as the buffer over the whole of it (tests/unit/interior_heap_check.cpp). The heap of
+// each base is opened once more and kept.
+HRESULT_T import_host_buffer_at(PcObj dev, void* base, uint64_t off, uint64_t width, PcObj* res) {
+    static std::mutex mu;
+    static std::map<void*, ID3D12Heap*> heaps;
+    ID3D12Heap* heap = nullptr;
+    {
+        std::lock_guard<std::mutex> g(mu);
+        auto it = heaps.find(base);
+        if (it != heaps.end()) heap = it->second;
+        else {
+            ID3D12Device3* d3 = nullptr;
+            HRESULT hr = as<ID3D12Device>(dev)->QueryInterface(IID_PPV_ARGS(&d3));
+            if (FAILED(hr)) return hr;
+            hr = d3->OpenExistingHeapFromAddress(base, IID_PPV_ARGS(&heap));
+            d3->Release();
+            if (FAILED(hr)) return logged(hr, "OpenExistingHeapFromAddress (for a buffer inside)");
+            heaps[base] = heap;
+        }
+    }
+    D3D12_RESOURCE_DESC rd{};
+    rd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    rd.Width = width;
+    rd.Height = rd.DepthOrArraySize = rd.MipLevels = 1;
+    rd.SampleDesc.Count = 1;
+    rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    rd.Flags = D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+    ID3D12Resource* r = nullptr;
+    HRESULT hr = as<ID3D12Device>(dev)->CreatePlacedResource(heap, off, &rd, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&r));
+    if (FAILED(hr)) return logged(hr, "CreatePlacedResource (a buffer inside host memory)");
+    *res = r;
     return S_OK;
 }
 
@@ -5190,6 +5246,8 @@ bool (*g_tc_read)(uint64_t, uint32_t, uint32_t*, uint32_t*, bool*) = nullptr;
 int (*g_tc_fix)(uint64_t, uint32_t, uint32_t) = nullptr;
 uint64_t (*g_tc_fresh)(uint64_t, uint32_t) = nullptr;
 bool (*g_tc_dump)(uint64_t, uint32_t, const char*) = nullptr;
+uint64_t (*g_tc_mem)(uint64_t) = nullptr;
+void set_table_memory_reader(uint64_t (*mem)(uint64_t)) { g_tc_mem = mem; }
 void set_table_slot_reader(bool (*read)(uint64_t, uint32_t, uint32_t*, uint32_t*, bool*), int (*fix)(uint64_t, uint32_t, uint32_t), uint64_t (*fresh)(uint64_t, uint32_t),
                            bool (*dump)(uint64_t, uint32_t, const char*)) {
     g_tc_read = read;
@@ -6150,6 +6208,7 @@ HRESULT_T list_cut(PcObj dev, PcObj from, PcObj alloc, PcObj* out) {
     return S_OK;
 }
 void note_pso_rs(PcObj pso, PcObj rs, bool compute) {
+    if (pso) { std::lock_guard<std::mutex> g(g_gm_mu); g_pso_compute[pso] = compute; }
     if (!g_info || !pso) return;
     std::lock_guard<std::mutex> g(g_rs_mu);
     g_pso_rs[pso] = {rs, compute};
@@ -6396,6 +6455,12 @@ struct GpuProf {
     ID3D12CommandQueue* queue = nullptr;   // (for its timestamp frequency)
     uint64_t freq = 0;
     uint64_t* map = nullptr;               // the read-back buffer, mapped for good (a removed device maps nothing)
+    // XSL_PIPE_STATS=1 (with XSL_GPU_PROFILE): pipeline statistics of every operation too (what
+    // the mesh or vertex stage was run for, the primitives it made, what the clipper let through,
+    // the pixel shader's invocations), summed per pipeline in the report.
+    ID3D12QueryHeap* sheap = nullptr;
+    ID3D12Resource* srb = nullptr;
+    uint64_t* smap = nullptr;
     uint32_t next = 0;
     std::vector<GpuProfOp> ops;
     bool done = false;
@@ -6436,6 +6501,26 @@ static void prof_slow_check(uint64_t present) {
         for (int k = 0; k < 5; k++) why[k] = InterlockedExchange(&g_rays_why[k], 0);
         char wb[160] = "";
         if (rs) snprintf(wb, sizeof wb, " (no pipeline %ld, start program building %ld, failed %ld, reached program building %ld, indirect %ld)", why[0], why[1], why[2], why[3], why[4]);
+        if (g_ei_map) {   // what the last indirect calls ran with (their arguments as the GPU read them)
+            const long last = g_ei_next;
+            uint32_t zero = 0, notRun = 0, some = 0;
+            std::map<std::string, uint32_t> kinds;
+            for (long k = last - 256; k > std::max(0L, last - 8192); k--) {   // (the newest have not run yet)
+                const uint32_t* e = g_ei_map + (k % kEiSlots) * (kEiBytes / 4);
+                if (e[0] == 0xcdcdcdcd && e[1] == 0xcdcdcdcd) { notRun++; continue; }
+                if (!e[0] || !e[1] || (e[0] == 0 && e[1] == 0 && e[2] == 0)) { zero++; continue; }
+                some++;
+                char b[64];
+                snprintf(b, sizeof b, "%x %x %x %x %x", e[0], e[1], e[2], e[3], e[4]);
+                if (kinds.size() < 400) kinds[b]++;
+            }
+            std::vector<std::pair<uint32_t, std::string>> v;
+            for (auto& [t, n] : kinds) v.push_back({n, t});
+            std::sort(v.rbegin(), v.rend());
+            std::string ex;
+            for (size_t i = 0; i < v.size() && i < 8; i++) ex += " [" + v[i].second + "] x" + std::to_string(v[i].first);
+            XSL_INFO(CH, "indirect arguments of the last calls: %u with a zero count, %u with work, %u not run%s", zero, some, notRun, ex.c_str());
+        }
         {
             extern volatile long g_tc_differ[3];
             const long d0 = InterlockedExchange(&g_tc_differ[0], 0), d1 = InterlockedExchange(&g_tc_differ[1], 0), d2 = InterlockedExchange(&g_tc_differ[2], 0);
@@ -6493,6 +6578,14 @@ static int32_t prof_begin(PcObj l, char kind, uint32_t a, uint32_t b, uint32_t c
             return -1;
         g_prof.rb->Map(0, nullptr, (void**)&g_prof.map);
         if (g_prof.queue) g_prof.queue->GetTimestampFrequency(&g_prof.freq);
+        if (env_on("XSL_PIPE_STATS")) {
+            D3D12_QUERY_HEAP_DESC sd{D3D12_QUERY_HEAP_TYPE_PIPELINE_STATISTICS1, kProfQueries / 2, 0};
+            rd.Width = (kProfQueries / 2) * (uint64_t)sizeof(D3D12_QUERY_DATA_PIPELINE_STATISTICS1);
+            if (SUCCEEDED(g_main_device->CreateQueryHeap(&sd, IID_PPV_ARGS(&g_prof.sheap))) &&
+                SUCCEEDED(g_main_device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&g_prof.srb))))
+                g_prof.srb->Map(0, nullptr, (void**)&g_prof.smap);
+            XSL_INFO(CH, "pipeline statistics of every profiled operation: %s", g_prof.smap ? "on" : "not available");
+        }
     }
     if (prof_ring() && (g_prof.next + 2 > kProfQueries || g_prof.next == kProfQueries / 2)) {
         // The other half: its slots are cleared (the lists that still write into it are 16,384
@@ -6510,10 +6603,19 @@ static int32_t prof_begin(PcObj l, char kind, uint32_t a, uint32_t b, uint32_t c
     g_prof.ops.push_back({q, pso, kind, a, b, c, g_wr_present.load() + 1});
     L->EndQuery(g_prof.heap, D3D12_QUERY_TYPE_TIMESTAMP, q);
     L->ResolveQueryData(g_prof.heap, D3D12_QUERY_TYPE_TIMESTAMP, q, 1, g_prof.rb, q * 8ull);   // (at once: an operation that hangs leaves its start)
+    if (g_prof.smap && kind != 'D') L->BeginQuery(g_prof.sheap, D3D12_QUERY_TYPE_PIPELINE_STATISTICS1, q / 2);
     return (int32_t)q;
 }
 static void prof_end(PcObj l, int32_t q) {
     if (q < 0) return;
+    if (g_prof.smap) {
+        bool stats = false;
+        { std::lock_guard<std::mutex> g(g_prof.mu); for (size_t i = g_prof.ops.size(); i-- > 0 && i + 64 > g_prof.ops.size();) if (g_prof.ops[i].q == (uint32_t)q) { stats = g_prof.ops[i].kind != 'D'; break; } }
+        if (stats) {
+            L->EndQuery(g_prof.sheap, D3D12_QUERY_TYPE_PIPELINE_STATISTICS1, q / 2);
+            L->ResolveQueryData(g_prof.sheap, D3D12_QUERY_TYPE_PIPELINE_STATISTICS1, q / 2, 1, g_prof.srb, (q / 2) * (uint64_t)sizeof(D3D12_QUERY_DATA_PIPELINE_STATISTICS1));
+        }
+    }
     L->EndQuery(g_prof.heap, D3D12_QUERY_TYPE_TIMESTAMP, q + 1);
     L->ResolveQueryData(g_prof.heap, D3D12_QUERY_TYPE_TIMESTAMP, q + 1, 1, g_prof.rb, (q + 1) * 8ull);
 }
@@ -6566,6 +6668,33 @@ static void prof_report(ID3D12CommandQueue* queue, bool now = false) {
             single.push_back({us, i});
             total += us;
         }
+        if (g_prof.smap) {   // per pipeline: what its draws were run for and what came of them
+            struct St { uint32_t ops = 0; uint64_t ia = 0, vs = 0, ms = 0, msPrims = 0, cIn = 0, cOut = 0, ps = 0; };
+            std::map<PcObj, St> st;
+            St all;
+            for (size_t i = i0; i < i1; i++) {
+                const GpuProfOp& o = g_prof.ops[i];
+                if (o.kind == 'D' || !t[o.q] || !t[o.q + 1]) continue;
+                const auto* d = (const D3D12_QUERY_DATA_PIPELINE_STATISTICS1*)g_prof.smap + o.q / 2;
+                for (St* x : {&st[o.pso], &all}) {
+                    x->ops++; x->ia += d->IAVertices; x->vs += d->VSInvocations; x->ms += d->MSInvocations; x->msPrims += d->MSPrimitives;
+                    x->cIn += d->CInvocations; x->cOut += d->CPrimitives; x->ps += d->PSInvocations;
+                }
+            }
+            XSL_INFO(CH, "pipeline statistics of present %llu: %u draws; vertices %llu, vertex shader %llu, mesh shader %llu groups making %llu primitives, clipper %llu in and %llu out, pixel shader %llu",
+                     (unsigned long long)g_prof.ops[i0].present, all.ops, (unsigned long long)all.ia, (unsigned long long)all.vs, (unsigned long long)all.ms, (unsigned long long)all.msPrims,
+                     (unsigned long long)all.cIn, (unsigned long long)all.cOut, (unsigned long long)all.ps);
+            std::vector<std::pair<uint32_t, PcObj>> sv;
+            for (auto& [p, x] : st) sv.push_back({x.ops, p});
+            std::sort(sv.rbegin(), sv.rend());
+            for (size_t i = 0; i < sv.size() && i < 40; i++) {
+                const St& x = st[sv[i].second];
+                wchar_t name[128];
+                name_of(sv[i].second, name, sizeof name);
+                XSL_INFO(CH, "  stats: %4u draws, vertices %llu, VS %llu, MS %llu groups / %llu primitives, clipper %llu in / %llu out, PS %llu: %ls", x.ops, (unsigned long long)x.ia,
+                         (unsigned long long)x.vs, (unsigned long long)x.ms, (unsigned long long)x.msPrims, (unsigned long long)x.cIn, (unsigned long long)x.cOut, (unsigned long long)x.ps, name);
+            }
+        }
         std::vector<std::pair<double, PcObj>> v;
         for (auto& [p, e] : per) v.push_back({e.first, p});
         std::sort(v.rbegin(), v.rend());
@@ -6588,8 +6717,31 @@ static void prof_report(ID3D12CommandQueue* queue, bool now = false) {
 }
 static void prof_report_now() { prof_report(nullptr, true); }
 // (see XSL_TABLE_CHECK above)
+// The table addresses for translated code (see kPtrConsts), set before every draw and dispatch of a
+// list whose root signature has the parameter.
+static void ptrs_bind(PcObj l) {
+    if (!g_tc_mem) return;
+    PcObj pso = nullptr;
+    { std::lock_guard<std::mutex> g(g_cs_mu); auto it = g_cs_shadow.find(l); if (it != g_cs_shadow.end()) pso = it->second.pso; }
+    if (!pso) return;
+    bool compute = false;
+    { std::lock_guard<std::mutex> g(g_gm_mu); auto it = g_pso_compute.find(pso); if (it == g_pso_compute.end()) return; compute = it->second; }
+    RootBind b;
+    { std::lock_guard<std::mutex> g(g_bind_mu); auto it = g_root_bind.find(l); if (it == g_root_bind.end()) return; b = it->second[compute ? 1 : 0]; }
+    const PcObj rs = b.bound ? b.bound : b.own ? b.own : b.title;
+    uint32_t idx = 0;
+    { std::lock_guard<std::mutex> g(g_gm_mu); auto it = g_rs_ptr.find(rs); if (it == g_rs_ptr.end()) return; idx = it->second; }
+    uint32_t v[kPtrConsts] = {};
+    for (auto& [i, p] : b.params)
+        if (i < kPtrConsts - 1 && p.first == 0) v[i] = (uint32_t)g_tc_mem(p.second);
+    v[kPtrConsts - 1] = (uint32_t)g_tc_mem(0);
+    auto* L2 = as<ID3D12GraphicsCommandList>(l);
+    if (compute) L2->SetComputeRoot32BitConstants(idx, kPtrConsts, v, 0);
+    else L2->SetGraphicsRoot32BitConstants(idx, kPtrConsts, v, 0);
+}
 volatile long g_tc_differ[3];   // views of another kind than declared, left: buffer against texture, shader view against unordered view, another dimension
 static void table_check(PcObj l) {
+    ptrs_bind(l);
     if (!table_check_on() || !g_tc_read || !g_own_rs_any) return;
     PcObj pso = nullptr;
     { std::lock_guard<std::mutex> g(g_cs_mu); auto it = g_cs_shadow.find(l); if (it != g_cs_shadow.end()) pso = it->second.pso; }
@@ -6729,7 +6881,8 @@ static void table_check(PcObj l) {
         }
         // Empty slots, console bytes and old tags whatever the shader declares there, and constant
         // buffer views read as buffers: see table_slot_fix.
-        if (table_fix_on() && g_tc_fix && q.kind && q.kind <= 16 && cls != D3D12_DESCRIPTOR_RANGE_TYPE_CBV && (kind == 0 || kind == 2 || kind == 0xfe || (kind == 1 && buffer)))
+        if (table_fix_on() && g_tc_fix && q.kind && q.kind <= 16 && cls != D3D12_DESCRIPTOR_RANGE_TYPE_CBV &&
+            (kind == 0 || kind == 2 || kind == 0xfe || (kind == 1 && buffer) || (kind > 2 && kind < 0xfe && (kind & 0x80) && (kind & 0x7f) != want)))
             fixed = g_tc_fix(pa->second.second, at, want | form << 8);
         if (fixed <= 0 && kind != 0 && kind != 1 && kind != 2 && kind < 0xfe && (kind & 0x7f) != want && q.kind && q.kind <= 16)
             InterlockedIncrement(&g_tc_differ[((kind & 0x0f) == 1) != ((want & 0x0f) == 1) ? 0 : (kind & 0x30) != (want & 0x30) ? 1 : 2]);
