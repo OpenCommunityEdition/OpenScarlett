@@ -18,6 +18,16 @@
 #include "isa.h"
 
 namespace gpucode {
+// The step limit of a program without barriers. A loop that never meets its exit (a count read from
+// data an earlier pass has not written) runs to the limit in every lane; in pixel and vertex or
+// mesh stages that is every pixel or vertex of a draw, and the GPU is reset. Those stages get
+// smaller limits (another project's experience with the same title: its opening scene lost the
+// card with large limits there and ran with small ones). An explicit limit (XSL_LOOP_GUARD) holds
+// for every stage.
+static unsigned stage_guard(const TranslateOptions& opt, ProgramKind kind) {
+    if (opt.loop_guard != TranslateOptions().loop_guard) return opt.loop_guard;
+    return kind == ProgramKind::CS ? opt.loop_guard : kind == ProgramKind::PS ? 512u : 1024u;
+}
 namespace {
 
 std::string fmt(const char* f, ...) {
@@ -4065,7 +4075,7 @@ std::string Translator::generate() {
                      "  if (pc == 0xffffffffu || atb_) break;\n  if (++guard_ > %uu) { pc = 0xffffffffu; break; }\n  [forcecase] switch (pc) {", start, opt.loop_guard_barrier));
         else
         line(fmt("uint pc = %zuu, guard_ = 0u, guard2_ = 0u;\n  [loop] for (;;) {\n  if (++guard_ > %uu) %s\n  [forcecase] switch (pc) {", start,
-                 barriers ? opt.loop_guard_barrier : opt.loop_guard, opt.raw_stats ? "{ dbg_add(5u); dbg_set2(19u, pc, guard_); RETURN; }" : "RETURN;"));
+                 barriers ? opt.loop_guard_barrier : stage_guard(opt, c.kind), opt.raw_stats ? "{ dbg_add(5u); dbg_set2(19u, pc, guard_); RETURN; }" : "RETURN;"));
     }
     // Blocks not reachable from the entry (data after the last instruction) are not emitted.
     std::vector<bool> live(nb, indirect);
@@ -4133,7 +4143,7 @@ std::string Translator::generate() {
         else if (!inCase) line(fmt("case %zuu: {", b));
         open_block = !loops && has_barrier ? int(b) : -1;
         if (loops && !inCase && barriers && !barrier_ahead[b])   // past the last barrier: the small limit (see barrier_ahead)
-            line(fmt("if (++guard2_ > %uu) %s", opt.loop_guard, opt.raw_stats ? "{ dbg_add(5u); dbg_set2(19u, pc, guard_); RETURN; }" : "RETURN;"));
+            line(fmt("if (++guard2_ > %uu) %s", stage_guard(opt, c.kind), opt.raw_stats ? "{ dbg_add(5u); dbg_set2(19u, pc, guard_); RETURN; }" : "RETURN;"));
         // The next block continues this case when control only falls into it.
         const bool goesOn = loops && b + 1 < nb && live[b + 1] && !entered[b + 1];
         inCase = false;
@@ -4995,6 +5005,8 @@ uint64_t translation_salt(const Container& c) {
     if (barrier && !backward) add("barrier-all-1");
     // 2026-11: global stores take their data from the data field (they read v0); global atomics.
     if (global_write) add("global-write-2");
+    // 2026-11: smaller step limits in pixel, vertex and mesh stages (stage_guard).
+    if (backward && c.kind != ProgramKind::CS) add("stage-guard-1");
     // 2026-11: a gather at a named level reads that level (it read level 0).
     if (gather_level) add("gather-level-1");
     // 2026-11: 16-bit vertex and mesh outputs are unpacked into the registers their records name
