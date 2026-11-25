@@ -3686,6 +3686,44 @@ template <class D> const D* view_fix(PcObj res, const void* desc, D& tmp) {
     return &tmp;
 }
 
+// A texture the GPU writes in one format and the title reads through a view of another format of
+// the same texel width, placed at the texture's address: a title packs light into R32_UINT
+// textures with compute shaders (which cannot store R9G9B9E5) and samples them as R9G9B9E5. On
+// the console the view shows the texture's memory. Here the texture is made with that second
+// format in its list of castable formats, where the device has relaxed format casting, and the
+// view is then a view of the texture itself (xs: written_texture_at). Without the feature the
+// view keeps a texture of its own, which nothing fills.
+DXGI_FORMAT cast_partner(DXGI_FORMAT f) { return f == DXGI_FORMAT_R32_UINT ? DXGI_FORMAT_R9G9B9E5_SHAREDEXP : DXGI_FORMAT_UNKNOWN; }
+std::set<ID3D12Resource*> g_castable;   // (under g_remap_mu) made with their cast partner
+bool relaxed_casting(ID3D12Device* dev) {
+    static const bool on = [dev] {
+        char b[4];
+        if (GetEnvironmentVariableA("XSL_CAST_VIEWS", b, 4) && b[0] == '0') return false;
+        ID3D12Device10* d10 = nullptr;
+        D3D12_FEATURE_DATA_D3D12_OPTIONS12 o12{};
+        const bool api = SUCCEEDED(dev->QueryInterface(IID_PPV_ARGS(&d10)));
+        if (d10) d10->Release();
+        const bool ok = api && SUCCEEDED(dev->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS12, &o12, sizeof o12)) && o12.RelaxedFormatCastingSupported;
+        if (ok) XSL_INFO(CH, "relaxed format casting: textures the GPU writes as R32_UINT can be viewed as R9G9B9E5 where a title places such a view on them");
+        else XSL_WARN(CH, "no relaxed format casting on this device or runtime: a view in another format placed on a texture the GPU writes shows nothing");
+        return ok;
+    }();
+    return on;
+}
+// The layout a texture made through the newer creation call starts in, for the state the older
+// call would be given (false: no single layout stands for it; the older call is used).
+bool layout_of(D3D12_RESOURCE_STATES st, D3D12_BARRIER_LAYOUT* out) {
+    const D3D12_RESOURCE_STATES read = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+    if (st == D3D12_RESOURCE_STATE_COMMON) *out = D3D12_BARRIER_LAYOUT_COMMON;
+    else if (st == D3D12_RESOURCE_STATE_UNORDERED_ACCESS) *out = D3D12_BARRIER_LAYOUT_UNORDERED_ACCESS;
+    else if (st == D3D12_RESOURCE_STATE_RENDER_TARGET) *out = D3D12_BARRIER_LAYOUT_RENDER_TARGET;
+    else if (st == D3D12_RESOURCE_STATE_COPY_DEST) *out = D3D12_BARRIER_LAYOUT_COPY_DEST;
+    else if (st == D3D12_RESOURCE_STATE_COPY_SOURCE) *out = D3D12_BARRIER_LAYOUT_COPY_SOURCE;
+    else if (st && !(st & ~read)) *out = D3D12_BARRIER_LAYOUT_SHADER_RESOURCE;
+    else return false;
+    return true;
+}
+
 D3D12_RESOURCE_DESC clean_desc(const void* desc) {
     D3D12_RESOURCE_DESC d = *static_cast<const D3D12_RESOURCE_DESC*>(desc);
     d.Flags = (D3D12_RESOURCE_FLAGS)(d.Flags & 0xBF);  // PC flags only; Xbox compression/DCC bits dropped
@@ -3811,8 +3849,35 @@ HRESULT_T create_committed_resource(PcObj dev, const void* heapProps, uint32_t h
     if (hp.Type == D3D12_HEAP_TYPE_UPLOAD) st = D3D12_RESOURCE_STATE_GENERIC_READ;
     if (d.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER && cached_upload(&hp)) st = D3D12_RESOURCE_STATE_GENERIC_READ;
     else if (hp.Type == D3D12_HEAP_TYPE_READBACK) st = D3D12_RESOURCE_STATE_COPY_DEST;
-    HRESULT hr = as<ID3D12Device>(dev)->CreateCommittedResource(&hp, clean_heap_flags(heapFlags), &d, st, cv,
-                                                                IID_PPV_ARGS(reinterpret_cast<ID3D12Resource**>(out)));
+    HRESULT hr = E_FAIL;
+    bool castable = false;
+    D3D12_BARRIER_LAYOUT layout;
+    if (const DXGI_FORMAT partner = cast_partner(d.Format);
+        partner != DXGI_FORMAT_UNKNOWN && d.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER && d.SampleDesc.Count <= 1 && hp.Type == D3D12_HEAP_TYPE_DEFAULT &&
+        (d.Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)) && !(d.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL) &&
+        layout_of(st, &layout) && relaxed_casting(as<ID3D12Device>(dev))) {
+        ID3D12Device10* d10 = nullptr;
+        if (SUCCEEDED(as<ID3D12Device>(dev)->QueryInterface(IID_PPV_ARGS(&d10)))) {
+            D3D12_RESOURCE_DESC1 d1{};
+            memcpy(&d1, &d, sizeof d);
+            const DXGI_FORMAT formats[2] = {d.Format, partner};
+            hr = d10->CreateCommittedResource3(&hp, clean_heap_flags(heapFlags), &d1, layout, cv, nullptr, 2, formats,
+                                               IID_PPV_ARGS(reinterpret_cast<ID3D12Resource**>(out)));
+            d10->Release();
+            castable = SUCCEEDED(hr);
+            static volatile long n = 0;
+            if (const long k = InterlockedIncrement(&n); k <= 4 || !castable)
+                XSL_INFO(CH, "texture %llux%u format %d the GPU writes: %s format %d too (%08lx)", (unsigned long long)d.Width, d.Height, (int)d.Format,
+                         castable ? "made so that it can be viewed as" : "could not be made viewable as", (int)partner, hr);
+        }
+    }
+    if (!castable)
+        hr = as<ID3D12Device>(dev)->CreateCommittedResource(&hp, clean_heap_flags(heapFlags), &d, st, cv, IID_PPV_ARGS(reinterpret_cast<ID3D12Resource**>(out)));
+    if (SUCCEEDED(hr)) {   // (a freed texture's pointer may come back as another's)
+        std::lock_guard<std::mutex> g(g_remap_mu);
+        if (castable) g_castable.insert(*reinterpret_cast<ID3D12Resource**>(out));
+        else g_castable.erase(*reinterpret_cast<ID3D12Resource**>(out));
+    }
     if (SUCCEEDED(hr)) note_buffer_fwd(*out);
     if (SUCCEEDED(hr) && g_info) {   // debug layer: name layer resources (others show as unnamed)
         wchar_t nm[96];
@@ -3836,6 +3901,12 @@ HRESULT_T create_committed_resource(PcObj dev, const void* heapProps, uint32_t h
         note_removed(hr);
     return hr;
 }
+// Whether a view of console format `format` can be made of the texture (see cast_partner).
+bool res_castable_to(PcObj r, int format) {
+    if (!r) return false;
+    std::lock_guard<std::mutex> g(g_remap_mu);
+    return g_castable.count(static_cast<ID3D12Resource*>(r)) && cast_partner(static_cast<ID3D12Resource*>(r)->GetDesc().Format) == (DXGI_FORMAT)format;
+}
 HRESULT_T create_reserved_resource(PcObj dev, const void* desc, uint32_t state, const void* clear, PcObj* out) {
     D3D12_RESOURCE_DESC d = clean_desc(desc);
     d.Alignment = 0;
@@ -3853,6 +3924,7 @@ HRESULT_T create_reserved_resource(PcObj dev, const void* desc, uint32_t state, 
     }
     HRESULT hr = logged(as<ID3D12Device>(dev)->CreateReservedResource(&d, depth_state(d, pc_state(state)), cv,
                                                                      IID_PPV_ARGS(reinterpret_cast<ID3D12Resource**>(out))), "CreateReservedResource");
+    if (SUCCEEDED(hr)) { std::lock_guard<std::mutex> g(g_remap_mu); g_castable.erase(*reinterpret_cast<ID3D12Resource**>(out)); }
     if (FAILED(hr)) {
         static volatile long n = 0;
         if (InterlockedIncrement(&n) <= 40)
@@ -3973,6 +4045,7 @@ HRESULT_T create_placed_resource(PcObj dev, PcObj heap, uint64_t offset, const v
     if (!(d.Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL))) cv = nullptr;
     HRESULT hr = as<ID3D12Device>(dev)->CreatePlacedResource(as<ID3D12Heap>(heap), offset, &d, depth_state(d, pc_state(state)), cv,
                                                              IID_PPV_ARGS(reinterpret_cast<ID3D12Resource**>(out)));
+    if (SUCCEEDED(hr)) { std::lock_guard<std::mutex> g(g_remap_mu); g_castable.erase(*reinterpret_cast<ID3D12Resource**>(out)); }
     if (hr == E_INVALIDARG && d.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER) {
         // The PC layout can be larger than the console's (e.g. D32_S8 depth), so a texture placed for
         // the console's size may run past the heap. It gets its own memory instead (no aliasing

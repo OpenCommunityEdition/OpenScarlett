@@ -207,6 +207,64 @@ HRESULT D3DAPI D_UnregisterPagePoolX(ID3D12Device*, HANDLE h) {
     return E_INVALIDARG;
 }
 
+// Textures the GPU writes (render targets, depth, unordered access) placed on title memory, by
+// address. On the console such a texture's memory is what any other view placed at the address
+// shows; here it has a PC texture of its own, so a view placed there has to be a view of that
+// texture (it got a second, empty texture). A title packs light into R32_UINT textures with
+// compute shaders and samples them through R9G9B9E5 views placed at their addresses: sky, probes,
+// bounced light.
+namespace {
+struct Written { void* obj; D3D12_RESOURCE_DESC desc; };
+std::mutex g_written_mu;
+std::multimap<uint64_t, Written> g_written;
+// Formats that are views of one another on a PC (a typeless family).
+int format_family(DXGI_FORMAT f) {
+    const int v = (int)f;
+    static const int ends[] = {4, 8, 14, 18, 22, 25, 26, 32, 38, 43, 47, 52, 59, 65};   // last format of each family, in order
+    for (int e : ends)
+        if (v <= e) return e;
+    if (v == 87 || v == 90 || v == 91) return 91;   // B8G8R8A8
+    if (v == 88 || v == 92 || v == 93) return 93;   // B8G8R8X8
+    return v;
+}
+}  // namespace
+void written_forget(uint64_t va, void* obj) {
+    std::lock_guard<std::mutex> g(g_written_mu);
+    auto range = g_written.equal_range(va);
+    for (auto it = range.first; it != range.second;) it = it->second.obj == obj ? g_written.erase(it) : std::next(it);
+}
+// The texture the GPU writes at the address, if a view of a texture described by rd placed there
+// can be a view of it: the same shape, and a format of the same family or one the texture was
+// made castable to (*cast, where the caller can take such a view; the view then names its format).
+ID3D12Resource* written_texture_at(uint64_t va, const D3D12_RESOURCE_DESC* rd, bool* cast) {
+    static const bool on = [] { char b[4]; return !(GetEnvironmentVariableA("XSL_PLACED_ALIAS", b, 4) && b[0] == '0'); }();
+    if (cast) *cast = false;
+    if (!on || !rd || !va) return nullptr;
+    std::lock_guard<std::mutex> g(g_written_mu);
+    auto range = g_written.equal_range(va);
+    for (auto it = range.first; it != range.second; ++it) {
+        const D3D12_RESOURCE_DESC& w = it->second.desc;
+        if (w.Dimension != rd->Dimension || w.Width != rd->Width || w.Height != rd->Height || w.DepthOrArraySize != rd->DepthOrArraySize || w.MipLevels != rd->MipLevels ||
+            w.SampleDesc.Count != rd->SampleDesc.Count)
+            continue;
+        const bool family = format_family(w.Format) == format_family(rd->Format);
+        const bool castable = !family && cast && pc::res_castable_to(pc_of((ID3D12Resource*)it->second.obj), (int)rd->Format);
+        static volatile long shown = 0, refused = 0;
+        if (family || castable) {
+            if (InterlockedIncrement(&shown) <= 12)
+                XSL_INFO(CH, "a view placed at %llx (%llux%u format %d flags %x) is a view of the texture the GPU writes there (format %d flags %x)%s", (unsigned long long)va,
+                         (unsigned long long)rd->Width, rd->Height, (int)rd->Format, (unsigned)rd->Flags, (int)w.Format, (unsigned)w.Flags, castable ? ", in the other format" : "");
+            if (cast) *cast = castable;
+            return (ID3D12Resource*)it->second.obj;
+        }
+        if (InterlockedIncrement(&refused) <= 12)
+            XSL_WARN(CH, "a view placed at %llx (%llux%u format %d flags %x) lies on a texture the GPU writes in format %d (flags %x): no view of one as the other here, the view "
+                         "shows a texture of its own",
+                     (unsigned long long)va, (unsigned long long)rd->Width, rd->Height, (int)rd->Format, (unsigned)rd->Flags, (int)w.Format, (unsigned)w.Flags);
+    }
+    return nullptr;
+}
+
 // Set while the layer itself places a texture for a placed view (the title never sees the resource).
 static thread_local bool t_placed_view = false;
 void placed_view_scope(bool on) { t_placed_view = on; }
@@ -288,6 +346,16 @@ HRESULT D3DAPI D_CreatePlacedResourceX(ID3D12Device* d, D3D12_GPU_VIRTUAL_ADDRES
         detile_register(r, va, desc, pc::pc_state_of(st), skip);
         hr = make_resource((Device*)d, r, riid, out);
         if (SUCCEEDED(hr) && out && *out) resource_set_title_va(*out, va);
+        if (SUCCEEDED(hr) && out && *out && gpuWritten && !isBuffer) {
+            {
+                std::lock_guard<std::mutex> g(g_written_mu);
+                g_written.insert({va, Written{*out, *desc}});
+            }
+            static volatile long late = 0;
+            if (!t_placed_view && placed_view_made_at(va) && InterlockedIncrement(&late) <= 8)
+                XSL_WARN(CH, "a texture the GPU writes (%llux%u format %d flags %x) is placed at %llx after a view was placed there: that view keeps a texture of its own",
+                         (unsigned long long)desc->Width, desc->Height, (int)desc->Format, (unsigned)desc->Flags, (unsigned long long)va);
+        }
         return hr;
     }
     if (desc && desc->Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D) {

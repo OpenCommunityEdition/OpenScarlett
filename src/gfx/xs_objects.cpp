@@ -503,6 +503,7 @@ void Res_Destroy(IGraphicsUnknown* self) {
     auto* e = ex<ID3D12Resource2, ResExtra>((ID3D12Resource2*)self);
     if (e->trackedVa) cbv_untrack(e->trackedVa);
     if (e->placedVa) pagemap_forget(e->placedVa, hdr(self)->pc);
+    if (e->titleVa) written_forget(e->titleVa, self);
     pc::gm_forget(hdr(self)->pc);
     detile_forget(hdr(self)->pc);
     pc::note_reduced(hdr(self)->pc, false);

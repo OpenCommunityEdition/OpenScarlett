@@ -31,6 +31,9 @@ const Caps& caps();
 void set_host_waves(unsigned min_lanes, unsigned max_lanes, bool sm66);
 // PC stand-in for a console format that PC GPUs cannot render to (0 = none needed).
 int format_stand_in(int format);
+// Whether the texture was made so that a view of that other format can be made of it (a texture
+// the GPU writes, read through a view of another format placed at its address).
+bool res_castable_to(PcObj r, int format);
 void release(PcObj o);
 void addref(PcObj o);
 // Console descriptor model: every CBV/SRV/UAV descriptor heap is GPU-visible and descriptor tables may

@@ -236,6 +236,11 @@ HRESULT make_rtv_dsv_shadow_heap(Device* dev, PcObj pch, const D3D12_DESCRIPTOR_
 void resource_set_title_va(void* resource, uint64_t va);   // CreatePlacedResourceX on committed title memory
 void resource_set_placed(void* resource, uint64_t va);  // CreatePlacedResourceX on reserved address space
 void pagemap_forget(uint64_t va, PcObj res);
+// Textures the GPU writes, placed on title memory: the one a view placed at the address can be a
+// view of (xs_pagemap.cpp), and its removal when the texture is destroyed.
+ID3D12Resource* written_texture_at(uint64_t va, const D3D12_RESOURCE_DESC* rd, bool* cast);
+void written_forget(uint64_t va, void* resource);
+bool placed_view_made_at(uint64_t va);   // xs_device.cpp
 HRESULT D3DAPI D_RegisterPagePoolX(ID3D12Device* d, D3D12_GPU_VIRTUAL_ADDRESS va, UINT pageCount, HANDLE* out);
 HRESULT D3DAPI D_UnregisterPagePoolX(ID3D12Device* d, HANDLE h);
 HRESULT D3DAPI D_CreatePlacedResourceX(ID3D12Device* d, D3D12_GPU_VIRTUAL_ADDRESS va, const D3D12_RESOURCE_DESC* desc, D3D12_RESOURCE_STATES st,

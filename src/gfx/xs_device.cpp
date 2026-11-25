@@ -1234,7 +1234,10 @@ PcObj placed_buffer(ID3D12Device* d, uint64_t va, uint64_t* off) {
 }
 std::mutex g_pv_mu;
 std::map<std::array<uint64_t, 6>, ID3D12Resource*> g_pv_tex;   // (address, description) -> placed console resource
-ID3D12Resource* placed_texture(ID3D12Device* d, const D3D12_RESOURCE_DESC* rd, uint64_t va) {
+// cast: set when the texture returned is one the GPU writes in another format, of which the view
+// has to name its own (null: the caller cannot take such a view).
+ID3D12Resource* placed_texture(ID3D12Device* d, const D3D12_RESOURCE_DESC* rd, uint64_t va, bool* cast = nullptr) {
+    if (ID3D12Resource* w = written_texture_at(va, rd, cast)) return w;
     std::array<uint64_t, 6> key{va, rd->Width, (uint64_t)rd->Height << 32 | rd->DepthOrArraySize, (uint64_t)rd->MipLevels << 32 | (uint32_t)rd->Format,
                                 (uint64_t)rd->Dimension << 32 | (uint32_t)rd->Flags, (uint64_t)rd->Layout << 32 | rd->SampleDesc.Count};
     std::lock_guard<std::mutex> g(g_pv_mu);
@@ -1319,7 +1322,11 @@ void D3DAPI D_CreatePlacedRawSRV(ID3D12Device* d, const D3D12_RESOURCE_DESC* rd,
                            (v.Buffer.Flags & D3D12_BUFFER_SRV_FLAG_RAW) != 0, false, h.ptr, &v);
         return;
     }
-    if (ID3D12Resource* r = placed_texture(d, rd, x->ResourceLocation)) D_CreateSRV(d, r, &v, h);
+    bool cast = false;
+    if (ID3D12Resource* r = placed_texture(d, rd, x->ResourceLocation, &cast)) {
+        if (cast && v.Format == DXGI_FORMAT_UNKNOWN) v.Format = rd->Format;
+        D_CreateSRV(d, r, &v, h);
+    }
 }
 void D3DAPI D_CreatePlacedRawUAV(ID3D12Device* d, const D3D12_RESOURCE_DESC* rd, const D3D12XBOX_UNORDERED_ACCESS_VIEW_DESC* x, D3D12_CPU_DESCRIPTOR_HANDLE h) {
     if (!rd || !x) return;
@@ -2520,6 +2527,13 @@ HRESULT create_dxgi_device(Device* dev, void** out) {
     return S_OK;
 }
 
+// Whether a view was already placed at the address with a texture of its own (diagnostics: a
+// texture the GPU writes placed there afterwards cannot reach that view any more).
+bool placed_view_made_at(uint64_t va) {
+    std::lock_guard<std::mutex> g(g_pv_mu);
+    auto it = g_pv_tex.lower_bound(std::array<uint64_t, 6>{va, 0, 0, 0, 0, 0});
+    return it != g_pv_tex.end() && it->first[0] == va;
+}
 }  // namespace xs
 
 // ============================================================================================
