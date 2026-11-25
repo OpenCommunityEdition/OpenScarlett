@@ -175,6 +175,11 @@ bool map_shadow_written(PcObj r);   // the title wrote into that copy since the 
 // Allocator and command list
 HRESULT_T alloc_reset(PcObj a);
 HRESULT_T list_close(PcObj l);
+// Read-backs (pc_backend.cpp, "Read-backs").
+HRESULT_T create_readback(PcObj dev, uint64_t bytes, PcObj* out);
+const void* readback_map(PcObj r);
+void readback_unmap(PcObj r);
+uint32_t format_texel_bytes(int format);
 // Lists cut at waits for memory values (pc_backend.cpp, "Lists cut at waits").
 void list_cuts_prepare(bool all);
 HRESULT_T list_cut(PcObj dev, PcObj from, PcObj alloc, PcObj* out);

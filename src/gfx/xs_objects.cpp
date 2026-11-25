@@ -717,13 +717,25 @@ ListExtra* lx(ID3D12GraphicsCommandList* l) { return ex<XList, ListExtra>((XList
 // while its queue has a backlog is given to the backlog for good (a second submission of the same
 // recording runs nothing). XSL_LIST_WAITS=0: waits are skipped, as before.
 struct ValueWait { uint64_t va, ref, mask; int cmp; bool wide; };
-struct MemWrite { uint64_t va, value; bool wide; };
+struct MemWrite {
+    uint64_t va, value;
+    bool wide;
+    // A read-back instead of a value (staging set): rows of texels a list copied into a buffer of
+    // the layer's own, to be stored at va once the list has run (see list_read_back).
+    PcObj staging = nullptr;
+    uint32_t rows = 0, rowBytes = 0, pitch = 0;
+};
 struct ListPart { std::vector<ValueWait> waits; PcObj list; std::vector<MemWrite> writes; };
 struct ListWaits {
     std::vector<ListPart> earlier;   // the parts before the PC list being recorded, with the waits before each
     std::vector<ValueWait> gate;     // the waits before the PC list being recorded
-    std::vector<MemWrite> writes;    // its writes the CPU does not see by itself
+    std::vector<MemWrite> writes;    // its writes the CPU does not see by itself, and its read-backs
 };
+static void mem_write_drop(std::vector<MemWrite>& v) {   // (of a recording that is never run)
+    for (MemWrite& w : v)
+        if (w.staging) pc::release(w.staging);
+    v.clear();
+}
 static bool list_waits_on() {
     static const bool on = [] { char b[4]; return !(GetEnvironmentVariableA("XSL_LIST_WAITS", b, 4) && b[0] == '0'); }();
     return on;
@@ -795,7 +807,13 @@ static void backlog_pump(Backlog* b) {
         while (!b->landing.empty() && b->landing.front().first <= done) {
             for (const MemWrite& w : b->landing.front().second) {
                 SIZE_T put = 0;
-                WriteProcessMemory(GetCurrentProcess(), wait_cpu_address(w.va), &w.value, w.wide ? 8 : 4, &put);
+                if (!w.staging) { WriteProcessMemory(GetCurrentProcess(), wait_cpu_address(w.va), &w.value, w.wide ? 8 : 4, &put); continue; }
+                if (const uint8_t* from = (const uint8_t*)pc::readback_map(w.staging)) {
+                    for (uint32_t r = 0; r < w.rows; r++)
+                        WriteProcessMemory(GetCurrentProcess(), (uint8_t*)wait_cpu_address(w.va) + (size_t)r * w.pitch, from + (size_t)r * w.pitch, w.rowBytes, &put);
+                    pc::readback_unmap(w.staging);
+                }
+                pc::release(w.staging);
             }
             b->landing.pop_front();
         }
@@ -914,10 +932,10 @@ HRESULT D3DAPI L_Reset(ID3D12GraphicsCommandList* l, ID3D12CommandAllocator* a, 
     lx(l)->placeholderWhy = lx(l)->placeholderPso ? placeholder_reason(p) : -1;
     // Parts cut at waits and waits recorded since the last reset, never submitted: gone with the recording.
     if (ListWaits* w = lx(l)->w) {
-        for (ListPart& part : w->earlier) { pc::list_forget(part.list); pc::release(part.list); }
+        for (ListPart& part : w->earlier) { pc::list_forget(part.list); pc::release(part.list); mem_write_drop(part.writes); }
         w->earlier.clear();
         w->gate.clear();
-        w->writes.clear();
+        mem_write_drop(w->writes);
     }
     lx(l)->alloc = P(a);
     HRESULT hr = pc::list_reset(LPC(l), P(a), P(p));
@@ -929,7 +947,8 @@ HRESULT D3DAPI L_Reset(ID3D12GraphicsCommandList* l, ID3D12CommandAllocator* a, 
 void list_parts_free(IGraphicsUnknown* self) {
     ListExtra* e = ex<XList, ListExtra>((XList*)self);
     if (!e->w) return;
-    for (ListPart& part : e->w->earlier) { pc::list_forget(part.list); pc::release(part.list); }
+    for (ListPart& part : e->w->earlier) { pc::list_forget(part.list); pc::release(part.list); mem_write_drop(part.writes); }
+    mem_write_drop(e->w->writes);
     delete e->w;
     e->w = nullptr;
 }
@@ -1364,7 +1383,62 @@ void D3DAPI L_SetGfxRoot32(ID3D12GraphicsCommandList* l, UINT i, UINT n, const v
 void D3DAPI L_SetGfxRoot32One(ID3D12GraphicsCommandList* l, UINT i, UINT v, UINT o) { pc::list_gfx_root_constants(LPC(l), i, 1, &v, o); }
 void D3DAPI L_SetComputeRoot32(ID3D12GraphicsCommandList* l, UINT i, UINT n, const void* d, UINT o) { pc::list_compute_root_constants(LPC(l), i, n, d, o); }
 void D3DAPI L_SetComputeRoot32One(ID3D12GraphicsCommandList* l, UINT i, UINT v, UINT o) { pc::list_compute_root_constants(LPC(l), i, 1, &v, o); }
+// Diagnostics: a copy on the GPU into a buffer the title placed on its own memory. The buffer has
+// a PC buffer of its own there, so what is copied does not reach the memory the title's CPU code
+// reads (a title reads small render targets back this way). Counted, and the first ones logged.
+static void note_copy_to_placed(ID3D12Resource* d, const char* from, UINT64 off, UINT64 bytes, int format) {
+    if (!d || !is_ours(d)) return;
+    const uint64_t va = ex<ID3D12Resource2, ResExtra>((ID3D12Resource2*)d)->titleVa;
+    if (!va) return;
+    static volatile long n = 0;
+    const long k = InterlockedIncrement(&n);
+    if (k <= 12 || k % 5000 == 0)
+        XSL_INFO(CH, "a copy from a %s into a buffer placed on title memory (at %llx, offset %llu, %llu bytes, format %d): not brought back to that memory (%ld such copies so far)", from,
+                 (unsigned long long)va, (unsigned long long)off, (unsigned long long)bytes, format, k);
+}
+// A texture-to-buffer copy into a buffer the title placed on its own memory: a read-back. The
+// buffer has a PC buffer of its own, so the title's CPU code would read memory nothing wrote (a
+// title meters its exposure from two tiny float targets it reads back every frame). The texels
+// are also copied into a buffer of the layer's own, and stored in the title's memory once the
+// list has run. False: not such a copy, or one this does not take (a part of a footprint not at
+// its origin, a format whose texel size is not known, more than 64 MB).
+// XSL_READ_BACK=0: none are made.
+static bool list_read_back(ID3D12GraphicsCommandList* l, const D3D12_TEXTURE_COPY_LOCATION* d, UINT x, UINT y, UINT z, const D3D12_TEXTURE_COPY_LOCATION* src,
+                           const D3D12_BOX* box) {
+    static const bool on = [] { char b[4]; return !(GetEnvironmentVariableA("XSL_READ_BACK", b, 4) && b[0] == '0'); }();
+    if (!on || !list_waits_on() || !d->pResource || !is_ours(d->pResource) || src->Type != D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX) return false;
+    const uint64_t va = ex<ID3D12Resource2, ResExtra>((ID3D12Resource2*)d->pResource)->titleVa;
+    const D3D12_SUBRESOURCE_FOOTPRINT& f = d->PlacedFootprint.Footprint;
+    const uint32_t texel = pc::format_texel_bytes((int)f.Format);
+    if (!va || x || y || z || !texel || f.Depth > 1 || !f.RowPitch) return false;
+    const uint32_t width = box ? box->right - box->left : f.Width, rows = box ? box->bottom - box->top : f.Height;
+    const uint64_t bytes = (uint64_t)f.RowPitch * rows;
+    if (!rows || !width || (uint64_t)width * texel > f.RowPitch || bytes > (64ull << 20)) return false;
+    PcObj staging = nullptr;
+    if (FAILED(pc::create_readback(dev_extra(hdr(l)->device)->pcDevice, bytes + 256, &staging)) || !staging) return false;
+    D3D12_TEXTURE_COPY_LOCATION to{};
+    to.pResource = (ID3D12Resource*)staging;
+    to.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    to.PlacedFootprint.Footprint = f;
+    to.PlacedFootprint.Footprint.Height = rows;
+    to.PlacedFootprint.Footprint.Width = width;
+    pc::list_copy_texture_region(LPC(l), &to, 0, 0, 0, src, box);
+    ListExtra* e = lx(l);
+    if (!e->w) e->w = new ListWaits;
+    MemWrite w{va + d->PlacedFootprint.Offset, 0, false};
+    w.staging = staging;
+    w.rows = rows;
+    w.rowBytes = width * texel;
+    w.pitch = f.RowPitch;
+    e->w->writes.push_back(w);
+    static volatile long n = 0;
+    if (const long k = InterlockedIncrement(&n); k <= 8 || k % 20000 == 0)
+        XSL_INFO(CH, "read-back: %ux%u texels of format %d copied into a buffer placed on title memory go to that memory (%llx) once the list has run (%ld so far)", width, rows,
+                 (int)f.Format, (unsigned long long)w.va, k);
+    return true;
+}
 void D3DAPI L_CopyBufferRegion(ID3D12GraphicsCommandList* l, ID3D12Resource* d, UINT64 doff, ID3D12Resource* s, UINT64 soff, UINT64 n) {
+    note_copy_to_placed(d, "buffer", doff, n, 0);
     pc::list_copy_buffer_region(LPC(l), P(d), doff, P(s), soff, n);
 }
 void D3DAPI L_CopyTextureRegion(ID3D12GraphicsCommandList* l, const D3D12_TEXTURE_COPY_LOCATION* d, UINT x, UINT y, UINT z,
@@ -1416,6 +1490,9 @@ void D3DAPI L_CopyTextureRegion(ID3D12GraphicsCommandList* l, const D3D12_TEXTUR
         }
     }
     if (!is_ours(s->pResource) && getenv("XSL_SKIP_VIDEO_COPIES")) return;   // experiment: copies out of decoder textures
+    if (d->Type == D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT && !list_read_back(l, d, x, y, z, &ss, box))
+        note_copy_to_placed(d->pResource, "texture", d->PlacedFootprint.Offset, (UINT64)d->PlacedFootprint.Footprint.RowPitch * d->PlacedFootprint.Footprint.Height,
+                            (int)d->PlacedFootprint.Footprint.Format);
     pc::list_copy_texture_region(LPC(l), &dd, x, y, z, &ss, box);
 }
 void D3DAPI L_CopyResource(ID3D12GraphicsCommandList* l, ID3D12Resource* d, ID3D12Resource* s) { pc::list_copy_resource(LPC(l), P_or_pc(d), P_or_pc(s)); }

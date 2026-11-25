@@ -5921,6 +5921,35 @@ static bool twin_barrier(PcObj l, const D3D12_RESOURCE_BARRIER& b) {
     } else twin_to_depth(l, cl, b.Transition.pResource, *t, b.Transition.Subresource, after);
     return true;
 }
+// ---- Read-backs -----------------------------------------------------------------------------------
+// A buffer of the layer's own that a list copies texels into and the CPU reads once the list has
+// run (xs: a title's texture-to-buffer copy into a buffer placed on its own memory).
+HRESULT_T create_readback(PcObj dev, uint64_t bytes, PcObj* out) {
+    D3D12_RESOURCE_DESC bd{};
+    bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    bd.Width = bytes;
+    bd.Height = bd.DepthOrArraySize = bd.MipLevels = 1;
+    bd.SampleDesc.Count = 1;
+    bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    const D3D12_HEAP_PROPERTIES hp{D3D12_HEAP_TYPE_READBACK};
+    return as<ID3D12Device>(dev)->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                                          IID_PPV_ARGS(reinterpret_cast<ID3D12Resource**>(out)));
+}
+const void* readback_map(PcObj r) {
+    void* p = nullptr;
+    return SUCCEEDED(as<ID3D12Resource>(r)->Map(0, nullptr, &p)) ? p : nullptr;
+}
+void readback_unmap(PcObj r) {
+    const D3D12_RANGE none{0, 0};
+    as<ID3D12Resource>(r)->Unmap(0, &none);
+}
+// Bytes of one texel of a format (0: not known, or a block-compressed format).
+uint32_t format_texel_bytes(int format) {
+    const int v = format;
+    if ((v >= 70 && v <= 84) || (v >= 94 && v <= 99)) return 0;   // block-compressed
+    return format_bytes_of((DXGI_FORMAT)format);
+}
+
 // ---- Lists cut at waits ---------------------------------------------------------------------------
 // The console GPU can stand at a point of a command list until a memory value passes a comparison;
 // a title orders the work of its queues that way. A PC list cannot wait, so the layer cuts the
