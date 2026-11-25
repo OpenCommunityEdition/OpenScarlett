@@ -3594,6 +3594,13 @@ struct GfxShadow {
     D3D12_VIEWPORT vp[16]{};
     D3D12_RECT sc[16]{};
     int topo = 0;
+    // What a continuation of the list needs besides (a list cut at a wait: list_cut).
+    D3D12_VERTEX_BUFFER_VIEW vb[32]{};
+    uint32_t vbMask = 0, nheaps = 0, stencilRef = 0;
+    D3D12_INDEX_BUFFER_VIEW ib{};
+    PcObj heaps[2]{};
+    float blend[4]{}, boundsLo = 0, boundsHi = 1;
+    bool ibSet = false, blendSet = false, stencilSet = false, boundsSet = false;
 };
 std::atomic<bool> g_gfx_shadow_on{false};
 std::mutex g_gfx_mu;
@@ -5914,6 +5921,101 @@ static bool twin_barrier(PcObj l, const D3D12_RESOURCE_BARRIER& b) {
     } else twin_to_depth(l, cl, b.Transition.pResource, *t, b.Transition.Subresource, after);
     return true;
 }
+// ---- Lists cut at waits ---------------------------------------------------------------------------
+// The console GPU can stand at a point of a command list until a memory value passes a comparison;
+// a title orders the work of its queues that way. A PC list cannot wait, so the layer cuts the
+// title's list there (xs: L_Wait32/64): what was recorded so far stays in the PC list it was
+// recorded into, and the title's calls record into a new PC list from here on, which the queue
+// runs when the wait is met. The new list starts without any state, so the state the title has
+// set is put on it again: view heaps, pipeline, root signatures and their arguments (through the
+// lazy binding of root_ensure), targets, viewports, scissors, topology, vertex and index buffers,
+// blend factor, stencil reference and depth bounds. Not carried over: queries begun and not
+// ended, predication, shading rate, sample positions.
+namespace {
+template <class M> void list_rekey(M& m, PcObj from, PcObj to) {
+    auto it = m.find(from);
+    if (it == m.end()) { m.erase(to); return; }
+    auto v = std::move(it->second);
+    m.erase(it);
+    m[to] = std::move(v);
+}
+}  // namespace
+// From now on lists record what a continuation needs (all = root signatures and arguments too:
+// set at the first wait a title records, as it changes how root signatures are bound).
+void list_cuts_prepare(bool all) {
+    g_gfx_shadow_on = true;
+    if (all) g_own_rs_any = true;
+}
+// The per-list records of a PC list that is let go.
+void list_forget(PcObj l) {
+    list_shadow_reset(l);
+    { std::lock_guard<std::mutex> g(g_gm_mu); g_list_global_heap.erase(l); g_list_gm_rs.erase(l); g_list_sampler_heap.erase(l); }
+    { std::lock_guard<std::mutex> g(g_rs_mu); g_list_rs.erase(l); }
+    if (trace_writers()) {
+        std::lock_guard<std::mutex> g(g_wr_mu);
+        g_cs_tables.erase(l); g_gfx_tables.erase(l); g_wr_rt0.erase(l); g_wr_pso.erase(l); g_wr_rtv0.erase(l); g_wr_vp.erase(l); g_wr_sc.erase(l);
+    }
+}
+// A closed list of that type that records on no allocator yet (for a title list whose own PC
+// list was handed to a queue's backlog).
+HRESULT_T create_list_closed(PcObj dev, int type, PcObj* out) {
+    ID3D12Device4* d4 = nullptr;
+    HRESULT hr = as<ID3D12Device>(dev)->QueryInterface(IID_PPV_ARGS(&d4));
+    if (FAILED(hr)) return hr;
+    hr = d4->CreateCommandList1(0, (D3D12_COMMAND_LIST_TYPE)type, D3D12_COMMAND_LIST_FLAG_NONE, IID_PPV_ARGS(reinterpret_cast<ID3D12GraphicsCommandList**>(out)));
+    d4->Release();
+    return hr;
+}
+// The same, of the type of another list.
+HRESULT_T create_list_closed_like(PcObj dev, PcObj like, PcObj* out) {
+    return create_list_closed(dev, (int)as<ID3D12GraphicsCommandList>(like)->GetType(), out);
+}
+// Closes `from` and gives the list the title's calls record into from here on, on the same
+// allocator, with the title's state on it. On failure `from` is left open and untouched.
+HRESULT_T list_cut(PcObj dev, PcObj from, PcObj alloc, PcObj* out) {
+    auto* old = as<ID3D12GraphicsCommandList>(from);
+    PcObj to = nullptr;
+    HRESULT hr = create_list_closed(dev, (int)old->GetType(), &to);
+    if (FAILED(hr)) return hr;
+    old->Close();
+    auto* cl = as<ID3D12GraphicsCommandList>(to);
+    hr = cl->Reset(as<ID3D12CommandAllocator>(alloc), nullptr);
+    if (FAILED(hr)) { XSL_ERR(CH, "a list cut at a wait: the new list does not start (%08lx); what the title records from here on is lost", hr); }
+    { std::lock_guard<std::mutex> g(g_gm_mu); list_rekey(g_list_global_heap, from, to); list_rekey(g_list_gm_rs, from, to); list_rekey(g_list_sampler_heap, from, to); }
+    { std::lock_guard<std::mutex> g(g_cs_mu); list_rekey(g_cs_shadow, from, to); }
+    { std::lock_guard<std::mutex> g(g_gfx_mu); list_rekey(g_gfx_shadow, from, to); }
+    { std::lock_guard<std::mutex> g(g_bind_mu); list_rekey(g_root_bind, from, to); }
+    { std::lock_guard<std::mutex> g(g_rs_mu); list_rekey(g_list_rs, from, to); }
+    if (trace_writers()) {
+        std::lock_guard<std::mutex> g(g_wr_mu);
+        list_rekey(g_cs_tables, from, to); list_rekey(g_gfx_tables, from, to); list_rekey(g_wr_rt0, from, to); list_rekey(g_wr_pso, from, to);
+        list_rekey(g_wr_rtv0, from, to); list_rekey(g_wr_vp, from, to); list_rekey(g_wr_sc, from, to);
+    }
+    name_recording(to);
+    // The title's state, on the new list.
+    GfxShadow sh;
+    { std::lock_guard<std::mutex> g(g_gfx_mu); auto it = g_gfx_shadow.find(to); if (it != g_gfx_shadow.end()) sh = it->second; }
+    if (sh.nheaps) cl->SetDescriptorHeaps(sh.nheaps, reinterpret_cast<ID3D12DescriptorHeap* const*>(sh.heaps));
+    {   // (the global-memory tables go on again with the root signatures)
+        std::lock_guard<std::mutex> g(g_gm_mu);
+        auto it = g_list_gm_rs.find(to);
+        if (it != g_list_gm_rs.end()) it->second = {nullptr, nullptr};
+    }
+    root_lost(to, false);
+    restore_compute_state(to);   // the pipeline, and the compute root signature with its arguments
+    if (sh.om) cl->OMSetRenderTargets(sh.nrt, sh.nrt ? sh.rt : nullptr, sh.single, sh.hasDsv ? &sh.dsv : nullptr);
+    if (sh.nvp) cl->RSSetViewports(sh.nvp, sh.vp);
+    if (sh.nsc) cl->RSSetScissorRects(sh.nsc, sh.sc);
+    if (sh.topo) cl->IASetPrimitiveTopology((D3D12_PRIMITIVE_TOPOLOGY)sh.topo);
+    for (uint32_t i = 0; i < 32; i++)
+        if (sh.vbMask >> i & 1) cl->IASetVertexBuffers(i, 1, &sh.vb[i]);
+    if (sh.ibSet) cl->IASetIndexBuffer(&sh.ib);
+    if (sh.blendSet) cl->OMSetBlendFactor(sh.blend);
+    if (sh.stencilSet) cl->OMSetStencilRef(sh.stencilRef);
+    if (sh.boundsSet) list_depth_bounds(to, sh.boundsLo, sh.boundsHi);
+    *out = to;
+    return S_OK;
+}
 void note_pso_rs(PcObj pso, PcObj rs, bool compute) {
     if (!g_info || !pso) return;
     std::lock_guard<std::mutex> g(g_rs_mu);
@@ -6023,8 +6125,26 @@ void list_ia_topology(PcObj l, int t) {
     if (g_gfx_shadow_on.load(std::memory_order_relaxed)) { std::lock_guard<std::mutex> g(g_gfx_mu); g_gfx_shadow[l].topo = t; }
     L->IASetPrimitiveTopology((D3D12_PRIMITIVE_TOPOLOGY)t);
 }
-void list_ia_vbs(PcObj l, uint32_t s, uint32_t n, const void* v) { L->IASetVertexBuffers(s, n, static_cast<const D3D12_VERTEX_BUFFER_VIEW*>(v)); }
-void list_ia_ib(PcObj l, const void* v) { L->IASetIndexBuffer(static_cast<const D3D12_INDEX_BUFFER_VIEW*>(v)); }
+void list_ia_vbs(PcObj l, uint32_t s, uint32_t n, const void* v) {
+    if (g_gfx_shadow_on.load(std::memory_order_relaxed)) {
+        std::lock_guard<std::mutex> g(g_gfx_mu);
+        GfxShadow& sh = g_gfx_shadow[l];
+        for (uint32_t i = 0; i < n && s + i < 32; i++) {
+            if (v) { sh.vb[s + i] = static_cast<const D3D12_VERTEX_BUFFER_VIEW*>(v)[i]; sh.vbMask |= 1u << (s + i); }
+            else sh.vbMask &= ~(1u << (s + i));
+        }
+    }
+    L->IASetVertexBuffers(s, n, static_cast<const D3D12_VERTEX_BUFFER_VIEW*>(v));
+}
+void list_ia_ib(PcObj l, const void* v) {
+    if (g_gfx_shadow_on.load(std::memory_order_relaxed)) {
+        std::lock_guard<std::mutex> g(g_gfx_mu);
+        GfxShadow& sh = g_gfx_shadow[l];
+        sh.ibSet = v != nullptr;
+        if (v) sh.ib = *static_cast<const D3D12_INDEX_BUFFER_VIEW*>(v);
+    }
+    L->IASetIndexBuffer(static_cast<const D3D12_INDEX_BUFFER_VIEW*>(v));
+}
 static bool trace_dispatch_size(PcObj l, const char* how, uint32_t x, uint32_t y, uint32_t z, std::string* name);
 // XSL_PLANE_OPS=<present> (with XSL_TRACE_WRITERS=1): every draw, clear and copy that writes a
 // presented image during the frame before that present, in recording order.
@@ -6679,6 +6799,7 @@ HRESULT_T rs_vdeserializer_desc(PcObj d, int version, const void** out) {
 }
 const void* rs_vdeserializer_unconverted(PcObj d) { return as<ID3D12VersionedRootSignatureDeserializer>(d)->GetUnconvertedRootSignatureDesc(); }
 void list_depth_bounds(PcObj l, float lo, float hi) {
+    if (g_gfx_shadow_on.load(std::memory_order_relaxed)) { std::lock_guard<std::mutex> g(g_gfx_mu); GfxShadow& sh = g_gfx_shadow[l]; sh.boundsLo = lo; sh.boundsHi = hi; sh.boundsSet = true; }
     ID3D12GraphicsCommandList1* l1 = nullptr;
     if (SUCCEEDED(L->QueryInterface(IID_PPV_ARGS(&l1)))) { l1->OMSetDepthBounds(lo, hi); l1->Release(); }
 }
@@ -6880,6 +7001,12 @@ void list_write_immediate(PcObj l, uint64_t va, uint32_t value, bool bottom) {
 }
 void list_discard(PcObj l, PcObj r) { L->DiscardResource(as<ID3D12Resource>(r), nullptr); }
 void list_set_heaps(PcObj l, uint32_t n, PcObj* h) {
+    if (g_gfx_shadow_on.load(std::memory_order_relaxed)) {
+        std::lock_guard<std::mutex> g(g_gfx_mu);
+        GfxShadow& sh = g_gfx_shadow[l];
+        sh.nheaps = n > 2 ? 2 : n;
+        for (uint32_t i = 0; i < sh.nheaps; i++) sh.heaps[i] = h[i];
+    }
     {   // table bindings refer to the previous heaps: not restored after this
         std::lock_guard<std::mutex> g(g_cs_mu);
         auto it = g_cs_shadow.find(l);
@@ -7226,8 +7353,14 @@ void list_resolve_subresource(PcObj l, PcObj dst, uint32_t ds, PcObj src, uint32
     }
     L->ResolveSubresource(d, ds, s, ss, (DXGI_FORMAT)fmt);
 }
-void list_blend_factor(PcObj l, const float* f) { L->OMSetBlendFactor(f); }
-void list_stencil_ref(PcObj l, uint32_t r) { L->OMSetStencilRef(r); }
+void list_blend_factor(PcObj l, const float* f) {
+    if (f && g_gfx_shadow_on.load(std::memory_order_relaxed)) { std::lock_guard<std::mutex> g(g_gfx_mu); GfxShadow& sh = g_gfx_shadow[l]; memcpy(sh.blend, f, sizeof sh.blend); sh.blendSet = true; }
+    L->OMSetBlendFactor(f);
+}
+void list_stencil_ref(PcObj l, uint32_t r) {
+    if (g_gfx_shadow_on.load(std::memory_order_relaxed)) { std::lock_guard<std::mutex> g(g_gfx_mu); GfxShadow& sh = g_gfx_shadow[l]; sh.stencilRef = r; sh.stencilSet = true; }
+    L->OMSetStencilRef(r);
+}
 #undef L
 
 std::set<PcObj> g_plane_lists;   // XSL_PLANE_OPS: lists that wrote a presented image this frame

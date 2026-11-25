@@ -4,6 +4,8 @@
 #include <algorithm>
 #include <windows.h>
 #include <tlhelp32.h>
+#include <atomic>
+#include <deque>
 #include <map>
 #include <mutex>
 #include <set>
@@ -78,8 +80,10 @@ void note_plane_alias(PcObj r, uint64_t off) {
     std::lock_guard<std::mutex> g(g_alias_mu);
     g_plane_alias[r] = off;
 }
+void list_parts_free(IGraphicsUnknown* self);   // a list's parts cut at waits and never submitted
 void free_object(IGraphicsUnknown* self) {
     ObjHeader* h = hdr(self);
+    if (h->kind == Kind::List) list_parts_free(self);
     if (h->pc && h->kind == Kind::Resource) { std::lock_guard<std::mutex> g(g_alias_mu); g_plane_alias.erase(h->pc); }
     // Resources: the PC object outlives the console one by a few frames. Titles free resources once
     // their own fences say the GPU is done, but other components given the PC object (Media
@@ -669,6 +673,10 @@ struct ListExtra {
     static constexpr uint32_t kTracked = 64;
     uint32_t nTracked;
     struct { void* res; uint32_t state; } tracked[kTracked];
+    // Waits for memory values (see "Waits for memory values").
+    PcObj alloc;                  // the PC allocator of the current recording
+    bool touched;                 // something was recorded into the current PC list
+    struct ListWaits* w;          // the parts cut off so far and the waits before the current one (null: none yet)
 };
 volatile long g_skipped_work = 0;   // draws/dispatches skipped for placeholder pipelines
 // Why each placeholder pipeline has no PC pipeline, and how much work each reason skipped.
@@ -687,6 +695,175 @@ static void placeholder_skip(int why) {
     if ((size_t)why < g_ph_why.size()) g_ph_why[why].second++;
 }
 ListExtra* lx(ID3D12GraphicsCommandList* l) { return ex<XList, ListExtra>((XList*)l); }
+
+// ---- Waits for memory values --------------------------------------------------------------------
+// The console GPU can stand at a point of a command list until a value in memory passes a
+// comparison (Wait32BitValueX, Wait64BitValueX), and write a value to memory when the work before
+// a point of a list is done (the bottom-of-pipe writes). A title orders the work of its queues
+// with the two: one queue's lighting waits for a value the depth pass of another writes. Skipped,
+// as they were here, the work runs in the order the lists happen to be submitted in.
+//
+// A list is cut at each wait (pc::list_cut): the PC list recorded so far is a part of its own, and
+// the wait stands before the part that follows. A wait before any work of a part joins the waits
+// before that part. A queue given such parts keeps a backlog: it runs the parts in order, stands
+// at an unmet wait, and everything given to it meanwhile (lists, signals, waits for fences) goes
+// behind. A thread looks at the backlogs every millisecond, and so does every submission.
+//
+// A wait reads the title's memory. Writes from lists reach that memory where it is shared with
+// the GPU (unified memory, sections); for other addresses the value is written here once the part
+// that holds the write has run (a fence of the layer's own after it).
+// Shortcuts: a write counts as done when its whole part has run, not at its place in the part;
+// a wait not met within XSL_WAIT_TIMEOUT_MS (3000) is given up, with a warning; a list submitted
+// while its queue has a backlog is given to the backlog for good (a second submission of the same
+// recording runs nothing). XSL_LIST_WAITS=0: waits are skipped, as before.
+struct ValueWait { uint64_t va, ref, mask; int cmp; bool wide; };
+struct MemWrite { uint64_t va, value; bool wide; };
+struct ListPart { std::vector<ValueWait> waits; PcObj list; std::vector<MemWrite> writes; };
+struct ListWaits {
+    std::vector<ListPart> earlier;   // the parts before the PC list being recorded, with the waits before each
+    std::vector<ValueWait> gate;     // the waits before the PC list being recorded
+    std::vector<MemWrite> writes;    // its writes the CPU does not see by itself
+};
+static bool list_waits_on() {
+    static const bool on = [] { char b[4]; return !(GetEnvironmentVariableA("XSL_LIST_WAITS", b, 4) && b[0] == '0'); }();
+    return on;
+}
+static ULONGLONG wait_timeout_ms() {
+    static const ULONGLONG v = [] { char b[16]; return GetEnvironmentVariableA("XSL_WAIT_TIMEOUT_MS", b, sizeof b) ? (ULONGLONG)strtoull(b, nullptr, 10) : 3000ull; }();
+    return v;
+}
+// The CPU address of a title GPU address (xmem.dll knows the views of CPU memory).
+static void* wait_cpu_address(uint64_t va) {
+    typedef uintptr_t(WINAPI * Fn)(uintptr_t);
+    static Fn src = [] { HMODULE m = GetModuleHandleW(L"xmem.dll"); return m ? (Fn)GetProcAddress(m, "xsl_xmem_source") : nullptr; }();
+    return (void*)(src ? src((uintptr_t)va) : (uintptr_t)va);
+}
+static bool wait_value(const ValueWait& w, uint64_t* out) {
+    uint64_t v = 0;
+    SIZE_T got = 0;
+    const SIZE_T n = w.wide ? 8 : 4;
+    // (Through the kernel: memory that is not there is reported, not a fault.)
+    if (!w.va || !ReadProcessMemory(GetCurrentProcess(), wait_cpu_address(w.va), &v, n, &got) || got != n) return false;
+    *out = w.wide ? v : (v & (w.mask ? w.mask : 0xffffffffull));
+    return true;
+}
+static bool wait_met(const ValueWait& w) {
+    uint64_t v = 0;
+    if (!wait_value(w, &v)) return true;   // nothing readable there: nothing to wait for
+    switch (w.cmp) {
+        case D3D12_COMPARISON_FUNC_NEVER: return false;
+        case D3D12_COMPARISON_FUNC_LESS: return v < w.ref;
+        case D3D12_COMPARISON_FUNC_EQUAL: return v == w.ref;
+        case D3D12_COMPARISON_FUNC_LESS_EQUAL: return v <= w.ref;
+        case D3D12_COMPARISON_FUNC_GREATER: return v > w.ref;
+        case D3D12_COMPARISON_FUNC_NOT_EQUAL: return v != w.ref;
+        case D3D12_COMPARISON_FUNC_GREATER_EQUAL: return v >= w.ref;
+        default: return true;
+    }
+}
+struct BackItem {
+    int kind = 0;   // 0: wait for a memory value, 1: run lists, 2: signal a fence, 3: wait for a fence
+    ValueWait wait{};
+    std::vector<PcObj> lists, owned;   // owned: let go after they ran
+    std::vector<MemWrite> writes;
+    PcObj fence = nullptr;
+    uint64_t value = 0;
+};
+struct Backlog {
+    std::mutex mu;
+    std::deque<BackItem> items;
+    PcObj q = nullptr, dev = nullptr, fence = nullptr;
+    uint64_t fenceNext = 0;
+    std::deque<std::pair<uint64_t, std::vector<MemWrite>>> landing;   // writes of parts that were run, by the fence value after each
+    ULONGLONG since = 0;                                              // when the wait at the front was first found unmet
+};
+static std::mutex g_backlogs_mu;
+static std::vector<Backlog*> g_backlogs;
+static std::atomic<uint64_t> g_wait_stats[5];   // waits recorded, cuts, waits a queue stood at, given up, parts run from a backlog
+static void backlog_run(Backlog* b, std::vector<PcObj>& lists, std::vector<MemWrite>& writes) {
+    if (!lists.empty()) pc::queue_execute(b->q, (uint32_t)lists.size(), lists.data());
+    if (writes.empty()) return;
+    if (!b->fence && FAILED(pc::create_fence(b->dev, 0, 0, &b->fence))) b->fence = nullptr;
+    if (!b->fence) return;
+    pc::queue_signal(b->q, b->fence, ++b->fenceNext);
+    b->landing.push_back({b->fenceNext, std::move(writes)});
+}
+// Runs what the backlog can run now (its mutex is held).
+static void backlog_pump(Backlog* b) {
+    if (b->fence && !b->landing.empty()) {
+        const uint64_t done = pc::fence_completed(b->fence);
+        while (!b->landing.empty() && b->landing.front().first <= done) {
+            for (const MemWrite& w : b->landing.front().second) {
+                SIZE_T put = 0;
+                WriteProcessMemory(GetCurrentProcess(), wait_cpu_address(w.va), &w.value, w.wide ? 8 : 4, &put);
+            }
+            b->landing.pop_front();
+        }
+    }
+    while (!b->items.empty()) {
+        BackItem& it = b->items.front();
+        if (it.kind == 0) {
+            if (!wait_met(it.wait)) {
+                const ULONGLONG now = GetTickCount64();
+                if (!b->since) { b->since = now; g_wait_stats[2]++; }
+                if (now - b->since < wait_timeout_ms()) return;
+                uint64_t v = 0;
+                wait_value(it.wait, &v);
+                static volatile long said = 0;
+                if (const long k = InterlockedIncrement(&said); k <= 12 || k % 500 == 0)
+                    XSL_WARN(CH, "queue %p stood %llu ms at a wait for the value at %llx (comparison %d with %llx, it holds %llx): given up (%ld so far)", b->q,
+                             (unsigned long long)(now - b->since), (unsigned long long)it.wait.va, it.wait.cmp, (unsigned long long)it.wait.ref, (unsigned long long)v, k);
+                g_wait_stats[3]++;
+            }
+            b->since = 0;
+        } else if (it.kind == 1) {
+            backlog_run(b, it.lists, it.writes);
+            for (PcObj o : it.owned) { pc::list_forget(o); pc::release(o); }
+            g_wait_stats[4]++;
+        } else if (it.kind == 2) {
+            pc::queue_signal(b->q, it.fence, it.value);
+            pc::release(it.fence);
+        } else {
+            pc::queue_wait(b->q, it.fence, it.value);
+            pc::release(it.fence);
+        }
+        b->items.pop_front();
+    }
+}
+static DWORD WINAPI backlog_thread(void*) {
+    // Half a millisecond between looks where the system has high-resolution timers (a plain sleep
+    // of 1 ms can last a whole timer tick, 15.6 ms, and a list may hold a dozen waits).
+    HANDLE timer = CreateWaitableTimerExW(nullptr, nullptr, 0x2 /* CREATE_WAITABLE_TIMER_HIGH_RESOLUTION */, TIMER_ALL_ACCESS);
+    for (;;) {
+        LARGE_INTEGER due;
+        due.QuadPart = -5000;
+        if (timer && SetWaitableTimer(timer, &due, 0, nullptr, nullptr, FALSE)) WaitForSingleObject(timer, 50);
+        else Sleep(1);
+        std::vector<Backlog*> all;
+        { std::lock_guard<std::mutex> g(g_backlogs_mu); all = g_backlogs; }
+        for (Backlog* b : all) {
+            std::unique_lock<std::mutex> g(b->mu, std::try_to_lock);
+            if (g.owns_lock() && (!b->items.empty() || !b->landing.empty())) backlog_pump(b);
+        }
+    }
+}
+struct QueueExtra;
+static Backlog* queue_backlog(ID3D12CommandQueue* q, bool create);
+// The queue's backlog is given time to empty (before a present, which is not put behind it).
+static void backlog_drain(ID3D12CommandQueue* q, ULONGLONG ms) {
+    Backlog* b = queue_backlog(q, false);
+    if (!b) return;
+    const ULONGLONG t0 = GetTickCount64();
+    for (;;) {
+        {
+            std::lock_guard<std::mutex> g(b->mu);
+            backlog_pump(b);
+            if (b->items.empty()) return;
+        }
+        if (GetTickCount64() - t0 >= ms) return;
+        Sleep(1);
+    }
+}
 
 // Quad emulation: a layer-owned index buffer turning every 4 vertices into 2 triangles.
 constexpr uint32_t kQuadMax = 1u << 18;
@@ -717,7 +894,9 @@ D3D12_INDEX_BUFFER_VIEW quad_ib(Device* dev) {
     });
     return view;
 }
-#define LPC(l) pc_of(l)
+// The PC list of a title list, for a call that records into it.
+template <class T> inline PcObj list_pc(T* l) { ex<XList, ListExtra>((XList*)l)->touched = true; return pc_of(l); }
+#define LPC(l) list_pc(l)
 
 HRESULT D3DAPI L_Close(ID3D12GraphicsCommandList* l) { XSL_TRACE("gfx.cmd", "list %p Close", (void*)l); return pc::list_close(LPC(l)); }
 HRESULT D3DAPI L_Reset(ID3D12GraphicsCommandList* l, ID3D12CommandAllocator* a, ID3D12PipelineState* p);
@@ -733,9 +912,68 @@ HRESULT D3DAPI L_Reset(ID3D12GraphicsCommandList* l, ID3D12CommandAllocator* a, 
     if (p && !P(p)) pso_wait_ready(p);
     lx(l)->placeholderPso = p && !P(p);
     lx(l)->placeholderWhy = lx(l)->placeholderPso ? placeholder_reason(p) : -1;
+    // Parts cut at waits and waits recorded since the last reset, never submitted: gone with the recording.
+    if (ListWaits* w = lx(l)->w) {
+        for (ListPart& part : w->earlier) { pc::list_forget(part.list); pc::release(part.list); }
+        w->earlier.clear();
+        w->gate.clear();
+        w->writes.clear();
+    }
+    lx(l)->alloc = P(a);
     HRESULT hr = pc::list_reset(LPC(l), P(a), P(p));
     if (SUCCEEDED(hr)) list_bind_global_heap(l, LPC(l));
+    lx(l)->touched = false;   // (nothing of the title's is in the list yet: a wait now stands before all of it)
     return hr;
+}
+}  // namespace
+void list_parts_free(IGraphicsUnknown* self) {
+    ListExtra* e = ex<XList, ListExtra>((XList*)self);
+    if (!e->w) return;
+    for (ListPart& part : e->w->earlier) { pc::list_forget(part.list); pc::release(part.list); }
+    delete e->w;
+    e->w = nullptr;
+}
+namespace {
+// A wait for a memory value recorded into the list: the list is cut here (see "Waits for memory
+// values"), unless nothing was recorded since the last cut or reset.
+static void list_wait(ID3D12GraphicsCommandList* l, const ValueWait& w) {
+    ListExtra* e = lx(l);
+    static std::once_flag once;
+    std::call_once(once, [] { pc::list_cuts_prepare(true); });
+    if (!e->w) e->w = new ListWaits;
+    const uint64_t n = ++g_wait_stats[0];
+    if (n <= 4 || n % 20000 == 0)
+        XSL_INFO(CH, "a wait for the value at %llx (comparison %d with %llx, %d bits) on list %p: %llu waits recorded so far, %llu lists cut, queues stood at %llu, %llu given up, %llu "
+                     "parts run from backlogs",
+                 (unsigned long long)w.va, w.cmp, (unsigned long long)w.ref, w.wide ? 64 : 32, (void*)l, (unsigned long long)n, (unsigned long long)g_wait_stats[1].load(),
+                 (unsigned long long)g_wait_stats[2].load(), (unsigned long long)g_wait_stats[3].load(), (unsigned long long)g_wait_stats[4].load());
+    if (!e->touched || !e->alloc) { e->w->gate.push_back(w); return; }
+    PcObj to = nullptr;
+    const HRESULT hr = pc::list_cut(dev_extra(hdr(l)->device)->pcDevice, pc_of(l), e->alloc, &to);
+    if (FAILED(hr)) {   // no new PC list: the wait stands before the part it was recorded in
+        static volatile long said = 0;
+        if (InterlockedIncrement(&said) <= 3) XSL_WARN(CH, "a list cannot be cut at a wait (%08lx): the wait moves to the start of the part", hr);
+        e->w->gate.push_back(w);
+        return;
+    }
+    g_wait_stats[1]++;
+    e->w->earlier.push_back(ListPart{std::move(e->w->gate), pc_of(l), std::move(e->w->writes)});
+    e->w->gate.assign(1, w);
+    e->w->writes.clear();
+    hdr(l)->pc = to;
+    e->touched = false;
+}
+// A value a list writes to memory: remembered when the CPU does not see the GPU's write there by
+// itself (memory that is not shared with the GPU), to be written here once the part has run.
+static void list_note_write(ID3D12GraphicsCommandList* l, uint64_t va, uint64_t value, bool wide) {
+    if (!list_waits_on() || !va) return;
+    UnifiedRef r;
+    uint64_t run = 0;
+    Device* dev = hdr(l)->device;
+    if (unified_lookup(dev, va, &r) || section_lookup(dev, va, &r, &run)) return;
+    ListExtra* e = lx(l);
+    if (!e->w) e->w = new ListWaits;
+    e->w->writes.push_back(MemWrite{va, value, wide});
 }
 // Console drivers tolerate a transition whose StateBefore is not the resource's current state (the
 // GDK samples' Present() assumes RENDER_TARGET after a compute pass left the back buffer in
@@ -1221,9 +1459,11 @@ void D3DAPI L_Write64BOP(ID3D12GraphicsCommandList* l, D3D12_GPU_VIRTUAL_ADDRESS
     uint64_t g = gpu_va(dev, va);
     pc::list_write_immediate(LPC(l), g, (uint32_t)v, true);
     pc::list_write_immediate(LPC(l), g + 4, (uint32_t)(v >> 32), true);
+    list_note_write(l, va, v, true);
 }
 void D3DAPI L_Write32BOP(ID3D12GraphicsCommandList* l, D3D12_GPU_VIRTUAL_ADDRESS va, UINT v, D3D12XBOX_FLUSH, D3D12XBOX_WRITE_VALUE_BOP_FLAGS) {
     pc::list_write_immediate(LPC(l), gpu_va(hdr(l)->device, va), v, true);
+    list_note_write(l, va, v, false);
 }
 // Top-of-pipe value writes: stored at this point of the list's timeline, low dword then high.
 void D3DAPI L_Write64TOP(ID3D12GraphicsCommandList* l, D3D12_GPU_VIRTUAL_ADDRESS va, UINT64 v, D3D12XBOX_WRITE_VALUE_TOP_FLAGS flags) {
@@ -1239,24 +1479,28 @@ void D3DAPI L_Write64TOP(ID3D12GraphicsCommandList* l, D3D12_GPU_VIRTUAL_ADDRESS
     const uint64_t a[2] = {g, g + 4};
     const uint32_t vals[2] = {(uint32_t)v, (uint32_t)(v >> 32)};
     pc::list_write_immediate(LPC(l), 2, a, vals);
+    list_note_write(l, va, v, true);
 }
 void D3DAPI L_Write32TOP(ID3D12GraphicsCommandList* l, D3D12_GPU_VIRTUAL_ADDRESS va, UINT v, D3D12XBOX_WRITE_VALUE_TOP_FLAGS) {
     const uint64_t a = gpu_va(hdr(l)->device, va);
     const uint32_t val = v;
     pc::list_write_immediate(LPC(l), 1, &a, &val);
+    list_note_write(l, va, v, false);
 }
-// The console GPU can stall its command stream until a memory value passes a comparison. PC lists
-// have nothing like it, so the wait is skipped (logged once) and the list carries on.
+// The console GPU can stand at a point of its command stream until a memory value passes a
+// comparison: the list is cut there (list_wait). With XSL_LIST_WAITS=0 the wait is skipped.
 void D3DAPI L_Wait64(ID3D12GraphicsCommandList* l, D3D12_GPU_VIRTUAL_ADDRESS va, D3D12_COMPARISON_FUNC f, UINT64 ref, D3D12XBOX_WAIT_FLAGS flags) {
+    if (list_waits_on()) { list_wait(l, ValueWait{va, ref, ~0ull, (int)f, true}); return; }
     static volatile long n = 0;
     if (InterlockedIncrement(&n) == 1)
-        XSL_INFO(CH, "Wait64BitValueX on list %p skipped (no PC equivalent): address %llx, comparison %d, reference %llx, flags %#x", (void*)l,
+        XSL_INFO(CH, "Wait64BitValueX on list %p skipped (XSL_LIST_WAITS=0): address %llx, comparison %d, reference %llx, flags %#x", (void*)l,
                  (unsigned long long)va, (int)f, (unsigned long long)ref, (unsigned)flags);
 }
 void D3DAPI L_Wait32(ID3D12GraphicsCommandList* l, D3D12_GPU_VIRTUAL_ADDRESS va, D3D12_COMPARISON_FUNC f, UINT ref, UINT mask, D3D12XBOX_WAIT_FLAGS flags) {
+    if (list_waits_on()) { list_wait(l, ValueWait{va, ref, mask, (int)f, false}); return; }
     static volatile long n = 0;
     if (InterlockedIncrement(&n) == 1)
-        XSL_INFO(CH, "Wait32BitValueX on list %p skipped (no PC equivalent): address %llx, comparison %d, reference %x, mask %x, flags %#x", (void*)l,
+        XSL_INFO(CH, "Wait32BitValueX on list %p skipped (XSL_LIST_WAITS=0): address %llx, comparison %d, reference %x, mask %x, flags %#x", (void*)l,
                  (unsigned long long)va, (int)f, ref, mask, (unsigned)flags);
 }
 void D3DAPI L_FlushPipelineX(ID3D12GraphicsCommandList* l, D3D12XBOX_FLUSH, D3D12_GPU_VIRTUAL_ADDRESS, SIZE_T) {
@@ -1774,7 +2018,105 @@ HRESULT make_list(Device* dev, PcObj pcl, D3D12_COMMAND_LIST_TYPE t, REFIID riid
 // Command queue, including PresentX.
 // ============================================================================================
 namespace {
-struct QueueExtra { D3D12_COMMAND_QUEUE_DESC desc; };
+struct QueueExtra { D3D12_COMMAND_QUEUE_DESC desc; Backlog* backlog; };
+static Backlog* queue_backlog(ID3D12CommandQueue* q, bool create) {
+    QueueExtra* e = ex<ID3D12CommandQueue, QueueExtra>(q);
+    if (e->backlog || !create) return e->backlog;
+    std::lock_guard<std::mutex> g(g_backlogs_mu);
+    if (e->backlog) return e->backlog;
+    auto* b = new Backlog;
+    b->q = pc_of(q);
+    b->dev = dev_extra(hdr(q)->device)->pcDevice;
+    static bool started = false;
+    if (!started) { started = true; CloseHandle(CreateThread(nullptr, 0, backlog_thread, nullptr, 0, nullptr)); }
+    g_backlogs.push_back(b);
+    return e->backlog = b;
+}
+// Gives the queue the submitted lists. Without waits and writes to bring to memory, and with no
+// backlog, they run at once (false: the caller runs them as before).
+static bool queue_submit(ID3D12CommandQueue* q, UINT n, ID3D12CommandList* const* lists) {
+    if (!list_waits_on()) return false;
+    bool parts = false, writes = false;
+    for (UINT i = 0; i < n; i++) {
+        const ListWaits* w = ex<XList, ListExtra>((XList*)lists[i])->w;
+        if (!w) continue;
+        parts |= !w->earlier.empty() || !w->gate.empty();
+        writes |= !w->writes.empty();
+    }
+    Backlog* b = queue_backlog(q, parts || writes);
+    if (!b) return false;
+    std::lock_guard<std::mutex> g(b->mu);
+    backlog_pump(b);
+    if (!parts && b->items.empty()) {   // nothing to stand at: run now
+        std::vector<PcObj> v(n);
+        std::vector<MemWrite> wr;
+        for (UINT i = 0; i < n; i++) {
+            v[i] = P(lists[i]);
+            if (ListWaits* w = ex<XList, ListExtra>((XList*)lists[i])->w) { wr.insert(wr.end(), w->writes.begin(), w->writes.end()); w->writes.clear(); }
+        }
+        backlog_run(b, v, wr);
+        return true;
+    }
+    // Into the backlog, part by part; an entry of lists ends where waits stand before the next part.
+    BackItem cur;
+    cur.kind = 1;
+    auto flush = [&] {
+        if (cur.lists.empty()) return;
+        b->items.push_back(std::move(cur));
+        cur = BackItem();
+        cur.kind = 1;
+    };
+    auto stand = [&](std::vector<ValueWait>& waits) {
+        if (waits.empty()) return;
+        flush();
+        for (const ValueWait& w : waits) { BackItem it; it.wait = w; b->items.push_back(std::move(it)); }
+        waits.clear();
+    };
+    for (UINT i = 0; i < n; i++) {
+        ListExtra* e = ex<XList, ListExtra>((XList*)lists[i]);
+        if (ListWaits* w = e->w) {
+            for (ListPart& part : w->earlier) {
+                stand(part.waits);
+                cur.lists.push_back(part.list);
+                cur.owned.push_back(part.list);
+                cur.writes.insert(cur.writes.end(), part.writes.begin(), part.writes.end());
+            }
+            w->earlier.clear();
+            stand(w->gate);
+            cur.writes.insert(cur.writes.end(), w->writes.begin(), w->writes.end());
+            w->writes.clear();
+        }
+        // The list's own PC list goes to the backlog for good: the title may reset the list before
+        // the queue has run it, so it gets a new one.
+        PcObj own = P(lists[i]), fresh = nullptr;
+        cur.lists.push_back(own);
+        if (own && SUCCEEDED(pc::create_list_closed_like(b->dev, own, &fresh)) && fresh) {
+            hdr(lists[i])->pc = fresh;
+            cur.owned.push_back(own);
+        } else {
+            static volatile long said = 0;
+            if (InterlockedIncrement(&said) <= 3) XSL_WARN(CH, "a list given to a queue's backlog keeps its PC list: reset before the queue runs it, its work is lost");
+        }
+    }
+    flush();
+    backlog_pump(b);
+    return true;
+}
+// A signal or a wait for a fence goes behind the backlog, if there is one (false: done at once by the caller).
+static bool queue_behind(ID3D12CommandQueue* q, int kind, PcObj fence, UINT64 value) {
+    Backlog* b = queue_backlog(q, false);
+    if (!b) return false;
+    std::lock_guard<std::mutex> g(b->mu);
+    backlog_pump(b);
+    if (b->items.empty()) return false;
+    BackItem it;
+    it.kind = kind;
+    it.fence = fence;
+    it.value = value;
+    pc::addref(fence);
+    b->items.push_back(std::move(it));
+    return true;
+}
 // XSL_SUBMIT_TIMES=1 (diagnostics): where the time of submissions goes, every 200 of them.
 static bool submit_times() { static bool on = [] { char b[4]; return GetEnvironmentVariableA("XSL_SUBMIT_TIMES", b, 4) && b[0] == '1'; }(); return on; }
 void D3DAPI Q_Execute(ID3D12CommandQueue* q, UINT n, ID3D12CommandList* const* lists) {
@@ -1796,9 +2138,11 @@ void D3DAPI Q_Execute(ID3D12CommandQueue* q, UINT n, ID3D12CommandList* const* l
     lap(2);
     pc::gm_flush(dev_extra(hdr(q)->device)->pcDevice);             // global-memory views and address table
     lap(3);
-    std::vector<PcObj> v(n);
-    for (UINT i = 0; i < n; i++) { v[i] = P(lists[i]); XSL_TRACE("gfx.cmd", "Execute list %p", (void*)lists[i]); }
-    pc::queue_execute(pc_of(q), n, v.data());
+    if (!queue_submit(q, n, lists)) {   // (lists cut at waits, or a queue standing at one: see queue_submit)
+        std::vector<PcObj> v(n);
+        for (UINT i = 0; i < n; i++) { v[i] = P(lists[i]); XSL_TRACE("gfx.cmd", "Execute list %p", (void*)lists[i]); }
+        pc::queue_execute(pc_of(q), n, v.data());
+    }
     lap(4);
     if (timed && ++calls % 200 == 0)
         XSL_INFO(CH, "last 200 submissions: descriptors %llu ms, constant views %llu ms, textures %llu ms, global memory %llu ms, execute %llu ms",
@@ -1811,11 +2155,17 @@ void D3DAPI Q_Execute(ID3D12CommandQueue* q, UINT n, ID3D12CommandList* const* l
                  (unsigned long long)(d[0] >> 20), (unsigned long long)d[1], (unsigned long long)d[2], (unsigned long long)d[4], (unsigned long long)(d[3] >> 20));
     }
 }
-HRESULT D3DAPI Q_Signal(ID3D12CommandQueue* q, ID3D12Fence* f, UINT64 v) { return pc::queue_signal(pc_of(q), P_or_pc(f), v); }
+HRESULT D3DAPI Q_Signal(ID3D12CommandQueue* q, ID3D12Fence* f, UINT64 v) {
+    if (queue_behind(q, 2, P_or_pc(f), v)) return S_OK;
+    return pc::queue_signal(pc_of(q), P_or_pc(f), v);
+}
 // Signal with console cache-flush flags: a PC queue signal already follows completion of all prior
 // work, caches included.
-HRESULT D3DAPI Q_SignalX(ID3D12CommandQueue* q, ID3D12Fence* f, UINT64 v, D3D12XBOX_FLUSH) { return pc::queue_signal(pc_of(q), P_or_pc(f), v); }
-HRESULT D3DAPI Q_Wait(ID3D12CommandQueue* q, ID3D12Fence* f, UINT64 v) { return pc::queue_wait(pc_of(q), P_or_pc(f), v); }
+HRESULT D3DAPI Q_SignalX(ID3D12CommandQueue* q, ID3D12Fence* f, UINT64 v, D3D12XBOX_FLUSH) { return Q_Signal(q, f, v); }
+HRESULT D3DAPI Q_Wait(ID3D12CommandQueue* q, ID3D12Fence* f, UINT64 v) {
+    if (queue_behind(q, 3, P_or_pc(f), v)) return S_OK;
+    return pc::queue_wait(pc_of(q), P_or_pc(f), v);
+}
 // The X forms add a frame-pipeline token and console sync parameters (cache flushes at the signal
 // or wait point); on PC a queue signal/wait already orders all prior work.
 void D3DAPI Q_Execute2X(ID3D12CommandQueue* q, UINT n, ID3D12CommandList* const* lists, D3D12XBOX_FRAME_PIPELINE_TOKEN, D3D12XBOX_EXECUTE_COMMAND_LIST_FLAGS) {
@@ -1862,6 +2212,7 @@ void release_kept() {   // references older than 8 frames (the frame latency is 
 }
 HRESULT D3DAPI Q_PresentX(ID3D12CommandQueue* q, UINT planes, const D3D12XBOX_PRESENT_PLANE_PARAMETERS* p, const D3D12XBOX_PRESENT_PARAMETERS*) {
     if (planes == 0 || !p || !p->ResourceCount || !p->ppResources) return S_OK;  // "present blank": nothing to show yet
+    backlog_drain(q, wait_timeout_ms());   // (a present is not put behind the queue's backlog: the backlog is given time to empty)
     release_kept();
     xsl_fixed_time_frame();
     {
@@ -1967,6 +2318,7 @@ HRESULT make_queue(Device* dev, PcObj pcq, const D3D12_COMMAND_QUEUE_DESC* d, RE
         g_queue_tbl.SetMarker = Q_Event;
         g_queue_tbl.EndEvent = Q_EndEvent;
     });
+    if (list_waits_on()) pc::list_cuts_prepare(false);   // lists record what a continuation after a wait needs, from the first one on
     auto* o = make<ID3D12CommandQueue, QueueExtra>(Kind::Queue, &g_queue_tbl, pcq, dev, Iids<ID3D12CommandQueue>::list, nullptr);
     o->m_Type = d->Type;
     ex<ID3D12CommandQueue, QueueExtra>(o)->desc = *d;

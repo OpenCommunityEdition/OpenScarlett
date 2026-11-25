@@ -175,6 +175,12 @@ bool map_shadow_written(PcObj r);   // the title wrote into that copy since the 
 // Allocator and command list
 HRESULT_T alloc_reset(PcObj a);
 HRESULT_T list_close(PcObj l);
+// Lists cut at waits for memory values (pc_backend.cpp, "Lists cut at waits").
+void list_cuts_prepare(bool all);
+HRESULT_T list_cut(PcObj dev, PcObj from, PcObj alloc, PcObj* out);
+HRESULT_T create_list_closed(PcObj dev, int type, PcObj* out);
+HRESULT_T create_list_closed_like(PcObj dev, PcObj like, PcObj* out);
+void list_forget(PcObj l);
 HRESULT_T list_reset(PcObj l, PcObj alloc, PcObj pso);
 void list_barriers(PcObj l, uint32_t n, const void* barriers);
 void list_om_set_render_targets(PcObj l, uint32_t n, const uint64_t* rtvs, int single, const uint64_t* dsv);
