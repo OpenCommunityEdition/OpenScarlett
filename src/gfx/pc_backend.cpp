@@ -996,8 +996,17 @@ uint64_t adapter_luid() { return ((uint64_t)(uint32_t)g_adapter_luid.HighPart <<
 const Caps& caps() { return g_caps; }
 int format_stand_in(int f) { return stand_in((DXGI_FORMAT)f); }
 void drop_map_shadow(PcObj o);
+// Depth textures that shaders also write: their colour twins (defined with the lists' code).
+static bool twin_wanted(const D3D12_RESOURCE_DESC& title);
+static void twin_make(ID3D12Device* dev, ID3D12Resource* depth, DXGI_FORMAT consoleFormat);
+static void twin_drop(PcObj r);
+static bool twin_view(ID3D12Device* dev, PcObj res, const void* desc, uint64_t h);
+static bool twin_barrier(PcObj l, const D3D12_RESOURCE_BARRIER& b);
+static ID3D12Resource* twin_cleared(uint64_t view, PcObj res);
+static bool twin_is(ID3D12Resource* r);
+static std::atomic<long> g_twin_count{0};
 void release(PcObj o) {
-    if (o && as<IUnknown>(o)->Release() == 0) drop_map_shadow(o);
+    if (o && as<IUnknown>(o)->Release() == 0) { drop_map_shadow(o); twin_drop(o); }
 }
 void addref(PcObj o) { if (o) static_cast<IUnknown*>(o)->AddRef(); }
 
@@ -3031,6 +3040,7 @@ HRESULT_T create_graphics_pso(PcObj dev, const void* desc, PcObj* out) {
     D3D12_GRAPHICS_PIPELINE_STATE_DESC d = *static_cast<const D3D12_GRAPHICS_PIPELINE_STATE_DESC*>(desc);
     for (UINT i = 0; i < 8; i++)
         if (DXGI_FORMAT sf = stand_in(d.RTVFormats[i]); sf != DXGI_FORMAT_UNKNOWN) d.RTVFormats[i] = sf;
+    if (DXGI_FORMAT sf = stand_in(d.DSVFormat); sf != DXGI_FORMAT_UNKNOWN) d.DSVFormat = sf;   // (the console's 16-bit depth with stencil)
     no_blend_on_integers(d.BlendState, d.RTVFormats, d.NumRenderTargets);
     ShaderFix fx;
     fx.fix(d.VS, 0); fx.fix(d.PS, 1); fx.fix(d.DS, 2); fx.fix(d.HS, 3); fx.fix(d.GS, 4);
@@ -3575,6 +3585,19 @@ struct CsShadow {
 };
 std::mutex g_cs_mu;
 std::unordered_map<PcObj, CsShadow> g_cs_shadow;
+// The graphics state of each list that a draw pass of the layer's own disturbs (kept from the
+// moment such a pass can occur: twin_make), to put the title's back afterwards.
+struct GfxShadow {
+    D3D12_CPU_DESCRIPTOR_HANDLE rt[8]{}, dsv{};
+    uint32_t nrt = 0, nvp = 0, nsc = 0;
+    bool single = false, hasDsv = false, om = false;
+    D3D12_VIEWPORT vp[16]{};
+    D3D12_RECT sc[16]{};
+    int topo = 0;
+};
+std::atomic<bool> g_gfx_shadow_on{false};
+std::mutex g_gfx_mu;
+std::unordered_map<PcObj, GfxShadow> g_gfx_shadow;
 std::mutex g_rays_mu;
 static bool guard_on() { static bool on = [] { char b[4]; return !(GetEnvironmentVariableA("XSL_INDIRECT_GUARD", b, 4) && b[0] == '0'); }(); return on; }
 // Signatures the guard handles: byte offset of the dispatch/draw argument in a record, and its kind.
@@ -3846,6 +3869,10 @@ HRESULT_T create_committed_resource(PcObj dev, const void* heapProps, uint32_t h
         if (cv) { cvTmp = *cv; cvTmp.Format = standIn; cv = &cvTmp; }
     }
     D3D12_RESOURCE_STATES st = depth_state(d, pc_state(state));
+    // A depth texture shaders also write gets colour twins for them (twin_make); while the title
+    // has it in the unordered-access state the PC texture is a copy source.
+    const bool twinned = twin_wanted(*static_cast<const D3D12_RESOURCE_DESC*>(desc));
+    if (twinned && (pc_state(state) & D3D12_RESOURCE_STATE_UNORDERED_ACCESS)) st = D3D12_RESOURCE_STATE_COPY_SOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
     if (hp.Type == D3D12_HEAP_TYPE_UPLOAD) st = D3D12_RESOURCE_STATE_GENERIC_READ;
     if (d.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER && cached_upload(&hp)) st = D3D12_RESOURCE_STATE_GENERIC_READ;
     else if (hp.Type == D3D12_HEAP_TYPE_READBACK) st = D3D12_RESOURCE_STATE_COPY_DEST;
@@ -3879,6 +3906,7 @@ HRESULT_T create_committed_resource(PcObj dev, const void* heapProps, uint32_t h
         else g_castable.erase(*reinterpret_cast<ID3D12Resource**>(out));
     }
     if (SUCCEEDED(hr)) note_buffer_fwd(*out);
+    if (SUCCEEDED(hr) && twinned) twin_make(as<ID3D12Device>(dev), as<ID3D12Resource>(*out), static_cast<const D3D12_RESOURCE_DESC*>(desc)->Format);
     if (SUCCEEDED(hr) && g_info) {   // debug layer: name layer resources (others show as unnamed)
         wchar_t nm[96];
         swprintf(nm, 96, L"xsl committed %llux%u fmt %d", (unsigned long long)d.Width, d.Height, (int)d.Format);
@@ -4299,6 +4327,7 @@ void create_uav(PcObj dev, PcObj res, PcObj counter, const void* desc, uint64_t 
     if (trace_writers() || (trace_rtvs() && res && as<ID3D12Resource>(res)->GetDesc().Dimension == D3D12_RESOURCE_DIMENSION_BUFFER)) {
         std::lock_guard<std::mutex> g(g_wr_mu); g_uav_res[h] = res; g_srv_res.erase(h);
     }
+    if (res && twin_view(as<ID3D12Device>(dev), res, desc, h)) return;   // a depth texture shaders also write: a view of its colour twin
     if (res && !(as<ID3D12Resource>(res)->GetDesc().Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)) {
         // e.g. a depth-stencil resource whose UAV flag was dropped: null view of the requested dimension
         {
@@ -4884,6 +4913,14 @@ void list_barriers(PcObj l, uint32_t n, const void* b) {
         if (tmp[k].Type == D3D12_RESOURCE_BARRIER_TYPE_TRANSITION) {
             tmp[k].Transition.StateBefore = pc_state(tmp[k].Transition.StateBefore);
             tmp[k].Transition.StateAfter = pc_state(tmp[k].Transition.StateAfter);
+            // A depth texture with colour twins: its moves into and out of the unordered-access
+            // state are where the two sides are brought in step (in order with the barriers
+            // before it, which go out first).
+            if (g_twin_count.load(std::memory_order_relaxed)) {
+                const D3D12_RESOURCE_BARRIER x = tmp[k];
+                if (k && twin_is(x.Transition.pResource)) { L->ResourceBarrier(k, tmp); k = 0; }
+                if (twin_barrier(l, x)) continue;
+            }
             if (trace_writers() && (tmp[k].Transition.Subresource == D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES || tmp[k].Transition.Subresource == 0) &&
                 !(tmp[k].Flags & D3D12_RESOURCE_BARRIER_FLAG_BEGIN_ONLY)) {
                 std::lock_guard<std::mutex> g(g_wr_mu);
@@ -4980,6 +5017,12 @@ void list_om_set_render_targets(PcObj l, uint32_t n, const uint64_t* rtvs, int s
         g_wr_rtv0[l] = cnt ? rtvs[0] : 0;
     }
     D3D12_CPU_DESCRIPTOR_HANDLE d = dsv ? cpu(*dsv) : D3D12_CPU_DESCRIPTOR_HANDLE{};
+    if (g_gfx_shadow_on.load(std::memory_order_relaxed)) {
+        std::lock_guard<std::mutex> g(g_gfx_mu);
+        GfxShadow& sh = g_gfx_shadow[l];
+        for (uint32_t i = 0; i < cnt && i < 8; i++) sh.rt[i] = r[i];
+        sh.nrt = n > 8 ? 8 : n; sh.single = single != 0; sh.hasDsv = dsv != nullptr; sh.dsv = d; sh.om = true;
+    }
     L->OMSetRenderTargets(n, n ? r : nullptr, single, dsv ? &d : nullptr);
 }
 extern std::set<PcObj> g_plane_lists;
@@ -4999,10 +5042,22 @@ std::map<PcObj, D3D12_VIEWPORT> g_wr_vp;   // writer tracing: viewport 0 and sci
 std::map<PcObj, D3D12_RECT> g_wr_sc;
 void list_viewports(PcObj l, uint32_t n, const void* v) {
     if (trace_writers() && n) { std::lock_guard<std::mutex> g(g_wr_mu); g_wr_vp[l] = *static_cast<const D3D12_VIEWPORT*>(v); }
+    if (g_gfx_shadow_on.load(std::memory_order_relaxed) && n <= 16) {
+        std::lock_guard<std::mutex> g(g_gfx_mu);
+        GfxShadow& sh = g_gfx_shadow[l];
+        memcpy(sh.vp, v, n * sizeof(D3D12_VIEWPORT));
+        sh.nvp = n;
+    }
     L->RSSetViewports(n, static_cast<const D3D12_VIEWPORT*>(v));
 }
 void list_scissors(PcObj l, uint32_t n, const void* r) {
     if (trace_writers() && n) { std::lock_guard<std::mutex> g(g_wr_mu); g_wr_sc[l] = *static_cast<const D3D12_RECT*>(r); }
+    if (g_gfx_shadow_on.load(std::memory_order_relaxed) && n <= 16) {
+        std::lock_guard<std::mutex> g(g_gfx_mu);
+        GfxShadow& sh = g_gfx_shadow[l];
+        memcpy(sh.sc, r, n * sizeof(D3D12_RECT));
+        sh.nsc = n;
+    }
     L->RSSetScissorRects(n, static_cast<const D3D12_RECT*>(r));
 }
 // ---- Root signatures described by the shaders themselves ----------------------------------------
@@ -5425,6 +5480,440 @@ static void root_lost(PcObj l, bool compute) {
     std::lock_guard<std::mutex> g(g_bind_mu);
     g_root_bind[l][compute].bound = nullptr;
 }
+// ---- Depth textures that shaders also write -----------------------------------------------------
+// The console lets a depth texture be written through unordered-access views too; a PC gives a
+// depth texture no such views. A title's tiled lighting writes each pixel's material class into
+// the depth plane and masks into the stencil plane from compute shaders, then draws each class
+// with the depth test "equal"; its shadow maps are written the same way. Such views were null
+// here and the writes lost.
+//
+// Each such texture gets colour twins, which the views are views of:
+//   - one plane (16- or 32-bit depth): a twin of the same typeless family, copied to and from the
+//     depth texture as it is;
+//   - depth with stencil: an 8-bit twin of the stencil plane, copied to and from the plane
+//     through a buffer, and a twin of the depth plane (16-bit steps for the console's 16-bit
+//     depth-stencil format, floats otherwise). No colour format holds a 24-bit depth plane, so
+//     that twin is drawn into the plane by a pass of the layer's own, and the plane is never
+//     copied into the twin.
+// The two sides are brought in step where the title moves the texture into or out of the
+// unordered-access state (twin_barrier), whole or one subresource at a time. While the title has
+// it in that state the PC depth texture is a copy source that compute shaders may also read.
+// XSL_DEPTH_TWINS=0: no twins (the views are null, as before).
+namespace {
+struct Twin {
+    ID3D12Resource *one = nullptr, *depth = nullptr, *stencil = nullptr, *through = nullptr;
+    ID3D12DescriptorHeap* dsv = nullptr;   // a view of each level and slice, for the pass
+    bool steps = false;                    // the depth plane's twin holds 16-bit steps
+    DXGI_FORMAT dsvFormat = DXGI_FORMAT_UNKNOWN;
+    uint32_t mips = 1, slices = 1, dsvInc = 0;
+    uint64_t width = 0;
+    uint32_t height = 0;
+    std::vector<D3D12_PLACED_SUBRESOURCE_FOOTPRINT> depthAt, stencilAt;   // where each level and slice lies in `through`
+};
+std::mutex g_twin_mu;
+std::map<ID3D12Resource*, std::shared_ptr<Twin>> g_twins;
+std::map<uint64_t, ID3D12Resource*> g_twin_views;   // view handle -> the twin it is a view of (for clears)
+bool twins_on() {
+    static const bool on = [] { char b[4]; return !(GetEnvironmentVariableA("XSL_DEPTH_TWINS", b, 4) && b[0] == '0'); }();
+    return on;
+}
+std::shared_ptr<Twin> twin_of(ID3D12Resource* r) {
+    std::lock_guard<std::mutex> g(g_twin_mu);
+    auto it = g_twins.find(r);
+    return it == g_twins.end() ? nullptr : it->second;
+}
+void twin_move(ID3D12GraphicsCommandList* cl, ID3D12Resource* r, UINT sub, D3D12_RESOURCE_STATES before, D3D12_RESOURCE_STATES after) {
+    if (!r || before == after) return;
+    D3D12_RESOURCE_BARRIER b{};
+    b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    b.Transition.pResource = r;
+    b.Transition.Subresource = sub;
+    b.Transition.StateBefore = before;
+    b.Transition.StateAfter = after;
+    cl->ResourceBarrier(1, &b);
+}
+const UINT kAllSubs = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+const D3D12_RESOURCE_STATES kTwinRead = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+// The PC state of the depth texture while the title has it in the unordered-access state (states a
+// compute list can name too).
+const D3D12_RESOURCE_STATES kTwinOpen = D3D12_RESOURCE_STATE_COPY_SOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+D3D12_TEXTURE_COPY_LOCATION twin_sub(ID3D12Resource* r, UINT sub) {
+    D3D12_TEXTURE_COPY_LOCATION c{};
+    c.pResource = r;
+    c.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    c.SubresourceIndex = sub;
+    return c;
+}
+D3D12_TEXTURE_COPY_LOCATION twin_at(ID3D12Resource* buffer, const D3D12_PLACED_SUBRESOURCE_FOOTPRINT& f) {
+    D3D12_TEXTURE_COPY_LOCATION c{};
+    c.pResource = buffer;
+    c.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    c.PlacedFootprint = f;
+    return c;
+}
+// The pass that draws the twin of a depth plane into the plane: one triangle over a level of a
+// slice, its pixel shader giving the twin's texel (read from the buffer the twin was copied to,
+// so that the pass needs no view heap of its own on the title's list) as the depth, with the test
+// "always" and no stencil. A 16-bit step becomes the step times the float nearest 1/65535: a
+// title's lighting computes the depth of what it then draws with the test "equal" in that way
+// (the class number times that constant), so the pass and the draw give the same float.
+struct PlanePass { ID3D12RootSignature* rs = nullptr; ID3D12PipelineState* pso[2] = {}; bool failed = false; std::mutex mu; } g_plane_pass;
+bool plane_pass_init(ID3D12Device* dev) {
+    std::lock_guard<std::mutex> g(g_plane_pass.mu);
+    if (g_plane_pass.pso[0]) return true;
+    if (g_plane_pass.failed) return false;
+    g_plane_pass.failed = true;
+    HMODULE m = LoadLibraryW(L"d3dcompiler_47.dll");
+    typedef HRESULT(WINAPI * Compile)(const void*, SIZE_T, const char*, const void*, void*, const char*, const char*, UINT, UINT, ID3DBlob**, ID3DBlob**);
+    auto compile = m ? (Compile)GetProcAddress(m, "D3DCompile") : nullptr;
+    if (!compile) return false;
+    static const char src[] =
+        "ByteAddressBuffer b : register(t0);\n"
+        "cbuffer C : register(b0) { uint off, pitch, floats; };\n"
+        "float4 vs(uint i : SV_VertexID) : SV_Position { return float4(float(i & 1) * 4.0 - 1.0, float(i >> 1) * 4.0 - 1.0, 0.0, 1.0); }\n"
+        "float ps(float4 p : SV_Position) : SV_Depth {\n"
+        "  uint2 q = uint2(p.xy);\n"
+        "  if (floats != 0) return asfloat(b.Load(off + q.y * pitch + q.x * 4));\n"
+        "  uint a = off + q.y * pitch + q.x * 2;\n"
+        "  uint w = b.Load(a & ~3u);\n"
+        "  return float((a & 2) != 0 ? w >> 16 : w & 0xffff) * asfloat(0x37800080u);\n"
+        "}\n";
+    ID3DBlob *vs = nullptr, *ps = nullptr, *err = nullptr;
+    if (FAILED(compile(src, sizeof src - 1, "xsl_plane", nullptr, nullptr, "vs", "vs_5_0", 0, 0, &vs, &err)) ||
+        FAILED(compile(src, sizeof src - 1, "xsl_plane", nullptr, nullptr, "ps", "ps_5_0", 0, 0, &ps, &err))) {
+        XSL_ERR(CH, "depth twins: the plane pass does not compile: %s", err ? (const char*)err->GetBufferPointer() : "?");
+        return false;
+    }
+    D3D12_ROOT_PARAMETER params[2] = {};
+    params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
+    params[0].Descriptor = {0, 0};
+    params[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+    params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    params[1].Constants = {0, 0, 3};
+    params[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+    D3D12_ROOT_SIGNATURE_DESC rsd{2, params, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_NONE};
+    ID3DBlob* rsb = nullptr;
+    if (FAILED(D3D12SerializeRootSignature(&rsd, D3D_ROOT_SIGNATURE_VERSION_1, &rsb, &err)) ||
+        FAILED(dev->CreateRootSignature(0, rsb->GetBufferPointer(), rsb->GetBufferSize(), IID_PPV_ARGS(&g_plane_pass.rs))))
+        return false;
+    static const DXGI_FORMAT formats[2] = {DXGI_FORMAT_D24_UNORM_S8_UINT, DXGI_FORMAT_D32_FLOAT_S8X24_UINT};
+    for (int k = 0; k < 2; k++) {
+        D3D12_GRAPHICS_PIPELINE_STATE_DESC pd{};
+        pd.pRootSignature = g_plane_pass.rs;
+        pd.VS = {vs->GetBufferPointer(), vs->GetBufferSize()};
+        pd.PS = {ps->GetBufferPointer(), ps->GetBufferSize()};
+        pd.SampleMask = UINT_MAX;
+        pd.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+        pd.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+        pd.RasterizerState.DepthClipEnable = TRUE;
+        pd.DepthStencilState.DepthEnable = TRUE;
+        pd.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
+        pd.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_ALWAYS;
+        pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+        pd.DSVFormat = formats[k];
+        pd.SampleDesc.Count = 1;
+        if (FAILED(dev->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&g_plane_pass.pso[k])))) {
+            XSL_ERR(CH, "depth twins: no pipeline for the plane pass on depth format %d", (int)formats[k]);
+            g_plane_pass.pso[0] = nullptr;
+            return false;
+        }
+    }
+    g_plane_pass.failed = false;
+    return true;
+}
+// The level-and-slice indices a move of `sub` covers in one plane (plane 0: depth, 1: stencil).
+std::vector<UINT> twin_parts(const Twin& t, UINT sub, UINT plane) {
+    const UINT n = t.mips * t.slices;
+    std::vector<UINT> v;
+    if (sub == kAllSubs) for (UINT s = 0; s < n; s++) v.push_back(s);
+    else if (sub / n == plane) v.push_back(sub % n);
+    return v;
+}
+// The title moved the texture into the unordered-access state: the twins take what the depth
+// texture holds (now a copy source). Not the twin of a depth plane beside a stencil plane.
+void twin_from_depth(ID3D12GraphicsCommandList* cl, ID3D12Resource* depth, const Twin& t, UINT sub) {
+    const UINT n = t.mips * t.slices;
+    if (t.one) {
+        twin_move(cl, t.one, kAllSubs, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_DEST);
+        if (sub == kAllSubs) cl->CopyResource(t.one, depth);
+        else if (sub < n) {
+            const D3D12_TEXTURE_COPY_LOCATION d = twin_sub(t.one, sub), s = twin_sub(depth, sub);
+            cl->CopyTextureRegion(&d, 0, 0, 0, &s, nullptr);
+        }
+        twin_move(cl, t.one, kAllSubs, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        return;
+    }
+    const std::vector<UINT> parts = twin_parts(t, sub, 1);
+    if (!t.stencil || !t.through || parts.empty()) return;
+    for (UINT s : parts) {
+        const D3D12_TEXTURE_COPY_LOCATION d = twin_at(t.through, t.stencilAt[s]), from = twin_sub(depth, n + s);
+        cl->CopyTextureRegion(&d, 0, 0, 0, &from, nullptr);
+    }
+    twin_move(cl, t.through, kAllSubs, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    twin_move(cl, t.stencil, kAllSubs, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_DEST);
+    for (UINT s : parts) {
+        const D3D12_TEXTURE_COPY_LOCATION d = twin_sub(t.stencil, s), from = twin_at(t.through, t.stencilAt[s]);
+        cl->CopyTextureRegion(&d, 0, 0, 0, &from, nullptr);
+    }
+    twin_move(cl, t.stencil, kAllSubs, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    twin_move(cl, t.through, kAllSubs, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
+}
+// The title moved the texture out of the unordered-access state, to `after`: the depth texture
+// (a copy source until now) takes what shaders wrote to the twins.
+void twin_to_depth(PcObj l, ID3D12GraphicsCommandList* cl, ID3D12Resource* depth, const Twin& t, UINT sub, D3D12_RESOURCE_STATES after) {
+    const UINT n = t.mips * t.slices;
+    twin_move(cl, depth, sub, kTwinOpen, D3D12_RESOURCE_STATE_COPY_DEST);
+    if (t.one) {
+        twin_move(cl, t.one, kAllSubs, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        if (sub == kAllSubs) cl->CopyResource(depth, t.one);
+        else if (sub < n) {
+            const D3D12_TEXTURE_COPY_LOCATION d = twin_sub(depth, sub), s = twin_sub(t.one, sub);
+            cl->CopyTextureRegion(&d, 0, 0, 0, &s, nullptr);
+        }
+        twin_move(cl, t.one, kAllSubs, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        twin_move(cl, depth, sub, D3D12_RESOURCE_STATE_COPY_DEST, after);
+        return;
+    }
+    const std::vector<UINT> stencil = twin_parts(t, sub, 1), plane = twin_parts(t, sub, 0);
+    if (t.stencil && t.through && !stencil.empty()) {
+        twin_move(cl, t.stencil, kAllSubs, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        for (UINT s : stencil) {
+            const D3D12_TEXTURE_COPY_LOCATION d = twin_at(t.through, t.stencilAt[s]), from = twin_sub(t.stencil, s);
+            cl->CopyTextureRegion(&d, 0, 0, 0, &from, nullptr);
+        }
+        twin_move(cl, t.stencil, kAllSubs, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        twin_move(cl, t.through, kAllSubs, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        for (UINT s : stencil) {
+            const D3D12_TEXTURE_COPY_LOCATION d = twin_sub(depth, n + s), from = twin_at(t.through, t.stencilAt[s]);
+            cl->CopyTextureRegion(&d, 0, 0, 0, &from, nullptr);
+        }
+        twin_move(cl, t.through, kAllSubs, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
+    }
+    // The depth plane: drawn from its twin. Only when the whole texture moves (the pass binds a
+    // level of both planes) and on a list that can draw.
+    bool pass = t.depth && t.through && t.dsv && !plane.empty();
+    if (pass && (sub != kAllSubs || cl->GetType() != D3D12_COMMAND_LIST_TYPE_DIRECT)) {
+        static volatile long said = 0;
+        if (InterlockedIncrement(&said) <= 6)
+            XSL_WARN(CH, "depth twins: the depth plane of a %llux%u texture is not drawn from its twin (%s)", (unsigned long long)t.width, t.height,
+                     sub != kAllSubs ? "one subresource moved alone" : "the list cannot draw");
+        pass = false;
+    }
+    if (pass && !plane_pass_init(g_main_device)) pass = false;
+    if (!pass) { twin_move(cl, depth, sub, D3D12_RESOURCE_STATE_COPY_DEST, after); return; }
+    twin_move(cl, t.depth, kAllSubs, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    for (UINT s : plane) {
+        const D3D12_TEXTURE_COPY_LOCATION d = twin_at(t.through, t.depthAt[s]), from = twin_sub(t.depth, s);
+        cl->CopyTextureRegion(&d, 0, 0, 0, &from, nullptr);
+    }
+    twin_move(cl, t.depth, kAllSubs, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    twin_move(cl, t.through, kAllSubs, D3D12_RESOURCE_STATE_COPY_DEST, kTwinRead);
+    twin_move(cl, depth, sub, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_DEPTH_WRITE);
+    cl->SetPipelineState(g_plane_pass.pso[t.dsvFormat == DXGI_FORMAT_D24_UNORM_S8_UINT ? 0 : 1]);
+    cl->SetGraphicsRootSignature(g_plane_pass.rs);
+    cl->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    cl->SetGraphicsRootShaderResourceView(0, t.through->GetGPUVirtualAddress());
+    for (UINT s : plane) {
+        const UINT mip = s % t.mips;
+        const UINT w = (UINT)std::max<uint64_t>(t.width >> mip, 1), h = std::max<UINT>(t.height >> mip, 1);
+        const uint32_t consts[3] = {(uint32_t)t.depthAt[s].Offset, t.depthAt[s].Footprint.RowPitch, t.steps ? 0u : 1u};
+        cl->SetGraphicsRoot32BitConstants(1, 3, consts, 0);
+        const D3D12_VIEWPORT vp{0, 0, (float)w, (float)h, 0, 1};
+        const D3D12_RECT sr{0, 0, (LONG)w, (LONG)h};
+        cl->RSSetViewports(1, &vp);
+        cl->RSSetScissorRects(1, &sr);
+        D3D12_CPU_DESCRIPTOR_HANDLE dv = t.dsv->GetCPUDescriptorHandleForHeapStart();
+        dv.ptr += (SIZE_T)s * t.dsvInc;
+        cl->OMSetRenderTargets(0, nullptr, FALSE, &dv);
+        cl->DrawInstanced(3, 1, 0, 0);
+    }
+    twin_move(cl, depth, sub, D3D12_RESOURCE_STATE_DEPTH_WRITE, after);
+    twin_move(cl, t.through, kAllSubs, kTwinRead, D3D12_RESOURCE_STATE_COPY_DEST);
+    // The title's state, as far as the pass changed it.
+    PcObj pso = nullptr;
+    { std::lock_guard<std::mutex> g(g_cs_mu); auto it = g_cs_shadow.find(l); if (it != g_cs_shadow.end()) pso = it->second.pso; }
+    if (pso) cl->SetPipelineState(as<ID3D12PipelineState>(pso));
+    root_lost(l, false);
+    GfxShadow sh;
+    { std::lock_guard<std::mutex> g(g_gfx_mu); auto it = g_gfx_shadow.find(l); if (it != g_gfx_shadow.end()) sh = it->second; }
+    if (sh.om) cl->OMSetRenderTargets(sh.nrt, sh.nrt ? sh.rt : nullptr, sh.single, sh.hasDsv ? &sh.dsv : nullptr);
+    if (sh.nvp) cl->RSSetViewports(sh.nvp, sh.vp);
+    if (sh.nsc) cl->RSSetScissorRects(sh.nsc, sh.sc);
+    if (sh.topo) cl->IASetPrimitiveTopology((D3D12_PRIMITIVE_TOPOLOGY)sh.topo);
+    static volatile long drawn = 0;
+    if (InterlockedIncrement(&drawn) == 1) XSL_INFO(CH, "depth twins: a depth plane (%llux%u) was drawn from its twin for the first time", (unsigned long long)t.width, t.height);
+}
+}  // namespace
+static bool twin_is(ID3D12Resource* r) { return twin_of(r) != nullptr; }
+// Whether a texture the title describes so gets twins: depth and unordered access both, one
+// sample, in a depth format of one plane or of depth with stencil.
+static bool twin_wanted(const D3D12_RESOURCE_DESC& title) {
+    if (!twins_on() || title.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || title.SampleDesc.Count > 1) return false;
+    const UINT both = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+    if ((title.Flags & both) != both) return false;
+    const DXGI_FORMAT s = stand_in(title.Format);
+    const int f = (int)(s != DXGI_FORMAT_UNKNOWN ? s : title.Format);
+    return f == 53 || f == 55 || f == 39 || f == 40 || f == 44 || f == 45 || f == 19 || f == 20;
+}
+static void twin_make(ID3D12Device* dev, ID3D12Resource* depth, DXGI_FORMAT consoleFormat) {
+    const D3D12_RESOURCE_DESC dd = depth->GetDesc();
+    auto t = std::make_shared<Twin>();
+    t->mips = dd.MipLevels ? dd.MipLevels : 1;
+    t->slices = dd.DepthOrArraySize ? dd.DepthOrArraySize : 1;
+    t->width = dd.Width;
+    t->height = dd.Height;
+    const int f = (int)dd.Format;
+    const bool planes = f == 44 || f == 45 || f == 19 || f == 20;
+    auto make = [&](DXGI_FORMAT fmt) -> ID3D12Resource* {
+        D3D12_RESOURCE_DESC cd = dd;
+        cd.Format = fmt;
+        cd.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+        cd.Alignment = 0;
+        cd.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+        const D3D12_HEAP_PROPERTIES hp{D3D12_HEAP_TYPE_DEFAULT};
+        ID3D12Resource* r = nullptr;
+        const HRESULT hr = dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &cd, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr, IID_PPV_ARGS(&r));
+        if (FAILED(hr)) XSL_WARN(CH, "depth twins: no colour twin of format %d for a %llux%u depth texture (%08lx): its views are null", (int)fmt, (unsigned long long)dd.Width, dd.Height, hr);
+        return SUCCEEDED(hr) ? r : nullptr;
+    };
+    if (!planes) t->one = make(f == 53 || f == 55 ? DXGI_FORMAT_R16_TYPELESS : DXGI_FORMAT_R32_TYPELESS);
+    else {
+        t->steps = (int)consoleFormat >= 118 && (int)consoleFormat <= 120;
+        t->depth = make(t->steps ? DXGI_FORMAT_R16_TYPELESS : DXGI_FORMAT_R32_TYPELESS);
+        t->stencil = make(DXGI_FORMAT_R8_TYPELESS);
+        t->dsvFormat = f == 44 || f == 45 ? DXGI_FORMAT_D24_UNORM_S8_UINT : DXGI_FORMAT_D32_FLOAT_S8X24_UINT;
+        const UINT n = t->mips * t->slices;
+        uint64_t total = 0, bytes = 0;
+        if (t->depth) {
+            const D3D12_RESOURCE_DESC td = t->depth->GetDesc();
+            t->depthAt.resize(n);
+            dev->GetCopyableFootprints(&td, 0, n, 0, t->depthAt.data(), nullptr, nullptr, &bytes);
+            total = (bytes + 511) & ~511ull;
+        }
+        if (t->stencil) {   // laid out as the depth texture's own stencil plane is copied
+            t->stencilAt.resize(n);
+            dev->GetCopyableFootprints(&dd, n, n, total, t->stencilAt.data(), nullptr, nullptr, &bytes);
+            total += bytes;
+        }
+        D3D12_RESOURCE_DESC bd{};
+        bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        bd.Width = total + 64;
+        bd.Height = bd.DepthOrArraySize = bd.MipLevels = 1;
+        bd.SampleDesc.Count = 1;
+        bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        const D3D12_HEAP_PROPERTIES hp{D3D12_HEAP_TYPE_DEFAULT};
+        if (FAILED(dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&t->through)))) t->through = nullptr;
+        const D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_DSV, n, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
+        if (t->depth && SUCCEEDED(dev->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&t->dsv)))) {
+            t->dsvInc = dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_DSV);
+            for (UINT s = 0; s < n; s++) {
+                D3D12_DEPTH_STENCIL_VIEW_DESC v{};
+                v.Format = t->dsvFormat;
+                if (t->slices > 1) { v.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2DARRAY; v.Texture2DArray = {s % t->mips, s / t->mips, 1}; }
+                else { v.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2D; v.Texture2D.MipSlice = s; }
+                D3D12_CPU_DESCRIPTOR_HANDLE h = t->dsv->GetCPUDescriptorHandleForHeapStart();
+                h.ptr += (SIZE_T)s * t->dsvInc;
+                dev->CreateDepthStencilView(depth, &v, h);
+            }
+            // The pass changes the graphics state of title lists: what it changes is recorded from
+            // now on, root signatures and their arguments included (bound again by root_ensure).
+            g_gfx_shadow_on = true;
+            g_own_rs_any = true;
+        }
+    }
+    {
+        std::lock_guard<std::mutex> g(g_twin_mu);
+        g_twins[depth] = t;
+    }
+    const long k = ++g_twin_count;
+    if (k <= 8 || k % 500 == 0)
+        XSL_INFO(CH, "depth twins: a %llux%u depth texture (format %d, console %d, %u levels, %u slices) shaders also write has %s (%ld such textures so far)",
+                 (unsigned long long)dd.Width, dd.Height, f, (int)consoleFormat, t->mips, t->slices,
+                 !planes ? (t->one ? "a colour twin" : "no twin") : t->steps ? "twins of its stencil plane and of its depth plane (16-bit steps)" : "twins of its stencil plane and of its depth plane (floats)", k);
+}
+static void twin_drop(PcObj r) {
+    if (!g_twin_count.load(std::memory_order_relaxed)) return;
+    std::shared_ptr<Twin> t;
+    {
+        std::lock_guard<std::mutex> g(g_twin_mu);
+        auto it = g_twins.find(static_cast<ID3D12Resource*>(r));
+        if (it == g_twins.end()) return;
+        t = it->second;
+        g_twins.erase(it);
+        for (auto v = g_twin_views.begin(); v != g_twin_views.end();)
+            v = v->second == t->one || v->second == t->depth || v->second == t->stencil ? g_twin_views.erase(v) : std::next(v);
+    }
+    // (The textures are let go at once: a list in flight that still names them is the title's own
+    // use of a texture it has destroyed.)
+    for (IUnknown* u : {(IUnknown*)t->one, (IUnknown*)t->depth, (IUnknown*)t->stencil, (IUnknown*)t->through, (IUnknown*)t->dsv})
+        if (u) u->Release();
+}
+// The title's unordered-access view of such a texture, as a view of the twin its format and plane
+// name (false: the texture has no twins).
+static bool twin_view(ID3D12Device* dev, PcObj res, const void* desc, uint64_t h) {
+    if (!g_twin_count.load(std::memory_order_relaxed)) return false;
+    const std::shared_ptr<Twin> t = twin_of(as<ID3D12Resource>(res));
+    if (!t) return false;
+    D3D12_UNORDERED_ACCESS_VIEW_DESC v{};
+    if (desc) v = *static_cast<const D3D12_UNORDERED_ACCESS_VIEW_DESC*>(desc);
+    else if (t->slices > 1) { v.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2DARRAY; v.Texture2DArray.ArraySize = t->slices; }
+    else v.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+    const DXGI_FORMAT si = stand_in(v.Format);
+    const int f = (int)(si != DXGI_FORMAT_UNKNOWN ? si : v.Format);
+    UINT plane = 0;
+    if (v.ViewDimension == D3D12_UAV_DIMENSION_TEXTURE2DARRAY) { plane = v.Texture2DArray.PlaneSlice; v.Texture2DArray.PlaneSlice = 0; }
+    else if (v.ViewDimension == D3D12_UAV_DIMENSION_TEXTURE2D) { plane = v.Texture2D.PlaneSlice; v.Texture2D.PlaneSlice = 0; }
+    ID3D12Resource* target = nullptr;
+    if (t->one) {
+        target = t->one;
+        const bool wide = f == 39 || f == 40 || f == 41 || f == 42 || f == 43;
+        if (t->one->GetDesc().Format == DXGI_FORMAT_R16_TYPELESS) v.Format = f == 54 || f == 57 || f == 58 || f == 59 ? (DXGI_FORMAT)f : DXGI_FORMAT_R16_UNORM;
+        else v.Format = wide && (f == 42 || f == 43) ? (DXGI_FORMAT)f : DXGI_FORMAT_R32_FLOAT;
+    } else if (f == 47 || f == 22 || f == 62 || plane == 1) {   // the stencil plane's formats
+        target = t->stencil;
+        v.Format = DXGI_FORMAT_R8_UINT;
+    } else {
+        target = t->depth;
+        v.Format = t->steps ? (f == 57 ? DXGI_FORMAT_R16_UINT : DXGI_FORMAT_R16_UNORM) : (f == 42 ? DXGI_FORMAT_R32_UINT : DXGI_FORMAT_R32_FLOAT);
+    }
+    static volatile long shown = 0;
+    if (InterlockedIncrement(&shown) <= 16)
+        XSL_INFO(CH, "depth twins: an unordered-access view (format %d, plane %u) of a %llux%u depth texture is a view of %s in format %d", f, plane,
+                 (unsigned long long)t->width, t->height, !target ? "nothing (no twin)" : target == t->stencil ? "its stencil twin" : target == t->depth ? "its depth-plane twin" : "its twin",
+                 (int)v.Format);
+    if (!target) v.Format = DXGI_FORMAT_R32_FLOAT;
+    dev->CreateUnorderedAccessView(target, nullptr, &v, cpu(h));
+    std::lock_guard<std::mutex> g(g_twin_mu);
+    if (target) g_twin_views[h] = target;
+    else g_twin_views.erase(h);
+    return true;
+}
+// The texture a clear through an unordered-access view is given: the twin the view is of, the
+// resource itself when it has no twins, null when the view is not known (the clear is left out).
+static ID3D12Resource* twin_cleared(uint64_t view, PcObj res) {
+    if (!res || !g_twin_count.load(std::memory_order_relaxed) || !twin_is(as<ID3D12Resource>(res))) return as<ID3D12Resource>(res);
+    std::lock_guard<std::mutex> g(g_twin_mu);
+    auto it = g_twin_views.find(view);
+    return it == g_twin_views.end() ? nullptr : it->second;
+}
+// A move of such a texture between states (PC states; true: handled here, nothing to forward).
+static bool twin_barrier(PcObj l, const D3D12_RESOURCE_BARRIER& b) {
+    const std::shared_ptr<Twin> t = twin_of(b.Transition.pResource);
+    if (!t) return false;
+    if (b.Flags & D3D12_RESOURCE_BARRIER_FLAG_BEGIN_ONLY) return true;   // (the whole move is made at its end)
+    auto* cl = as<ID3D12GraphicsCommandList>(l);
+    const D3D12_RESOURCE_STATES before = b.Transition.StateBefore, after = b.Transition.StateAfter;
+    const bool wasOpen = (before & D3D12_RESOURCE_STATE_UNORDERED_ACCESS) != 0, isOpen = (after & D3D12_RESOURCE_STATE_UNORDERED_ACCESS) != 0;
+    if (wasOpen == isOpen) {
+        if (!wasOpen) twin_move(cl, b.Transition.pResource, b.Transition.Subresource, before, after);
+        return true;
+    }
+    if (isOpen) {
+        twin_move(cl, b.Transition.pResource, b.Transition.Subresource, before, kTwinOpen);
+        twin_from_depth(cl, b.Transition.pResource, *t, b.Transition.Subresource);
+    } else twin_to_depth(l, cl, b.Transition.pResource, *t, b.Transition.Subresource, after);
+    return true;
+}
 void note_pso_rs(PcObj pso, PcObj rs, bool compute) {
     if (!g_info || !pso) return;
     std::lock_guard<std::mutex> g(g_rs_mu);
@@ -5441,6 +5930,7 @@ static void shadow_param(PcObj l, uint32_t i, int kind, uint64_t v) {
     g_cs_shadow[l].params[i] = {kind, v};
 }
 void list_shadow_reset(PcObj l) {
+    if (g_gfx_shadow_on.load(std::memory_order_relaxed)) { std::lock_guard<std::mutex> g(g_gfx_mu); g_gfx_shadow.erase(l); }
     if (g_own_rs_any) { std::lock_guard<std::mutex> g(g_bind_mu); g_root_bind.erase(l); }
     std::lock_guard<std::mutex> g(g_cs_mu);
     g_cs_shadow.erase(l);
@@ -5529,7 +6019,10 @@ void list_set_pso(PcObj l, PcObj pso) {
         }
     }
 }
-void list_ia_topology(PcObj l, int t) { L->IASetPrimitiveTopology((D3D12_PRIMITIVE_TOPOLOGY)t); }
+void list_ia_topology(PcObj l, int t) {
+    if (g_gfx_shadow_on.load(std::memory_order_relaxed)) { std::lock_guard<std::mutex> g(g_gfx_mu); g_gfx_shadow[l].topo = t; }
+    L->IASetPrimitiveTopology((D3D12_PRIMITIVE_TOPOLOGY)t);
+}
 void list_ia_vbs(PcObj l, uint32_t s, uint32_t n, const void* v) { L->IASetVertexBuffers(s, n, static_cast<const D3D12_VERTEX_BUFFER_VIEW*>(v)); }
 void list_ia_ib(PcObj l, const void* v) { L->IASetIndexBuffer(static_cast<const D3D12_INDEX_BUFFER_VIEW*>(v)); }
 static bool trace_dispatch_size(PcObj l, const char* how, uint32_t x, uint32_t y, uint32_t z, std::string* name);
@@ -6368,10 +6861,14 @@ void list_execute_indirect(PcObj l, PcObj sig, uint32_t max, PcObj args, uint64_
     prof_end(l, pq);
 }
 void list_clear_uav_uint(PcObj l, uint64_t g, uint64_t c, PcObj r, const uint32_t* v, uint32_t n, const void* rects) {
-    L->ClearUnorderedAccessViewUint(gpu(g), cpu(c), as<ID3D12Resource>(r), v, n, static_cast<const D3D12_RECT*>(rects));
+    ID3D12Resource* res = twin_cleared(c, r);   // (the colour twin of a depth texture shaders also write)
+    if (r && !res) return;
+    L->ClearUnorderedAccessViewUint(gpu(g), cpu(c), res, v, n, static_cast<const D3D12_RECT*>(rects));
 }
 void list_clear_uav_float(PcObj l, uint64_t g, uint64_t c, PcObj r, const float* v, uint32_t n, const void* rects) {
-    L->ClearUnorderedAccessViewFloat(gpu(g), cpu(c), as<ID3D12Resource>(r), v, n, static_cast<const D3D12_RECT*>(rects));
+    ID3D12Resource* res = twin_cleared(c, r);
+    if (r && !res) return;
+    L->ClearUnorderedAccessViewFloat(gpu(g), cpu(c), res, v, n, static_cast<const D3D12_RECT*>(rects));
 }
 void list_write_immediate(PcObj l, uint64_t va, uint32_t value, bool bottom) {
     ID3D12GraphicsCommandList2* l2 = nullptr;

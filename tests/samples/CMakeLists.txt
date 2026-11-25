@@ -174,7 +174,8 @@ foreach(s ${XSL_SAMPLES_NODEBUG})
 endforeach()
 
 # ---- Synthetic Series X|S titles (tests/synthetic) -----------------------------------------------
-# xsl_add_synthetic(<name> <source> [<compute shader .hlsl> ...]): shaders become <stem>.cso next to the exe.
+# xsl_add_synthetic(<name> <source> [<shader .hlsl> ...]): shaders become <stem>.cso next to the exe.
+# A stem ending in _vs or _ps is a vertex or pixel shader; any other is a compute shader.
 function(xsl_add_synthetic name src)
   set(outdir "${CMAKE_BINARY_DIR}/synthetic/${name}")
   add_executable(${name} "${src}")
@@ -185,10 +186,16 @@ function(xsl_add_synthetic name src)
     get_filename_component(dir "${hlsl}" DIRECTORY)
     get_filename_component(fname "${hlsl}" NAME)
     set(out "${outdir}/${stem}.cso")
+    set(profile cs_6_0)
+    if(stem MATCHES "_vs$")
+      set(profile vs_6_0)
+    elseif(stem MATCHES "_ps$")
+      set(profile ps_6_0)
+    endif()
     add_custom_command(OUTPUT "${out}"
       COMMAND ${CMAKE_COMMAND} -E make_directory "${outdir}"
       COMMAND ${CMAKE_COMMAND} -E env WINEPREFIX=${XSL_TOOL_PREFIX} WINEDEBUG=-all
-              ${XSL_WINE} "${XSL_DXC}" -nologo -T cs_6_0 -E main "${fname}" -Fo "Z:${out}"
+              ${XSL_WINE} "${XSL_DXC}" -nologo -T ${profile} -E main "${fname}" -Fo "Z:${out}"
       WORKING_DIRECTORY "${dir}" DEPENDS "${hlsl}" COMMENT "dxc_xs ${name}/${stem}")
     list(APPEND outs "${out}")
   endforeach()
@@ -205,6 +212,8 @@ xsl_add_synthetic(runtime_smoke "${CMAKE_SOURCE_DIR}/tests/synthetic/runtime_smo
 xsl_add_synthetic(xmem_smoke "${CMAKE_SOURCE_DIR}/tests/synthetic/xmem_smoke.cpp")
 xsl_add_synthetic(save_smoke "${CMAKE_SOURCE_DIR}/tests/synthetic/save_smoke.cpp")
 xsl_add_synthetic(memtime_smoke "${CMAKE_SOURCE_DIR}/tests/synthetic/memtime_smoke.cpp" "${CMAKE_SOURCE_DIR}/tests/synthetic/memtime.hlsl")
+xsl_add_synthetic(depth_uav_smoke "${CMAKE_SOURCE_DIR}/tests/synthetic/depth_uav_smoke.cpp" "${CMAKE_SOURCE_DIR}/tests/synthetic/depth_uav.hlsl"
+  "${CMAKE_SOURCE_DIR}/tests/synthetic/depth_equal_vs.hlsl" "${CMAKE_SOURCE_DIR}/tests/synthetic/depth_equal_ps.hlsl")
 xsl_add_synthetic(dstorage_smoke "${CMAKE_SOURCE_DIR}/tests/synthetic/dstorage_smoke.cpp")
 target_link_libraries(dstorage_smoke PRIVATE dstorage_xs.lib xsl_zlib)
 xsl_add_synthetic(patch_smoke "${CMAKE_SOURCE_DIR}/tests/synthetic/patch_smoke.cpp")
