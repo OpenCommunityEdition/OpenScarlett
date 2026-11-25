@@ -214,6 +214,8 @@ xsl_add_synthetic(save_smoke "${CMAKE_SOURCE_DIR}/tests/synthetic/save_smoke.cpp
 xsl_add_synthetic(memtime_smoke "${CMAKE_SOURCE_DIR}/tests/synthetic/memtime_smoke.cpp" "${CMAKE_SOURCE_DIR}/tests/synthetic/memtime.hlsl")
 xsl_add_synthetic(depth_uav_smoke "${CMAKE_SOURCE_DIR}/tests/synthetic/depth_uav_smoke.cpp" "${CMAKE_SOURCE_DIR}/tests/synthetic/depth_uav.hlsl"
   "${CMAKE_SOURCE_DIR}/tests/synthetic/depth_equal_vs.hlsl" "${CMAKE_SOURCE_DIR}/tests/synthetic/depth_equal_ps.hlsl")
+xsl_add_synthetic(placed_view_smoke "${CMAKE_SOURCE_DIR}/tests/synthetic/placed_view_smoke.cpp" "${CMAKE_SOURCE_DIR}/tests/synthetic/placed_view_write.hlsl"
+  "${CMAKE_SOURCE_DIR}/tests/synthetic/placed_view_read.hlsl")
 xsl_add_synthetic(dstorage_smoke "${CMAKE_SOURCE_DIR}/tests/synthetic/dstorage_smoke.cpp")
 target_link_libraries(dstorage_smoke PRIVATE dstorage_xs.lib xsl_zlib)
 xsl_add_synthetic(patch_smoke "${CMAKE_SOURCE_DIR}/tests/synthetic/patch_smoke.cpp")
