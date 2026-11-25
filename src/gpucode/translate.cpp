@@ -3095,10 +3095,40 @@ bool Translator::emit_mimg(const Instr& in, size_t idx) {
         }
         if (starts(n, "image_gather4")) {
             const char* ch = in.dmask == 1 ? "Red" : in.dmask == 2 ? "Green" : in.dmask == 4 ? "Blue" : "Alpha";
+            if (zc.empty() && !lod.empty() && (dim == 1 || (dim == 5 && R.dim != 3))) {
+                // A gather at a named level (occlusion tests read a depth pyramid this way). HLSL
+                // gathers at level 0 only, so the four texels of the footprint at that level are
+                // read one by one, in the order a gather returns them. Texels of a float format
+                // are sampled at their centres, where a filter gives the texel itself: the
+                // sampler's address mode and border colour then hold as on the console (a pyramid
+                // is read with a border). Integer formats cannot be sampled so: their texels are
+                // loaded, with coordinates past the edge clamped.
+                const char cc = in.dmask == 1 ? 'x' : in.dmask == 2 ? 'y' : in.dmask == 4 ? 'z' : 'w';
+                const std::string gofs = offs.empty() ? "int2(0, 0)" : fmt("int2(int(%s << 26) >> 26, int(%s << 18) >> 26)", offs.c_str(), offs.c_str());
+                const char* dd = dim == 5 ? "d_, " : "";
+                line(fmt("if (kexec) { uint w_, h_, d_, l_; %s.GetDimensions(0u, w_, h_, %sl_); uint m_ = min(uint(max(round(asfloat(%s)), 0.0)), max(l_, 1u) - 1u); "
+                         "%s.GetDimensions(m_, w_, h_, %sl_);",
+                         T.c_str(), dd, lod.c_str(), T.c_str(), dd));
+                line(fmt("  float2 s_ = float2(max(w_, 1u), max(h_, 1u)); int2 q_ = int2(floor((%s).xy * s_ - 0.5)) + %s;", tc.c_str(), gofs.c_str()));
+                static const char* corner[4] = {"int2(0, 1)", "int2(1, 1)", "int2(1, 0)", "int2(0, 0)"};
+                std::string v;
+                for (int b = 0; b < 4; b++) {
+                    std::string e;
+                    if (R.is_uint || R.scalar)
+                        e = dim == 5 ? fmt("%s.Load(int4(clamp(q_ + %s, int2(0, 0), int2(s_) - 1), int((%s).z), int(m_))).%c", T.c_str(), corner[b], tc.c_str(), cc)
+                                     : fmt("%s.Load(int3(clamp(q_ + %s, int2(0, 0), int2(s_) - 1), int(m_))).%c", T.c_str(), corner[b], cc);
+                    else
+                        e = dim == 5 ? fmt("%s.SampleLevel(%s, float3((float2(q_ + %s) + 0.5) / s_, (%s).z), float(m_)).%c", T.c_str(), SS.c_str(), corner[b], tc.c_str(), cc)
+                                     : fmt("%s.SampleLevel(%s, (float2(q_ + %s) + 0.5) / s_, float(m_)).%c", T.c_str(), SS.c_str(), corner[b], cc);
+                    v += (b ? ", " : "") + e;
+                }
+                line(fmt("  %s t_ = %s(%s);", R.is_uint || R.scalar ? "uint4" : "float4", R.is_uint || R.scalar ? "uint4" : "float4", v.c_str()));
+            } else {
             if (!zc.empty()) call = fmt("%s.GatherCmp%s(%s, %s, asfloat(%s)%s)", T.c_str(), ch, SS.c_str(), tc.c_str(), zc.c_str(), gatherOfs.c_str());
             else call = fmt("%s.Gather%s(%s, %s%s)", T.c_str(), ch, SS.c_str(), tc.c_str(), gatherOfs.c_str());   // (HLSL gathers at level 0)
             // Gather returns 4 values regardless of dmask.
             line(fmt("if (kexec) { %s t_ = %s;", R.is_uint ? "uint4" : "float4", call.c_str()));
+            }
             if (in.d16)
                 for (int b = 0; b < 4; b += 2)
                     line(fmt("  %s = %s | (%s << 16);", V(in.vdata + b / 2).c_str(), pack16(fmt("t_.%c", sw[b])).c_str(), pack16(fmt("t_.%c", sw[b + 1])).c_str()));
@@ -4926,7 +4956,7 @@ bool translate_gs_copy(const Container& c, TranslateResult& r) {
 // ---- cache key salts ---------------------------------------------------------------------------
 uint64_t translation_salt(const Container& c) {
     const std::vector<uint32_t> code = c.code();
-    bool barrier = false, backward = false, global_write = false, computed = false;
+    bool barrier = false, backward = false, global_write = false, computed = false, gather_level = false;
     for (size_t i = 0; i < code.size();) {
         Instr in;
         if (!decode(code.data(), code.size(), i, in)) break;
@@ -4936,6 +4966,7 @@ uint64_t translation_salt(const Container& c) {
         if ((starts(in.name, "s_cbranch") || !strcmp(in.name, "s_branch")) && in.simm16 < 0) backward = true;
         if (!strcmp(in.name, "s_setpc_b64") || !strcmp(in.name, "s_swappc_b64")) computed = true;
         if (starts(in.name, "global_store_") || starts(in.name, "global_atomic_")) global_write = true;
+        if (starts(in.name, "image_gather4_l") && !starts(in.name, "image_gather4_lz")) gather_level = true;
     }
     uint64_t h = 0;
     auto add = [&](const char* tag) { for (const char* p = tag; *p; p++) h = (h ^ (uint8_t)*p) * 1099511628211ull + 0x9e3779b97f4a7c15ull; };
@@ -4949,6 +4980,8 @@ uint64_t translation_salt(const Container& c) {
     if (barrier && !backward) add("barrier-all-1");
     // 2026-11: global stores take their data from the data field (they read v0); global atomics.
     if (global_write) add("global-write-2");
+    // 2026-11: a gather at a named level reads that level (it read level 0).
+    if (gather_level) add("gather-level-1");
     // 2026-11: 16-bit vertex and mesh outputs are unpacked into the registers their records name
     // (they went out as 16-bit patterns, and a packed pair's later registers into the wrong ones).
     Meta m;
