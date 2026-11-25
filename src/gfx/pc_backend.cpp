@@ -3026,10 +3026,12 @@ static HRESULT cached_pso(uint64_t key, const void*& cachedPtr, SIZE_T& cachedSi
 }
 void table_note_stage(PcObj pso, const void* code, size_t size);
 void table_forget(PcObj pso);
+static bool no_blend_on_integers(D3D12_BLEND_DESC& b, const DXGI_FORMAT* formats, UINT n);
 HRESULT_T create_graphics_pso(PcObj dev, const void* desc, PcObj* out) {
     D3D12_GRAPHICS_PIPELINE_STATE_DESC d = *static_cast<const D3D12_GRAPHICS_PIPELINE_STATE_DESC*>(desc);
     for (UINT i = 0; i < 8; i++)
         if (DXGI_FORMAT sf = stand_in(d.RTVFormats[i]); sf != DXGI_FORMAT_UNKNOWN) d.RTVFormats[i] = sf;
+    no_blend_on_integers(d.BlendState, d.RTVFormats, d.NumRenderTargets);
     ShaderFix fx;
     fx.fix(d.VS, 0); fx.fix(d.PS, 1); fx.fix(d.DS, 2); fx.fix(d.HS, 3); fx.fix(d.GS, 4);
     if (had_untranslated()) return E_FAIL;   // console code the PC runtime cannot take (see create_compute_pso)
@@ -3221,6 +3223,65 @@ void trace_pso_stream(const void* stream, size_t size) {
     XSL_INFO(CH, "pso %s:%s", translated_keys(), out.c_str());
 }
 }  // namespace
+// A render target of an integer format cannot be blended on a PC, and a pipeline that says so is
+// refused; the console ignores the blend state of such a target (a title leaves one blend state
+// on for all its targets, a mask of integers among them). Blending is turned off for those.
+static bool integer_format(DXGI_FORMAT f) {
+    switch (f) {
+    case DXGI_FORMAT_R32G32B32A32_UINT: case DXGI_FORMAT_R32G32B32A32_SINT: case DXGI_FORMAT_R32G32B32_UINT: case DXGI_FORMAT_R32G32B32_SINT:
+    case DXGI_FORMAT_R16G16B16A16_UINT: case DXGI_FORMAT_R16G16B16A16_SINT: case DXGI_FORMAT_R32G32_UINT: case DXGI_FORMAT_R32G32_SINT:
+    case DXGI_FORMAT_R10G10B10A2_UINT: case DXGI_FORMAT_R8G8B8A8_UINT: case DXGI_FORMAT_R8G8B8A8_SINT: case DXGI_FORMAT_R16G16_UINT:
+    case DXGI_FORMAT_R16G16_SINT: case DXGI_FORMAT_R32_UINT: case DXGI_FORMAT_R32_SINT: case DXGI_FORMAT_R8G8_UINT: case DXGI_FORMAT_R8G8_SINT:
+    case DXGI_FORMAT_R16_UINT: case DXGI_FORMAT_R16_SINT: case DXGI_FORMAT_R8_UINT: case DXGI_FORMAT_R8_SINT: return true;
+    default: return false;
+    }
+}
+static bool no_blend_on_integers(D3D12_BLEND_DESC& b, const DXGI_FORMAT* formats, UINT n) {
+    bool any = false;
+    for (UINT k = 0; k < n && k < 8; k++) {
+        const auto& r = b.RenderTarget[b.IndependentBlendEnable ? k : 0];
+        any |= integer_format(formats[k]) && (r.BlendEnable || r.LogicOpEnable);
+    }
+    if (!any) return false;
+    if (!b.IndependentBlendEnable) {
+        for (int k = 1; k < 8; k++) b.RenderTarget[k] = b.RenderTarget[0];
+        b.IndependentBlendEnable = TRUE;
+    }
+    for (UINT k = 0; k < n && k < 8; k++)
+        if (integer_format(formats[k])) b.RenderTarget[k].BlendEnable = b.RenderTarget[k].LogicOpEnable = FALSE;
+    static volatile long said = 0;
+    if (InterlockedIncrement(&said) == 1) XSL_INFO(CH, "a pipeline blends into a render target of an integer format: blending is off for that target (the console ignores it there)");
+    return true;
+}
+// The same for a pipeline stream (its blend and render-target-format parts, wherever they are).
+static void stream_no_blend_on_integers(void* stream, size_t size) {
+    uint8_t* p = (uint8_t*)stream;
+    D3D12_BLEND_DESC* blend = nullptr;
+    const D3D12_RT_FORMAT_ARRAY* rts = nullptr;
+    for (size_t o = 0; o + 4 <= size;) {
+        const auto t = *(const D3D12_PIPELINE_STATE_SUBOBJECT_TYPE*)(p + o);
+        size_t n = 0;
+        switch (t) {
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE: n = sizeof(StreamSub<void*>); break;
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS: case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS: case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DS:
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_HS: case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_GS: case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CS:
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS: case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS: n = sizeof(StreamSub<D3D12_SHADER_BYTECODE>); break;
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_INPUT_LAYOUT: n = sizeof(StreamSub<D3D12_INPUT_LAYOUT_DESC>); break;
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND: n = sizeof(StreamSub<D3D12_BLEND_DESC>); blend = &((StreamSub<D3D12_BLEND_DESC>*)(p + o))->v; break;
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS: n = sizeof(StreamSub<D3D12_RT_FORMAT_ARRAY>); rts = &((const StreamSub<D3D12_RT_FORMAT_ARRAY>*)(p + o))->v; break;
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK: case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_IB_STRIP_CUT_VALUE: case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY:
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_NODE_MASK: n = sizeof(StreamSub<UINT>); break;
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER: n = sizeof(StreamSub<D3D12_RASTERIZER_DESC>); break;
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL: n = sizeof(StreamSub<D3D12_DEPTH_STENCIL_DESC>); break;
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL_FORMAT: n = sizeof(StreamSub<DXGI_FORMAT>); break;
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_DESC: n = sizeof(StreamSub<DXGI_SAMPLE_DESC>); break;
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_FLAGS: n = sizeof(StreamSub<D3D12_PIPELINE_STATE_FLAGS>); break;
+        default: return;   // (a part this does not know: left as it is)
+        }
+        o += n;
+    }
+    if (blend && rts) no_blend_on_integers(*blend, rts->RTFormats, rts->NumRenderTargets);
+}
 static bool own_rs_blob(PcObj rs, std::vector<uint8_t>* out);
 // What a pipeline stream describes, as a key for its stored blob: the shaders' bytes, the root
 // signature's serialized form (one made from a shader's description), the input elements and the
@@ -3301,6 +3362,7 @@ static bool stream_key(const void* stream, size_t size, uint64_t* key) {
 HRESULT_T create_pso_stream(PcObj dev, void* stream, size_t size, PcObj* out) {
     *out = nullptr;
     if (getenv("XSL_TRACE_WRITERS") && pso_traced()) trace_pso_stream(stream, size);
+    stream_no_blend_on_integers(stream, size);
     D3D12_PIPELINE_STATE_STREAM_DESC d{size, stream};
     ID3D12Device2* d2 = nullptr;
     if (driver_refused(translated_keys())) return E_FAIL;
