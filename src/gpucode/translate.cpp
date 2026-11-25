@@ -4974,8 +4974,10 @@ uint64_t translation_salt(const Container& c) {
     // small limit past the last barrier.
     // 2026-11: with loops the threads of a group take turns between barriers; without, every
     // thread makes each barrier call.
-    // 2026-11: in code with loops a block only fallen into continues the case before it.
-    if (backward || computed) add("inline-fall-1");
+    // (2026-11: in code with loops a block only fallen into continues the case before it. No salt:
+    // the translations from before compute the same, and a cache of thousands of programs and
+    // their pipelines stays good.)
+    (void)computed;
     if (barrier && backward) add("barrier-coop-1");
     if (barrier && !backward) add("barrier-all-1");
     // 2026-11: global stores take their data from the data field (they read v0); global atomics.
