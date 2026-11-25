@@ -4088,6 +4088,19 @@ std::string Translator::generate() {
                 if (!live[x]) { live[x] = true; work.push_back(x); }
         }
     }
+    // With computed jumps every block counts as reachable. Words that are no instruction (a table
+    // of data after the code) are not: a block that holds one, and that nothing is known to jump
+    // to, is left out.
+    if (indirect) {
+        std::set<size_t> targets;
+        for (uint32_t t : jump_targets)
+            if (block_of.count(t)) targets.insert(block_of[t]);
+        for (size_t b = 1; b < nb; b++) {
+            if (targets.count(b)) continue;
+            for (size_t i = block_start[b]; i < block_end(b); i++)
+                if (!ins[i].name && !(ins[i].fmt == Fmt::VOP3 && ins[i].op == 384)) { live[b] = false; break; }
+        }
+    }
     // Code with loops: a block that is only ever entered by falling into it (the code after a
     // conditional branch that nothing else jumps to) is not a case of its own: it goes on in the
     // case of the block before it. That halves the cases of the dispatch and takes most values
