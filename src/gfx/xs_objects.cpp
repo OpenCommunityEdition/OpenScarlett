@@ -6,7 +6,9 @@
 #include <tlhelp32.h>
 #include <atomic>
 #include <deque>
+#include <functional>
 #include <map>
+#include <unordered_map>
 #include <mutex>
 #include <set>
 #include <vector>
@@ -774,9 +776,10 @@ static bool wait_met(const ValueWait& w) {
     }
 }
 struct BackItem {
-    int kind = 0;   // 0: wait for a memory value, 1: run lists, 2: signal a fence, 3: wait for a fence
+    int kind = 0;   // 0: wait for a memory value, 1: run lists, 2: signal a fence, 3: wait for a fence, 4: a call (a present)
     ValueWait wait{};
-    std::vector<PcObj> lists, owned;   // owned: let go after they ran
+    std::function<void()> call;
+    std::vector<PcObj> lists, owned, kept;   // owned: let go after they ran; kept: title lists' own PC lists, held until they ran
     std::vector<MemWrite> writes;
     PcObj fence = nullptr;
     uint64_t value = 0;
@@ -791,6 +794,11 @@ struct Backlog {
 };
 static std::mutex g_backlogs_mu;
 static std::vector<Backlog*> g_backlogs;
+// The PC lists of title lists that wait in a backlog (how many times each). The title may run a
+// list again without resetting it, so the list keeps its PC list; when the title resets a list
+// whose PC list still waits, the list gets a new one and the backlog keeps the old (list_unhook).
+static std::mutex g_list_pending_mu;
+static std::unordered_map<PcObj, int> g_list_pending;
 static std::atomic<uint64_t> g_wait_stats[5];   // waits recorded, cuts, waits a queue stood at, given up, parts run from a backlog
 static void backlog_run(Backlog* b, std::vector<PcObj>& lists, std::vector<MemWrite>& writes) {
     if (!lists.empty()) pc::queue_execute(b->q, (uint32_t)lists.size(), lists.data());
@@ -837,10 +845,16 @@ static void backlog_pump(Backlog* b) {
         } else if (it.kind == 1) {
             backlog_run(b, it.lists, it.writes);
             for (PcObj o : it.owned) { pc::list_forget(o); pc::release(o); }
+            for (PcObj o : it.kept) {   // (the title's own PC lists: the backlog's hold on each ends)
+                { std::lock_guard<std::mutex> g(g_list_pending_mu); auto p = g_list_pending.find(o); if (p != g_list_pending.end() && --p->second <= 0) g_list_pending.erase(p); }
+                pc::release(o);
+            }
             g_wait_stats[4]++;
         } else if (it.kind == 2) {
             pc::queue_signal(b->q, it.fence, it.value);
             pc::release(it.fence);
+        } else if (it.kind == 4) {
+            it.call();
         } else {
             pc::queue_wait(b->q, it.fence, it.value);
             pc::release(it.fence);
@@ -867,20 +881,20 @@ static DWORD WINAPI backlog_thread(void*) {
 }
 struct QueueExtra;
 static Backlog* queue_backlog(ID3D12CommandQueue* q, bool create);
-// The queue's backlog is given time to empty (before a present, which is not put behind it).
-static void backlog_drain(ID3D12CommandQueue* q, ULONGLONG ms) {
+// A call that has to keep its place among the queue's work (a present): put behind the backlog if
+// there is one (false: the caller makes it now). The title's thread is not held: what a wait in
+// the backlog waits for may be in lists that thread has yet to submit.
+static bool queue_behind_call(ID3D12CommandQueue* q, std::function<void()> call) {
     Backlog* b = queue_backlog(q, false);
-    if (!b) return;
-    const ULONGLONG t0 = GetTickCount64();
-    for (;;) {
-        {
-            std::lock_guard<std::mutex> g(b->mu);
-            backlog_pump(b);
-            if (b->items.empty()) return;
-        }
-        if (GetTickCount64() - t0 >= ms) return;
-        Sleep(1);
-    }
+    if (!b) return false;
+    std::lock_guard<std::mutex> g(b->mu);
+    backlog_pump(b);
+    if (b->items.empty()) return false;
+    BackItem it;
+    it.kind = 4;
+    it.call = std::move(call);
+    b->items.push_back(std::move(it));
+    return true;
 }
 
 // Quad emulation: a layer-owned index buffer turning every 4 vertices into 2 triangles.
@@ -912,6 +926,24 @@ D3D12_INDEX_BUFFER_VIEW quad_ib(Device* dev) {
     });
     return view;
 }
+// Before a title list is reset: if its PC list still waits in a queue's backlog, the list gets
+// a new PC list to record into and the backlog keeps the old one (it holds a reference).
+static void list_unhook(ID3D12GraphicsCommandList* l) {
+    const PcObj old = pc_of(l);
+    {
+        std::lock_guard<std::mutex> g(g_list_pending_mu);
+        if (!old || !g_list_pending.count(old)) return;
+    }
+    PcObj fresh = nullptr;
+    if (FAILED(pc::create_list_closed_like(dev_extra(hdr(l)->device)->pcDevice, old, &fresh)) || !fresh) {
+        static volatile long said = 0;
+        if (InterlockedIncrement(&said) <= 3) XSL_WARN(CH, "a list is reset while its PC list waits in a queue's backlog, and no new PC list can be made: that work is lost");
+        return;
+    }
+    pc::list_forget(old);
+    hdr(l)->pc = fresh;
+    pc::release(old);   // (the title's reference; the backlog has its own)
+}
 // The PC list of a title list, for a call that records into it.
 template <class T> inline PcObj list_pc(T* l) { ex<XList, ListExtra>((XList*)l)->touched = true; return pc_of(l); }
 #define LPC(l) list_pc(l)
@@ -938,6 +970,7 @@ HRESULT D3DAPI L_Reset(ID3D12GraphicsCommandList* l, ID3D12CommandAllocator* a, 
         mem_write_drop(w->writes);
     }
     lx(l)->alloc = P(a);
+    list_unhook(l);
     HRESULT hr = pc::list_reset(LPC(l), P(a), P(p));
     if (SUCCEEDED(hr)) list_bind_global_heap(l, LPC(l));
     lx(l)->touched = false;   // (nothing of the title's is in the list yet: a wait now stands before all of it)
@@ -2163,16 +2196,14 @@ static bool queue_submit(ID3D12CommandQueue* q, UINT n, ID3D12CommandList* const
             cur.writes.insert(cur.writes.end(), w->writes.begin(), w->writes.end());
             w->writes.clear();
         }
-        // The list's own PC list goes to the backlog for good: the title may reset the list before
-        // the queue has run it, so it gets a new one.
-        PcObj own = P(lists[i]), fresh = nullptr;
-        cur.lists.push_back(own);
-        if (own && SUCCEEDED(pc::create_list_closed_like(b->dev, own, &fresh)) && fresh) {
-            hdr(lists[i])->pc = fresh;
-            cur.owned.push_back(own);
-        } else {
-            static volatile long said = 0;
-            if (InterlockedIncrement(&said) <= 3) XSL_WARN(CH, "a list given to a queue's backlog keeps its PC list: reset before the queue runs it, its work is lost");
+        // The list's own PC list waits in the backlog, held by it. The title may run the list
+        // again as it is, or reset it before the queue got to it (L_Reset then gives it another).
+        if (PcObj own = P(lists[i])) {
+            cur.lists.push_back(own);
+            cur.kept.push_back(own);
+            pc::addref(own);
+            std::lock_guard<std::mutex> g2(g_list_pending_mu);
+            g_list_pending[own]++;
         }
     }
     flush();
@@ -2289,7 +2320,6 @@ void release_kept() {   // references older than 8 frames (the frame latency is 
 }
 HRESULT D3DAPI Q_PresentX(ID3D12CommandQueue* q, UINT planes, const D3D12XBOX_PRESENT_PLANE_PARAMETERS* p, const D3D12XBOX_PRESENT_PARAMETERS*) {
     if (planes == 0 || !p || !p->ResourceCount || !p->ppResources) return S_OK;  // "present blank": nothing to show yet
-    backlog_drain(q, wait_timeout_ms());   // (a present is not put behind the queue's backlog: the backlog is given time to empty)
     release_kept();
     xsl_fixed_time_frame();
     {
@@ -2327,7 +2357,8 @@ HRESULT D3DAPI Q_PresentX(ID3D12CommandQueue* q, UINT planes, const D3D12XBOX_PR
     }
     // Swap chains need a direct queue; titles may present from a compute queue (FramePacing does).
     PcObj presentQ = pc_of(q);
-    if (ex<ID3D12CommandQueue, QueueExtra>(q)->desc.Type != D3D12_COMMAND_LIST_TYPE_DIRECT) {
+    const bool viaDirect = ex<ID3D12CommandQueue, QueueExtra>(q)->desc.Type != D3D12_COMMAND_LIST_TYPE_DIRECT;
+    if (viaDirect) {
         if (!de->presentQueue) {
             D3D12_COMMAND_QUEUE_DESC qd{};
             qd.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
@@ -2336,23 +2367,40 @@ HRESULT D3DAPI Q_PresentX(ID3D12CommandQueue* q, UINT planes, const D3D12XBOX_PR
         if (!de->presentSyncFence && FAILED(pc::create_fence(de->pcDevice, 0, 0, &de->presentSyncFence))) return E_FAIL;
         static volatile long once = 0;
         if (InterlockedIncrement(&once) == 1) XSL_INFO(CH, "PresentX on a type-%d queue: presenting through a direct queue", (int)ex<ID3D12CommandQueue, QueueExtra>(q)->desc.Type);
-        uint64_t v = ++de->presentSyncValue;
-        pc::queue_signal(pc_of(q), de->presentSyncFence, v);
-        pc::queue_wait(de->presentQueue, de->presentSyncFence, v);
         presentQ = de->presentQueue;
     }
-    HRESULT hr = null_graphics() ? pc::null_present(de->window)
-                                 : pc::present(de->pcDevice, presentQ, dbg_present_override() ? dbg_present_override() : P(p->ppResources[0]),
-                                               de->window, 0, (uint32_t)p->ColorSpace,
-                                               planes > 1 && p[1].ResourceCount && p[1].ppResources ? P(p[1].ppResources[0]) : nullptr);
     // Enforce the console's frame-latency bound: block until the GPU has finished every frame
     // older than maxLatency. Without this a title resets command allocators still in flight.
     if (!de->latencyFence) {
         pc::create_fence(de->pcDevice, 0, 0, &de->latencyFence);
         de->latencyEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
     }
-    uint64_t v = ++de->presentCount;
-    pc::queue_signal(presentQ, de->latencyFence, v);
+    const uint64_t v = ++de->presentCount;
+    // The present itself, and the fence that says this frame is done. It keeps its place among
+    // the queue's work: with a backlog (the queue stands at a wait for a memory value) it goes
+    // behind it and runs when the queue gets there; the planes are kept alive until then.
+    HRESULT hr = S_OK;
+    const PcObj plane0 = dbg_present_override() ? dbg_present_override() : P(p->ppResources[0]);
+    const PcObj plane1 = planes > 1 && p[1].ResourceCount && p[1].ppResources ? P(p[1].ppResources[0]) : nullptr;
+    const uint32_t colorSpace = (uint32_t)p->ColorSpace;
+    const PcObj titleQ = pc_of(q);
+    auto present = [de, presentQ, titleQ, viaDirect, plane0, plane1, colorSpace, v]() -> HRESULT {
+        if (viaDirect) {
+            const uint64_t sv = ++de->presentSyncValue;
+            pc::queue_signal(titleQ, de->presentSyncFence, sv);
+            pc::queue_wait(de->presentQueue, de->presentSyncFence, sv);
+        }
+        const HRESULT r = null_graphics() ? pc::null_present(de->window) : pc::present(de->pcDevice, presentQ, plane0, de->window, 0, colorSpace, plane1);
+        pc::queue_signal(presentQ, de->latencyFence, v);
+        return r;
+    };
+    pc::addref(plane0);
+    if (plane1) pc::addref(plane1);
+    if (!list_waits_on() || !queue_behind_call(q, [present, plane0, plane1] { present(); pc::release(plane0); if (plane1) pc::release(plane1); })) {
+        hr = present();
+        pc::release(plane0);
+        if (plane1) pc::release(plane1);
+    }
     LARGE_INTEGER retQpc;
     QueryPerformanceCounter(&retQpc);
     frame_stats_present(dev, p->Token, callQpc.QuadPart, retQpc.QuadPart, v);

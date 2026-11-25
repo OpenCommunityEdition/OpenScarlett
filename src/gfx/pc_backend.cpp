@@ -2886,16 +2886,33 @@ static bool gm_extend_root_signature(const void* blob, size_t size, std::vector<
 // and an argument for a parameter it does not have, or of another type, crashes the driver.
 std::mutex g_rs_par_mu;
 std::unordered_map<PcObj, std::vector<uint8_t>> g_rs_params;
+std::unordered_map<PcObj, std::vector<uint32_t>> g_rs_const_counts;   // per parameter: its 32-bit values (0: not constants)
 static void note_rs_params(PcObj rs, const void* blob, size_t size) {
     ID3D12VersionedRootSignatureDeserializer* ds = nullptr;
     if (FAILED(D3D12CreateVersionedRootSignatureDeserializer(blob, size, IID_PPV_ARGS(&ds)))) return;
     const D3D12_VERSIONED_ROOT_SIGNATURE_DESC* d = nullptr;
     std::vector<uint8_t> kinds;
+    std::vector<uint32_t> counts;
     if (SUCCEEDED(ds->GetRootSignatureDescAtVersion(D3D_ROOT_SIGNATURE_VERSION_1_1, &d)) && d)
-        for (UINT i = 0; i < d->Desc_1_1.NumParameters; i++) kinds.push_back((uint8_t)d->Desc_1_1.pParameters[i].ParameterType);
+        for (UINT i = 0; i < d->Desc_1_1.NumParameters; i++) {
+            const auto& par = d->Desc_1_1.pParameters[i];
+            kinds.push_back((uint8_t)par.ParameterType);
+            counts.push_back(par.ParameterType == D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS ? par.Constants.Num32BitValues : 0);
+        }
     ds->Release();
     std::lock_guard<std::mutex> g(g_rs_par_mu);
     g_rs_params[rs] = std::move(kinds);
+    g_rs_const_counts[rs] = std::move(counts);
+}
+// How many of n 32-bit constants from offset o parameter i of the root signature takes (constants
+// set for a signature with more values there are cut: past the parameter's end the call is invalid
+// and removes the device). n itself for a signature not made here.
+static uint32_t rs_const_room(PcObj rs, uint32_t i, uint32_t o, uint32_t n) {
+    std::lock_guard<std::mutex> g(g_rs_par_mu);
+    auto it = g_rs_const_counts.find(rs);
+    if (it == g_rs_const_counts.end() || i >= it->second.size()) return n;
+    const uint32_t have = it->second[i];
+    return o >= have ? 0 : std::min(n, have - o);
 }
 // kind: 0 table, 1 CBV, 2 SRV, 3 UAV, 4 constants (root-argument kinds of the lazy binding).
 static bool rs_param_ok(PcObj rs, uint32_t i, int kind) {
@@ -3754,6 +3771,44 @@ bool layout_of(D3D12_RESOURCE_STATES st, D3D12_BARRIER_LAYOUT* out) {
     return true;
 }
 
+// A texture made through the newer creation call takes the older kind of barrier only from the
+// common state ("barrier interop"; a barrier from another layout is an invalid call, and the
+// device is removed). Such a texture is made in the common layout and moved to the state the title
+// asked for with one barrier of the older kind, on a queue of the layer's own, before the title
+// can use it.
+struct StateMover { std::mutex mu; ID3D12CommandQueue* q = nullptr; ID3D12CommandAllocator* a = nullptr; ID3D12GraphicsCommandList* l = nullptr; ID3D12Fence* f = nullptr; uint64_t v = 0; HANDLE e = nullptr; } g_mover;
+bool move_from_common(ID3D12Device* dev, ID3D12Resource* r, D3D12_RESOURCE_STATES to) {
+    if (to == D3D12_RESOURCE_STATE_COMMON) return true;
+    std::lock_guard<std::mutex> g(g_mover.mu);
+    if (!g_mover.q) {
+        const D3D12_COMMAND_QUEUE_DESC qd{D3D12_COMMAND_LIST_TYPE_DIRECT};
+        if (FAILED(dev->CreateCommandQueue(&qd, IID_PPV_ARGS(&g_mover.q))) || FAILED(dev->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&g_mover.a))) ||
+            FAILED(dev->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, g_mover.a, nullptr, IID_PPV_ARGS(&g_mover.l))) || FAILED(dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&g_mover.f)))) {
+            g_mover.q = nullptr;
+            return false;
+        }
+        g_mover.l->Close();
+        g_mover.e = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    }
+    if (g_mover.f->GetCompletedValue() < g_mover.v) {   // (the allocator is free again once the move before has run)
+        g_mover.f->SetEventOnCompletion(g_mover.v, g_mover.e);
+        WaitForSingleObject(g_mover.e, 2000);
+    }
+    if (FAILED(g_mover.a->Reset()) || FAILED(g_mover.l->Reset(g_mover.a, nullptr))) return false;
+    D3D12_RESOURCE_BARRIER b{};
+    b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    b.Transition.pResource = r;
+    b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    b.Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
+    b.Transition.StateAfter = to;
+    g_mover.l->ResourceBarrier(1, &b);
+    g_mover.l->Close();
+    ID3D12CommandList* lists[] = {g_mover.l};
+    g_mover.q->ExecuteCommandLists(1, lists);
+    g_mover.q->Signal(g_mover.f, ++g_mover.v);
+    return true;
+}
+
 D3D12_RESOURCE_DESC clean_desc(const void* desc) {
     D3D12_RESOURCE_DESC d = *static_cast<const D3D12_RESOURCE_DESC*>(desc);
     d.Flags = (D3D12_RESOURCE_FLAGS)(d.Flags & 0xBF);  // PC flags only; Xbox compression/DCC bits dropped
@@ -3888,17 +3943,24 @@ HRESULT_T create_committed_resource(PcObj dev, const void* heapProps, uint32_t h
     D3D12_BARRIER_LAYOUT layout;
     if (const DXGI_FORMAT partner = cast_partner(d.Format);
         partner != DXGI_FORMAT_UNKNOWN && d.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER && d.SampleDesc.Count <= 1 && hp.Type == D3D12_HEAP_TYPE_DEFAULT &&
-        (d.Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)) && !(d.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL) &&
+        // (Unordered access only: a render target made this way stays in the common layout for
+        // the runtime, which then refuses its use as a target.)
+        (d.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) && !(d.Flags & (D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL | D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET)) &&
         layout_of(st, &layout) && relaxed_casting(as<ID3D12Device>(dev))) {
         ID3D12Device10* d10 = nullptr;
         if (SUCCEEDED(as<ID3D12Device>(dev)->QueryInterface(IID_PPV_ARGS(&d10)))) {
             D3D12_RESOURCE_DESC1 d1{};
             memcpy(&d1, &d, sizeof d);
             const DXGI_FORMAT formats[2] = {d.Format, partner};
-            hr = d10->CreateCommittedResource3(&hp, clean_heap_flags(heapFlags), &d1, layout, cv, nullptr, 2, formats,
+            hr = d10->CreateCommittedResource3(&hp, clean_heap_flags(heapFlags), &d1, D3D12_BARRIER_LAYOUT_COMMON, cv, nullptr, 2, formats,
                                                IID_PPV_ARGS(reinterpret_cast<ID3D12Resource**>(out)));
             d10->Release();
             castable = SUCCEEDED(hr);
+            if (castable && !move_from_common(as<ID3D12Device>(dev), *reinterpret_cast<ID3D12Resource**>(out), st)) {
+                (*reinterpret_cast<ID3D12Resource**>(out))->Release();   // (no way to bring it to its state: made the older way)
+                *out = nullptr;
+                castable = false;
+            }
             static volatile long n = 0;
             if (const long k = InterlockedIncrement(&n); k <= 4 || !castable)
                 XSL_INFO(CH, "texture %llux%u format %d the GPU writes: %s format %d too (%08lx)", (unsigned long long)d.Width, d.Height, (int)d.Format,
@@ -5437,8 +5499,10 @@ static void root_ensure(PcObj l, bool compute) {
     }
     for (auto& [i, c] : b.consts) {
         if (!rs_param_ok(b.bound, i, 4)) continue;
-        if (compute) L2->SetComputeRoot32BitConstants(i, (UINT)c.size(), c.data(), 0);
-        else L2->SetGraphicsRoot32BitConstants(i, (UINT)c.size(), c.data(), 0);
+        const uint32_t take = rs_const_room(b.bound, i, 0, (uint32_t)c.size());
+        if (!take) continue;
+        if (compute) L2->SetComputeRoot32BitConstants(i, take, c.data(), 0);
+        else L2->SetGraphicsRoot32BitConstants(i, take, c.data(), 0);
     }
 }
 // With lazily bound root signatures: whether rs is the one on the list for that bind point.
@@ -5456,14 +5520,18 @@ static bool root_arg(PcObj l, bool compute, uint32_t i, int kind, uint64_t v) {
     b.params[i] = {kind, v};
     return b.bound && b.bound == (b.own ? b.own : b.title) && rs_param_ok(b.bound, i, kind);
 }
-static bool root_consts(PcObj l, bool compute, uint32_t i, uint32_t n, const void* d, uint32_t o) {
+// (*take: how many of the n values the signature on the list has room for.)
+static bool root_consts(PcObj l, bool compute, uint32_t i, uint32_t n, const void* d, uint32_t o, uint32_t* take) {
+    *take = n;
     if (!g_own_rs_any) return true;
     std::lock_guard<std::mutex> g(g_bind_mu);
     auto& b = g_root_bind[l][compute];
     auto& c = b.consts[i];
     if (c.size() < o + n) c.resize(o + n);
     memcpy(c.data() + o, d, n * 4ull);
-    return b.bound && b.bound == (b.own ? b.own : b.title) && rs_param_ok(b.bound, i, 4);
+    if (!(b.bound && b.bound == (b.own ? b.own : b.title) && rs_param_ok(b.bound, i, 4))) return false;
+    *take = rs_const_room(b.bound, i, o, n);
+    return *take != 0;
 }
 // The title's root signature for a bind point; true when it is to be bound at once (no pipeline
 // with a root signature of its own exists).
@@ -7168,7 +7236,10 @@ static void trace_root_uav(PcObj l, uint32_t i, uint64_t va, const char* kind) {
 }
 void list_gfx_root_uav(PcObj l, uint32_t i, uint64_t va) { trace_root_uav(l, i, va, "graphics"); if (root_arg(l, false, i, 3, va)) L->SetGraphicsRootUnorderedAccessView(i, va); }
 void list_compute_root_uav(PcObj l, uint32_t i, uint64_t va) { trace_root_uav(l, i, va, "compute"); shadow_param(l, i, 3, va); if (root_arg(l, true, i, 3, va)) L->SetComputeRootUnorderedAccessView(i, va); }
-void list_gfx_root_constants(PcObj l, uint32_t i, uint32_t n, const void* d, uint32_t o) { if (root_consts(l, false, i, n, d, o)) L->SetGraphicsRoot32BitConstants(i, n, d, o); }
+void list_gfx_root_constants(PcObj l, uint32_t i, uint32_t n, const void* d, uint32_t o) {
+    uint32_t take = n;
+    if (root_consts(l, false, i, n, d, o, &take)) L->SetGraphicsRoot32BitConstants(i, take, d, o);
+}
 void list_compute_root_constants(PcObj l, uint32_t i, uint32_t n, const void* d, uint32_t o) {
     {
         std::lock_guard<std::mutex> g(g_cs_mu);
@@ -7176,7 +7247,8 @@ void list_compute_root_constants(PcObj l, uint32_t i, uint32_t n, const void* d,
         if (c.size() < o + n) c.resize(o + n);
         memcpy(c.data() + o, d, n * 4);
     }
-    if (root_consts(l, true, i, n, d, o)) L->SetComputeRoot32BitConstants(i, n, d, o);
+    uint32_t take = n;
+    if (root_consts(l, true, i, n, d, o, &take)) L->SetComputeRoot32BitConstants(i, take, d, o);
 }
 static void restore_compute_state(PcObj l) {
     CsShadow sh;
@@ -7199,7 +7271,8 @@ static void restore_compute_state(PcObj l) {
         default: L->SetComputeRootUnorderedAccessView(i, p.second); break;
         }
     }
-    for (auto& [i, c] : sh.consts) L->SetComputeRoot32BitConstants(i, (UINT)c.size(), c.data(), 0);
+    for (auto& [i, c] : sh.consts)
+        if (const uint32_t take = rs_const_room(sh.rs, i, 0, (uint32_t)c.size())) L->SetComputeRoot32BitConstants(i, take, c.data(), 0);
 }
 // Bytes per element and block width (1, or 4 for block-compressed) of a DXGI format; {0, 0} for
 // formats this does not know.

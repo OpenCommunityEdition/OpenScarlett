@@ -478,6 +478,15 @@ bool native_translate(const void* in, size_t n, void** out, size_t* outSize) {
         if (strstr(dk, k)) cpath.clear();
     }
     bool cached = !t_dry && !cpath.empty() && read_file(cpath, dxil);
+    // A cached program of a megabyte and more of DXIL takes the GPU driver minutes to build a
+    // pipeline from (354 s for 3.6 MB on one driver). In the pipeline and compile workers it is
+    // put off like a compile, so that it ends with the one worker for giants and the other
+    // workers stay free for the hundreds of ordinary pipelines behind it.
+    if (cached && (t_defer_compile || t_defer_giant) && !t_dry && dxil.size() >= kGiantHlsl) {
+        t_compile_deferred = true;
+        t_untranslated = noFallback;
+        return false;
+    }
     if (cached) XSL_INFO(CH, "shader %016llx (%s): from cache", (unsigned long long)key, gpucode::kind_name(c.kind));
     if (!cached && t_defer_compile && !t_dry && ovr.empty()) {
         t_compile_deferred = true;
