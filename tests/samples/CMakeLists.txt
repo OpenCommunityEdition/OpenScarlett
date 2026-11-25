@@ -218,6 +218,8 @@ xsl_add_synthetic(placed_view_smoke "${CMAKE_SOURCE_DIR}/tests/synthetic/placed_
   "${CMAKE_SOURCE_DIR}/tests/synthetic/placed_view_read.hlsl")
 xsl_add_synthetic(list_wait_smoke "${CMAKE_SOURCE_DIR}/tests/synthetic/list_wait_smoke.cpp" "${CMAKE_SOURCE_DIR}/tests/synthetic/list_wait_add.hlsl"
   "${CMAKE_SOURCE_DIR}/tests/synthetic/list_wait_copy.hlsl")
+xsl_add_synthetic(helper_lanes_smoke "${CMAKE_SOURCE_DIR}/tests/synthetic/helper_lanes_smoke.cpp" "${CMAKE_SOURCE_DIR}/tests/synthetic/helper_lanes_vs.hlsl"
+  "${CMAKE_SOURCE_DIR}/tests/synthetic/helper_lanes_ps.hlsl")
 xsl_add_synthetic(dstorage_smoke "${CMAKE_SOURCE_DIR}/tests/synthetic/dstorage_smoke.cpp")
 target_link_libraries(dstorage_smoke PRIVATE dstorage_xs.lib xsl_zlib)
 xsl_add_synthetic(patch_smoke "${CMAKE_SOURCE_DIR}/tests/synthetic/patch_smoke.cpp")
