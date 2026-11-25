@@ -87,6 +87,18 @@ zlib, BCPack, zlib+BCPack; error records; cancellation; fence signals) — all p
 - **Barrier states**: console drivers tolerate a `StateBefore` that is not the resource's state (the
   samples' `Present()` after a compute pass). Within one command list the layer starts such a
   transition from the state the previous transition left (`XSL_BARRIER_FIX=0` disables).
+- **Waits for memory values**: the console GPU can stand at a point of a command list until a value
+  in memory passes a comparison (`Wait32BitValueX`, `Wait64BitValueX`), and titles order their queues
+  with that and the bottom-of-pipe value writes. The layer cuts the list at each wait and gives the
+  queue a backlog that runs the parts in order (`XSL_LIST_WAITS=0` skips waits;
+  `XSL_WAIT_TIMEOUT_MS`, 3000, is how long a queue stands at one wait before giving it up).
+- **Depth textures with unordered access**: allowed on the console, not on a PC. Such a texture gets
+  colour twins that its unordered-access views are views of, brought in step with the depth texture
+  where the title moves it into or out of the unordered-access state (`XSL_DEPTH_TWINS=0`: null views).
+- **Views placed on a texture the GPU writes**: a view placed at the address of a render target or a
+  texture with unordered access is a view of that texture; for an R9G9B9E5 view on an R32_UINT
+  texture the texture is made castable, which needs relaxed format casting (`XSL_PLACED_ALIAS=0`,
+  `XSL_CAST_VIEWS=0`).
 - **LLVM intrinsics in Xbox DXIL**: `llvm.copysign` for `sign()` and other math intrinsics that
   upstream dxil-spirv drops. Unknown value-producing intrinsics now fail the conversion loudly.
 - **Stripped shaders**: containers whose DXIL part holds only native code are translated from their debug
