@@ -690,8 +690,17 @@ static int placeholder_reason(void* obj) {
     auto it = g_ph_of.find(obj);
     return it == g_ph_of.end() ? -1 : it->second;
 }
-static void placeholder_skip(int why) {
+static std::map<uint64_t, std::pair<int, long>> g_ph_waiting;   // (under g_ph_mu) pipeline hash -> (workers that have it, skips since the last report)
+static void placeholder_skip(int why, const void* pso = nullptr) {
     InterlockedIncrement(&g_skipped_work);
+    if (why < 0 && pso) {   // not built yet: which workers it waits with
+        uint64_t key = 0;
+        const int level = pso_pending_level((void*)pso, &key);
+        std::lock_guard<std::mutex> g(g_ph_mu);
+        auto& w = g_ph_waiting[level < 0 ? 0 : key];
+        w.first = level;
+        w.second++;
+    }
     if (why < 0) return;
     std::lock_guard<std::mutex> g(g_ph_mu);
     if ((size_t)why < g_ph_why.size()) g_ph_why[why].second++;
@@ -1253,7 +1262,7 @@ void D3DAPI L_DrawInstanced(ID3D12GraphicsCommandList* l, UINT a, UINT b, UINT c
     if (null_graphics()) return;
     if (draw_dump_now()) XSL_INFO(CH, "draw dump: list %p Draw(%u vertices, %u instances, first %u), topology %d, pipeline %s%s", (void*)l, a, b, c, lx(l)->topology,
                                   pc::list_pso_name(LPC(l)).c_str(), dump_skipped(l).c_str());
-    if (lx(l)->placeholderPso) { placeholder_skip(lx(l)->placeholderWhy); return; }
+    if (lx(l)->placeholderPso) { placeholder_skip(lx(l)->placeholderWhy, lx(l)->psoObj); return; }
     if (lx(l)->topology == D3D_PRIMITIVE_TOPOLOGY_QUADLIST) {
         D3D12_INDEX_BUFFER_VIEW q = quad_ib(hdr(l)->device);
         uint32_t quads = a / 4;
@@ -1269,7 +1278,7 @@ void D3DAPI L_DrawIndexedInstanced(ID3D12GraphicsCommandList* l, UINT a, UINT b,
     if (null_graphics()) return;
     if (draw_dump_now()) XSL_INFO(CH, "draw dump: list %p DrawIndexed(%u indices, %u instances, first %u, base %d), topology %d, pipeline %s%s", (void*)l, a, b, c, d, lx(l)->topology,
                                   pc::list_pso_name(LPC(l)).c_str(), dump_skipped(l).c_str());
-    if (lx(l)->placeholderPso) { placeholder_skip(lx(l)->placeholderWhy); return; }
+    if (lx(l)->placeholderPso) { placeholder_skip(lx(l)->placeholderWhy, lx(l)->psoObj); return; }
     XSL_TRACE("gfx.cmd", "list %p DrawIndexed %u x%u", (void*)l, a, b);
     pc::list_draw_indexed(LPC(l), a, b, c, d, e);
 }
@@ -1293,7 +1302,7 @@ void D3DAPI L_Dispatch(ID3D12GraphicsCommandList* l, UINT x, UINT y, UINT z) {
         if (InterlockedIncrement(&n) <= 20) XSL_INFO(CH, "large Dispatch(%u, %u, %u) on list %p", x, y, z, (void*)l);
     }
     if (draw_dump_now()) XSL_INFO(CH, "draw dump: list %p Dispatch(%u, %u, %u), pipeline %s%s", (void*)l, x, y, z, pc::list_pso_name(LPC(l)).c_str(), dump_skipped(l).c_str());
-    if (lx(l)->placeholderPso) { placeholder_skip(lx(l)->placeholderWhy); return; }
+    if (lx(l)->placeholderPso) { placeholder_skip(lx(l)->placeholderWhy, lx(l)->psoObj); return; }
     if (!null_graphics()) pc::list_dispatch(LPC(l), x, y, z);
 }
 // DispatchX: a dispatch with console options. Only one changes what runs: with
@@ -1470,8 +1479,33 @@ static bool list_read_back(ID3D12GraphicsCommandList* l, const D3D12_TEXTURE_COP
                  (int)f.Format, (unsigned long long)w.va, k);
     return true;
 }
+static bool resolve_memory(Device* dev, uint64_t va, PcObj* res, uint64_t* off);
+// A copy into a buffer the title placed on its own memory. The buffer has a PC buffer of its own,
+// but shaders and the title's CPU code also read that memory by its address, where the bytes are
+// the title's memory seen by the GPU: the copy has to reach it too, or they read what was there
+// before (a title builds its per-frame tables with dozens of such copies a frame; loops then ran
+// on stale counts). The same bytes are copied a second time, to the memory at the address.
+// XSL_PLACED_COPY=0: only into the buffer's own PC buffer, as before.
+static bool copy_to_placed_memory(ID3D12GraphicsCommandList* l, ID3D12Resource* d, UINT64 doff, PcObj src, UINT64 soff, UINT64 n) {
+    static const bool on = [] { char b[4]; return !(GetEnvironmentVariableA("XSL_PLACED_COPY", b, 4) && b[0] == '0'); }();
+    if (!on || !n || !d || !is_ours(d)) return false;
+    const uint64_t va = ex<ID3D12Resource2, ResExtra>((ID3D12Resource2*)d)->titleVa;
+    if (!va) return false;
+    PcObj at = nullptr;
+    uint64_t off = 0;
+    if (!resolve_memory(hdr(l)->device, va + doff, &at, &off) || !at || at == P(d) || at == src) return false;
+    D3D12_RESOURCE_DESC rd{};
+    pc::res_desc(at, &rd);
+    if (rd.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER || off + n > rd.Width) return false;
+    pc::list_copy_buffer_region(LPC(l), at, off, src, soff, n);
+    static volatile long k = 0;
+    if (const long c = InterlockedIncrement(&k); c <= 6 || c % 20000 == 0)
+        XSL_INFO(CH, "a copy into a buffer placed on title memory (at %llx, offset %llu, %llu bytes) is also made to that memory, which shaders read by address (%ld so far)",
+                 (unsigned long long)va, (unsigned long long)doff, (unsigned long long)n, c);
+    return true;
+}
 void D3DAPI L_CopyBufferRegion(ID3D12GraphicsCommandList* l, ID3D12Resource* d, UINT64 doff, ID3D12Resource* s, UINT64 soff, UINT64 n) {
-    note_copy_to_placed(d, "buffer", doff, n, 0);
+    if (!copy_to_placed_memory(l, d, doff, P(s), soff, n)) note_copy_to_placed(d, "buffer", doff, n, 0);
     pc::list_copy_buffer_region(LPC(l), P(d), doff, P(s), soff, n);
 }
 void D3DAPI L_CopyTextureRegion(ID3D12GraphicsCommandList* l, const D3D12_TEXTURE_COPY_LOCATION* d, UINT x, UINT y, UINT z,
@@ -1621,7 +1655,7 @@ void D3DAPI L_FlushPipelineX(ID3D12GraphicsCommandList* l, D3D12XBOX_FLUSH, D3D1
 void D3DAPI L_ExecuteIndirect(ID3D12GraphicsCommandList* l, ID3D12CommandSignature* sig, UINT max, ID3D12Resource* args, UINT64 ao,
                               ID3D12Resource* cnt, UINT64 co) {
     if (draw_dump_now()) XSL_INFO(CH, "draw dump: list %p ExecuteIndirect(up to %u), pipeline %s%s", (void*)l, max, pc::list_pso_name(LPC(l)).c_str(), dump_skipped(l).c_str());
-    if (lx(l)->placeholderPso) placeholder_skip(lx(l)->placeholderWhy);
+    if (lx(l)->placeholderPso) placeholder_skip(lx(l)->placeholderWhy, lx(l)->psoObj);
     if (null_graphics() || lx(l)->placeholderPso) return;   // placeholder PSO: its work is skipped
     if (sig && args && pc::is_rays_signature(P(sig)) && rt_bind_trace(l)) rt_peek_tables(l, "ExecuteIndirect (rays)");
     if (sig && args && pc::is_rays_signature(P(sig))) {   // indirect rays on a translated pipeline (count buffer ignored)
@@ -1909,6 +1943,7 @@ void D3DAPI L_DepthBounds(ID3D12GraphicsCommandList1* l, FLOAT lo, FLOAT hi) { p
 // The PC buffer and offset behind a title address: GPU-visible title memory, a buffer the title
 // placed, or page-mapped pool memory.
 static bool resolve_memory(Device* dev, uint64_t va, PcObj* res, uint64_t* off) {
+    if (written_buffer_at(va, res, off)) return true;
     UnifiedRef u;
     if (unified_lookup(dev, va, &u)) { *res = u.res; *off = u.offset; return true; }
     uint64_t avail = 0;
@@ -2336,6 +2371,16 @@ HRESULT D3DAPI Q_PresentX(ID3D12CommandQueue* q, UINT planes, const D3D12XBOX_PR
                     if (k) t += " [" + std::to_string(k) + ": " + why + "]";
                     k = 0;
                 }
+                // (those not built yet: by the workers that have them, and the ones skipped most)
+                long by[4] = {};
+                std::vector<std::pair<long, uint64_t>> top;
+                for (auto& [key, w] : g_ph_waiting) { by[w.first < 0 ? 3 : w.first] += w.second; if (key) top.push_back({w.second, key}); }
+                std::sort(top.rbegin(), top.rend());
+                char b[160];
+                snprintf(b, sizeof b, " [not built yet: %ld with the pipeline workers, %ld compile, %ld giants, %ld other; %zu pipelines]", by[0], by[1], by[2], by[3], top.size());
+                t += b;
+                for (size_t k = 0; k < top.size() && k < 6; k++) { snprintf(b, sizeof b, " %016llx x%ld (%d)", (unsigned long long)top[k].second, top[k].first, g_ph_waiting[top[k].second].first); t += b; }
+                g_ph_waiting.clear();
                 XSL_INFO(CH, "placeholder pipelines skipped %ld draws/dispatches over the last 10 s%s", n, t.c_str());
             }
         }

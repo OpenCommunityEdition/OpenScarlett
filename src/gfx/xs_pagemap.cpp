@@ -228,8 +228,29 @@ int format_family(DXGI_FORMAT f) {
     return v;
 }
 }  // namespace
+// Buffers the GPU writes (unordered access) that the title placed on its own memory: each has a
+// PC buffer of its own, which its views are views of. What reaches that memory by its address (a
+// view placed there, a root view, a copy between addresses) has to reach the same PC buffer, not
+// the title's memory seen by the GPU, or one pass writes one and the next reads the other.
+namespace {
+struct WrittenBuf { PcObj res; uint64_t size; void* obj; };
+std::map<uint64_t, WrittenBuf> g_written_bufs;   // (under g_written_mu) by address
+}  // namespace
+bool written_buffer_at(uint64_t va, PcObj* res, uint64_t* off) {
+    static const bool on = [] { char b[4]; return !(GetEnvironmentVariableA("XSL_WRITTEN_BUFFERS", b, 4) && b[0] == '0'); }();
+    if (!on) return false;
+    std::lock_guard<std::mutex> g(g_written_mu);
+    auto it = g_written_bufs.upper_bound(va);
+    if (it == g_written_bufs.begin()) return false;
+    --it;
+    if (va >= it->first + it->second.size) return false;
+    *res = it->second.res;
+    *off = va - it->first;
+    return true;
+}
 void written_forget(uint64_t va, void* obj) {
     std::lock_guard<std::mutex> g(g_written_mu);
+    if (auto b = g_written_bufs.find(va); b != g_written_bufs.end() && b->second.obj == obj) g_written_bufs.erase(b);
     auto range = g_written.equal_range(va);
     for (auto it = range.first; it != range.second;) it = it->second.obj == obj ? g_written.erase(it) : std::next(it);
 }
@@ -346,6 +367,14 @@ HRESULT D3DAPI D_CreatePlacedResourceX(ID3D12Device* d, D3D12_GPU_VIRTUAL_ADDRES
         detile_register(r, va, desc, pc::pc_state_of(st), skip);
         hr = make_resource((Device*)d, r, riid, out);
         if (SUCCEEDED(hr) && out && *out) resource_set_title_va(*out, va);
+        if (SUCCEEDED(hr) && out && *out && gpuWritten && isBuffer) {
+            std::lock_guard<std::mutex> g(g_written_mu);
+            g_written_bufs[va] = WrittenBuf{r, desc->Width, *out};
+            static volatile long n = 0;
+            if (const long k = InterlockedIncrement(&n); k <= 4 || k % 500 == 0)
+                XSL_INFO(CH, "a buffer the GPU writes (%llu bytes, flags %x) placed on title memory at %llx: what reaches that memory by address goes to its PC buffer (%ld such buffers so far)",
+                         (unsigned long long)desc->Width, (unsigned)desc->Flags, (unsigned long long)va, k);
+        }
         if (SUCCEEDED(hr) && out && *out && gpuWritten && !isBuffer) {
             {
                 std::lock_guard<std::mutex> g(g_written_mu);

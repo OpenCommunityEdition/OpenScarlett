@@ -194,6 +194,7 @@ bool desc_view_attach(uint32_t first, uint32_t count, void* mem);
 // Placeholder pipelines (no PC pipeline; their work is skipped): why, for the log of skipped work.
 void placeholder_note(void* titleObject, const char* why);
 void pso_wait_ready(void* titlePipeline);   // a pipeline still being built is built (or awaited) now
+int pso_pending_level(void* titlePipeline, uint64_t* key);   // which workers have it (0 pipeline, 1 compile, 2 giants; -1: built or not known)
 void placed_view_scope(bool on);            // the calling thread is placing a texture for a placed view
 bool pso_thread_group(const void* titlePipeline, uint32_t out[3]);   // a compute pipeline's console thread-group size
 std::string pso_pool_stats();   // what the pipeline worker pools did since the last call (periodic line)
@@ -240,6 +241,7 @@ void pagemap_forget(uint64_t va, PcObj res);
 // view of (xs_pagemap.cpp), and its removal when the texture is destroyed.
 ID3D12Resource* written_texture_at(uint64_t va, const D3D12_RESOURCE_DESC* rd, bool* cast);
 void written_forget(uint64_t va, void* resource);
+bool written_buffer_at(uint64_t va, PcObj* res, uint64_t* off);   // a buffer the GPU writes, placed on title memory, that holds the address
 bool placed_view_made_at(uint64_t va);   // xs_device.cpp
 HRESULT D3DAPI D_RegisterPagePoolX(ID3D12Device* d, D3D12_GPU_VIRTUAL_ADDRESS va, UINT pageCount, HANDLE* out);
 HRESULT D3DAPI D_UnregisterPagePoolX(ID3D12Device* d, HANDLE h);

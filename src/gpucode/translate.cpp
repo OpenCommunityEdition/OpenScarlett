@@ -26,7 +26,7 @@ namespace gpucode {
 // for every stage.
 static unsigned stage_guard(const TranslateOptions& opt, ProgramKind kind) {
     if (opt.loop_guard != TranslateOptions().loop_guard) return opt.loop_guard;
-    return kind == ProgramKind::CS ? opt.loop_guard : kind == ProgramKind::PS ? 512u : 1024u;
+    return kind == ProgramKind::PS ? 512u : 1024u;   // (compute too: 4,096 steps in every thread of a volume or a particle pass still reset the GPU)
 }
 namespace {
 
@@ -5007,6 +5007,7 @@ uint64_t translation_salt(const Container& c) {
     if (global_write) add("global-write-2");
     // 2026-11: smaller step limits in pixel, vertex and mesh stages (stage_guard).
     if (backward && c.kind != ProgramKind::CS) add("stage-guard-1");
+    if (backward && c.kind == ProgramKind::CS && !barrier) add("cs-guard-1");
     // 2026-11: a gather at a named level reads that level (it read level 0).
     if (gather_level) add("gather-level-1");
     // 2026-11: 16-bit vertex and mesh outputs are unpacked into the registers their records name

@@ -29,6 +29,7 @@
 #define CH "gfx.pc"
 
 namespace pc {
+std::wstring rt_cache_dir();   // (native_shaders.cpp: the shader cache's folder)
 namespace {
 DXGI_FORMAT stand_in(DXGI_FORMAT f);
 template <class T> T* as(PcObj o) { return static_cast<T*>(o); }
@@ -51,6 +52,20 @@ void dump_debug_messages() {
     g_info->ClearStoredMessages();
 }
 ID3D12Device* g_main_device = nullptr;   // for removal reports from calls that do not pass it
+// A pipeline the GPU was running when Windows reset it for not answering: its first shader's key
+// goes to hung-shaders.txt beside the shader cache, and later runs leave that shader out (see
+// native_shaders.cpp). One reset costs one line; the file can be edited or deleted.
+bool g_removed_hung = false;
+void note_hung_pipeline(const std::wstring& marker) {
+    if (!g_removed_hung || marker.size() < 20 || marker.compare(0, 4, L"xsl ") != 0) return;
+    const std::wstring dir = rt_cache_dir();
+    if (dir.empty()) return;
+    if (FILE* f = _wfopen((dir + L"hung-shaders.txt").c_str(), L"a")) {
+        fprintf(f, "%ls\n", marker.substr(4, 16).c_str());
+        fclose(f);
+        XSL_WARN("gfx.pc", "the shader %ls is noted in hung-shaders.txt: later runs leave it out", marker.substr(4, 16).c_str());
+    }
+}
 struct RsTrack { PcObj gfx = nullptr, cs = nullptr, pso = nullptr; };
 std::mutex g_rs_mu;
 std::map<PcObj, std::pair<PcObj, bool>> g_pso_rs;
@@ -129,6 +144,7 @@ void report_device_removed(ID3D12Device* dev) {
     static volatile long once = 0;
     if (!dev || InterlockedExchange(&once, 1)) return;
     XSL_ERR(CH, "device removed: reason %08lx", dev->GetDeviceRemovedReason());
+    g_removed_hung = dev->GetDeviceRemovedReason() == DXGI_ERROR_DEVICE_HUNG;
     prof_report_now();   // (a profiled frame's times, when the device went before their report)
     dump_debug_messages();
     ID3D12DeviceRemovedExtendedData* dred = nullptr;
@@ -193,6 +209,7 @@ void report_device_removed(ID3D12Device* dev) {
                     auto it = g_marks.find(nm);
                     if (it != g_marks.end() && marks && marks <= it->second.size()) {
                         XSL_ERR(CH, "DRED: pipeline in use: %ls (marker %u of %zu)", it->second[marks - 1].c_str(), marks, it->second.size());
+                        note_hung_pipeline(it->second[marks - 1]);
                         for (UINT m = marks > 8 ? marks - 8 : 0; m < marks; m++) XSL_ERR(CH, "DRED:   marker %u: %ls", m + 1, it->second[m].c_str());
                     }
                     else

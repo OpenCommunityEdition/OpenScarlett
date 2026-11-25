@@ -438,6 +438,25 @@ bool native_translate(const void* in, size_t n, void** out, size_t* outSize) {
     }
     bool fallbackRs = false, meshKind = false;
     const uint64_t key = shader_key(c, in, n, &fallbackRs, &meshKind);
+    {   // shaders that hung the GPU in an earlier run (hung-shaders.txt beside the cache; XSL_HUNG_SKIP=0 runs them)
+        static const std::set<uint64_t> hung = [] {
+            std::set<uint64_t> v;
+            char b[4];
+            if (GetEnvironmentVariableA("XSL_HUNG_SKIP", b, 4) && b[0] == '0') return v;
+            if (FILE* f = cache_dir().empty() ? nullptr : _wfopen((cache_dir() + L"hung-shaders.txt").c_str(), L"r")) {
+                char line[64];
+                while (fgets(line, sizeof line, f))
+                    if (const uint64_t k = strtoull(line, nullptr, 16)) v.insert(k);
+                fclose(f);
+            }
+            if (!v.empty()) XSL_WARN(CH, "%zu shaders hung the GPU in earlier runs and are left out (hung-shaders.txt beside the shader cache)", v.size());
+            return v;
+        }();
+        if (hung.count(key)) {
+            t_untranslated = noFallback;
+            return false;
+        }
+    }
     if (const char* sk = getenv("XSL_SKIP_SHADERS"); sk && *sk) {   // debugging: these keys become placeholders
         char k[20];
         snprintf(k, sizeof k, "%016llx", (unsigned long long)key);

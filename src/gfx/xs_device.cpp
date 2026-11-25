@@ -539,6 +539,15 @@ static void pending_run(const std::shared_ptr<PendingPso>& j, int level = 0) {
     j->busy = false;
     j->cv.notify_all();
 }
+// Which workers have a pipeline that is not built yet (0 pipeline, 1 compile, 2 giants; -1: none,
+// it is built or not known), and its shaders' hash (diagnostics: what skipped draws wait for).
+int pso_pending_level_impl(void* obj, uint64_t* key) {
+    std::lock_guard<std::mutex> g(g_pending_mu);
+    auto it = g_pending.find(obj);
+    if (it == g_pending.end() || it->second->state.load() == 2) return -1;
+    if (key) *key = it->second->key;
+    return it->second->level.load();
+}
 void pso_wait_ready_impl(void* obj) {
     std::shared_ptr<PendingPso> j;
     {
@@ -1225,6 +1234,7 @@ D3D12_UNORDERED_ACCESS_VIEW_DESC pc_uav_desc(const D3D12XBOX_UNORDERED_ACCESS_VI
 }
 // PC buffer and byte offset holding title address va (0: none).
 PcObj placed_buffer(ID3D12Device* d, uint64_t va, uint64_t* off) {
+    if (PcObj w = nullptr; written_buffer_at(va, &w, off)) return w;
     UnifiedRef u;
     if (unified_lookup(DEV(d), va, &u)) { *off = u.offset; return u.res; }
     PcObj r;
@@ -2485,6 +2495,7 @@ bool rt_dispatch(PcObj list, const void* so, const uint64_t* tables, const D3D12
 }
 void console_memory_release(PcObj r) { console_memory_release_impl(r); }
 void pso_wait_ready(void* titlePipeline) { pso_wait_ready_impl(titlePipeline); }
+int pso_pending_level(void* titlePipeline, uint64_t* key) { return pso_pending_level_impl(titlePipeline, key); }
 bool pso_thread_group(const void* titlePipeline, uint32_t out[3]) { return pso_thread_group_impl(titlePipeline, out); }
 std::string pso_pool_stats() { return pso_pool_stats_impl(); }
 // The memory a resource took from the title's allocator, if any.

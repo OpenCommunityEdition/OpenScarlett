@@ -121,6 +121,12 @@ uint64_t unified_cpu_of_gpu(uint64_t gpu) {
     return 0;
 }
 uint64_t gpu_va(Device* dev, uint64_t va) {
+    {   // (a buffer the GPU writes, placed there: its own PC buffer)
+        PcObj w = nullptr;
+        uint64_t off = 0;
+        if (written_buffer_at(va, &w, &off))
+            if (const uint64_t base = pc::res_gpu_va(w)) return base + off;
+    }
     UnifiedRef r;
     if (unified_lookup(dev, va, &r)) return r.gpu;
     if (va < (1ull << 32)) return va;
